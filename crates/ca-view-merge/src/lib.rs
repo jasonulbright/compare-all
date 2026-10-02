@@ -1010,6 +1010,13 @@ impl MergeView {
     /// The pane supplies the saved text. Keep the model's sections in step
     /// with it so later takes and aligned rows address the same actual lines.
     fn absorb_output_edits(&mut self) {
+        self.absorb_edits(true);
+    }
+
+    /// With `remember`, an edit that moves lines between sections keeps the
+    /// sections it touched under its undo group, so undoing it returns them
+    /// to the ranges an earlier recorded step expects.
+    fn absorb_edits(&mut self, remember: bool) {
         let spans = self.output_pane.take_changes();
         let Some((first, old_end, new_end)) = edited_window(&spans) else {
             return;
@@ -1035,6 +1042,9 @@ impl MergeView {
                         local_start..local_end,
                         replacement,
                     ) {
+                        if remember {
+                            self.forget_extended_history();
+                        }
                         self.current = section;
                         let entry = &self.data.model.sections()[section];
                         let rows_changed = self
@@ -1074,12 +1084,37 @@ impl MergeView {
                 .unwrap_or(start)
         };
         let lines = self.buffer_lines(start, end.max(start));
+        let touched: Vec<_> = (from..=to).collect();
+        let before = remember.then(|| self.data.model.history_sections(&touched));
         for section in (from + 1)..=to {
             self.data.model.set_edited(section, Vec::new());
         }
         self.data.model.set_edited(from, lines);
+        if let Some(before) = before {
+            self.remember_edit(before);
+        }
         self.current = from;
         self.touched();
+    }
+
+    /// An edit typed into the group a recorded step belongs to leaves that
+    /// step's after state stale; replaying it then drops the later text.
+    fn forget_extended_history(&mut self) {
+        if let Some(id) = self.output_pane.buffer().undo_group_id() {
+            self.take_history.remove(&id);
+        }
+    }
+
+    fn remember_edit(&mut self, before: Vec<model::HistorySection>) {
+        let Some(id) = self.output_pane.buffer().undo_group_id() else {
+            return;
+        };
+        if self.take_history.remove(&id).is_some() {
+            return;
+        }
+        let indices: Vec<_> = before.iter().map(|entry| entry.index).collect();
+        let after = self.data.model.history_sections(&indices);
+        self.keep_history(id, before, after);
     }
 
     /// The buffer's lines in a range, each with the terminator the buffer
@@ -1159,21 +1194,42 @@ impl MergeView {
     fn remember_take(&mut self, before_id: Option<u64>, before: Vec<model::HistorySection>) {
         let indices: Vec<_> = before.iter().map(|entry| entry.index).collect();
         let after = self.data.model.history_sections(&indices);
-        let (before, after): (Vec<_>, Vec<_>) = before
-            .into_iter()
-            .zip(after)
-            .filter(|(old, new)| old.section != new.section)
-            .unzip();
-        if before.is_empty() {
+        if before
+            .iter()
+            .zip(&after)
+            .all(|(old, new)| old.section == new.section)
+        {
             return;
         }
         if self.output_pane.buffer().undo_group_id() == before_id {
             self.output_pane.buffer_mut().record_metadata_command();
         }
-        let buffer = self.output_pane.buffer();
-        let live: std::collections::HashSet<u64> = buffer.group_ids().collect();
+        if let Some(id) = self
+            .output_pane
+            .buffer()
+            .undo_group_id()
+            .filter(|id| Some(*id) != before_id)
+        {
+            self.keep_history(id, before, after);
+        }
+    }
+
+    /// Keep the changed sections of one undo group and release the history
+    /// of every group the pane can no longer replay.
+    fn keep_history(
+        &mut self,
+        id: u64,
+        before: Vec<model::HistorySection>,
+        after: Vec<model::HistorySection>,
+    ) {
+        let (before, after): (Vec<_>, Vec<_>) = before
+            .into_iter()
+            .zip(after)
+            .filter(|(old, new)| old.section != new.section)
+            .unzip();
+        let live: std::collections::HashSet<u64> = self.output_pane.buffer().group_ids().collect();
         self.take_history.retain(|id, _| live.contains(id));
-        if let Some(id) = buffer.undo_group_id().filter(|id| Some(*id) != before_id) {
+        if !before.is_empty() {
             self.take_history.insert(id, TakeHistory { before, after });
         }
     }
@@ -1210,7 +1266,7 @@ impl MergeView {
             });
             self.touched();
         } else {
-            self.absorb_output_edits();
+            self.absorb_edits(false);
         }
         self.follow_caret();
     }
@@ -3074,6 +3130,29 @@ mod tests {
     }
 
     #[test]
+    fn abandoned_edit_history_is_released_by_the_next_edit_across_sections() {
+        let (mut view, _dir) = open("a\nL\nc\n", Some("a\nb\nc\n"), "a\nR\nc\n");
+        run_until_ready(&mut view);
+        let join = |view: &mut MergeView| {
+            view.output_pane
+                .place(ca_ui::editor::Caret::new(2, 0), false);
+            view.output_pane.backspace();
+            view.absorb_output_edits();
+        };
+        for _ in 0..8 {
+            join(&mut view);
+            view.run(Command::Undo);
+            view.output_pane
+                .place(ca_ui::editor::Caret::new(0, 0), false);
+            view.output_pane.type_character('X');
+            view.absorb_output_edits();
+        }
+        join(&mut view);
+        assert_eq!(view.take_history.len(), 1);
+        assert_output_lines_match_pane(&view);
+    }
+
+    #[test]
     fn undoing_a_take_after_an_edit_joined_its_section_with_the_next_keeps_every_line() {
         let (mut view, _dir) = open("a\nL\nc\n", Some("a\nb\nc\n"), "a\nR\nc\n");
         run_until_ready(&mut view);
@@ -3093,6 +3172,56 @@ mod tests {
         assert_output_lines_match_pane(&view);
         view.run(Command::Redo);
         assert_output_lines_match_pane(&view);
+    }
+
+    #[test]
+    fn undoing_an_edit_across_a_taken_section_and_then_the_take_restores_the_conflict() {
+        let edits: [fn(&mut MergeView); 2] = [
+            |view| {
+                view.output_pane
+                    .place(ca_ui::editor::Caret::new(2, 0), false);
+                view.output_pane.backspace();
+            },
+            |view| {
+                view.output_pane
+                    .place(ca_ui::editor::Caret::new(1, 0), false);
+                view.output_pane
+                    .place(ca_ui::editor::Caret::new(2, 0), true);
+                view.output_pane.delete();
+            },
+        ];
+        for (case, edit) in edits.into_iter().enumerate() {
+            let (mut view, dir) = open("a\nL\nc\n", Some("a\nb\nc\n"), "a\nR\nc\n");
+            run_until_ready(&mut view);
+            view.run(Command::NextConflict);
+            let original = (view.output_text(), view.model().sections().to_vec());
+            view.run(Command::TakeLeft);
+            let taken = view.output_text();
+            edit(&mut view);
+            view.absorb_output_edits();
+            let edited = view.output_text();
+            assert_ne!(edited, taken, "case {case}");
+            view.run(Command::Undo);
+            assert_eq!(view.output_text(), taken, "case {case}");
+            assert_output_lines_match_pane(&view);
+            view.run(Command::Undo);
+            assert_eq!(
+                (view.output_text(), view.model().sections().to_vec()),
+                original,
+                "case {case}"
+            );
+            assert_eq!(view.model().totals().conflicts_remaining, 1, "case {case}");
+            assert_output_lines_match_pane(&view);
+            assert!(save_with_markers(&mut view, &dir).contains("<<<<<<<"));
+            assert_eq!(view.exit_code(), Some(14), "case {case}");
+            view.run(Command::Redo);
+            assert_eq!(view.output_text(), taken, "case {case}");
+            assert_eq!(view.model().totals().conflicts_remaining, 0, "case {case}");
+            assert_output_lines_match_pane(&view);
+            view.run(Command::Redo);
+            assert_eq!(view.output_text(), edited, "case {case}");
+            assert_output_lines_match_pane(&view);
+        }
     }
 
     #[test]
