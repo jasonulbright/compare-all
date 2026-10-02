@@ -674,7 +674,7 @@ fn xml_entries_at(
                         return Err("duplicate XML attribute".into());
                     }
                     let key = std::str::from_utf8(attribute.key.as_ref())
-                        .map_err(|error| error.to_string())?;
+                        .map_err(crate::prettify::xml_reason)?;
                     let prefix = if key == "xmlns" {
                         Some("")
                     } else {
@@ -748,7 +748,7 @@ fn xml_entries_at(
                 }
                 append_xml_text(
                     &mut stack,
-                    &value.xml10_content().map_err(|error| error.to_string())?,
+                    &value.xml10_content().map_err(crate::prettify::xml_reason)?,
                 )?;
             }
             Event::CData(value) => {
@@ -757,7 +757,7 @@ fn xml_entries_at(
                 }
                 append_xml_text(
                     &mut stack,
-                    &value.xml10_content().map_err(|error| error.to_string())?,
+                    &value.xml10_content().map_err(crate::prettify::xml_reason)?,
                 )?;
             }
             Event::GeneralRef(reference) => {
@@ -766,22 +766,22 @@ fn xml_entries_at(
                 }
                 let value = if let Some(character) = reference
                     .resolve_char_ref()
-                    .map_err(|error| error.to_string())?
+                    .map_err(crate::prettify::xml_reason)?
                 {
                     if !xml_char(character) {
                         return Err("invalid XML character reference".into());
                     }
                     character.to_string()
                 } else {
-                    let name = reference.decode().map_err(|error| error.to_string())?;
+                    let name = reference.decode().map_err(crate::prettify::xml_reason)?;
                     quick_xml::escape::unescape(&format!("&{name};"))
-                        .map_err(|error| error.to_string())?
+                        .map_err(crate::prettify::xml_reason)?
                         .into_owned()
                 };
                 append_xml_text(&mut stack, &value)?;
             }
             Event::Comment(value) => {
-                let value = value.xml10_content().map_err(|error| error.to_string())?;
+                let value = value.xml10_content().map_err(crate::prettify::xml_reason)?;
                 xml_misc(&mut stack, document, "comment()", &value)?;
             }
             Event::PI(value) => {
@@ -790,9 +790,9 @@ fn xml_entries_at(
                     return Err("invalid XML processing instruction target".into());
                 }
                 let target =
-                    std::str::from_utf8(value.target()).map_err(|error| error.to_string())?;
+                    std::str::from_utf8(value.target()).map_err(crate::prettify::xml_reason)?;
                 let data = std::str::from_utf8(value.content())
-                    .map_err(|error| error.to_string())?
+                    .map_err(crate::prettify::xml_reason)?
                     .trim_start_matches([' ', '\t', '\r', '\n']);
                 let value = if data.is_empty() {
                     target.to_owned()
@@ -807,23 +807,28 @@ fn xml_entries_at(
                 if declaration
                     || roots > 0
                     || reader.buffer_position()
-                        != u64::try_from(value.len() + 4).map_err(|error| error.to_string())?
+                        != u64::try_from(value.len() + 4).map_err(crate::prettify::xml_reason)?
                 {
                     return Err("invalid XML declaration position".into());
                 }
                 declaration = true;
-                if value.version().map_err(|error| error.to_string())?.as_ref() != b"1.0" {
+                if value
+                    .version()
+                    .map_err(crate::prettify::xml_reason)?
+                    .as_ref()
+                    != b"1.0"
+                {
                     return Err("only XML 1.0 is supported".into());
                 }
                 let start = quick_xml::events::BytesStart::from_content(
-                    std::str::from_utf8(value.as_ref()).map_err(|error| error.to_string())?,
+                    std::str::from_utf8(value.as_ref()).map_err(crate::prettify::xml_reason)?,
                     3,
                 );
                 validate_attributes(&start, cancel)?;
                 let mut names = Vec::new();
                 let mut raw_keys = BTreeSet::new();
                 for attribute in start.attributes().with_checks(false) {
-                    let attribute = attribute.map_err(|error| error.to_string())?;
+                    let attribute = attribute.map_err(crate::prettify::xml_reason)?;
                     let key = attribute.key.as_ref();
                     if !raw_keys.insert(key.to_vec()) {
                         return Err("duplicate XML declaration attribute".into());
@@ -878,13 +883,13 @@ fn xml_entries_at(
 }
 
 fn attribute_value(bytes: &[u8]) -> Result<String, String> {
-    let raw = std::str::from_utf8(bytes).map_err(|error| error.to_string())?;
+    let raw = std::str::from_utf8(bytes).map_err(crate::prettify::xml_reason)?;
     if raw.contains('<') {
         return Err("invalid XML attribute character".into());
     }
     let raw = raw.replace("\r\n", " ").replace(['\r', '\n', '\t'], " ");
     let value = quick_xml::escape::unescape(&raw)
-        .map_err(|error| error.to_string())?
+        .map_err(crate::prettify::xml_reason)?
         .into_owned();
     if value.chars().any(|character| !xml_char(character)) {
         return Err("invalid XML attribute character reference".into());
@@ -1012,7 +1017,7 @@ fn finish_xml(frame: XmlFrame, document: &mut Document) -> Result<(), String> {
 }
 
 fn valid_qname(bytes: &[u8]) -> Result<(), String> {
-    let name = std::str::from_utf8(bytes).map_err(|error| error.to_string())?;
+    let name = std::str::from_utf8(bytes).map_err(crate::prettify::xml_reason)?;
     let mut count = 0;
     for part in name.split(':') {
         count += 1;

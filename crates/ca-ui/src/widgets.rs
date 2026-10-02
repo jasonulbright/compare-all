@@ -261,7 +261,9 @@ pub fn notice(
     };
     ui.horizontal_top(|ui| {
         icon.show(ui, size, tint);
-        wrapped_text(ui, text);
+        ui.vertical(|ui| {
+            wrapped_text(ui, text);
+        });
     });
 }
 

@@ -17,6 +17,51 @@ fn long_path() -> PathBuf {
     ))
 }
 
+#[test]
+fn notice_text_starts_after_the_icon_and_stays_inside_the_panel() {
+    for width in [200.0, 640.0, 1280.0] {
+        let ctx = egui::Context::default();
+        let mut output = egui::FullOutput::default();
+        for _ in 0..2 {
+            output = ctx.run(sized_input(width, 400.0), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ca_ui::widgets::notice_current(
+                        ui,
+                        ca_ui::icons::Icon::Info,
+                        16.0,
+                        "Structured comparison is active and the original files remain available.",
+                    );
+                });
+            });
+        }
+        let icon = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Mesh(mesh) if mesh.texture_id != egui::TextureId::default() => {
+                    Some(mesh.calc_bounds())
+                }
+                _ => None,
+            })
+            .expect("notice icon");
+        let text = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text().starts_with("Structured") => {
+                    Some(text.visual_bounding_rect())
+                }
+                _ => None,
+            })
+            .expect("notice text");
+        assert!(
+            text.left() >= icon.right(),
+            "width {width}: icon {icon:?}, text {text:?}"
+        );
+        assert!(text.right() <= width, "width {width}: {text:?}");
+    }
+}
+
 /// The area every shape one frame painted covers.
 fn painted_area(output: &egui::FullOutput) -> egui::Rect {
     let mut area = egui::Rect::NOTHING;

@@ -17,3 +17,9 @@ pub mod tree;
 pub mod update;
 
 pub use shell::{App, VERSION};
+
+/// Product name and version shown by the window and Help menu.
+#[must_use]
+pub fn product_title() -> String {
+    format!("Compare All {VERSION}")
+}

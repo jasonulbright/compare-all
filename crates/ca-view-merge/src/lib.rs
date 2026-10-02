@@ -228,9 +228,15 @@ pub struct WidgetRect {
     pub rect: egui::Rect,
 }
 
+struct TakeHistory {
+    before: Vec<(usize, model::Section)>,
+    after: Vec<(usize, model::Section)>,
+}
+
 /// The three way merge tab.
 #[allow(clippy::struct_excessive_bools)]
 pub struct MergeView {
+    take_history: std::collections::HashMap<u64, TakeHistory>,
     id: egui::Id,
     paths: MergePaths,
     /// The session's settings, which the merge options are derived from.
@@ -416,6 +422,7 @@ impl MergeView {
     #[must_use]
     pub fn over(paths: MergePaths, titles: Titles, context: &ViewContext, salt: u64) -> Self {
         let mut view = Self {
+            take_history: std::collections::HashMap::new(),
             id: egui::Id::new(("merge", salt)),
             paths,
             titles,
@@ -910,6 +917,7 @@ impl MergeView {
     }
 
     fn reset_output_buffer(&mut self) {
+        self.take_history.clear();
         let column = self.output_pane.caret_column();
         let line = self.output_pane.caret().line;
         self.output_pane
@@ -1120,10 +1128,13 @@ impl MergeView {
                     .map(|range| (index, range))
             })
             .collect();
+        let before_id = self.output_pane.buffer().undo_group_id();
+        let before = self.data.model.history_sections(&sections);
         self.data.model.set_resolutions(&sections, resolution);
         self.current = sections[0];
         self.touched();
         self.replace_output_sections(&changed);
+        self.remember_take(before_id, before);
     }
 
     /// Take one input's version of the current line into the output.
@@ -1132,13 +1143,61 @@ impl MergeView {
             return;
         }
         let row = self.row;
+        let sections: Vec<_> = self.data.model.section_of_row(row).into_iter().collect();
+        let before_id = self.output_pane.buffer().undo_group_id();
+        let before = self.data.model.history_sections(&sections);
         if let Some((section, old, new)) = self.data.model.take_line_with_range(row, pane) {
             self.current = section;
             self.touched();
             self.replace_output_ranges(&[(old, new)]);
+            self.remember_take(before_id, before);
         } else {
             self.message = Some("The output already holds that line".to_owned());
         }
+    }
+
+    fn remember_take(&mut self, before_id: Option<u64>, before: Vec<(usize, model::Section)>) {
+        let indices: Vec<_> = before.iter().map(|(index, _)| *index).collect();
+        let after = self.data.model.history_sections(&indices);
+        if before != after && self.output_pane.buffer().undo_group_id() == before_id {
+            self.output_pane.buffer_mut().record_metadata_command();
+        }
+        if let Some(id) = self
+            .output_pane
+            .buffer()
+            .undo_group_id()
+            .filter(|id| Some(*id) != before_id)
+        {
+            self.take_history.insert(id, TakeHistory { before, after });
+        }
+    }
+
+    fn replay_output_history(&mut self, redo: bool) {
+        let id = if redo {
+            self.output_pane.buffer().redo_group_id()
+        } else {
+            self.output_pane.buffer().undo_group_id()
+        };
+        let replayed = if redo {
+            self.output_pane.redo()
+        } else {
+            self.output_pane.undo()
+        };
+        if !replayed {
+            return;
+        }
+        if let Some(history) = id.and_then(|id| self.take_history.get(&id)) {
+            let _ = self.output_pane.take_changes();
+            self.data.model.restore_history_sections(if redo {
+                &history.after
+            } else {
+                &history.before
+            });
+            self.touched();
+        } else {
+            self.absorb_output_edits();
+        }
+        self.follow_caret();
     }
 
     /// Record that the model changed: the strip is redrawn and the filter
@@ -2464,9 +2523,15 @@ impl SessionView for MergeView {
             Command::TakeLeftThenRight => self.take(Resolution::LeftThenRight),
             Command::TakeRightThenLeft => self.take(Resolution::RightThenLeft),
             Command::TakeAllNonConflicting => {
+                let indices: Vec<_> = (0..self.data.model.sections().len()).collect();
+                let before_id = self.output_pane.buffer().undo_group_id();
+                let before = self.data.model.history_sections(&indices);
                 let changed = self.data.model.take_all_non_conflicting();
                 self.touched();
                 self.replace_output_sections(&changed);
+                if !changed.is_empty() {
+                    self.remember_take(before_id, before);
+                }
             }
             Command::FavorLeft => self.rules.favor_left = !self.rules.favor_left,
             Command::FavorRight => self.rules.favor_right = !self.rules.favor_right,
@@ -2499,16 +2564,8 @@ impl SessionView for MergeView {
                 self.focus = Pane::Output;
                 self.paste_requested = true;
             }
-            Command::Undo => {
-                if self.output_pane.undo() {
-                    self.absorb_output_edits();
-                }
-            }
-            Command::Redo => {
-                if self.output_pane.redo() {
-                    self.absorb_output_edits();
-                }
-            }
+            Command::Undo => self.replay_output_history(false),
+            Command::Redo => self.replay_output_history(true),
             Command::SaveFile => self.save_output(),
             Command::Reload => self.start_merge(),
             Command::SwapSides => self.swap_sides(),
@@ -2857,7 +2914,7 @@ mod tests {
     }
 
     fn assert_saved_pane(view: &mut MergeView, dir: &tempfile::TempDir) {
-        // Suppression saves the pane without explicitly requested conflict markers.
+        // Clearing the conflict saves the pane without conflict markers.
         for section in 0..view.model().sections().len() {
             view.data.model.clear_conflict(section);
         }
@@ -2889,6 +2946,66 @@ mod tests {
             assert_output_lines_match_pane(&view);
             assert_saved_pane(&mut view, &dir);
         }
+    }
+
+    #[test]
+    fn undoing_a_take_restores_the_unresolved_conflict_and_redo_resolves_it() {
+        for command in [
+            Command::TakeLeft,
+            Command::TakeCenter,
+            Command::TakeRight,
+            Command::TakeLeftThenRight,
+            Command::TakeRightThenLeft,
+        ] {
+            let (mut view, dir) = open("a\nL\nc\n", Some("a\nb\nc\n"), "a\nR\nc\n");
+            run_until_ready(&mut view);
+            view.run(Command::NextConflict);
+            let original = view.output_text();
+            view.run(command);
+            let taken = view.output_text();
+            assert_eq!(view.model().totals().conflicts_remaining, 0);
+            view.run(Command::Undo);
+            assert_eq!(view.output_text(), original);
+            assert_eq!(view.model().totals().conflicts_remaining, 1, "{command:?}");
+            assert_output_lines_match_pane(&view);
+            assert!(save_with_markers(&mut view, &dir).contains("<<<<<<<"));
+            assert_eq!(view.exit_code(), Some(14));
+            view.run(Command::Redo);
+            assert_eq!(view.output_text(), taken);
+            assert_eq!(view.model().totals().conflicts_remaining, 0);
+        }
+    }
+
+    #[test]
+    fn undo_and_redo_reveal_the_replayed_text() {
+        let text = "line\n".repeat(200);
+        let (mut view, _dir) = open(&text, Some(&text), &text);
+        run_until_ready(&mut view);
+        view.output_pane
+            .place(ca_ui::editor::Caret::new(150, 1), false);
+        view.output_pane.type_character('X');
+        view.absorb_output_edits();
+        view.output_pane
+            .place(ca_ui::editor::Caret::new(0, 0), false);
+        view.run(Command::Undo);
+        assert!(view.scroll.first_row() > 100);
+        view.scroll = ca_ui::scroll::RowScroll::default();
+        view.run(Command::Redo);
+        assert!(view.scroll.first_row() > 100);
+    }
+
+    #[test]
+    fn taking_an_empty_ancestor_is_undoable_even_without_changed_bytes() {
+        let (mut view, _dir) = open("L\n", Some(""), "R\n");
+        run_until_ready(&mut view);
+        view.run(Command::NextConflict);
+        view.run(Command::TakeCenter);
+        assert_eq!(view.model().totals().conflicts_remaining, 0);
+        view.run(Command::Undo);
+        assert_eq!(view.model().totals().conflicts_remaining, 1);
+        assert_eq!(view.output_text(), "");
+        view.run(Command::Redo);
+        assert_eq!(view.model().totals().conflicts_remaining, 0);
     }
 
     #[test]
@@ -4214,6 +4331,22 @@ mod tests {
             marker_block(&view, "\r\n", ["L\r", "B\r", "R\r"])
         );
         assert_eq!(saved, expected);
+        assert_output_lines_match_pane(&view);
+    }
+
+    #[test]
+    fn reload_preserves_an_unclaimed_inserted_separator() {
+        let (mut view, _dir) = open("a\nb", Some("a\nb"), "a\nb\nc\n");
+        run_until_ready(&mut view);
+        view.output_pane
+            .place(ca_ui::editor::Caret::new(0, 0), false);
+        view.output_pane.type_character('X');
+        view.absorb_output_edits();
+        view.run(Command::Reload);
+        run_until_ready(&mut view);
+        view.current = view.model().sections().len() - 1;
+        view.run(Command::TakeLeft);
+        assert_eq!(view.output_text(), "Xa\nb");
         assert_output_lines_match_pane(&view);
     }
 

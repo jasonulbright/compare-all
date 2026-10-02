@@ -37,17 +37,55 @@ fn main() -> anyhow::Result<()> {
 /// stamps the date of the last compile. Passing the date as a tracked
 /// environment variable makes it an input: the day it changes, cargo rebuilds
 /// what carries the version; within one day nothing is rebuilt. Arguments after
-/// `build` are passed to cargo unchanged.
+/// `build` select the packages and profile; workspace builds exclude this
+/// already-running helper so Windows never has to replace its executable.
 fn build(root: &Path) -> anyhow::Result<()> {
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
     let status = std::process::Command::new(cargo)
         .current_dir(root)
         .arg("build")
-        .args(std::env::args().skip(2))
+        .args(build_arguments(std::env::args().skip(2).collect()))
         .env(version::BUILD_DATE_VAR, version::today_iso())
         .status()?;
     if !status.success() {
         anyhow::bail!("cargo build failed");
     }
     Ok(())
+}
+
+fn build_arguments(mut arguments: Vec<String>) -> Vec<String> {
+    let workspace = arguments
+        .iter()
+        .any(|arg| arg == "--workspace" || arg == "--all");
+    let selected = arguments
+        .iter()
+        .any(|arg| arg == "--package" || arg.starts_with("--package=") || arg.starts_with("-p"));
+    if workspace || !selected {
+        if !workspace {
+            arguments.push("--workspace".to_owned());
+        }
+        arguments.extend(["--exclude".to_owned(), "xtask".to_owned()]);
+    }
+    arguments
+}
+
+#[cfg(test)]
+mod build_tests {
+    #[test]
+    fn workspace_build_excludes_the_running_helper() {
+        for arguments in [
+            vec![],
+            vec!["--workspace"],
+            vec!["--workspace", "--release"],
+        ] {
+            let args = super::build_arguments(arguments.into_iter().map(str::to_owned).collect());
+            assert!(args.windows(2).any(|pair| pair == ["--exclude", "xtask"]));
+            assert!(args.iter().any(|arg| arg == "--workspace"));
+        }
+    }
+    #[test]
+    fn selected_packages_keep_their_build_options() {
+        let arguments = vec!["-p".to_owned(), "ca-app".to_owned(), "--release".to_owned()];
+        assert_eq!(super::build_arguments(arguments.clone()), arguments);
+    }
 }

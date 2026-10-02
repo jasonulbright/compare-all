@@ -1648,7 +1648,7 @@ impl App {
             .show(ctx, |ui| match &notice {
                 UpdateNotice::Newer(release) => {
                     ui.label(format!(
-                        "compare-all {} is available. This build is {VERSION}.",
+                        "Compare All {} is available. This build is {VERSION}.",
                         release.version
                     ));
                     ui.horizontal(|ui| {
@@ -3139,7 +3139,7 @@ impl App {
                     }
                     if *name == "Help" {
                         ui.separator();
-                        ui.label(format!("compare-all {VERSION}"));
+                        ui.label(crate::product_title());
                     }
                 });
                 if matches!(view, MenuView::Other | MenuView::Merge) && *name == ACTIONS_AFTER {

@@ -1,4 +1,4 @@
-# compare-all
+# Compare All
 
 [![CI](https://github.com/jasonulbright/compare-all/actions/workflows/ci.yml/badge.svg?branch=main&event=push)](https://github.com/jasonulbright/compare-all/actions/workflows/ci.yml)
 [![Release workflow](https://img.shields.io/github/actions/workflow/status/jasonulbright/compare-all/release.yml?label=release%20workflow)](https://github.com/jasonulbright/compare-all/actions/workflows/release.yml)
@@ -8,7 +8,7 @@
 [![Rust](https://img.shields.io/badge/Rust-1.94.1-CE422B)](#build-from-source)
 [![License](https://img.shields.io/github/license/jasonulbright/compare-all)](LICENSE)
 
-compare-all compares files and folders. It shows the differences side by
+Compare All compares files and folders. It shows the differences side by
 side. It can also merge, synchronize, and edit. It is written in Rust and uses
 the egui toolkit.
 
@@ -41,6 +41,7 @@ Text Compare highlights the syntax of common data formats and programming
 languages. For JSON and XML, View > Compare Structure compares paths and
 values instead of lines.
 
+![Structured comparison](docs/images/structured-compare.jpg)
 
 ![Text merge](docs/images/text-merge.jpg)
 
@@ -127,7 +128,7 @@ sync mirror:left->right
 ### Git
 
 Add these lines to your Git configuration. Change the path if you installed
-compare-all in a different folder.
+Compare All in a different folder.
 
 ```ini
 [diff]
@@ -161,6 +162,6 @@ files at the paths that Visual Studio gives.
 
 ## License
 
-compare-all is licensed under the MIT license. See [LICENSE](LICENSE).
+Compare All is licensed under the MIT license. See [LICENSE](LICENSE).
 The licenses of third-party components are in
 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).

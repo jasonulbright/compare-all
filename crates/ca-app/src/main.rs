@@ -4,7 +4,7 @@
 
 use ca_app::cli;
 use ca_app::shell::{DEFAULT_WINDOW_SIZE, MINIMUM_WINDOW_SIZE};
-use ca_app::{App, VERSION};
+use ca_app::App;
 use ca_ui::options::AppOptions;
 use ca_ui::theme::{palette, Variant};
 use ca_ui::view::ViewContext;
@@ -51,7 +51,7 @@ fn main() -> eframe::Result {
         ..eframe::NativeOptions::default()
     };
     let outcome = eframe::run_native(
-        &format!("compare-all {VERSION}"),
+        &ca_app::product_title(),
         options,
         Box::new(move |creation| {
             let repaint = creation.egui_ctx.clone();
