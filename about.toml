@@ -8,49 +8,49 @@ ignore = true
 [accesskit.clarify]
 license = "MIT"
 [["accesskit".clarify.git]]
-path = "LICENSE-MIT"
+path = "LICENSE"
 license = "MIT"
 checksum = "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
 
 [accesskit_atspi_common.clarify]
 license = "MIT"
 [["accesskit_atspi_common".clarify.git]]
-path = "LICENSE-MIT"
+path = "LICENSE"
 license = "MIT"
 checksum = "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
 
 [accesskit_consumer.clarify]
 license = "MIT"
 [["accesskit_consumer".clarify.git]]
-path = "LICENSE-MIT"
+path = "LICENSE"
 license = "MIT"
 checksum = "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
 
 [accesskit_macos.clarify]
 license = "MIT"
 [["accesskit_macos".clarify.git]]
-path = "LICENSE-MIT"
+path = "LICENSE"
 license = "MIT"
 checksum = "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
 
 [accesskit_unix.clarify]
 license = "MIT"
 [["accesskit_unix".clarify.git]]
-path = "LICENSE-MIT"
+path = "LICENSE"
 license = "MIT"
 checksum = "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
 
 [accesskit_windows.clarify]
 license = "MIT"
 [["accesskit_windows".clarify.git]]
-path = "LICENSE-MIT"
+path = "LICENSE"
 license = "MIT"
 checksum = "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
 
 [atspi-proxies.clarify]
 license = "MIT"
 [["atspi-proxies".clarify.git]]
-path = "LICENSE-MIT.txt"
+path = "LICENSE.txt"
 license = "MIT"
 checksum = "a94bf521d21b7db984c8b141b6f9341bbedbe24e617c1a55d952f8ef613ef1cd"
 
@@ -64,77 +64,77 @@ checksum = "946c9835d8034d24404f8cfec5f4654cee5dad17e944afc3d06d742cf2882831"
 [delegate.clarify]
 license = "MIT"
 [["delegate".clarify.git]]
-path = "LICENSE-MIT"
+path = "LICENSE"
 license = "MIT"
 checksum = "be7ee8aa49dc586023669a0c600a0536fce6a9f61264a53a67cdd842564ed899"
 
 [ecolor.clarify]
 license = "MIT"
 [["ecolor".clarify.git]]
-path = "LICENSE-MIT"
+path = "LICENSE"
 license = "MIT"
 checksum = "95ca92f5f8ea5231f1580b3a2a799e8260af3114b900e1def5355a7f44bcf60c"
 
 [eframe.clarify]
 license = "MIT"
 [["eframe".clarify.git]]
-path = "LICENSE-MIT"
+path = "LICENSE"
 license = "MIT"
 checksum = "95ca92f5f8ea5231f1580b3a2a799e8260af3114b900e1def5355a7f44bcf60c"
 
 [egui.clarify]
 license = "MIT"
 [["egui".clarify.git]]
-path = "LICENSE-MIT"
+path = "LICENSE"
 license = "MIT"
 checksum = "95ca92f5f8ea5231f1580b3a2a799e8260af3114b900e1def5355a7f44bcf60c"
 
 [egui_glow.clarify]
 license = "MIT"
 [["egui_glow".clarify.git]]
-path = "LICENSE-MIT"
+path = "LICENSE"
 license = "MIT"
 checksum = "95ca92f5f8ea5231f1580b3a2a799e8260af3114b900e1def5355a7f44bcf60c"
 
 [egui-winit.clarify]
 license = "MIT"
 [["egui-winit".clarify.git]]
-path = "LICENSE-MIT"
+path = "LICENSE"
 license = "MIT"
 checksum = "95ca92f5f8ea5231f1580b3a2a799e8260af3114b900e1def5355a7f44bcf60c"
 
 [emath.clarify]
 license = "MIT"
 [["emath".clarify.git]]
-path = "LICENSE-MIT"
+path = "LICENSE"
 license = "MIT"
 checksum = "95ca92f5f8ea5231f1580b3a2a799e8260af3114b900e1def5355a7f44bcf60c"
 
 [epaint.clarify]
 license = "MIT"
 [["epaint".clarify.git]]
-path = "LICENSE-MIT"
+path = "LICENSE"
 license = "MIT"
 checksum = "95ca92f5f8ea5231f1580b3a2a799e8260af3114b900e1def5355a7f44bcf60c"
 
 [jni.clarify]
 license = "MIT"
 [["jni".clarify.git]]
-path = "LICENSE-MIT"
+path = "LICENSE"
 license = "MIT"
 checksum = "fea1d5bf3dd71605ce5d7d2ff695c1837e914c77195e523a86b5391716477960"
 
 [jni-macros.clarify]
 license = "MIT"
 [["jni-macros".clarify.git]]
-path = "LICENSE-MIT"
+path = "LICENSE"
 license = "MIT"
 checksum = "fea1d5bf3dd71605ce5d7d2ff695c1837e914c77195e523a86b5391716477960"
 
 [jni-sys-macros.clarify]
 license = "MIT"
 [["jni-sys-macros".clarify.git]]
-path = "LICENSE-MIT"
+path = "LICENSE"
 license = "MIT"
 checksum = "1d85bd754b04ceec93e98e890edd1fa3c6a22e81bcb32135806beeccefa51cd1"
 
@@ -148,21 +148,21 @@ checksum = "2096783a9b939ae2a3a4789d9696740cec1a72ac04ccf8a7972d436fd0e7b240"
 [ndk.clarify]
 license = "MIT"
 [["ndk".clarify.git]]
-path = "LICENSE-MIT"
+path = "LICENSE"
 license = "MIT"
 checksum = "508a77d2e7b51d98adeed32648ad124b7b30241a8e70b2e72c99f92d8e5874d1"
 
 [ndk-context.clarify]
 license = "MIT"
 [["ndk-context".clarify.git]]
-path = "LICENSE-MIT"
+path = "LICENSE"
 license = "MIT"
 checksum = "508a77d2e7b51d98adeed32648ad124b7b30241a8e70b2e72c99f92d8e5874d1"
 
 [ndk-sys.clarify]
 license = "MIT"
 [["ndk-sys".clarify.git]]
-path = "LICENSE-MIT"
+path = "LICENSE"
 license = "MIT"
 checksum = "508a77d2e7b51d98adeed32648ad124b7b30241a8e70b2e72c99f92d8e5874d1"
 
@@ -183,7 +183,7 @@ checksum = "e353f37b12aefbb9f9b29490e837cfee05d9bda70804b3562839a3285c1df1e5"
 [profiling.clarify]
 license = "MIT"
 [["profiling".clarify.git]]
-path = "LICENSE-MIT"
+path = "LICENSE"
 license = "MIT"
 checksum = "c8167fdeeed46d3f244d3f85c5bf998ce889343691c32be2c61a8bc4b5c08333"
 
@@ -351,7 +351,7 @@ checksum = "c2cfccb812fe482101a8f04597dfc5a9991a6b2748266c47ac91b6a5aae15383"
 [zbus_xml.clarify]
 license = "MIT"
 [["zbus_xml".clarify.git]]
-path = "LICENSE-MIT"
+path = "LICENSE"
 license = "MIT"
 checksum = "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
 
@@ -359,7 +359,7 @@ checksum = "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
 license = "MIT"
 override-git-commit = "796a8e6c2971dc2ff1bcff166e6671284f9b5b6b"
 [[winapi-i686-pc-windows-gnu.clarify.git]]
-path = "LICENSE-MIT"
+path = "LICENSE"
 license = "MIT"
 checksum = "ce7bc3499fee93d5022ef430d5e4201e79a6d9154f3974e42f41349f0569e09b"
 
@@ -367,7 +367,7 @@ checksum = "ce7bc3499fee93d5022ef430d5e4201e79a6d9154f3974e42f41349f0569e09b"
 license = "MIT"
 override-git-commit = "796a8e6c2971dc2ff1bcff166e6671284f9b5b6b"
 [[winapi-x86_64-pc-windows-gnu.clarify.git]]
-path = "LICENSE-MIT"
+path = "LICENSE"
 license = "MIT"
 checksum = "ce7bc3499fee93d5022ef430d5e4201e79a6d9154f3974e42f41349f0569e09b"
 
