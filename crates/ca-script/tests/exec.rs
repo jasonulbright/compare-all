@@ -1127,9 +1127,9 @@ fn a_journal_is_written_for_a_batch_that_changes_the_disk() {
     }
     let mut journal = journal.expect("the write batch opened a journal");
     let clean = completed.unwrap_or_else(|| {
-        receive
-            .recv_timeout(std::time::Duration::from_secs(20))
-            .expect("the write batch finished")
+        // Each copy forces its data and journal records to stable storage.
+        // Wait for completion rather than imposing a disk-speed deadline.
+        receive.recv().expect("the write batch finished")
     });
     assert!(clean);
 

@@ -132,6 +132,13 @@ impl Terminal for MergeMessage {
     fn panicked(detail: String) -> Self {
         MergeMessage::Failed(detail)
     }
+
+    fn after_cancel(self) -> Self {
+        match self {
+            Self::Ready(_) => Self::Cancelled,
+            other => other,
+        }
+    }
 }
 
 /// How each input's bytes are decoded.
@@ -401,5 +408,31 @@ mod tests {
         assert!(seen
             .iter()
             .all(|message| !matches!(message, MergeMessage::Ready(_))));
+    }
+
+    #[test]
+    fn cancellation_discards_a_ready_result_already_in_the_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = MergePaths {
+            left: write(dir.path(), "left.txt", "a\n"),
+            center: None,
+            right: write(dir.path(), "right.txt", "b\n"),
+            output: None,
+        };
+        let data = ready(collect(paths));
+        let (sent, received) = std::sync::mpsc::channel();
+        let mut job = ca_ui::worker::Job::spawn(move |emitter, _| {
+            emitter.send(MergeMessage::Ready(data));
+            sent.send(()).unwrap();
+        });
+        received.recv().unwrap();
+        job.cancel();
+        let messages = job.drain();
+        assert!(messages
+            .iter()
+            .all(|message| !matches!(message, MergeMessage::Ready(_))));
+        assert!(messages
+            .iter()
+            .any(|message| matches!(message, MergeMessage::Cancelled)));
     }
 }
