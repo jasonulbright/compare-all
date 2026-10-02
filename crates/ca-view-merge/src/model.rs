@@ -256,6 +256,14 @@ pub struct DisplayRules {
     pub favor_right: bool,
 }
 
+/// A section as one undo step recorded it, with the output lines it covered.
+#[derive(Debug, Clone)]
+pub(crate) struct HistorySection {
+    pub(crate) index: usize,
+    pub(crate) output: Range<u32>,
+    pub(crate) section: Section,
+}
+
 /// One merged region across the three inputs and the output.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(clippy::struct_excessive_bools)]
@@ -925,7 +933,7 @@ const fn automatic(kind: MergeKind) -> Resolution {
 }
 
 impl MergeModel {
-    pub(crate) fn history_sections(&self, indices: &[usize]) -> Vec<(usize, Section)> {
+    pub(crate) fn history_sections(&self, indices: &[usize]) -> Vec<HistorySection> {
         indices
             .iter()
             .filter_map(|&index| {
@@ -934,17 +942,31 @@ impl MergeModel {
                     section.edited = self.edited_content(index, &section);
                     section.edited_from_output = false;
                 }
-                Some((index, section))
+                Some(HistorySection {
+                    index,
+                    output: self.output_range(index)?,
+                    section,
+                })
             })
             .collect()
     }
 
-    pub(crate) fn restore_history_sections(&mut self, sections: &[(usize, Section)]) {
+    /// True while every recorded section covers the output lines it covered
+    /// when recorded. After an edit moved lines between sections, a restore
+    /// drops or repeats output lines.
+    pub(crate) fn history_applies(&self, sections: &[HistorySection]) -> bool {
+        sections
+            .iter()
+            .all(|entry| self.output_range(entry.index).as_ref() == Some(&entry.output))
+    }
+
+    pub(crate) fn restore_history_sections(&mut self, sections: &[HistorySection]) {
         let mut changed = Vec::new();
-        for (index, section) in sections {
-            if let Some(entry) = self.sections.get_mut(*index) {
-                *entry = section.clone();
-                changed.push(*index);
+        for entry in sections {
+            if let Some(target) = self.sections.get_mut(entry.index) {
+                *target = entry.section.clone();
+                target.refresh(self.rules);
+                changed.push(entry.index);
             }
         }
         self.rebuild_changed_sections(&changed, true);

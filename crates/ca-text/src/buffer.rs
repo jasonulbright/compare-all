@@ -592,6 +592,15 @@ impl TextBuffer {
         self.redo.last().map(|group| group.id)
     }
 
+    /// Identities of every group Undo or Redo can still replay.
+    pub fn group_ids(&self) -> impl Iterator<Item = u64> + '_ {
+        self.open_group
+            .iter()
+            .chain(&self.undo)
+            .chain(&self.redo)
+            .map(|group| group.id)
+    }
+
     /// Record an undoable command that changes document metadata but no bytes.
     pub fn record_metadata_command(&mut self) {
         self.close_open_group();

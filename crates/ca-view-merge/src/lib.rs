@@ -229,8 +229,8 @@ pub struct WidgetRect {
 }
 
 struct TakeHistory {
-    before: Vec<(usize, model::Section)>,
-    after: Vec<(usize, model::Section)>,
+    before: Vec<model::HistorySection>,
+    after: Vec<model::HistorySection>,
 }
 
 /// The three way merge tab.
@@ -1156,18 +1156,24 @@ impl MergeView {
         }
     }
 
-    fn remember_take(&mut self, before_id: Option<u64>, before: Vec<(usize, model::Section)>) {
-        let indices: Vec<_> = before.iter().map(|(index, _)| *index).collect();
+    fn remember_take(&mut self, before_id: Option<u64>, before: Vec<model::HistorySection>) {
+        let indices: Vec<_> = before.iter().map(|entry| entry.index).collect();
         let after = self.data.model.history_sections(&indices);
-        if before != after && self.output_pane.buffer().undo_group_id() == before_id {
+        let (before, after): (Vec<_>, Vec<_>) = before
+            .into_iter()
+            .zip(after)
+            .filter(|(old, new)| old.section != new.section)
+            .unzip();
+        if before.is_empty() {
+            return;
+        }
+        if self.output_pane.buffer().undo_group_id() == before_id {
             self.output_pane.buffer_mut().record_metadata_command();
         }
-        if let Some(id) = self
-            .output_pane
-            .buffer()
-            .undo_group_id()
-            .filter(|id| Some(*id) != before_id)
-        {
+        let buffer = self.output_pane.buffer();
+        let live: std::collections::HashSet<u64> = buffer.group_ids().collect();
+        self.take_history.retain(|id, _| live.contains(id));
+        if let Some(id) = buffer.undo_group_id().filter(|id| Some(*id) != before_id) {
             self.take_history.insert(id, TakeHistory { before, after });
         }
     }
@@ -1178,6 +1184,15 @@ impl MergeView {
         } else {
             self.output_pane.buffer().undo_group_id()
         };
+        let id = id.filter(|id| {
+            self.take_history.get(id).is_some_and(|history| {
+                self.data.model.history_applies(if redo {
+                    &history.before
+                } else {
+                    &history.after
+                })
+            })
+        });
         let replayed = if redo {
             self.output_pane.redo()
         } else {
@@ -2974,6 +2989,128 @@ mod tests {
             assert_eq!(view.output_text(), taken);
             assert_eq!(view.model().totals().conflicts_remaining, 0);
         }
+    }
+
+    #[test]
+    fn undoing_a_line_take_or_take_all_restores_the_previous_section_state() {
+        for command in [Command::TakeLeftLine, Command::TakeRightLine] {
+            let (mut view, dir) = open("a\nL\nc\n", Some("a\nb\nc\n"), "a\nR\nc\n");
+            run_until_ready(&mut view);
+            view.run(Command::NextConflict);
+            view.row = view.model().row_of_section(view.current).unwrap();
+            view.run(command);
+            assert_eq!(view.model().totals().conflicts_remaining, 0, "{command:?}");
+            view.run(Command::Undo);
+            assert_eq!(view.model().totals().conflicts_remaining, 1, "{command:?}");
+            assert_output_lines_match_pane(&view);
+            assert!(save_with_markers(&mut view, &dir).contains("<<<<<<<"));
+            assert_eq!(view.exit_code(), Some(14));
+        }
+        let (mut view, _dir) = open(
+            "a\nL\nc\nd\ne\nf\nx\n",
+            Some("a\nb\nc\nd\ne\nf\nx\n"),
+            "a\nR\nc\nd\ne\nf\ny\n",
+        );
+        run_until_ready(&mut view);
+        let resolutions = |view: &MergeView| -> Vec<_> {
+            view.model()
+                .sections()
+                .iter()
+                .map(|section| section.resolution)
+                .collect()
+        };
+        let original = (view.output_text(), resolutions(&view));
+        let right = view
+            .model()
+            .sections()
+            .iter()
+            .position(|section| section.kind == ca_diff::merge3::MergeKind::RightChange)
+            .unwrap();
+        view.current = right;
+        view.run(Command::TakeLeft);
+        let taken = (view.output_text(), resolutions(&view));
+        view.run(Command::TakeAllNonConflicting);
+        assert_ne!((view.output_text(), resolutions(&view)), taken);
+        view.run(Command::Undo);
+        assert_eq!((view.output_text(), resolutions(&view)), taken);
+        assert_output_lines_match_pane(&view);
+        view.run(Command::Undo);
+        assert_eq!((view.output_text(), resolutions(&view)), original);
+        assert_eq!(view.model().totals().conflicts_remaining, 1);
+        assert_output_lines_match_pane(&view);
+    }
+
+    #[test]
+    fn undoing_a_take_after_an_edit_inside_its_section_still_restores_the_conflict() {
+        let (mut view, _dir) = open("a\nL\nc\n", Some("a\nb\nc\n"), "a\nR\nc\n");
+        run_until_ready(&mut view);
+        view.run(Command::NextConflict);
+        view.run(Command::TakeLeft);
+        view.output_pane
+            .place(ca_ui::editor::Caret::new(1, 1), false);
+        view.output_pane.type_character('X');
+        view.absorb_output_edits();
+        view.run(Command::Undo);
+        view.run(Command::Undo);
+        assert_eq!(view.model().totals().conflicts_remaining, 1);
+        assert_output_lines_match_pane(&view);
+    }
+
+    #[test]
+    fn abandoned_take_history_is_released_by_the_next_take() {
+        let (mut view, _dir) = open("a\nL\nc\n", Some("a\nb\nc\n"), "a\nR\nc\n");
+        run_until_ready(&mut view);
+        view.run(Command::NextConflict);
+        for _ in 0..8 {
+            view.run(Command::TakeLeft);
+            view.run(Command::Undo);
+            view.output_pane
+                .place(ca_ui::editor::Caret::new(0, 0), false);
+            view.output_pane.type_character('X');
+            view.absorb_output_edits();
+        }
+        view.run(Command::TakeLeft);
+        assert_eq!(view.take_history.len(), 1);
+    }
+
+    #[test]
+    fn undoing_a_take_after_an_edit_joined_its_section_with_the_next_keeps_every_line() {
+        let (mut view, _dir) = open("a\nL\nc\n", Some("a\nb\nc\n"), "a\nR\nc\n");
+        run_until_ready(&mut view);
+        view.run(Command::NextConflict);
+        view.run(Command::TakeLeft);
+        view.output_pane
+            .place(ca_ui::editor::Caret::new(2, 0), false);
+        view.output_pane.backspace();
+        view.absorb_output_edits();
+        assert_eq!(view.output_pane.buffer().text(), "a\nLc\n");
+        view.run(Command::Undo);
+        assert_output_lines_match_pane(&view);
+        view.run(Command::Undo);
+        assert_eq!(view.output_pane.buffer().text(), "a\nb\nc\n");
+        assert_output_lines_match_pane(&view);
+        view.run(Command::Redo);
+        assert_output_lines_match_pane(&view);
+        view.run(Command::Redo);
+        assert_output_lines_match_pane(&view);
+    }
+
+    #[test]
+    fn undoing_a_take_counts_the_section_under_the_current_rules() {
+        let (mut view, _dir) = open("a\nS\nc\n", Some("a\nb\nc\n"), "a\nS\nc\n");
+        run_until_ready(&mut view);
+        let section = (0..view.model().sections().len())
+            .find(|&index| {
+                view.model().sections()[index].kind == ca_diff::merge3::MergeKind::SameChange
+            })
+            .unwrap();
+        view.current = section;
+        view.run(Command::TakeCenter);
+        view.run(Command::ToggleIgnoreSameChanges);
+        assert_eq!(view.model().totals().differences, 0);
+        view.run(Command::Undo);
+        assert_eq!(view.model().totals().differences, 0);
+        assert!(!view.model().sections()[section].is_difference());
     }
 
     #[test]
