@@ -237,6 +237,8 @@ struct TakeHistory {
 #[allow(clippy::struct_excessive_bools)]
 pub struct MergeView {
     take_history: std::collections::HashMap<u64, TakeHistory>,
+    /// Undo group of the pane edit last folded into the sections.
+    absorbed_group: Option<u64>,
     id: egui::Id,
     paths: MergePaths,
     /// The session's settings, which the merge options are derived from.
@@ -423,6 +425,7 @@ impl MergeView {
     pub fn over(paths: MergePaths, titles: Titles, context: &ViewContext, salt: u64) -> Self {
         let mut view = Self {
             take_history: std::collections::HashMap::new(),
+            absorbed_group: None,
             id: egui::Id::new(("merge", salt)),
             paths,
             titles,
@@ -918,6 +921,7 @@ impl MergeView {
 
     fn reset_output_buffer(&mut self) {
         self.take_history.clear();
+        self.absorbed_group = None;
         let column = self.output_pane.caret_column();
         let line = self.output_pane.caret().line;
         self.output_pane
@@ -1021,6 +1025,10 @@ impl MergeView {
         let Some((first, old_end, new_end)) = edited_window(&spans) else {
             return;
         };
+        let recorded = remember && self.begins_group();
+        if remember && !recorded {
+            self.forget_extended_history();
+        }
         // The pane counts an empty line after a final terminator; the model
         // holds no line there.
         let output_len = u32::try_from(self.data.model.output_lines().len()).unwrap_or(u32::MAX);
@@ -1085,7 +1093,7 @@ impl MergeView {
         };
         let lines = self.buffer_lines(start, end.max(start));
         let touched: Vec<_> = (from..=to).collect();
-        let before = remember.then(|| self.data.model.history_sections(&touched));
+        let before = recorded.then(|| self.data.model.history_sections(&touched));
         for section in (from + 1)..=to {
             self.data.model.set_edited(section, Vec::new());
         }
@@ -1095,6 +1103,17 @@ impl MergeView {
         }
         self.current = from;
         self.touched();
+    }
+
+    /// True when no earlier edit of the pane's current undo group was folded
+    /// into the sections. Sections recorded at a later step of a group hold
+    /// the text of its earlier steps, which undoing the group removes from
+    /// the pane.
+    fn begins_group(&mut self) -> bool {
+        let id = self.output_pane.buffer().undo_group_id();
+        let first = id != self.absorbed_group;
+        self.absorbed_group = id;
+        first
     }
 
     /// An edit typed into the group a recorded step belongs to leaves that
@@ -3223,6 +3242,65 @@ mod tests {
             assert_eq!(view.output_text(), edited, "case {case}");
             assert_output_lines_match_pane(&view);
         }
+    }
+
+    #[test]
+    fn undo_and_redo_through_a_take_a_joining_edit_and_a_later_edit_keep_every_state() {
+        let (mut view, _dir) = open("a\nL\nc\n", Some("a\nb\nc\n"), "a\nR\nc\n");
+        run_until_ready(&mut view);
+        view.run(Command::NextConflict);
+        let original = (view.output_text(), view.model().sections().to_vec());
+        view.run(Command::TakeLeft);
+        let taken = view.output_text();
+        view.output_pane
+            .place(ca_ui::editor::Caret::new(2, 0), false);
+        view.output_pane.backspace();
+        view.absorb_output_edits();
+        let joined = view.output_text();
+        view.output_pane
+            .place(ca_ui::editor::Caret::new(1, 0), false);
+        view.output_pane.type_character('X');
+        view.absorb_output_edits();
+        let typed = view.output_text();
+        for expected in [&joined, &taken] {
+            view.run(Command::Undo);
+            assert_eq!(&view.output_text(), expected);
+            assert_output_lines_match_pane(&view);
+        }
+        view.run(Command::Undo);
+        assert_eq!(
+            (view.output_text(), view.model().sections().to_vec()),
+            original
+        );
+        assert_output_lines_match_pane(&view);
+        for expected in [&taken, &joined, &typed] {
+            view.run(Command::Redo);
+            assert_eq!(&view.output_text(), expected);
+            assert_output_lines_match_pane(&view);
+        }
+    }
+
+    #[test]
+    fn undoing_a_group_absorbed_in_two_steps_keeps_the_model_in_step_with_the_pane() {
+        let (mut view, _dir) = open("a\nL\nc\n", Some("a\nb\nc\n"), "a\nR\nc\n");
+        run_until_ready(&mut view);
+        view.run(Command::NextConflict);
+        view.run(Command::TakeLeft);
+        let taken = view.output_text();
+        view.output_pane.buffer_mut().begin_group();
+        view.output_pane
+            .place(ca_ui::editor::Caret::new(0, 0), false);
+        view.output_pane.type_character('X');
+        view.absorb_output_edits();
+        view.output_pane
+            .place(ca_ui::editor::Caret::new(2, 0), false);
+        view.output_pane.backspace();
+        view.absorb_output_edits();
+        view.output_pane.buffer_mut().end_group();
+        assert_output_lines_match_pane(&view);
+        view.run(Command::Undo);
+        assert_eq!(view.output_text(), taken);
+        assert_output_lines_match_pane(&view);
     }
 
     #[test]
