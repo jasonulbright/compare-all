@@ -115,7 +115,7 @@ pub(super) fn diagnostic_reason(reason: impl std::fmt::Display) -> String {
         fn write_str(&mut self, text: &str) -> std::fmt::Result {
             for character in text.chars() {
                 let escaped = character.is_control()
-                    || matches!(character, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}');
+                    || matches!(character, '\u{ad}' | '\u{0600}'..='\u{0605}' | '\u{061c}' | '\u{06dd}' | '\u{070f}' | '\u{0890}'..='\u{0891}' | '\u{08e2}' | '\u{180e}' | '\u{200b}'..='\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2060}'..='\u{206f}' | '\u{feff}' | '\u{fff9}'..='\u{fffb}' | '\u{110bd}' | '\u{110cd}' | '\u{13430}'..='\u{1343f}' | '\u{1bca0}'..='\u{1bca3}' | '\u{1d173}'..='\u{1d17a}' | '\u{e0001}' | '\u{e0020}'..='\u{e007f}');
                 let cost = if escaped { 10 } else { character.len_utf8() };
                 if self.0.len() + cost > 1024 {
                     return Err(std::fmt::Error);
@@ -545,6 +545,21 @@ impl<'a> JsonParser<'a> {
     }
 }
 
+pub(super) fn xml_reason(error: impl std::fmt::Display) -> String {
+    let message = error.to_string();
+    let reason = message
+        .split_once(": ")
+        .filter(|(prefix, _)| {
+            prefix.strip_prefix("at ").is_some_and(|range| {
+                range.split_once("..").is_some_and(|(start, end)| {
+                    start.parse::<usize>().is_ok() && end.parse::<usize>().is_ok()
+                })
+            })
+        })
+        .map_or(message.as_str(), |(_, reason)| reason);
+    reason.to_owned()
+}
+
 fn format_xml(text: &str, cancel: &dyn Cancel) -> Result<String, String> {
     let mut error_offset = 0;
     format_xml_at(text, cancel, &mut error_offset)
@@ -645,6 +660,13 @@ fn format_xml_at(
                 );
             }
             Event::GeneralRef(reference) => {
+                if reference
+                    .resolve_char_ref()
+                    .map_err(xml_reason)?
+                    .is_some_and(|ch| !crate::structure::xml_char(ch))
+                {
+                    return Err("invalid XML character reference".to_owned());
+                }
                 if stack.is_empty() {
                     return Err(
                         "invalid XML: entity reference outside the document element".to_owned()
@@ -799,12 +821,12 @@ fn xml_space(
                 format!("invalid XML attribute: {}", diagnostic_reason(reason))
             }
         })?;
+        let value = attribute.unescape_value().map_err(xml_reason)?;
+        if value.chars().any(|ch| !crate::structure::xml_char(ch)) {
+            return Err("invalid XML character reference".to_owned());
+        }
         if attribute.key.as_ref() == b"xml:space" {
-            preserve = match attribute
-                .unescape_value()
-                .map_err(|error| format!("invalid xml:space value: {error}"))?
-                .as_ref()
-            {
+            preserve = match value.as_ref() {
                 "preserve" => true,
                 "default" => false,
                 _ => return Err("xml:space must be 'default' or 'preserve'".to_owned()),
@@ -939,6 +961,49 @@ mod tests {
             .unwrap_or_default();
         assert!(error.contains("truncated"));
         assert!(error.len() < 1200, "{}", error.len());
+    }
+
+    #[test]
+    fn xml_rejects_invalid_character_references_and_uses_one_error_position() {
+        for input in ["<r>&#1;</r>", "<r>&#xFFFF;</r>", "<r a='&#1;'/>"] {
+            assert!(format(input, StructuredFormat::Xml).is_err(), "{input}");
+        }
+        let error = format("<r xml:space='&bogus;'/>", StructuredFormat::Xml)
+            .err()
+            .unwrap_or_default();
+        assert!(!error.contains(".."), "{error}");
+    }
+
+    #[test]
+    fn xml_entity_errors_do_not_expose_token_relative_positions() {
+        for input in [
+            "<r xml:space='&bogus;'/>",
+            "<r a='&bogus;'/>",
+            "<r>&bogus;</r>",
+        ] {
+            let error = crate::structure::compare(
+                input,
+                "<r/>",
+                crate::structure::Format::Xml,
+                &ca_ui::worker::Cancel::new(),
+            )
+            .err()
+            .unwrap_or_default();
+            assert!(!error.is_empty());
+            assert!(!error.contains(".."), "{error}");
+        }
+        let error = format("<r xml:space='&bogus;'/>", StructuredFormat::Xml)
+            .err()
+            .unwrap_or_default();
+        assert!(!error.contains(".."), "{error}");
+    }
+
+    #[test]
+    fn diagnostics_escape_invisible_format_characters() {
+        for ch in ['\u{200b}', '\u{feff}', '\u{ad}', '\u{fff9}', '\u{e0001}'] {
+            let reason = super::diagnostic_reason(format!("bad {ch} name"));
+            assert!(!reason.contains(ch), "{reason:?}");
+        }
     }
 
     #[test]

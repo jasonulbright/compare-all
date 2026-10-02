@@ -12,9 +12,9 @@ pub const SELECT_VERB: &str = "compare-all.selectleft";
 /// Key name of the verb that compares against the remembered left side.
 pub const COMPARE_VERB: &str = "compare-all.compare";
 /// Menu text of the verb that remembers the left side.
-pub const SELECT_TEXT: &str = "Select Left Side for compare-all";
+pub const SELECT_TEXT: &str = "Select Left Side for Compare All";
 /// Menu text of the verb that compares against the remembered left side.
-pub const COMPARE_TEXT: &str = "Compare with compare-all";
+pub const COMPARE_TEXT: &str = "Compare with Compare All";
 /// Class keys the verbs are written under: every file, and every folder.
 pub const CLASSES: [&str; 2] = ["*", "Directory"];
 

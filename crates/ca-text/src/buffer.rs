@@ -117,6 +117,7 @@ struct Edit {
 
 #[derive(Clone, Debug)]
 struct EditGroup {
+    id: u64,
     kind: EditKind,
     edits: Vec<Edit>,
 }
@@ -398,6 +399,7 @@ impl TextBuffer {
     pub fn begin_group(&mut self) {
         if self.open_depth == 0 {
             self.open_group = Some(EditGroup {
+                id: next_revision(),
                 kind: EditKind::Command,
                 edits: Vec::new(),
             });
@@ -510,6 +512,7 @@ impl TextBuffer {
         // A line break ends a typing run, so the next character starts its own group.
         self.sealed = kind != EditKind::Typing || edit.inserted.contains(['\r', '\n']);
         self.push_group(EditGroup {
+            id: next_revision(),
             kind,
             edits: vec![edit],
         });
@@ -571,6 +574,38 @@ impl TextBuffer {
     #[must_use]
     pub fn can_redo(&self) -> bool {
         !self.redo.is_empty()
+    }
+
+    /// Identity of the next group Undo will replay, stable across redo.
+    #[must_use]
+    pub fn undo_group_id(&self) -> Option<u64> {
+        self.open_group
+            .as_ref()
+            .filter(|group| !group.edits.is_empty())
+            .or_else(|| self.undo.last())
+            .map(|group| group.id)
+    }
+
+    /// Identity of the next group Redo will replay.
+    #[must_use]
+    pub fn redo_group_id(&self) -> Option<u64> {
+        self.redo.last().map(|group| group.id)
+    }
+
+    /// Record an undoable command that changes document metadata but no bytes.
+    pub fn record_metadata_command(&mut self) {
+        self.close_open_group();
+        self.redo.clear();
+        self.revision = next_revision();
+        self.push_group(EditGroup {
+            id: next_revision(),
+            kind: EditKind::Command,
+            edits: vec![Edit {
+                at: 0,
+                removed: String::new(),
+                inserted: String::new(),
+            }],
+        });
     }
 
     /// Undoes one group. Returns false when the undo stack is empty.

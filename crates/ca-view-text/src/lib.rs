@@ -4370,11 +4370,17 @@ impl TextView {
             Command::Undo => {
                 if self.active_pane_mut().undo() {
                     self.note_edit();
+                    if let Some(row) = self.caret_row() {
+                        self.go_to_row(row);
+                    }
                 }
             }
             Command::Redo => {
                 if self.active_pane_mut().redo() {
                     self.note_edit();
+                    if let Some(row) = self.caret_row() {
+                        self.go_to_row(row);
+                    }
                 }
             }
             Command::SelectAll => self.active_pane_mut().select_all(),
@@ -5998,6 +6004,24 @@ mod tests {
         }
         assert!(view.is_settled());
         (view, dir)
+    }
+
+    #[test]
+    fn undo_and_redo_reveal_the_replayed_text() {
+        use ca_ui::view::SessionView;
+        let (mut view, _dir) = settled_view(&"line\n".repeat(200));
+        view.viewport_height = 100.0;
+        view.left_pane
+            .place(ca_ui::editor::Caret::new(150, 1), false);
+        view.left_pane.type_character('X');
+        view.note_edit();
+        view.left_pane.place(ca_ui::editor::Caret::new(0, 0), false);
+        view.scroll_to_position(0);
+        view.run(ca_ui::Command::Undo);
+        assert!(view.scroll.first_row() > 100);
+        view.scroll_to_position(0);
+        view.run(ca_ui::Command::Redo);
+        assert!(view.scroll.first_row() > 100);
     }
 
     #[test]

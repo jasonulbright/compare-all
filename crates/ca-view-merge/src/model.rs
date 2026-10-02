@@ -925,6 +925,30 @@ const fn automatic(kind: MergeKind) -> Resolution {
 }
 
 impl MergeModel {
+    pub(crate) fn history_sections(&self, indices: &[usize]) -> Vec<(usize, Section)> {
+        indices
+            .iter()
+            .filter_map(|&index| {
+                let mut section = self.sections.get(index)?.clone();
+                if section.edited_from_output {
+                    section.edited = self.edited_content(index, &section);
+                    section.edited_from_output = false;
+                }
+                Some((index, section))
+            })
+            .collect()
+    }
+
+    pub(crate) fn restore_history_sections(&mut self, sections: &[(usize, Section)]) {
+        let mut changed = Vec::new();
+        for (index, section) in sections {
+            if let Some(entry) = self.sections.get_mut(*index) {
+                *entry = section.clone();
+                changed.push(*index);
+            }
+        }
+        self.rebuild_changed_sections(&changed, true);
+    }
     /// Merge three inputs, taking every non-conflicting change.
     ///
     /// An empty ancestor with `two_way` set compares the two versions directly
@@ -1765,8 +1789,18 @@ impl MergeModel {
     fn edited_content(&self, index: usize, section: &Section) -> Vec<String> {
         if section.edited_from_output {
             let lines = self.output_range(index).map_or_else(Vec::new, |range| {
-                self.output
-                    .copy_range(range.start as usize..range.end as usize)
+                let mut lines = self
+                    .output
+                    .copy_range(range.start as usize..range.end as usize);
+                for (offset, line) in lines.iter_mut().enumerate() {
+                    let repair = self
+                        .output_repairs
+                        .get(range.start as usize + offset)
+                        .copied()
+                        .unwrap_or(0);
+                    line.truncate(line.len().saturating_sub(repair));
+                }
+                lines
             });
             #[cfg(test)]
             EDITED_OUTPUT_READS.with(|reads| {
@@ -1837,16 +1871,7 @@ impl MergeModel {
             if !self.sections[index].edited_from_output {
                 continue;
             }
-            let Some(range) = self.output_range(index) else {
-                continue;
-            };
-            let lines = self
-                .output
-                .copy_range(range.start as usize..range.end as usize);
-            #[cfg(test)]
-            EDITED_OUTPUT_READS.with(|reads| {
-                reads.set(reads.get().saturating_add(lines.len()));
-            });
+            let lines = self.edited_content(index, &self.sections[index]);
             let section = &mut self.sections[index];
             section.edited = lines;
             section.edited_from_output = false;
