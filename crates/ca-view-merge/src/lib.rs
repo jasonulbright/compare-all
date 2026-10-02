@@ -2489,7 +2489,7 @@ impl SessionView for MergeView {
             self.toolbar(ui, &palette);
             widgets::file_info_bar(
                 ui,
-                ca_ui::format::local_offset_seconds(),
+                ca_ui::format::probed_offset().unwrap_or(0),
                 &self.file_info_lines(),
             );
             self.question_panel(ui);
