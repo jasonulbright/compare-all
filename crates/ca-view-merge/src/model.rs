@@ -960,11 +960,26 @@ impl MergeModel {
             .all(|entry| self.output_range(entry.index).as_ref() == Some(&entry.output))
     }
 
-    pub(crate) fn restore_history_sections(&mut self, sections: &[HistorySection]) {
+    /// Put back the sections of `restored`, leaving the state `left` recorded.
+    ///
+    /// Toggle Ignored and Toggle Conflict are not undo steps. A flag that
+    /// differs from its value in `left` was set after that step and stays.
+    pub(crate) fn restore_history_sections(
+        &mut self,
+        restored: &[HistorySection],
+        left: &[HistorySection],
+    ) {
         let mut changed = Vec::new();
-        for entry in sections {
+        for (entry, leaving) in restored.iter().zip(left) {
             if let Some(target) = self.sections.get_mut(entry.index) {
-                *target = entry.section.clone();
+                let mut section = entry.section.clone();
+                if target.ignored != leaving.section.ignored {
+                    section.ignored = target.ignored;
+                }
+                if target.conflict != leaving.section.conflict {
+                    section.conflict = target.conflict;
+                }
+                *target = section;
                 target.refresh(self.rules);
                 changed.push(entry.index);
             }

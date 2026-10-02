@@ -1259,11 +1259,12 @@ impl MergeView {
         }
         if let Some(history) = id.and_then(|id| self.take_history.get(&id)) {
             let _ = self.output_pane.take_changes();
-            self.data.model.restore_history_sections(if redo {
-                &history.after
+            let (restored, left) = if redo {
+                (&history.after, &history.before)
             } else {
-                &history.before
-            });
+                (&history.before, &history.after)
+            };
+            self.data.model.restore_history_sections(restored, left);
             self.touched();
         } else {
             self.absorb_edits(false);
@@ -3222,6 +3223,67 @@ mod tests {
             assert_eq!(view.output_text(), edited, "case {case}");
             assert_output_lines_match_pane(&view);
         }
+    }
+
+    #[test]
+    fn undo_and_redo_of_a_take_keep_an_ignored_mark_toggled_after_it() {
+        let (mut view, _dir) = open("a\nL\nc\n", Some("a\nb\nc\n"), "a\nR\nc\n");
+        run_until_ready(&mut view);
+        view.run(Command::NextConflict);
+        let section = view.current;
+        let original = view.output_text();
+        view.run(Command::TakeLeft);
+        view.run(Command::ToggleSectionIgnored);
+        assert!(view.model().sections()[section].ignored);
+        view.run(Command::Undo);
+        let entry = &view.model().sections()[section];
+        assert_eq!(view.output_text(), original);
+        assert!(entry.ignored, "undo dropped a later Toggle Ignored");
+        assert!(entry.conflict, "undo did not restore the conflict");
+        assert!(!entry.is_unresolved_conflict());
+        assert_eq!(view.model().totals().conflicts_remaining, 0);
+        assert_output_lines_match_pane(&view);
+        view.run(Command::ToggleSectionIgnored);
+        assert_eq!(view.model().totals().conflicts_remaining, 1);
+        view.run(Command::ToggleSectionIgnored);
+        view.run(Command::Redo);
+        let entry = &view.model().sections()[section];
+        assert!(entry.ignored, "redo dropped a later Toggle Ignored");
+        assert!(!entry.conflict);
+        assert_output_lines_match_pane(&view);
+    }
+
+    #[test]
+    fn undo_and_redo_of_a_take_keep_a_conflict_mark_toggled_after_it() {
+        let (mut view, _dir) = open(
+            "a\nL\nc\nd\ne\nf\nx\n",
+            Some("a\nb\nc\nd\ne\nf\nx\n"),
+            "a\nR\nc\nd\ne\nf\ny\n",
+        );
+        run_until_ready(&mut view);
+        let section = view
+            .model()
+            .sections()
+            .iter()
+            .position(|section| section.kind == ca_diff::merge3::MergeKind::RightChange)
+            .unwrap();
+        view.current = section;
+        let conflicts = view.model().totals().conflicts_remaining;
+        view.run(Command::TakeLeft);
+        view.run(Command::ToggleConflict);
+        assert!(view.model().sections()[section].is_unresolved_conflict());
+        view.run(Command::Undo);
+        assert!(
+            view.model().sections()[section].is_unresolved_conflict(),
+            "undo dropped a later Toggle Conflict"
+        );
+        assert_eq!(view.model().totals().conflicts_remaining, conflicts + 1);
+        view.run(Command::Redo);
+        assert!(
+            view.model().sections()[section].is_unresolved_conflict(),
+            "redo dropped a later Toggle Conflict"
+        );
+        assert_output_lines_match_pane(&view);
     }
 
     #[test]
