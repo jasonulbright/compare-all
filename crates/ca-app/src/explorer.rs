@@ -82,7 +82,7 @@ mod platform {
     };
     use crate::cli::{COMPARE_LEFT_SWITCH, LEFT_SIDE_SWITCH};
     use std::path::Path;
-    use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ};
+    use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_SET_VALUE};
     use winreg::RegKey;
 
     fn verb_key(base: &str, class: &str, verb: &str) -> String {
@@ -128,6 +128,27 @@ mod platform {
         Ok(())
     }
 
+    pub fn refresh_text(root: &MenuRoot) -> std::io::Result<()> {
+        let hive = RegKey::predef(HKEY_CURRENT_USER);
+        for class in CLASSES {
+            for (verb, text) in [(SELECT_VERB, SELECT_TEXT), (COMPARE_VERB, COMPARE_TEXT)] {
+                let key = match hive.open_subkey_with_flags(
+                    verb_key(&root.user, class, verb),
+                    KEY_READ | KEY_SET_VALUE,
+                ) {
+                    Ok(key) => key,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error),
+                };
+                let current: std::io::Result<String> = key.get_value("MUIVerb");
+                if current.ok().as_deref() != Some(text) {
+                    key.set_value("MUIVerb", &text)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn remove(root: &MenuRoot) -> std::io::Result<()> {
         let hive = RegKey::predef(HKEY_CURRENT_USER);
         for class in CLASSES {
@@ -160,6 +181,10 @@ mod platform {
         ))
     }
 
+    pub fn refresh_text(_root: &MenuRoot) -> std::io::Result<()> {
+        Ok(())
+    }
+
     pub fn remove(_root: &MenuRoot) -> std::io::Result<()> {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
@@ -187,6 +212,16 @@ pub fn installed(root: &MenuRoot) -> Installed {
 /// Returns the first registry error.
 pub fn install(root: &MenuRoot, program: &Path) -> std::io::Result<()> {
     platform::install(root, program)
+}
+
+/// Gives each verb under the user key the menu text of this build. A verb
+/// that is not there stays absent, and the icon and command stay as they are.
+///
+/// # Errors
+///
+/// Returns the first registry error.
+pub fn refresh_text(root: &MenuRoot) -> std::io::Result<()> {
+    platform::refresh_text(root)
 }
 
 /// Removes both verbs from the user key. A verb that is not there is not an
@@ -226,6 +261,9 @@ impl ca_ui::worker::Terminal for Message {
 
 /// Reads the state on a worker, and first writes or removes the user verbs
 /// when `wanted` says so.
+///
+/// With no `wanted`, registered user verbs first get the menu text of this
+/// build. A failure there leaves the old text and is not reported.
 #[must_use]
 pub fn spawn(
     root: MenuRoot,
@@ -237,7 +275,12 @@ pub fn spawn(
             let changed = match wanted {
                 Some(true) => this_program().and_then(|program| install(&root, &program)),
                 Some(false) => remove(&root),
-                None => Ok(()),
+                None => {
+                    if installed(&root).user {
+                        let _ = refresh_text(&root);
+                    }
+                    Ok(())
+                }
             };
             let state = installed(&root);
             emitter.send(match changed {
@@ -252,9 +295,14 @@ pub fn spawn(
 #[cfg(all(test, windows))]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::{command_line, install, installed, remove, MenuRoot, COMPARE_VERB};
+    use super::{
+        command_line, install, installed, remove, spawn, Installed, MenuRoot, Message, CLASSES,
+        COMPARE_TEXT, COMPARE_VERB, SELECT_TEXT, SELECT_VERB,
+    };
+    use crate::cli::{COMPARE_LEFT_SWITCH, LEFT_SIDE_SWITCH};
     use std::path::Path;
-    use winreg::enums::HKEY_CURRENT_USER;
+    use std::time::Duration;
+    use winreg::enums::{HKEY_CURRENT_USER, KEY_SET_VALUE};
     use winreg::RegKey;
 
     /// Parent of every key these tests create. Nothing outside it is written.
@@ -305,5 +353,169 @@ mod tests {
         remove(&root).unwrap();
         assert!(!installed(&root).any());
         remove(&root).unwrap();
+    }
+
+    fn user_root(key: &Throwaway) -> MenuRoot {
+        MenuRoot {
+            user: key.0.clone(),
+            machine: None,
+        }
+    }
+
+    /// Runs the read that starts with the window and returns what it sent.
+    fn read_at_start(root: &MenuRoot) -> Vec<Message> {
+        let notify: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(|| {});
+        let mut job = spawn(root.clone(), None, notify);
+        let messages = job.wait(Duration::from_secs(20));
+        assert!(job.is_finished());
+        messages
+    }
+
+    fn verb_path(root: &MenuRoot, class: &str, verb: &str) -> String {
+        format!(r"{}\{class}\shell\{verb}", root.user)
+    }
+
+    fn value(path: &str, name: &str) -> String {
+        RegKey::predef(HKEY_CURRENT_USER)
+            .open_subkey(path)
+            .unwrap()
+            .get_value(name)
+            .unwrap()
+    }
+
+    fn last_write(path: &str) -> (u32, u32) {
+        let info = RegKey::predef(HKEY_CURRENT_USER)
+            .open_subkey(path)
+            .unwrap()
+            .query_info()
+            .unwrap();
+        (
+            info.last_write_time.dwLowDateTime,
+            info.last_write_time.dwHighDateTime,
+        )
+    }
+
+    fn texts() -> [(&'static str, &'static str); 2] {
+        [(SELECT_VERB, SELECT_TEXT), (COMPARE_VERB, COMPARE_TEXT)]
+    }
+
+    /// Writes the verbs for `program`, then gives every verb `stale` as its
+    /// menu text.
+    fn install_with_text(root: &MenuRoot, program: &Path, stale: &str) {
+        install(root, program).unwrap();
+        for class in CLASSES {
+            for (verb, _) in texts() {
+                RegKey::predef(HKEY_CURRENT_USER)
+                    .open_subkey_with_flags(verb_path(root, class, verb), KEY_SET_VALUE)
+                    .unwrap()
+                    .set_value("MUIVerb", &stale)
+                    .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn the_read_at_start_gives_registered_verbs_the_current_menu_text() {
+        let key = Throwaway::new("stale-text");
+        let root = user_root(&key);
+        let program = Path::new(r"C:\Program Files\compare-all\compare-all.exe");
+        install_with_text(&root, program, "Select Left Side for compare-all");
+        assert_eq!(
+            read_at_start(&root),
+            vec![Message::State(Installed {
+                user: true,
+                machine: false
+            })]
+        );
+        for class in CLASSES {
+            for (verb, text) in texts() {
+                assert_eq!(value(&verb_path(&root, class, verb), "MUIVerb"), text);
+            }
+        }
+    }
+
+    #[test]
+    fn the_read_at_start_creates_no_verbs_when_none_are_registered() {
+        let key = Throwaway::new("absent");
+        let root = user_root(&key);
+        assert_eq!(
+            read_at_start(&root),
+            vec![Message::State(Installed::default())]
+        );
+        assert!(RegKey::predef(HKEY_CURRENT_USER)
+            .open_subkey(&key.0)
+            .is_err());
+    }
+
+    #[test]
+    fn the_read_at_start_leaves_a_partial_registration_alone() {
+        let key = Throwaway::new("partial");
+        let root = user_root(&key);
+        let program = Path::new(r"C:\Program Files\compare-all\compare-all.exe");
+        install_with_text(&root, program, "stale");
+        RegKey::predef(HKEY_CURRENT_USER)
+            .delete_subkey_all(verb_path(&root, "Directory", COMPARE_VERB))
+            .unwrap();
+        assert_eq!(
+            read_at_start(&root),
+            vec![Message::State(Installed::default())]
+        );
+        assert!(RegKey::predef(HKEY_CURRENT_USER)
+            .open_subkey(verb_path(&root, "Directory", COMPARE_VERB))
+            .is_err());
+        assert_eq!(
+            value(&verb_path(&root, "*", SELECT_VERB), "MUIVerb"),
+            "stale"
+        );
+    }
+
+    #[test]
+    fn the_read_at_start_keeps_the_icon_and_command_of_another_program() {
+        let key = Throwaway::new("other-program");
+        let root = user_root(&key);
+        let other = Path::new(r"D:\elsewhere\compare-all.exe");
+        install_with_text(&root, other, "stale");
+        read_at_start(&root);
+        for class in CLASSES {
+            for (verb, switch) in [
+                (SELECT_VERB, LEFT_SIDE_SWITCH),
+                (COMPARE_VERB, COMPARE_LEFT_SWITCH),
+            ] {
+                let path = verb_path(&root, class, verb);
+                assert_eq!(value(&path, "Icon"), other.display().to_string());
+                assert_eq!(
+                    value(&format!(r"{path}\command"), ""),
+                    command_line(other, switch)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_read_at_start_writes_nothing_when_the_text_is_current() {
+        let key = Throwaway::new("current");
+        let root = user_root(&key);
+        let program = Path::new(r"C:\Program Files\compare-all\compare-all.exe");
+        install(&root, program).unwrap();
+        let paths: Vec<String> = CLASSES
+            .iter()
+            .flat_map(|class| texts().map(|(verb, _)| verb_path(&root, class, verb)))
+            .collect();
+        let before: Vec<(u32, u32)> = paths.iter().map(|path| last_write(path)).collect();
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            read_at_start(&root),
+            vec![Message::State(Installed {
+                user: true,
+                machine: false
+            })]
+        );
+        let after: Vec<(u32, u32)> = paths.iter().map(|path| last_write(path)).collect();
+        assert_eq!(before, after);
+        for class in CLASSES {
+            for (verb, text) in texts() {
+                assert_eq!(value(&verb_path(&root, class, verb), "MUIVerb"), text);
+            }
+        }
     }
 }
