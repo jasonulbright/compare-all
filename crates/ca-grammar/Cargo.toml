@@ -1,0 +1,23 @@
+[package]
+name = "ca-grammar"
+description = "File formats and syntax grammars for compare-all"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+ca-diff.workspace = true
+fancy-regex.workspace = true
+globset.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

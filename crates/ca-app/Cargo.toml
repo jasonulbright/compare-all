@@ -1,0 +1,43 @@
+[package]
+name = "ca-app"
+description = "compare-all desktop application"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+build = "build.rs"
+
+[lib]
+name = "ca_app"
+path = "src/lib.rs"
+
+[[bin]]
+name = "compare-all"
+path = "src/main.rs"
+
+[dependencies]
+ca-session.workspace = true
+ca-io.workspace = true
+ca-vfs.workspace = true
+ca-ui.workspace = true
+ca-view-folder.workspace = true
+ca-view-hex.workspace = true
+ca-view-merge.workspace = true
+ca-view-picture.workspace = true
+ca-view-records.workspace = true
+ca-view-table.workspace = true
+ca-view-text.workspace = true
+eframe.workspace = true
+egui.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.56"
+
+[dev-dependencies]
+ca-vfs = { workspace = true, features = ["testing"] }
+tempfile.workspace = true
+
+[lints]
+workspace = true

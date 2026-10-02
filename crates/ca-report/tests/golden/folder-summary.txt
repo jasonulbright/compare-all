@@ -1,0 +1,19 @@
+Golden
+======
+Left:  left
+Right: right
+
+src                                      Different
+src/newer.txt                            Left newer
+src/only-left.txt                        Left only
+
+folders       1
+files         3
+same          1
+different     0
+left newer    1
+right newer   0
+left only     1
+right only    0
+errors        0
+differences   2

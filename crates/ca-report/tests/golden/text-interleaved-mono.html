@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Golden</title>
+<style>
+@page { size: portrait; }
+body { background: #ffffff; color: #000000; font-family: monospace; font-size: 10pt; margin: 8pt; }
+h1 { font-size: 14pt; margin: 0 0 4pt 0; }
+p.sides { margin: 0 0 8pt 0; }
+table { border-collapse: collapse; width: 100%; table-layout: fixed; }
+th { background: #ffffff; color: #000000; border: 1px solid #808080; text-align: left; padding: 1pt 3pt; }
+td { border: 1px solid #808080; padding: 1pt 3pt; vertical-align: top; white-space: pre; word-break: normal; overflow-wrap: anywhere; }
+td.num { text-align: right; color: #000000; background: #ffffff; width: 5em; }
+tr.same td { background: #ffffff; }
+tr.diff td { background: #ffffff; color: #000000; }
+tr.unimportant td { background: #ffffff; color: #000000; }
+tr.left-only td { background: #ffffff; }
+tr.right-only td { background: #ffffff; }
+span.inline { background: #ffffff; }
+span.strike { text-decoration: line-through; }
+td.mark { width: 2em; text-align: center; }
+dl.counts { margin: 0; }
+dl.counts dt { font-weight: bold; margin-top: 4pt; }
+img.difference { border: 1px solid #808080; max-width: 100%; }
+</style>
+</head>
+<body>
+<h1>Golden</h1>
+<p class="sides">left | right</p>
+<table>
+<tr><th class="mark">&nbsp;</th><th>Line</th></tr>
+<tr class="same"><td class="mark"> </td><td>the first line</td></tr>
+<tr class="diff"><td class="mark"><</td><td>value = <span class="inline">10</span></td></tr>
+<tr class="diff"><td class="mark">></td><td>value = <span class="inline">20</span></td></tr>
+<tr class="unimportant"><td class="mark"><</td><td>  indented</td></tr>
+<tr class="unimportant"><td class="mark">></td><td>indented</td></tr>
+<tr class="same"><td class="mark"> </td><td>shared</td></tr>
+<tr class="left-only"><td class="mark"><</td><td>removed</td></tr>
+<tr class="right-only"><td class="mark">></td><td>added</td></tr>
+</table>
+<dl class="counts">
+<dt>rows</dt><dd>6</dd>
+<dt>same</dt><dd>2</dd>
+<dt>different</dt><dd>1</dd>
+<dt>unimportant</dt><dd>1</dd>
+<dt>left only</dt><dd>1</dd>
+<dt>right only</dt><dd>1</dd>
+<dt>left lines</dt><dd>5</dd>
+<dt>right lines</dt><dd>5</dd>
+<dt>differences</dt><dd>4</dd>
+</dl>
+</body>
+</html>

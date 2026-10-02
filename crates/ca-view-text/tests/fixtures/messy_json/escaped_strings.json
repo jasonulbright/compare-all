@@ -1,0 +1,6 @@
+{"na\u006de": "\u0064emo", "version": 3, "enabled": true, "ratio": 0.25, "nothing": null,
+"tags": ["\u0061", "b", "\u0063"],
+"nested": {"deep": {"list": [1, 2, {"\u006b": "\u0076"}], "empty": {}, "none": []}},
+"text": "line1\u000aline2\u0009tab \u0022quoted\u0022 back\u005cslash\u000d\u000aend",
+"unicode": "café 😀 A",
+"json_like": "{\u0022a\u0022: [1, 2]}"}

@@ -1,0 +1,39 @@
+[package]
+name = "ca-cli"
+description = "compare-all command line interface"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+build = "build.rs"
+
+[lib]
+name = "ca_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ca"
+path = "src/main.rs"
+
+[dependencies]
+ca-diff.workspace = true
+ca-fs.workspace = true
+ca-script.workspace = true
+ca-session.workspace = true
+ca-vfs.workspace = true
+ca-view-merge.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+thiserror.workspace = true
+
+[features]
+default = ["os-keychain"]
+os-keychain = ["ca-vfs/os-keychain"]
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

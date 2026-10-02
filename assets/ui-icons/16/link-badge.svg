@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <g fill="none" stroke="#000" stroke-width="1" stroke-linecap="square" stroke-linejoin="miter">
+    <path d="M 1 8 H 8 V 15 H 1 Z M 3 9 H 7 V 13 H 6 V 11 L 3 14 L 2 13 L 5 10 H 3 Z" fill="#000" stroke="none" fill-rule="evenodd" />
+  </g>
+</svg>

@@ -1,0 +1,37 @@
+[package]
+name = "ca-fs"
+description = "Folder scanning, hashing, and comparison for compare-all"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+blake3 = { workspace = true, features = ["mmap", "rayon"] }
+ca-diff.workspace = true
+ca-grammar.workspace = true
+ca-io.workspace = true
+ca-text.workspace = true
+ca-vfs.workspace = true
+crc32fast.workspace = true
+filetime.workspace = true
+rayon.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+regex.workspace = true
+trash = "5"
+unicode-normalization.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+winsafe = { version = "0.0.24", features = ["kernel", "advapi"] }
+winapi-util = "0.1.11"
+
+[dev-dependencies]
+ca-vfs = { workspace = true, features = ["testing"] }
+proptest.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

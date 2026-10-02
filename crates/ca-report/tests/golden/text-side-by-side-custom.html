@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Golden</title>
+<link rel="stylesheet" href="report.css">
+</head>
+<body>
+<h1>Golden</h1>
+<p class="sides">left | right</p>
+<table>
+<tr><th>left</th><th>right</th></tr>
+<tr class="same"><td>the first line</td><td>the first line</td></tr>
+<tr class="diff"><td>value = <span class="inline">10</span></td><td>value = <span class="inline">20</span></td></tr>
+<tr class="unimportant"><td>  indented</td><td>indented</td></tr>
+<tr class="same"><td>shared</td><td>shared</td></tr>
+<tr class="left-only"><td>removed</td><td></td></tr>
+<tr class="right-only"><td></td><td>added</td></tr>
+</table>
+<dl class="counts">
+<dt>rows</dt><dd>6</dd>
+<dt>same</dt><dd>2</dd>
+<dt>different</dt><dd>1</dd>
+<dt>unimportant</dt><dd>1</dd>
+<dt>left only</dt><dd>1</dd>
+<dt>right only</dt><dd>1</dd>
+<dt>left lines</dt><dd>5</dd>
+<dt>right lines</dt><dd>5</dd>
+<dt>differences</dt><dd>4</dd>
+</dl>
+</body>
+</html>

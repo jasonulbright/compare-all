@@ -1,0 +1,11 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 2ed9a7bf4c0a5313c3bd4b88104f74e99117727a43198be4b8d3337420cc7dd0 # shrinks to base = ["alpha\n"], right = ["alpha\r"]
+cc ac886375eff470efb1170afca81a538ec1bb3a465b7129139efb7ad95762b1b1 # shrinks to base = ["\r\n"], left = ["\n"]
+cc e810179e22723169944e16c45382de3734be1e44b1ce6a8c5c70889803d4711b # shrinks to a = ["alpha\r\n"], b = ["alpha\n"]
+cc d837b4b604fab8a81aeecc5ee1f6d80547f66a2615009a47a4b8dbf8f71b303f # shrinks to a = ["alpha\r", "café\n", "café\n"], b = ["alpha\r\n"]
+cc 004afd82a561b3a2867c06fd73060fc3e5ee99016c0491b580e898caed14bb24 # shrinks to base = ["\r\n"], side = ["\n"]

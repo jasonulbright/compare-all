@@ -1,0 +1,17 @@
+[package]
+name = "ca-io"
+description = "Shared local file replacement for compare-all"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+tempfile.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+winsafe = { version = "0.0.24", features = ["kernel"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,17 @@
+Golden
+======
+Left:  left
+Right: right
+
+Stream              Name                    Left                    Right
+--------------------------------------------------------------------------------------------
+StringFileInfo      CompanyName             acme                    acme
+StringFileInfo      FileVersion             1.0.0.0                 1.1.0.0
+StringFileInfo      Comments                                        built later
+
+records       3
+same          1
+different     1
+left only     0
+right only    1
+differences   2

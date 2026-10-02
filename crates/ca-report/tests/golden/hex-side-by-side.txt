@@ -1,0 +1,14 @@
+Golden
+======
+Left:  left
+Right: right
+
+00000000: 48 45 41 44  HEAD   00000000: 48 45 41 44  HEAD
+00000004: 00 01 02 03  .... * 00000004: 00 FF 02 03  ....
+00000008: 54 41 49 4C  TAIL <         :              
+
+rows            3
+same rows       1
+different rows  2
+left bytes      12
+right bytes     8

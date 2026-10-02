@@ -1,0 +1,127 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Built by `cargo xtask package`, which passes every variable below.
+  ProductVersion is YY.MM.NNNN because Windows Installer reads three
+  numbers, the first two at most 255 and the third at most 65535.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+      Name="compare-all $(var.FullVersion)"
+      Manufacturer="compare-all"
+      Version="$(var.ProductVersion)"
+      UpgradeCode="6F1C2A4E-3B7D-4E59-9A21-C0DE0A11C0A1"
+      Scope="perUserOrMachine"
+      Language="1033"
+      Compressed="yes"
+      InstallerVersion="500">
+
+    <!-- A later version replaces an earlier one of the same scope in place. -->
+    <MajorUpgrade
+        DowngradeErrorMessage="A newer version of compare-all is already installed. Remove it first to install this version."
+        AllowSameVersionUpgrades="no" />
+
+    <MediaTemplate EmbedCab="yes" />
+
+    <Icon Id="AppIcon" SourceFile="$(var.IconFile)" />
+    <Property Id="ARPPRODUCTICON" Value="AppIcon" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/jasonulbright/compare-all" />
+
+    <!--
+      Each scope finds its own earlier install only, so an install of the other
+      scope would sit next to it with a second copy. These searches find the
+      marker value that each scope writes.
+    -->
+    <Property Id="MACHINEINSTALL" Secure="yes">
+      <RegistrySearch Root="HKLM" Key="Software\compare-all" Name="Version" Type="raw" />
+    </Property>
+    <Property Id="USERINSTALL" Secure="yes">
+      <RegistrySearch Root="HKCU" Key="Software\compare-all" Name="Version" Type="raw" />
+    </Property>
+    <Launch
+        Condition="Installed OR REMOVE OR NOT MACHINEINSTALL OR ALLUSERS=1 OR (ALLUSERS=2 AND NOT MSIINSTALLPERUSER=1)"
+        Message="compare-all is installed for every user on this computer. Remove that install first, or install with ALLUSERS=1." />
+    <Launch
+        Condition="Installed OR REMOVE OR NOT USERINSTALL OR ALLUSERS=&quot;&quot; OR (ALLUSERS=2 AND MSIINSTALLPERUSER=1)"
+        Message="compare-all is installed for the current user. Remove that install first, or install with MSIINSTALLPERUSER=1." />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="compare-all" />
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder" />
+    <StandardDirectory Id="DesktopFolder" />
+
+    <Feature Id="Application" Title="compare-all" Level="1" AllowAbsent="no" Display="expand">
+      <Component Id="MainExecutable" Directory="INSTALLFOLDER" Bitness="always64">
+        <File Id="CompareAllExe" Source="$(var.BinDir)\compare-all.exe" KeyPath="yes" />
+      </Component>
+      <Component Id="Documents" Directory="INSTALLFOLDER" Bitness="always64">
+        <File Id="ReadmeFile" Source="$(var.DocDir)\README.md" KeyPath="yes" />
+      </Component>
+      <Component Id="Changelog" Directory="INSTALLFOLDER" Bitness="always64">
+        <File Id="ChangelogFile" Source="$(var.DocDir)\CHANGELOG.md" KeyPath="yes" />
+      </Component>
+      <Component Id="LicenseMit" Directory="INSTALLFOLDER" Bitness="always64">
+        <File Id="LicenseMitFile" Source="$(var.LicenseMit)" KeyPath="yes" />
+      </Component>
+      <Component Id="ThirdPartyNotices" Directory="INSTALLFOLDER" Bitness="always64">
+        <File Id="ThirdPartyNoticesFile" Source="$(var.DocDir)\THIRD-PARTY-NOTICES.md" KeyPath="yes" />
+      </Component>
+      <!-- The full version, which ProductVersion cannot hold. -->
+      <Component Id="VersionMarker" Directory="INSTALLFOLDER" Bitness="always64">
+        <RegistryValue Root="HKMU" Key="Software\compare-all" Name="Version" Type="string" Value="$(var.FullVersion)" KeyPath="yes" />
+        <RegistryValue Root="HKMU" Key="Software\compare-all" Name="InstallFolder" Type="string" Value="[INSTALLFOLDER]" />
+      </Component>
+
+      <Feature Id="CommandLine" Title="Command line" Level="1">
+        <Component Id="CliExecutable" Directory="INSTALLFOLDER" Bitness="always64">
+          <File Id="CaExe" Source="$(var.BinDir)\ca.exe" KeyPath="yes" />
+        </Component>
+        <Component Id="MachinePath" Directory="INSTALLFOLDER" Condition="ALLUSERS=1" Bitness="always64">
+          <Environment Id="MachinePathEntry" Name="PATH" Value="[INSTALLFOLDER]" Part="last" Action="set" System="yes" Permanent="no" />
+          <RegistryValue Root="HKMU" Key="Software\compare-all\Features" Name="MachinePath" Type="integer" Value="1" KeyPath="yes" />
+        </Component>
+        <Component Id="UserPath" Directory="INSTALLFOLDER" Condition="NOT ALLUSERS=1" Bitness="always64">
+          <Environment Id="UserPathEntry" Name="PATH" Value="[INSTALLFOLDER]" Part="last" Action="set" System="no" Permanent="no" />
+          <RegistryValue Root="HKMU" Key="Software\compare-all\Features" Name="UserPath" Type="integer" Value="1" KeyPath="yes" />
+        </Component>
+      </Feature>
+
+      <!--
+        Classic context menu verbs only. They start the program once for each
+        selected item: the first verb remembers the left side, the second
+        compares the selected item against it.
+      -->
+      <Feature Id="ShellIntegration" Title="File manager menu" Level="1">
+        <Component Id="ShellVerbs" Directory="INSTALLFOLDER" Bitness="always64">
+          <RegistryValue Root="HKMU" Key="Software\compare-all\Features" Name="ShellIntegration" Type="integer" Value="1" KeyPath="yes" />
+          <RegistryValue Root="HKMU" Key="Software\Classes\*\shell\compare-all.selectleft" Name="MUIVerb" Type="string" Value="Select Left Side for compare-all" />
+          <RegistryValue Root="HKMU" Key="Software\Classes\*\shell\compare-all.selectleft" Name="Icon" Type="string" Value="[INSTALLFOLDER]compare-all.exe" />
+          <RegistryValue Root="HKMU" Key="Software\Classes\*\shell\compare-all.selectleft\command" Type="string" Value="&quot;[INSTALLFOLDER]compare-all.exe&quot; /leftside &quot;%1&quot;" />
+          <RegistryValue Root="HKMU" Key="Software\Classes\*\shell\compare-all.compare" Name="MUIVerb" Type="string" Value="Compare with compare-all" />
+          <RegistryValue Root="HKMU" Key="Software\Classes\*\shell\compare-all.compare" Name="Icon" Type="string" Value="[INSTALLFOLDER]compare-all.exe" />
+          <RegistryValue Root="HKMU" Key="Software\Classes\*\shell\compare-all.compare\command" Type="string" Value="&quot;[INSTALLFOLDER]compare-all.exe&quot; /compareleft &quot;%1&quot;" />
+          <RegistryValue Root="HKMU" Key="Software\Classes\Directory\shell\compare-all.selectleft" Name="MUIVerb" Type="string" Value="Select Left Side for compare-all" />
+          <RegistryValue Root="HKMU" Key="Software\Classes\Directory\shell\compare-all.selectleft" Name="Icon" Type="string" Value="[INSTALLFOLDER]compare-all.exe" />
+          <RegistryValue Root="HKMU" Key="Software\Classes\Directory\shell\compare-all.selectleft\command" Type="string" Value="&quot;[INSTALLFOLDER]compare-all.exe&quot; /leftside &quot;%1&quot;" />
+          <RegistryValue Root="HKMU" Key="Software\Classes\Directory\shell\compare-all.compare" Name="MUIVerb" Type="string" Value="Compare with compare-all" />
+          <RegistryValue Root="HKMU" Key="Software\Classes\Directory\shell\compare-all.compare" Name="Icon" Type="string" Value="[INSTALLFOLDER]compare-all.exe" />
+          <RegistryValue Root="HKMU" Key="Software\Classes\Directory\shell\compare-all.compare\command" Type="string" Value="&quot;[INSTALLFOLDER]compare-all.exe&quot; /compareleft &quot;%1&quot;" />
+        </Component>
+      </Feature>
+
+      <Feature Id="StartMenuShortcut" Title="Start menu shortcut" Level="1">
+        <Component Id="StartMenuEntry" Directory="ProgramMenuFolder" Bitness="always64">
+          <Shortcut Id="StartMenuLink" Name="compare-all" Target="[INSTALLFOLDER]compare-all.exe" WorkingDirectory="INSTALLFOLDER" Icon="AppIcon" />
+          <RegistryValue Root="HKMU" Key="Software\compare-all\Features" Name="StartMenuShortcut" Type="integer" Value="1" KeyPath="yes" />
+        </Component>
+      </Feature>
+
+      <Feature Id="DesktopShortcut" Title="Desktop shortcut" Level="2">
+        <Component Id="DesktopEntry" Directory="DesktopFolder" Bitness="always64">
+          <Shortcut Id="DesktopLink" Name="compare-all" Target="[INSTALLFOLDER]compare-all.exe" WorkingDirectory="INSTALLFOLDER" Icon="AppIcon" />
+          <RegistryValue Root="HKMU" Key="Software\compare-all\Features" Name="DesktopShortcut" Type="integer" Value="1" KeyPath="yes" />
+        </Component>
+      </Feature>
+    </Feature>
+  </Package>
+</Wix>

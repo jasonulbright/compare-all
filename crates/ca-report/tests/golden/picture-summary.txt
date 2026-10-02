@@ -1,0 +1,13 @@
+Golden
+======
+Left:  left
+Right: right
+
+tolerance                 4
+pixels                    1280
+same                      900
+similar                   24
+different                 100
+left only                 0
+right only                256
+differences               356

@@ -1,0 +1,5 @@
+/target
+/vendor/russh-sftp/target/
+/vendor/russh-sftp/Cargo.lock
+*.log
+.DS_Store

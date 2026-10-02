@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<text-report>
+  <title>Golden</title>
+  <left>left</left>
+  <right>right</right>
+  <lines>
+    <line kind="same">
+      <left number="1">the first line</left>
+      <right number="1">the first line</right>
+    </line>
+    <line kind="changed" importance="important">
+      <left number="2">value = 10</left>
+      <right number="2">value = 20</right>
+    </line>
+    <line kind="changed" importance="unimportant">
+      <left number="3">  indented</left>
+      <right number="3">indented</right>
+    </line>
+    <line kind="same">
+      <left number="4">shared</left>
+      <right number="4">shared</right>
+    </line>
+    <line kind="left-only" importance="important">
+      <left number="5">removed</left>
+    </line>
+    <line kind="right-only" importance="important">
+      <right number="5">added</right>
+    </line>
+  </lines>
+  <counts>
+    <count name="rows">6</count>
+    <count name="same">2</count>
+    <count name="different">1</count>
+    <count name="unimportant">1</count>
+    <count name="left-only">1</count>
+    <count name="right-only">1</count>
+    <count name="left-lines">5</count>
+    <count name="right-lines">5</count>
+    <count name="differences">4</count>
+  </counts>
+</text-report>
