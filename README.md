@@ -51,7 +51,13 @@ Open the Releases page of this repository. Each release has these files:
 
 - `compare-all-<version>-x64.msi`: the Windows installer.
 - A Windows zip file: the programs without an installer.
-- Linux and macOS `.tar.gz` files, and a Linux AppImage.
+- Linux and macOS `.tar.gz` files.
+- `compare-all-<version>-x86_64.AppImage`: the Linux AppImage. It contains
+  the keyboard and window libraries that the program loads. The C library,
+  the graphics driver, and the core X11 and Wayland client libraries come
+  from the system.
+- `compare-all-<version>-x86_64.AppImage.zsync`: the update file that AppImage
+  update tools use.
 - A `.sha256` file for each download.
 
 Compare the SHA-256 sum of a download with its `.sha256` file before you open
