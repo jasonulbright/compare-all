@@ -1,0 +1,20 @@
+[package]
+name = "ca-report"
+description = "Report engine for compare-all: comparison results as HTML, text, XML, and CSV"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+ca-diff.workspace = true
+ca-fs.workspace = true
+ca-image.workspace = true
+ca-table.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,23 @@
+Golden
+======
+Left:  left
+Right: right
+
+left                                                     | right
+---------------------------------------------------------+---------------------------------------------------------
+    1: the first line                                          1: the first line
+    2: value = 10                                        *     2: value = 20
+    3:   indented                                        *     3: indented
+    4: shared                                                  4: shared
+    5: removed                                           < 
+                                                         >     5: added
+
+rows          6
+same          2
+different     1
+unimportant   1
+left only     1
+right only    1
+left lines    5
+right lines   5
+differences   4

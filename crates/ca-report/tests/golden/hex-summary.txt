@@ -1,0 +1,10 @@
+Golden
+======
+Left:  left
+Right: right
+
+rows            3
+same rows       1
+different rows  2
+left bytes      12
+right bytes     8

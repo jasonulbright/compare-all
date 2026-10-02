@@ -1,0 +1,37 @@
+[package]
+name = "ca-ui"
+description = "Shared interface layer: job system, view trait, commands, theme and widgets"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "ca_ui"
+path = "src/lib.rs"
+
+[dependencies]
+ca-io.workspace = true
+ca-diff.workspace = true
+ca-fs.workspace = true
+ca-grammar.workspace = true
+ca-report.workspace = true
+ca-session.workspace = true
+ca-text.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+egui = { workspace = true, features = ["accesskit"] }
+rfd.workspace = true
+resvg.workspace = true
+unicode-segmentation.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+regex.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+winapi-util = "0.1.11"
+
+[lints]
+workspace = true

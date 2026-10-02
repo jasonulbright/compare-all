@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Golden</title>
+<style>
+@page { size: portrait; }
+body { background: #ffffff; color: #000000; font-family: monospace; font-size: 10pt; margin: 8pt; }
+h1 { font-size: 14pt; margin: 0 0 4pt 0; }
+p.sides { margin: 0 0 8pt 0; }
+table { border-collapse: collapse; width: 100%; table-layout: fixed; }
+th { background: #e8ecee; color: #000000; border: 1px solid #a0a0a0; text-align: left; padding: 1pt 3pt; }
+td { border: 1px solid #a0a0a0; padding: 1pt 3pt; vertical-align: top; white-space: pre; word-break: normal; overflow-wrap: anywhere; }
+td.num { text-align: right; color: #000000; background: #e8ecee; width: 5em; }
+tr.same td { background: #ffffff; }
+tr.diff td { background: #ffd8d8; color: #600000; }
+tr.unimportant td { background: #f0f0f0; color: #505050; }
+tr.left-only td { background: #daeaff; }
+tr.right-only td { background: #daffda; }
+span.inline { background: #ffa8a8; }
+span.strike { text-decoration: line-through; }
+td.mark { width: 2em; text-align: center; }
+dl.counts { margin: 0; }
+dl.counts dt { font-weight: bold; margin-top: 4pt; }
+img.difference { border: 1px solid #a0a0a0; max-width: 100%; }
+</style>
+</head>
+<body>
+<h1>Golden</h1>
+<p class="sides">left | right</p>
+<table>
+<tr><th>Key</th><th>Name</th><th>left</th><th>right</th></tr>
+<tr class="same"><td>StringFileInfo</td><td>CompanyName</td><td>acme</td><td>acme</td></tr>
+<tr class="diff"><td>StringFileInfo</td><td>FileVersion</td><td>1.0.0.0</td><td>1.1.0.0</td></tr>
+<tr class="right-only"><td>StringFileInfo</td><td>Comments</td><td></td><td>built later</td></tr>
+</table>
+<dl class="counts">
+<dt>records</dt><dd>3</dd>
+<dt>same</dt><dd>1</dd>
+<dt>different</dt><dd>1</dd>
+<dt>left only</dt><dd>0</dd>
+<dt>right only</dt><dd>1</dd>
+<dt>differences</dt><dd>2</dd>
+</dl>
+</body>
+</html>

@@ -1,0 +1,21 @@
+[package]
+name = "ca-diff"
+description = "Line, token, byte, and three way merge engines for compare-all"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+imara-diff.workspace = true
+regex.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+unicode-segmentation.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

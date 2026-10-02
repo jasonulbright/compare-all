@@ -1,0 +1,14 @@
+Golden
+======
+Left:  left
+Right: right
+
+Sheet: Orders
+
+rows            3
+same            1
+different       1
+unimportant     0
+left only       0
+right only      1
+cells different 4

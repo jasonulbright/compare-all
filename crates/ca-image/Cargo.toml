@@ -1,0 +1,42 @@
+[package]
+name = "ca-image"
+description = "Picture comparison engine for compare-all: decode, tolerance, difference and blend modes"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+rayon.workspace = true
+image = { version = "0.25", default-features = false, features = [
+    "png",
+    "jpeg",
+    "gif",
+    "bmp",
+    "tiff",
+    "ico",
+    "webp",
+    "tga",
+    "pnm",
+] }
+
+[dev-dependencies]
+proptest.workspace = true
+image = { version = "0.25", default-features = false, features = [
+    "png",
+    "jpeg",
+    "gif",
+    "bmp",
+    "tiff",
+    "ico",
+    "webp",
+    "tga",
+    "pnm",
+] }
+
+[lints]
+workspace = true

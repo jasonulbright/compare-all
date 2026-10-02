@@ -1,0 +1,115 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ca-io",
+    "crates/ca-diff",
+    "crates/ca-fs",
+    "crates/ca-session",
+    "crates/ca-text",
+    "crates/ca-grammar",
+    "crates/ca-vfs",
+    "crates/ca-table",
+    "crates/ca-image",
+    "crates/ca-report",
+    "crates/ca-script",
+    "crates/ca-records",
+    "crates/ca-cli",
+    "crates/ca-ui",
+    "crates/ca-view-text",
+    "crates/ca-view-folder",
+    "crates/ca-view-hex",
+    "crates/ca-view-table",
+    "crates/ca-view-picture",
+    "crates/ca-view-merge",
+    "crates/ca-view-records",
+    "crates/ca-app",
+    "xtask",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.94"
+license = "MIT"
+publish = false
+repository = "https://github.com/jasonulbright/compare-all"
+
+[workspace.dependencies]
+ca-io = { path = "crates/ca-io" }
+ca-diff = { path = "crates/ca-diff" }
+ca-fs = { path = "crates/ca-fs" }
+ca-session = { path = "crates/ca-session" }
+ca-text = { path = "crates/ca-text" }
+ca-grammar = { path = "crates/ca-grammar" }
+ca-vfs = { path = "crates/ca-vfs" }
+ca-table = { path = "crates/ca-table" }
+ca-image = { path = "crates/ca-image" }
+ca-report = { path = "crates/ca-report" }
+ca-script = { path = "crates/ca-script" }
+ca-records = { path = "crates/ca-records" }
+ca-ui = { path = "crates/ca-ui" }
+ca-view-text = { path = "crates/ca-view-text" }
+ca-view-folder = { path = "crates/ca-view-folder" }
+ca-view-hex = { path = "crates/ca-view-hex" }
+ca-view-table = { path = "crates/ca-view-table" }
+ca-view-picture = { path = "crates/ca-view-picture" }
+ca-view-merge = { path = "crates/ca-view-merge" }
+ca-view-records = { path = "crates/ca-view-records" }
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["arbitrary_precision"] }
+imara-diff = "0.1"
+blake3 = "1"
+jwalk = "0.8"
+clap = { version = "4", features = ["derive"] }
+eframe = "0.31"
+egui = "0.31"
+resvg = { version = "0.48.1", default-features = false }
+ropey = { version = "1", default-features = false }
+encoding_rs = "0.8"
+chardetng = "0.1"
+regex = "1"
+command-group = "5"
+fancy-regex = "0.14"
+globset = "0.4"
+crc32fast = "1"
+unicode-normalization = "0.1"
+unicode-segmentation = "1"
+rayon = "1"
+filetime = "0.2"
+tempfile = "3"
+proptest = "1"
+rfd = "0.15"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+# The YAML formatter budgets the scanner read-ahead from the calls this exact
+# version makes to its input.
+saphyr-parser = "=0.1.0"
+toml_edit = "0.25"
+
+[patch.crates-io]
+russh-sftp = { path = "vendor/russh-sftp" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.test]
+debug = "line-tables-only"

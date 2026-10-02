@@ -1,0 +1,31 @@
+[package]
+name = "ca-view-text"
+description = "Text comparison, text editor and patch views"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "ca_view_text"
+path = "src/lib.rs"
+
+[dependencies]
+ca-diff.workspace = true
+ca-grammar.workspace = true
+ca-session.workspace = true
+ca-text.workspace = true
+ca-ui.workspace = true
+egui.workspace = true
+quick-xml = "0.38.4"
+saphyr-parser.workspace = true
+serde_json.workspace = true
+toml_edit.workspace = true
+
+[dev-dependencies]
+ca-grammar.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

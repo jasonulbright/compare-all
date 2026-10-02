@@ -1,0 +1,26 @@
+[package]
+name = "ca-view-picture"
+description = "Picture comparison view"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "ca_view_picture"
+path = "src/lib.rs"
+
+[dependencies]
+ca-image.workspace = true
+ca-session.workspace = true
+ca-ui.workspace = true
+egui.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+tempfile.workspace = true
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,5 @@
+{
+  "name": "demo",
+  "nested": {
+    "deep": {
+      "list": [1, 2, {"k": "v

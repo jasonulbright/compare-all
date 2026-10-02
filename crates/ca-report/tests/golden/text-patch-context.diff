@@ -1,0 +1,15 @@
+*** left
+--- right
+***************
+*** 1,5 ****
+  the first line
+! value = 10
+!   indented
+  shared
+- removed
+--- 1,5 ----
+  the first line
+! value = 20
+! indented
+  shared
++ added

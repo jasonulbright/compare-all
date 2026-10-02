@@ -1,0 +1,26 @@
+[package]
+name = "ca-text"
+description = "Text loading for compare-all: encoding detection, line endings, rope buffer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Line breaks must be exactly LF, CR and CRLF. The crate's default feature set
+# also breaks lines on VT, FF, NEL, LS and PS, which would split a source file
+# at a page break. A workspace dependency cannot drop default features, so the
+# version is spelled out here.
+ropey = { workspace = true, features = ["cr_lines", "simd"] }
+encoding_rs.workspace = true
+chardetng.workspace = true
+fancy-regex.workspace = true
+serde = { workspace = true }
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

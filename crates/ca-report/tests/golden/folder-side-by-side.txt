@@ -1,0 +1,22 @@
+Golden
+======
+Left:  left
+Right: right
+
+Name                                    Size                CRC                 Modified            Attributes          Status        Size                CRC                 Modified            Attributes
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+src/                                    0                   0BAD1DEA            2024-01-01 00:00:00 RA                  Different     0                   0BAD1DEA            2024-01-01 00:00:00 RA
+  same.txt                              120                 0BAD1DEA            2024-01-01 00:00:00 RA                  Same          120                 0BAD1DEA            2024-01-01 00:00:00 RA
+  newer.txt                             240                 0BAD1DEA            2024-03-01 00:00:00 RA                  Left newer    200                 0BAD1DEA            2024-01-01 00:00:00 RA
+  only-left.txt                         9                   0BAD1DEA            2024-01-01 00:00:00 RA                  Left only
+
+folders       1
+files         3
+same          1
+different     0
+left newer    1
+right newer   0
+left only     1
+right only    0
+errors        0
+differences   2

@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+  <g fill="none" stroke="#000" stroke-width="2" stroke-linecap="square" stroke-linejoin="miter">
+    <rect x="3" y="2" width="4" height="2" fill="#000" stroke="none" />
+    <rect x="10" y="2" width="4" height="2" fill="#000" stroke="none" />
+    <rect x="17" y="2" width="4" height="2" fill="#000" stroke="none" />
+    <rect x="2" y="15" width="20" height="6" fill="#000" stroke="none" />
+    <line x1="5" y1="7" x2="5" y2="12" />
+    <path d="M 4 11 L 5 12 L 6 11" />
+    <line x1="12" y1="7" x2="12" y2="12" />
+    <path d="M 11 11 L 12 12 L 13 11" />
+    <line x1="19" y1="7" x2="19" y2="12" />
+    <path d="M 18 11 L 19 12 L 20 11" />
+  </g>
+</svg>

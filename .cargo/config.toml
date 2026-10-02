@@ -1,0 +1,9 @@
+[alias]
+xtask = "run -q -p xtask --"
+
+# Every process cargo starts in this workspace keeps its settings, journals and
+# sessions under the build directory. A test that injects no path of its own
+# therefore still cannot reach the real per-user folder. An environment that
+# already names a directory wins, so an explicit run can point elsewhere.
+[env]
+COMPARE_ALL_SETTINGS_DIR = { value = "target/settings", relative = true, force = false }

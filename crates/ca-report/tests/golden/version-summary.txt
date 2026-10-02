@@ -1,0 +1,12 @@
+Golden
+======
+Left:  left
+Right: right
+
+
+records       3
+same          1
+different     1
+left only     0
+right only    1
+differences   2

@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<folder-report>
+  <title>Golden</title>
+  <left>left</left>
+  <right>right</right>
+  <entries>
+    <entry kind="folder" status="different" depth="0">
+      <path>src</path>
+      <name>src</name>
+      <left present="true">
+        <size>0</size>
+        <modified>2024-01-01 00:00:00</modified>
+      </left>
+      <right present="true">
+        <size>0</size>
+        <modified>2024-01-01 00:00:00</modified>
+      </right>
+    </entry>
+    <entry kind="file" status="same" depth="1">
+      <path>src/same.txt</path>
+      <name>same.txt</name>
+      <left present="true">
+        <size>120</size>
+        <modified>2024-01-01 00:00:00</modified>
+      </left>
+      <right present="true">
+        <size>120</size>
+        <modified>2024-01-01 00:00:00</modified>
+      </right>
+    </entry>
+    <entry kind="file" status="left-newer" depth="1">
+      <path>src/newer.txt</path>
+      <name>newer.txt</name>
+      <left present="true">
+        <size>240</size>
+        <modified>2024-03-01 00:00:00</modified>
+      </left>
+      <right present="true">
+        <size>200</size>
+        <modified>2024-01-01 00:00:00</modified>
+      </right>
+    </entry>
+    <entry kind="file" status="left-orphan" depth="1">
+      <path>src/only-left.txt</path>
+      <name>only-left.txt</name>
+      <left present="true">
+        <size>9</size>
+        <modified>2024-01-01 00:00:00</modified>
+      </left>
+      <right present="false">
+        <size></size>
+        <modified></modified>
+      </right>
+    </entry>
+  </entries>
+  <counts>
+    <count name="folders">1</count>
+    <count name="files">3</count>
+    <count name="same">1</count>
+    <count name="different">0</count>
+    <count name="left-newer">1</count>
+    <count name="right-newer">0</count>
+    <count name="left-only">1</count>
+    <count name="right-only">0</count>
+    <count name="errors">0</count>
+    <count name="differences">2</count>
+  </counts>
+</folder-report>

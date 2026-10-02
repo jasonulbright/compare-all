@@ -1,0 +1,145 @@
+[package]
+name = "ca-vfs"
+description = "Virtual file system layer for compare-all: local, archive, and snapshot sources"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+ca-io.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+crc32fast.workspace = true
+command-group.workspace = true
+tempfile.workspace = true
+zip = { version = "8.6", default-features = false, features = [
+    "aes-crypto",
+    "deflate-flate2",
+    "deflate64",
+    "legacy-zip",
+    "lzma",
+    "ppmd",
+    "time",
+    "xz",
+] }
+tar = { version = "0.4", default-features = false }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+bzip2-rs = { version = "0.1", default-features = false }
+lzma-rust2 = { version = "0.21", default-features = false, features = [
+    "std",
+    "xz",
+] }
+lzxd = "0.2"
+sevenz-rust2 = { version = "0.22", default-features = false, features = [
+    "aes256",
+    "compress",
+    "ppmd",
+    "util",
+] }
+base64 = "0.23"
+percent-encoding = "2"
+rustls = { version = "0.23", default-features = false, optional = true, features = [
+    "ring",
+    "std",
+    "tls12",
+    "logging",
+] }
+rustls-pki-types = { version = "1", optional = true }
+webpki-roots = { version = "1", optional = true }
+sha2 = "0.11"
+sha1 = "0.11"
+hmac = "0.13"
+md-5 = { version = "0.11", optional = true }
+quick-xml = { version = "0.38", optional = true }
+russh = { version = "0.63.3", default-features = false, features = [
+    "ring",
+], optional = true }
+russh-sftp = { version = "2", optional = true }
+keyring = { version = "4.2", optional = true }
+rcgen = { version = "0.14", default-features = false, features = [
+    "pem",
+    "ring",
+], optional = true }
+rand = { version = "0.10", optional = true }
+tokio = { version = "1", default-features = false, features = [
+    "rt",
+    "io-util",
+    "net",
+    "time",
+], optional = true }
+
+[features]
+default = ["ftp", "sftp", "webdav", "s3", "subversion"]
+tls = ["dep:rustls", "dep:rustls-pki-types", "dep:webpki-roots"]
+ftp = ["tls"]
+sftp = ["dep:russh", "dep:russh-sftp", "dep:tokio"]
+http = ["tls", "dep:quick-xml", "dep:md-5"]
+webdav = ["http"]
+s3 = ["http"]
+subversion = ["dep:quick-xml"]
+os-keychain = ["dep:keyring"]
+# Test support only. Not product code, off by default, and meant for a
+# dev-dependency of a crate whose tests need a server.
+testing = [
+    "ftp",
+    "sftp",
+    "webdav",
+    "s3",
+    "dep:rcgen",
+    "dep:rand",
+    "tokio/sync",
+    "tokio/macros",
+    "russh/ring",
+]
+
+[dev-dependencies]
+cab = "0.6"
+proptest.workspace = true
+rand = "0.10"
+rcgen = { version = "0.14", default-features = false, features = [
+    "pem",
+    "ring",
+] }
+russh = { version = "0.63.3", default-features = false, features = ["ring"] }
+russh-sftp = "2"
+ca-vfs = { path = ".", features = ["testing"] }
+tokio = { version = "1", default-features = false, features = [
+    "rt",
+    "io-util",
+    "net",
+    "time",
+    "sync",
+    "macros",
+] }
+crc32fast.workspace = true
+serde_json.workspace = true
+banzai = "0.3"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+sevenz-rust2 = { version = "0.22", default-features = false, features = [
+    "aes256",
+    "compress",
+    "ppmd",
+    "util",
+] }
+tar = { version = "0.4", default-features = false }
+zip = { version = "8.6", default-features = false, features = [
+    "aes-crypto",
+    "deflate-flate2",
+    "deflate64",
+    "legacy-zip",
+    "lzma",
+    "ppmd",
+    "time",
+    "xz",
+] }
+lzma-rust2 = { version = "0.21", default-features = false, features = [
+    "encoder",
+    "std",
+    "xz",
+] }
+
+[lints]
+workspace = true

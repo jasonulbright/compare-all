@@ -1,0 +1,11 @@
+--- left
++++ right
+@@ -1,5 +1,5 @@
+ the first line
+-value = 10
+-  indented
++value = 20
++indented
+ shared
+-removed
++added
