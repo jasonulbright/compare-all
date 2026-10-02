@@ -6,7 +6,7 @@
 [![Downloads](https://img.shields.io/github/downloads/jasonulbright/compare-all/total?label=downloads)](https://github.com/jasonulbright/compare-all/releases)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-0078D4)](#platforms)
 [![Rust](https://img.shields.io/badge/Rust-1.94.1-CE422B)](#build-from-source)
-[![License](https://img.shields.io/github/license/jasonulbright/compare-all)](LICENSE-MIT)
+[![License](https://img.shields.io/github/license/jasonulbright/compare-all)](LICENSE)
 
 compare-all compares files and folders. It shows the differences side by
 side. It can also merge, synchronize, and edit. It is written in Rust and uses
@@ -161,6 +161,6 @@ files at the paths that Visual Studio gives.
 
 ## License
 
-compare-all is licensed under the MIT license. See [LICENSE-MIT](LICENSE-MIT).
+compare-all is licensed under the MIT license. See [LICENSE](LICENSE).
 The licenses of third-party components are in
 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).

@@ -51,9 +51,9 @@ pub fn run(root: &Path) -> anyhow::Result<()> {
                 .join("compare-all.ico")
                 .display()
         ));
-    let license = root.join("LICENSE-MIT");
+    let license = root.join("LICENSE");
     if !license.is_file() {
-        bail!("LICENSE-MIT is missing");
+        bail!("LICENSE is missing");
     }
     wix.arg("-d")
         .arg(format!("LicenseMit={}", license.display()));

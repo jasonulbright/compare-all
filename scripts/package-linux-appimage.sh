@@ -18,7 +18,7 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 target_dir="${CARGO_TARGET_DIR:-$root/target}"
 binary_dir="$target_dir/release"
 for file in "$binary_dir/compare-all" "$binary_dir/ca" "$root/README.md" \
-  "$root/CHANGELOG.md" "$root/LICENSE-MIT" "$root/THIRD-PARTY-NOTICES.md" \
+  "$root/CHANGELOG.md" "$root/LICENSE" "$root/THIRD-PARTY-NOTICES.md" \
   "$root/assets/icon/compare-all-512.png" "$appimagetool" "$runtime"; do
   if [[ ! -f "$file" ]]; then
     echo "required file is missing: $file" >&2
@@ -37,7 +37,7 @@ install -D -m 0755 "$binary_dir/ca" "$appdir/usr/bin/ca"
 install -D -m 0644 "$root/assets/icon/compare-all-512.png" "$appdir/compare-all.png"
 install -D -m 0644 "$root/assets/icon/compare-all-512.png" \
   "$appdir/usr/share/icons/hicolor/512x512/apps/compare-all.png"
-install -D -m 0644 "$root/LICENSE-MIT" "$appdir/usr/share/doc/compare-all/LICENSE-MIT"
+install -D -m 0644 "$root/LICENSE" "$appdir/usr/share/doc/compare-all/LICENSE"
 install -D -m 0644 "$root/THIRD-PARTY-NOTICES.md" "$appdir/usr/share/doc/compare-all/THIRD-PARTY-NOTICES.md"
 install -D -m 0644 "$root/README.md" "$appdir/usr/share/doc/compare-all/README.md"
 

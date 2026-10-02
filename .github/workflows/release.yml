@@ -140,7 +140,7 @@ jobs:
           $name = "compare-all-$version-windows-x64"
           $msi = "compare-all-$version-x64.msi"
           New-Item -ItemType Directory -Force "dist/$name" | Out-Null
-          Copy-Item target/release/compare-all.exe, target/release/ca.exe, README.md, CHANGELOG.md, LICENSE-MIT, THIRD-PARTY-NOTICES.md "dist/$name"
+          Copy-Item target/release/compare-all.exe, target/release/ca.exe, README.md, CHANGELOG.md, LICENSE, THIRD-PARTY-NOTICES.md "dist/$name"
           Compress-Archive -Path "dist/$name/*" -DestinationPath "dist/$name.zip"
           Copy-Item "target/release/$msi" dist/
           foreach ($file in @("$name.zip", $msi)) {
@@ -196,7 +196,7 @@ jobs:
             exit 1
           fi
           mkdir -p "dist/$name"
-          cp target/release/compare-all target/release/ca README.md CHANGELOG.md LICENSE-MIT THIRD-PARTY-NOTICES.md \
+          cp target/release/compare-all target/release/ca README.md CHANGELOG.md LICENSE THIRD-PARTY-NOTICES.md \
             assets/icon/compare-all-512.png "dist/$name/"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
           rm -r "dist/$name"
