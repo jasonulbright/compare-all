@@ -821,11 +821,18 @@ fn xml_space(
                 format!("invalid XML attribute: {}", diagnostic_reason(reason))
             }
         })?;
-        let value = attribute.unescape_value().map_err(xml_reason)?;
-        if value.chars().any(|ch| !crate::structure::xml_char(ch)) {
+        // Entities declared in a document type are not expanded, so a named
+        // reference stands for no characters here, as it does in text.
+        let characters = attribute
+            .unescape_value_with(|name| {
+                Some(quick_xml::escape::resolve_predefined_entity(name).unwrap_or(""))
+            })
+            .map_err(xml_reason)?;
+        if characters.chars().any(|ch| !crate::structure::xml_char(ch)) {
             return Err("invalid XML character reference".to_owned());
         }
         if attribute.key.as_ref() == b"xml:space" {
+            let value = attribute.unescape_value().map_err(xml_reason)?;
             preserve = match value.as_ref() {
                 "preserve" => true,
                 "default" => false,
@@ -972,6 +979,13 @@ mod tests {
             .err()
             .unwrap_or_default();
         assert!(!error.contains(".."), "{error}");
+    }
+
+    #[test]
+    fn xml_attribute_checks_leave_declared_entity_references_alone() {
+        let input = "<!DOCTYPE r [<!ENTITY e \"x\">]><r a=\"&e;\">&e;</r>";
+        assert!(format(input, StructuredFormat::Xml).is_ok());
+        assert!(format("<r a=\"&e;&#1;\"/>", StructuredFormat::Xml).is_err());
     }
 
     #[test]
