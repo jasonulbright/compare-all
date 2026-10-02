@@ -212,23 +212,21 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          appimagetool="$RUNNER_TEMP/appimagetool-x86_64.AppImage"
-          runtime="$RUNNER_TEMP/runtime-x86_64"
-          curl --fail --location --retry 3 \
-            https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage \
-            --output "$appimagetool"
-          printf '%s  %s\n' \
-            ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0 \
-            "$appimagetool" | sha256sum --check
-          chmod 0755 "$appimagetool"
-          curl --fail --location --retry 3 \
-            https://github.com/AppImage/type2-runtime/releases/download/20251108/runtime-x86_64 \
-            --output "$runtime"
-          printf '%s  %s\n' \
-            2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d \
-            "$runtime" | sha256sum --check
+          bash scripts/fetch-appimage-tools.sh "$RUNNER_TEMP"
           version="${GITHUB_REF_NAME#v}"
-          bash scripts/package-linux-appimage.sh "$version" "$appimagetool" "$runtime"
+          bash scripts/package-linux-appimage.sh "$version" \
+            "$RUNNER_TEMP/appimagetool-x86_64.AppImage" "$RUNNER_TEMP/runtime-x86_64"
+
+      # A failed check stops the job before anything is signed or uploaded, so
+      # the publish job never sees an AppImage that cannot start.
+      - name: Test the AppImage on a clean system
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          bash scripts/verify-linux-appimage.sh "dist/compare-all-$version-x86_64.AppImage" \
+            "$RUNNER_TEMP/appimage-check"
 
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
         with:

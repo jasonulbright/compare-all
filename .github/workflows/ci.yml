@@ -52,6 +52,54 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libgtk-3-dev
       - run: cargo fmt --all --check
       - if: runner.os == 'Linux'
-        run: bash -n scripts/package-linux-appimage.sh
+        run: |
+          bash -n scripts/package-linux-appimage.sh
+          bash -n scripts/fetch-appimage-tools.sh
+          bash -n scripts/verify-linux-appimage.sh
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+
+  # Builds the AppImage as the release does and starts it on a clean system,
+  # so a packaging fault shows before a release tag exists.
+  appimage:
+    name: check (appimage)
+    if: >-
+      (github.event.repository.name != '' && github.event.repository.private == false) ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
+      (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
+    permissions:
+      contents: read
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@9376cdc5a5e25b16da71af47712785cf06b0d6d4 # 1.94.1
+      - run: >-
+          sudo apt-get update && sudo apt-get install -y desktop-file-utils libgtk-3-dev
+          libxkbcommon-x11-0 libxcb-xkb1 zsync
+      - name: Build release binaries
+        run: cargo xtask build -p ca-app -p ca-cli --release
+      - name: Build the AppImage
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/fetch-appimage-tools.sh "$RUNNER_TEMP"
+          version="$(target/release/ca --version | awk '{print $NF}')"
+          bash scripts/package-linux-appimage.sh "$version" \
+            "$RUNNER_TEMP/appimagetool-x86_64.AppImage" "$RUNNER_TEMP/runtime-x86_64"
+          echo "version=$version" >> "$GITHUB_ENV"
+      - name: Test the AppImage on a clean system
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/verify-linux-appimage.sh "dist/compare-all-$version-x86_64.AppImage" \
+            "$RUNNER_TEMP/appimage-check"
+      - if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: appimage-check
+          path: ${{ runner.temp }}/appimage-check
+          if-no-files-found: ignore
