@@ -87,6 +87,7 @@ pub trait Terminal: Send + 'static {
 
     /// Adjust a queued message when the reader has since cancelled the job.
     /// Side-effecting jobs retain their completion reports by default.
+    #[must_use]
     fn after_cancel(self) -> Self
     where
         Self: Sized,
