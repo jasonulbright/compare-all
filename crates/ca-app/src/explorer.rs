@@ -182,7 +182,10 @@ mod platform {
     }
 
     pub fn refresh_text(_root: &MenuRoot) -> std::io::Result<()> {
-        Ok(())
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            super::UNSUPPORTED,
+        ))
     }
 
     pub fn remove(_root: &MenuRoot) -> std::io::Result<()> {
