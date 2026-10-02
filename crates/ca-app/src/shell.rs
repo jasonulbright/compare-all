@@ -3467,6 +3467,7 @@ impl App {
         self.poll_update();
         self.start_explorer_read(&context.notify);
         self.poll_explorer();
+        ca_ui::format::probe_offset(&context.notify);
         self.store_report_settings();
         self.restore_workspace(&context);
         if !self.restored && self.startup_wait_since.is_some() {
@@ -3916,6 +3917,16 @@ mod tests {
         let _ = egui::Context::default().run(raw_input(), |ctx| app.frame(ctx));
         assert_eq!(app.tab_count(), 1, "the dropped workspace load ran");
         assert_eq!(app.active_title().as_deref(), Some("Home"));
+    }
+
+    #[test]
+    fn a_frame_makes_the_zone_offset_known() {
+        let (_settings, mut app) = empty_app();
+        let _ = egui::Context::default().run(raw_input(), |ctx| app.frame(ctx));
+        assert!(ca_ui::testing::wait_until(
+            std::time::Duration::from_secs(5),
+            || ca_ui::format::probed_offset().is_some()
+        ));
     }
 
     /// The window close button pressed while a load waits ends the wait: the

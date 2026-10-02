@@ -5,6 +5,8 @@
 //! standard library, so it is probed once on a worker and passed in; a caller
 //! that has not probed it yet renders at zero offset rather than waiting.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Seconds in one day.
@@ -97,10 +99,36 @@ pub fn probed_offset() -> Option<i32> {
     ca_fs::probed_offset()
 }
 
+/// Read the offset on a worker, once per process, then call `notify`.
+///
+/// A frame drawn before the read ends shows coordinated universal time, and
+/// `notify` asks for the frame that corrects it.
+pub fn probe_offset(notify: &Arc<dyn Fn() + Send + Sync>) {
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    if STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let notify = Arc::clone(notify);
+    std::thread::spawn(move || {
+        let _ = ca_fs::local_offset_seconds();
+        notify();
+    });
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{civil_from_days, format_bytes, format_stamp};
+    use super::{civil_from_days, format_bytes, format_stamp, probe_offset, probed_offset};
+    use std::sync::Arc;
     use std::time::{Duration, UNIX_EPOCH};
+
+    #[test]
+    fn a_probe_makes_the_offset_known() {
+        let notify: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+        probe_offset(&notify);
+        assert!(crate::testing::wait_until(Duration::from_secs(5), || {
+            probed_offset().is_some()
+        }));
+    }
 
     #[test]
     fn a_size_carries_a_thousands_separator() {
