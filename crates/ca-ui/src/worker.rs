@@ -84,6 +84,15 @@ pub trait Terminal: Send + 'static {
 
     /// The message standing for a body that unwound, carrying what it said.
     fn panicked(detail: String) -> Self;
+
+    /// Adjust a queued message when the reader has since cancelled the job.
+    /// Side-effecting jobs retain their completion reports by default.
+    fn after_cancel(self) -> Self
+    where
+        Self: Sized,
+    {
+        self
+    }
 }
 
 /// The sending half handed to a job body.
@@ -207,7 +216,11 @@ impl<M: Terminal> Job<M> {
         let mut out = Vec::new();
         loop {
             match self.receiver.try_recv() {
-                Ok(message) => out.push(message),
+                Ok(message) => out.push(if self.cancel.is_cancelled() {
+                    message.after_cancel()
+                } else {
+                    message
+                }),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     self.finished = true;
@@ -233,7 +246,11 @@ impl<M: Terminal> Job<M> {
                 break;
             }
             match self.receiver.recv_timeout(left) {
-                Ok(message) => out.push(message),
+                Ok(message) => out.push(if self.cancel.is_cancelled() {
+                    message.after_cancel()
+                } else {
+                    message
+                }),
                 Err(RecvTimeoutError::Timeout) => break,
                 Err(RecvTimeoutError::Disconnected) => self.finished = true,
             }
