@@ -680,7 +680,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn a_read_only_settings_folder_is_named_as_not_saved() {
+    fn a_read_only_settings_folder_is_named_as_not_saved_when_not_run_as_root() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let settings = dir.path().join("compare-all");
@@ -700,7 +700,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn a_read_only_home_is_named_as_the_cause() {
+    fn a_read_only_home_is_named_as_the_cause_when_not_run_as_root() {
         use std::os::unix::fs::PermissionsExt;
         let home = tempfile::tempdir().unwrap();
         std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
@@ -712,6 +712,8 @@ mod tests {
             let notice = handle.notice().unwrap_or_default().to_owned();
             assert!(!notice.contains("Another instance"), "{notice}");
             assert!(notice.contains("cannot be created or written"), "{notice}");
+        } else {
+            println!("skipped: a privileged run can write a read-only folder");
         }
         std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
     }

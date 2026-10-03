@@ -303,11 +303,12 @@ mod tests {
     /// is checked where the test runs with that privilege.
     #[cfg(unix)]
     #[test]
-    fn a_root_of_another_user_is_not_used() {
+    fn a_root_of_another_user_is_not_used_when_run_as_root() {
         let settings = tempfile::tempdir().unwrap();
         let root = settings.path().join("temporary");
         std::fs::create_dir(&root).unwrap();
         if std::os::unix::fs::chown(&root, Some(65534), Some(65534)).is_err() {
+            println!("skipped: handing a folder to another user needs root");
             return;
         }
         let own = root.join("process-1");
