@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.jasonulbright.compare_all</id>
+  <metadata_license>MIT</metadata_license>
+  <project_license>MIT</project_license>
+  <name>Compare All</name>
+  <summary>Compare and merge files and folders</summary>
+  <description>
+    <p>
+      Compare All compares files and folders. It shows the differences side
+      by side. It can also merge, synchronize, and edit.
+    </p>
+    <p>Comparison types:</p>
+    <ul>
+      <li>Folder compare, merge, and synchronization</li>
+      <li>Text compare and two-way or three-way text merge</li>
+      <li>Table compare for CSV and other delimited data</li>
+      <li>Hex compare for binary files</li>
+      <li>Picture compare with marked pixel differences</li>
+      <li>Version compare and media tag compare</li>
+    </ul>
+    <p>
+      A side of a comparison can be a local path, an archive, or a remote
+      location.
+    </p>
+  </description>
+  <launchable type="desktop-id">compare-all.desktop</launchable>
+  <url type="homepage">https://github.com/jasonulbright/compare-all</url>
+  <url type="bugtracker">https://github.com/jasonulbright/compare-all/issues</url>
+  <developer_name>Jason Ulbright</developer_name>
+  <categories>
+    <category>Utility</category>
+  </categories>
+  <provides>
+    <binary>compare-all</binary>
+  </provides>
+  <content_rating type="oars-1.1"/>
+</component>
