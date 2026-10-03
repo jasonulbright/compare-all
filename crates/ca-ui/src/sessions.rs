@@ -386,10 +386,7 @@ fn spawn_load(paths: SettingsPaths, notify: Arc<dyn Fn() + Send + Sync>) -> Job<
             let (lock, claim) = match SettingsLock::acquire(directory) {
                 Ok(LockOutcome::Acquired(lock)) => (Some(lock), Claim::Taken),
                 Ok(LockOutcome::Held { .. }) => (None, Claim::HeldElsewhere),
-                Err(error) => (
-                    None,
-                    Claim::Unwritable(unwritable_notice(directory, &error)),
-                ),
+                Err(error) => (None, failed_claim(directory, &error)),
             };
             let announced = crate::paths::settings_notice_for(directory);
             let message = match SessionStore::load(&paths.sessions_file()) {
@@ -405,7 +402,7 @@ fn spawn_load(paths: SettingsPaths, notify: Arc<dyn Fn() + Send + Sync>) -> Job<
                 }
                 Err(error) => {
                     let mut parts: Vec<String> = announced.into_iter().map(str::to_owned).collect();
-                    if let Claim::Unwritable(text) = claim {
+                    if let Claim::Unwritable(text) | Claim::Unlocked(text) = claim {
                         parts.push(text);
                     }
                     parts.push(format!("The sessions document could not be read: {error}"));
@@ -428,23 +425,42 @@ enum Claim {
     Taken,
     /// Another instance holds it.
     HeldElsewhere,
-    /// The folder or its lock file cannot be created or written; the text
-    /// says which and why.
+    /// The folder cannot be created or written, so nothing is saved; the
+    /// text says why.
     Unwritable(String),
+    /// The folder takes new files but its lock or holder file cannot be
+    /// opened or written; the text says which and why.
+    Unlocked(String),
 }
 
-/// The line shown when the settings directory cannot be claimed because it
-/// cannot be created or written.
-fn unwritable_notice(directory: &std::path::Path, error: &ca_session::Error) -> String {
-    let cause = match error {
-        ca_session::Error::Io { path, source } if path == directory => source.to_string(),
-        ca_session::Error::Io { path, source } => format!("{}: {source}", path.display()),
-        other => other.to_string(),
+/// What a failed claim on the settings directory means for saving.
+///
+/// The lock only tells other instances that this one writes, and a save
+/// combines with the document on disk whether or not it is held. A lock file
+/// that cannot be opened in a folder that takes new files therefore leaves
+/// saving intact; only a folder that takes no file stops it.
+fn failed_claim(directory: &std::path::Path, error: &ca_session::Error) -> Claim {
+    let (failed, cause) = match error {
+        ca_session::Error::Io { path, source } => (Some(path.as_path()), source.to_string()),
+        other => (None, other.to_string()),
     };
-    format!(
-        "The settings folder {} cannot be created or written ({cause}). Settings and sessions are not saved.",
-        directory.display()
-    )
+    match failed {
+        Some(file) if file != directory && ca_io::private::accepts_new_files(directory) => {
+            Claim::Unlocked(format!(
+                "The lock file {} of the settings folder cannot be opened or written ({cause}). Settings and sessions are still saved, but other instances cannot see that this one is running.",
+                file.display()
+            ))
+        }
+        Some(file) if file != directory => Claim::Unwritable(format!(
+            "The settings folder {} cannot be created or written ({}: {cause}). Settings and sessions are not saved.",
+            directory.display(),
+            file.display()
+        )),
+        _ => Claim::Unwritable(format!(
+            "The settings folder {} cannot be created or written ({cause}). Settings and sessions are not saved.",
+            directory.display()
+        )),
+    }
 }
 
 /// What a load has to report, where it has anything. `announced` is what the
@@ -478,7 +494,7 @@ fn load_notice(
             "Another instance holds the settings directory. Changes made here are combined with that instance's when they are saved."
                 .to_owned(),
         ),
-        Claim::Unwritable(text) => parts.push(text),
+        Claim::Unwritable(text) | Claim::Unlocked(text) => parts.push(text),
     }
     (!parts.is_empty()).then(|| parts.join(" "))
 }
@@ -590,6 +606,70 @@ mod tests {
         assert!(notice.contains("cannot be created or written"), "{notice}");
         assert!(notice.contains(&settings.display().to_string()), "{notice}");
         assert!(!handle.is_read_mostly());
+    }
+
+    /// The lock only tells other instances that this one writes; a save does
+    /// not need it, so a lock file that cannot be opened leaves saving intact.
+    #[test]
+    fn a_lock_file_that_cannot_be_opened_does_not_claim_settings_are_lost() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = ca_session::SettingsPaths::at(ca_session::SettingsDirectory::PerUser(
+            dir.path().to_path_buf(),
+        ))
+        .lock_file();
+        std::fs::write(&lock, b"").unwrap();
+        let set_read_only = |read_only: bool| {
+            let mut permissions = std::fs::metadata(&lock).unwrap().permissions();
+            permissions.set_readonly(read_only);
+            std::fs::set_permissions(&lock, permissions).unwrap();
+        };
+        set_read_only(true);
+        if std::fs::OpenOptions::new().write(true).open(&lock).is_ok() {
+            set_read_only(false);
+            println!("skipped: a privileged run can write a read-only file");
+            return;
+        }
+        let mut handle = handle(dir.path());
+        settle(&mut handle);
+        let notice = handle.notice().unwrap_or_default().to_owned();
+        assert!(!notice.contains("not saved"), "{notice}");
+        assert!(notice.contains(&lock.display().to_string()), "{notice}");
+        assert!(notice.contains("still saved"), "{notice}");
+        let store = handle.store_mut().unwrap();
+        let id = store.next_id();
+        store
+            .add_session(
+                None,
+                SavedSession::new(id, "kept", SessionKind::TextCompare),
+            )
+            .unwrap();
+        handle.save();
+        settle(&mut handle);
+        handle.close();
+        set_read_only(false);
+        let mut second = handle_of(dir.path());
+        settle(&mut second);
+        assert_eq!(second.store().unwrap().sessions().len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_settings_folder_is_named_as_not_saved() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dir.path().join("compare-all");
+        std::fs::create_dir(&settings).unwrap();
+        std::fs::set_permissions(&settings, std::fs::Permissions::from_mode(0o555)).unwrap();
+        if std::fs::write(settings.join("probe"), b"").is_ok() {
+            println!("skipped: a privileged run can write a read-only folder");
+            return;
+        }
+        let mut handle = handle(&settings);
+        settle(&mut handle);
+        let notice = handle.notice().unwrap_or_default().to_owned();
+        std::fs::set_permissions(&settings, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(notice.contains("cannot be created or written"), "{notice}");
+        assert!(notice.contains("not saved"), "{notice}");
     }
 
     #[cfg(unix)]
