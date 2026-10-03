@@ -38,14 +38,6 @@ async-trait = ["dep:async-trait"]
 name = "russh_sftp"
 path = "src/lib.rs"
 
-[[example]]
-name = "client"
-path = "examples/client.rs"
-
-[[example]]
-name = "server"
-path = "examples/server.rs"
-
 [[bench]]
 name = "upload_benchmark"
 path = "benches/upload_benchmark.rs"
