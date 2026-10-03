@@ -265,6 +265,12 @@ pub struct TextView {
     context_lines: u32,
     visible: Visible,
     caret: usize,
+    /// The row a move made current, held while both text carets stay where
+    /// that move put them.
+    ///
+    /// A row the active pane has no line on is not the row of any text caret,
+    /// so the row caret cannot be derived from the caret there.
+    anchor: Option<RowAnchor>,
     /// A copy that moves to the next difference once its comparison lands.
     advance_after_copy: Option<PendingAdvance>,
     font: ca_ui::font::FontSize,
@@ -384,6 +390,15 @@ pub struct TextView {
     /// The files are copies the tab owns, so neither pane takes an edit and
     /// nothing is saved.
     read_only: bool,
+}
+
+/// The row a move made current and the carets it left.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RowAnchor {
+    row: usize,
+    active: Side,
+    left: editor::Caret,
+    right: editor::Caret,
 }
 
 /// What a copy left behind, so the move after it runs only while nothing else
@@ -538,6 +553,7 @@ impl TextView {
             context_lines: 2,
             visible: Visible::All(0),
             caret: 0,
+            anchor: None,
             advance_after_copy: None,
             font: ca_ui::font::FontSize::new(DEFAULT_FONT_SIZE),
             line_spacing: 0,
@@ -721,6 +737,7 @@ impl TextView {
         self.data = TextData::default();
         self.visible = Visible::All(0);
         self.caret = 0;
+        self.anchor = None;
         self.advance_after_copy = None;
         self.scroll = RowScroll::top();
         self.horizontal = 0.0;
@@ -1070,6 +1087,7 @@ impl TextView {
         self.right_edits = EditMarks::default();
         self.bookmarks.clear();
         self.caret = 0;
+        self.anchor = None;
         self.advance_after_copy = None;
         self.scroll = RowScroll::top();
         self.horizontal = 0.0;
@@ -1409,8 +1427,7 @@ impl TextView {
         }
         if self.navigation.go_to_first_difference_on_load {
             if let Some(first) = self.first_difference() {
-                self.go_to_row(first);
-                self.place_carets_on_row(first);
+                self.move_to_row(first);
             }
         }
     }
@@ -1423,6 +1440,9 @@ impl TextView {
     fn install(&mut self, data: TextData, keep_carets: bool) {
         let mut data = data;
         data.model.set_ignore_unimportant(self.ignore_unimportant);
+        // Rows are numbered afresh, so a row the old map made current names
+        // another place in the new one.
+        self.anchor = None;
         if let Some(sources) = data.sources.take() {
             if let Some(generation) = self.rediff.generation() {
                 self.loaded_generation = generation;
@@ -1570,52 +1590,59 @@ impl TextView {
     }
 
     /// Put the row caret back on the line the text caret is on.
+    ///
+    /// A row a move made current stays current while both text carets are
+    /// where the move left them and the same pane is active; any other caret
+    /// position makes the caret's own row current.
     fn follow_caret(&mut self) {
-        if let Some(row) = self.caret_row() {
-            self.caret = row;
+        if let Some(anchor) = self.anchor {
+            let held = anchor.active == self.active
+                && anchor.left == self.left_pane.caret()
+                && anchor.right == self.right_pane.caret()
+                && anchor.row < self.data.model.row_count();
+            if held {
+                self.caret = anchor.row;
+            } else {
+                self.anchor = None;
+            }
+        }
+        if self.anchor.is_none() {
+            if let Some(row) = self.caret_row() {
+                self.caret = row;
+            }
         }
         self.scroll
             .clamp(self.viewport_height, self.row_height(), self.visible.len());
     }
 
-    /// Put both text carets on the lines a row shows.
-    fn place_carets_on_row(&mut self, row: usize) {
-        let Some(entry) = self.data.model.row(row).copied() else {
-            return;
-        };
-        if let Some(line) = entry.left {
-            self.left_pane.place(editor::Caret::new(line, 0), false);
-        }
-        if let Some(line) = entry.right {
-            self.right_pane.place(editor::Caret::new(line, 0), false);
-        }
-    }
-
-    /// Reveal `row` and put the row caret and both text carets on it.
+    /// Reveal `row`, make it current and put both text carets on it.
     ///
-    /// Every frame takes the row caret from the active pane's text caret, so a
-    /// move of the row caret alone is undone by the next frame, and the copy
-    /// commands then act on the section the text caret is in. A pane with no
-    /// line on the row takes the nearest line above it, so the section that
-    /// follows that line is the section of the row; with no line above, it
-    /// takes the nearest line below.
+    /// A pane with no line on the row takes the nearest line above it, or with
+    /// none above, the nearest line below. The row stays current while the
+    /// carets stay where this leaves them, so the copy commands act on the
+    /// row's section even when the active pane's caret is on a line of another
+    /// row.
     fn move_to_row(&mut self, row: usize) {
         self.go_to_row(row);
         let row = self.caret;
-        self.place_carets_on_row(row);
         for side in [Side::Left, Side::Right] {
             let on_row = self
                 .data
                 .model
                 .row(row)
                 .and_then(|entry| side.line_of(entry));
-            if on_row.is_none() {
-                if let Some((_, line)) = self.nearest_line(row, side) {
-                    self.pane_mut(side)
-                        .place(editor::Caret::new(line, 0), false);
-                }
+            let line = on_row.or_else(|| self.nearest_line(row, side).map(|(_, line)| line));
+            if let Some(line) = line {
+                self.pane_mut(side)
+                    .place(editor::Caret::new(line, 0), false);
             }
         }
+        self.anchor = Some(RowAnchor {
+            row,
+            active: self.active,
+            left: self.left_pane.caret(),
+            right: self.right_pane.caret(),
+        });
     }
 
     /// The difference section the caret is in, or the next one.
@@ -1715,6 +1742,7 @@ impl TextView {
     fn note_edit(&mut self) {
         self.revision = self.revision.saturating_add(1);
         self.rediff.mark_stale(Instant::now());
+        self.anchor = None;
         self.advance_after_copy = None;
         for span in self.left_pane.take_changes() {
             self.bookmarks.shift(
@@ -3691,6 +3719,7 @@ impl TextView {
             self.pane_mut(side).place_at_column(line, column, true);
         }
         self.caret = index;
+        self.anchor = None;
     }
 
     /// Turn the frame's keyboard events into caret moves and edits.
