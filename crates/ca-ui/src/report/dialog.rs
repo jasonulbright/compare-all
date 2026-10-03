@@ -292,7 +292,7 @@ impl ReportDialog {
                         self.settings.target = target;
                     }
                 } else {
-                    response.on_hover_text(PRINTER_UNAVAILABLE);
+                    let _ = widgets::disabled_reason(response, PRINTER_UNAVAILABLE);
                 }
             }
             if !self.settings.layout_choice().fixed_document {
