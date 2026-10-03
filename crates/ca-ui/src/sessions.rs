@@ -706,14 +706,14 @@ mod tests {
         std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
         let settings = home.path().join(".config").join("compare-all");
         let writable = std::fs::create_dir(home.path().join("probe")).is_ok();
-        if !writable {
+        if writable {
+            println!("skipped: a privileged run can write a read-only folder");
+        } else {
             let mut handle = handle(&settings);
             settle(&mut handle);
             let notice = handle.notice().unwrap_or_default().to_owned();
             assert!(!notice.contains("Another instance"), "{notice}");
             assert!(notice.contains("cannot be created or written"), "{notice}");
-        } else {
-            println!("skipped: a privileged run can write a read-only folder");
         }
         std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
     }
