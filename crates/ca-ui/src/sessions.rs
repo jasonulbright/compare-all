@@ -383,12 +383,21 @@ fn spawn_load(paths: SettingsPaths, notify: Arc<dyn Fn() + Send + Sync>) -> Job<
     Job::spawn_notifying(
         move |emitter, _| {
             let directory = paths.directory().path();
+            let announced = crate::paths::settings_notice_for(directory);
+            if ca_session::SettingsPaths::is_unusable(directory) {
+                emitter.send(StoreMessage::Loaded {
+                    store: Box::default(),
+                    lock: None,
+                    read_mostly: false,
+                    notice: announced.map(str::to_owned),
+                });
+                return;
+            }
             let (lock, claim) = match SettingsLock::acquire(directory) {
                 Ok(LockOutcome::Acquired(lock)) => (Some(lock), Claim::Taken),
                 Ok(LockOutcome::Held { .. }) => (None, Claim::HeldElsewhere),
                 Err(error) => (None, failed_claim(directory, &error)),
             };
-            let announced = crate::paths::settings_notice_for(directory);
             let message = match SessionStore::load(&paths.sessions_file()) {
                 Ok(outcome) => {
                     let read_mostly = claim == Claim::HeldElsewhere;
@@ -606,6 +615,23 @@ mod tests {
         assert!(notice.contains("cannot be created or written"), "{notice}");
         assert!(notice.contains(&settings.display().to_string()), "{notice}");
         assert!(!handle.is_read_mostly());
+    }
+
+    /// A run with nowhere private to write is already told so once; the path
+    /// it uses names nothing a person can act on.
+    #[test]
+    fn the_unusable_directory_is_not_named_in_the_notice() {
+        let unusable = std::path::PathBuf::from(if cfg!(windows) { r"C:\" } else { "/" })
+            .join("compare-all\0");
+        assert!(ca_session::SettingsPaths::is_unusable(&unusable));
+        let mut handle = handle(&unusable);
+        settle(&mut handle);
+        let notice = handle.notice().unwrap_or_default().to_owned();
+        assert!(!notice.contains('\0'), "{notice:?}");
+        assert!(!notice.contains("cannot be created or written"), "{notice}");
+        assert!(!notice.contains("could not be read"), "{notice}");
+        assert!(!handle.is_read_mostly());
+        assert!(handle.store().unwrap().root.is_empty());
     }
 
     /// The lock only tells other instances that this one writes; a save does
