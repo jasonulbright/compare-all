@@ -41,6 +41,7 @@ const ASSERTED: &[&str] = &[
     "ownership-changed-without-edit",
     "lent-record-off-text",
     "lent-record-invariant",
+    "take-reordered-other-section-text",
 ];
 
 /// Every token with its byte range in `text`.

@@ -319,10 +319,8 @@ pub(crate) struct Lent {
     pub(crate) column: u32,
     /// The lent characters, as that line holds them.
     pub(crate) text: String,
-    /// Order of lending; an older text precedes a newer one in the lender.
+    /// Order of lending, unique in the model.
     pub(crate) seq: u64,
-    /// Characters into the lender's own text where the text goes back.
-    pub(crate) insert_at: usize,
     /// The lender's characters this record stands for, as the lender held
     /// them before it lent them, with the characters an edit later removed
     /// from the holder's line. The sources of a lender's records, oldest
@@ -964,6 +962,17 @@ struct Decision {
     ignored: bool,
     lent: Vec<Lent>,
     restore: Option<Box<Section>>,
+}
+
+/// Lent text a reload gives back, with places in the earlier output as
+/// `(holder, offset, column)`.
+#[derive(Debug, Default)]
+struct Returning {
+    /// Text whose holder the reload did not carry, with its lender.
+    texts: Vec<((usize, u32, u32), usize, Lent)>,
+    /// The earlier place of each record a carried holder still shows, by
+    /// lender and order number.
+    earlier: HashMap<(usize, u64), (usize, u32, u32)>,
 }
 
 /// How many sections before this one hold `print`, counting this one in.
@@ -1903,28 +1912,40 @@ impl MergeModel {
         self.lend_seq = self.lend_seq.max(previous.lend_seq);
         let mut decisions: Vec<&Decision> = kept.values().collect();
         decisions.sort_by_key(|decision| decision.index);
-        self.carry_lent_text(&decisions, &moved);
+        let returning = self.carry_lent_text(&decisions, &moved);
         self.rebuild();
+        self.return_carried_text(returning);
+        for index in 0..self.sections.len() {
+            self.settle_sources(index);
+        }
+        self.refresh_all_joined_through();
     }
 
-    /// Point lent text at the carried sections. Text whose holder was not
-    /// carried goes back to its lender at once, because the reload gave the
-    /// holder its input. A lender that was not carried but whose holder was
-    /// leaves out the text the holder still shows, so no line appears twice.
-    fn carry_lent_text(&mut self, decisions: &[&Decision], moved: &HashMap<usize, usize>) {
+    /// Point lent text at the carried sections. A lender that was not
+    /// carried but whose holder was leaves out the text the holder still
+    /// shows, so no line appears twice. Returns the text whose holder was
+    /// not carried: the reload gave that holder its input, so the text goes
+    /// back to its lender once the new output is built.
+    fn carry_lent_text(
+        &mut self,
+        decisions: &[&Decision],
+        moved: &HashMap<usize, usize>,
+    ) -> Returning {
         let carried: std::collections::HashSet<usize> = moved.values().copied().collect();
+        let mut returning = Returning::default();
         for decision in decisions {
             let mut lent: Vec<Lent> = decision.lent.clone();
             lent.sort_by_key(|entry| entry.seq);
             let lender = moved.get(&decision.index).copied();
-            let mut back = Vec::new();
             for entry in lent {
                 let holder = moved.get(&entry.holder).copied();
+                let at = (entry.holder, entry.offset, entry.column);
                 match (holder, lender) {
                     (Some(holder), Some(lender)) if holder < lender => {
+                        returning.earlier.insert((lender, entry.seq), at);
                         self.sections[lender].lent.push(Lent { holder, ..entry });
                     }
-                    (None, Some(_)) => back.push(entry),
+                    (None, Some(lender)) => returning.texts.push((at, lender, entry)),
                     (Some(holder), None) => {
                         let Some(target) = self.uncarried_successor(holder, &carried) else {
                             continue;
@@ -1935,32 +1956,20 @@ impl MergeModel {
                         if entry.source.is_none()
                             || !self.leave_out_lent_text(target, holder, entry.clone())
                         {
-                            self.sections[target].lent.push(Lent {
-                                holder,
-                                insert_at: 0,
-                                ..entry
-                            });
+                            self.sections[target].lent.push(Lent { holder, ..entry });
                         }
                     }
                     _ => {}
                 }
             }
-            if let Some(lender) = lender {
-                // Newer text goes in first, so older text at the same place
-                // ends up before it.
-                for entry in back.iter().rev() {
-                    let section = &mut self.sections[lender];
-                    ownership::insert_text(&mut section.edited, entry.insert_at, &entry.text);
-                    section.resolution = Resolution::Edited;
-                    if entry.source.as_deref() != Some(entry.text.as_str()) {
-                        section.restore = None;
-                    }
-                }
-            }
         }
         for index in 0..self.sections.len() {
             let section = &self.sections[index];
-            if section.lent.is_empty() && section.restore.is_some() {
+            let waits = returning
+                .texts
+                .iter()
+                .any(|(_, lender, _)| *lender == index);
+            if section.lent.is_empty() && section.restore.is_some() && !waits {
                 let Some(restore) = self.sections[index].restore.take() else {
                     continue;
                 };
@@ -1971,6 +1980,41 @@ impl MergeModel {
             }
         }
         self.refresh_all_joined_through();
+        returning
+    }
+
+    /// Give back the text of [`Self::carry_lent_text`], last in the earlier
+    /// output first, each in front of the lender's next character of the
+    /// earlier output: lent text a carried holder still shows, or the
+    /// lender's own text.
+    fn return_carried_text(&mut self, mut returning: Returning) {
+        returning
+            .texts
+            .sort_by_key(|(at, lender, entry)| (*at, *lender, entry.seq));
+        while let Some((at, lender, entry)) = returning.texts.pop() {
+            let next = self.sections.get(lender).and_then(|section| {
+                section
+                    .lent
+                    .iter()
+                    .filter_map(|other| {
+                        Some((*returning.earlier.get(&(lender, other.seq))?, other))
+                    })
+                    .filter(|(other_at, _)| *other_at > at)
+                    .min_by_key(|(other_at, _)| *other_at)
+                    .map(|(_, other)| other.clone())
+            });
+            let seq = entry.seq;
+            match next {
+                Some(next) => {
+                    if self.lend_before(lender, entry, &next).is_some() {
+                        returning.earlier.insert((lender, seq), at);
+                    }
+                }
+                None => {
+                    let _ = self.return_to_lender(lender, entry);
+                }
+            }
+        }
     }
 
     /// The section after `holder` whose text follows the holder's text in
@@ -2025,14 +2069,7 @@ impl MergeModel {
         target.resolution = Resolution::Edited;
         target.edited = text;
         target.conflict = false;
-        for other in &mut target.lent {
-            other.insert_at = 0;
-        }
-        target.lent.push(Lent {
-            holder,
-            insert_at: 0,
-            ..entry
-        });
+        target.lent.push(Lent { holder, ..entry });
         true
     }
 
