@@ -33,7 +33,8 @@ pub use share::{
     ExportSelection, ImportFailure, ImportOptions, ImportReport, SettingsPackage, SharedSessions,
 };
 pub use store::{
-    DocumentStamp, LoadOutcome, LoadRepairs, LockHolder, LockOutcome, SaveOutcome, SavedSession,
-    SessionId, SessionStore, SettingsDirectory, SettingsLock, SettingsPaths, TreeNode, UnknownNode,
-    WindowBounds, Workspace, WorkspaceTab, WorkspaceWindow, SETTINGS_DIRECTORY_VARIABLE,
+    DocumentStamp, LoadOutcome, LoadRepairs, LockHolder, LockOutcome, PlatformEnvironment,
+    PlatformFamily, SaveOutcome, SavedSession, SessionId, SessionStore, SettingsDirectory,
+    SettingsLock, SettingsPaths, TreeNode, UnknownNode, WindowBounds, Workspace, WorkspaceTab,
+    WorkspaceWindow, SETTINGS_DIRECTORY_VARIABLE,
 };
