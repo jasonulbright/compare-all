@@ -1243,6 +1243,9 @@ impl MergeView {
     }
 
     fn replay_output_history(&mut self, redo: bool) {
+        // An edit the pane holds but the model does not yet would belong to
+        // no recorded step, and the replay would leave the model behind.
+        self.absorb_output_edits();
         let id = if redo {
             self.output_pane.buffer().redo_group_id()
         } else {
