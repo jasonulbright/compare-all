@@ -1345,7 +1345,7 @@ impl TextView {
             _ => None,
         };
         if let Some(row) = target {
-            self.go_to_row(row);
+            self.move_to_row(row);
             return;
         }
         if self.navigation.wrap_around {
@@ -1357,7 +1357,7 @@ impl TextView {
                 _ => None,
             };
             if let Some(row) = wrapped {
-                self.go_to_row(row);
+                self.move_to_row(row);
                 return;
             }
         }
@@ -1551,6 +1551,33 @@ impl TextView {
         }
         if let Some(line) = entry.right {
             self.right_pane.place(editor::Caret::new(line, 0), false);
+        }
+    }
+
+    /// Reveal `row` and put the row caret and both text carets on it.
+    ///
+    /// Every frame takes the row caret from the active pane's text caret, so a
+    /// move of the row caret alone is undone by the next frame, and the copy
+    /// commands then act on the section the text caret is in. A pane with no
+    /// line on the row takes the nearest line above it, so the section that
+    /// follows that line is the section of the row; with no line above, it
+    /// takes the nearest line below.
+    fn move_to_row(&mut self, row: usize) {
+        self.go_to_row(row);
+        let row = self.caret;
+        self.place_carets_on_row(row);
+        for side in [Side::Left, Side::Right] {
+            let on_row = self
+                .data
+                .model
+                .row(row)
+                .and_then(|entry| side.line_of(entry));
+            if on_row.is_none() {
+                if let Some((_, line)) = self.nearest_line(row, side) {
+                    self.pane_mut(side)
+                        .place(editor::Caret::new(line, 0), false);
+                }
+            }
         }
     }
 
@@ -6196,5 +6223,193 @@ mod tests {
             0,
             "the result of a comparison over replaced text was installed"
         );
+    }
+
+    /// Rows of the two difference sections of [`two_sections`].
+    const FIRST_SECTION: usize = 20;
+    const SECOND_SECTION: usize = 150;
+    /// A line that matches on both sides, between the two sections.
+    const SAME_LINE: u32 = 100;
+
+    /// A loaded view over 200 lines that differ on two rows, drawn in frames.
+    fn two_sections() -> (super::TextView, egui::Context, tempfile::TempDir) {
+        let side = |differing: &str| -> String {
+            (0..200)
+                .map(|line| {
+                    if line == FIRST_SECTION || line == SECOND_SECTION {
+                        format!("{differing} {line}\n")
+                    } else {
+                        format!("line {line}\n")
+                    }
+                })
+                .collect()
+        };
+        let (left, right) = (side("LEFT"), side("right"));
+        let dir = tempfile::tempdir().unwrap();
+        let left_path = dir.path().join("left.txt");
+        let right_path = dir.path().join("right.txt");
+        std::fs::write(&left_path, left).unwrap();
+        std::fs::write(&right_path, right).unwrap();
+        let mut view = super::TextView::new(left_path, right_path, &ca_ui::testing::context(), 1);
+        let ctx = egui::Context::default();
+        settle_frames(&mut view, &ctx);
+        (view, ctx, dir)
+    }
+
+    /// Draw frames until the view has no comparison left to run.
+    fn settle_frames(view: &mut super::TextView, ctx: &egui::Context) {
+        use ca_ui::view::SessionView;
+        use std::time::{Duration, Instant};
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            view.tick();
+            clipboard_frame(ctx, view, Vec::new());
+            if view.is_settled() {
+                return;
+            }
+            assert!(Instant::now() < deadline, "the comparison never settled");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// The text one side shows on `line`.
+    fn line_text(view: &super::TextView, side: super::Side, line: usize) -> String {
+        view.pane(side)
+            .buffer()
+            .text()
+            .lines()
+            .nth(line)
+            .unwrap_or_default()
+            .to_owned()
+    }
+
+    #[test]
+    fn a_section_reached_by_next_section_stays_current_for_the_copy() {
+        use super::Side;
+        use ca_ui::command::Command;
+        use ca_ui::view::SessionView;
+
+        let (mut view, ctx, _dir) = two_sections();
+        assert_eq!(
+            view.current_section_rows(),
+            Some(FIRST_SECTION..FIRST_SECTION + 1)
+        );
+        view.run(Command::NextSection);
+        clipboard_frame(&ctx, &mut view, Vec::new());
+        assert_eq!(
+            view.current_section_rows(),
+            Some(SECOND_SECTION..SECOND_SECTION + 1),
+            "a frame after Next Section moved the current section back"
+        );
+        view.run(Command::CopyToRight);
+        assert_eq!(line_text(&view, Side::Right, SECOND_SECTION), "LEFT 150");
+        assert_eq!(line_text(&view, Side::Right, FIRST_SECTION), "right 20");
+    }
+
+    #[test]
+    fn a_section_reached_by_previous_section_stays_current_for_the_copy() {
+        use super::Side;
+        use ca_ui::command::Command;
+        use ca_ui::view::SessionView;
+
+        let (mut view, ctx, _dir) = two_sections();
+        let second = u32::try_from(SECOND_SECTION).unwrap();
+        view.left_pane
+            .place(ca_ui::editor::Caret::new(second, 0), false);
+        clipboard_frame(&ctx, &mut view, Vec::new());
+        assert_eq!(
+            view.current_section_rows(),
+            Some(SECOND_SECTION..SECOND_SECTION + 1)
+        );
+        view.run(Command::PreviousSection);
+        clipboard_frame(&ctx, &mut view, Vec::new());
+        assert_eq!(
+            view.current_section_rows(),
+            Some(FIRST_SECTION..FIRST_SECTION + 1)
+        );
+        view.run(Command::CopyToLeft);
+        assert_eq!(line_text(&view, Side::Left, FIRST_SECTION), "right 20");
+        assert_eq!(line_text(&view, Side::Left, SECOND_SECTION), "LEFT 150");
+    }
+
+    #[test]
+    fn a_section_with_no_line_on_the_active_side_stays_current_for_the_copy() {
+        use super::Side;
+        use ca_ui::command::Command;
+        use ca_ui::view::SessionView;
+
+        let dir = tempfile::tempdir().unwrap();
+        let left_path = dir.path().join("left.txt");
+        let right_path = dir.path().join("right.txt");
+        std::fs::write(&left_path, "a\nb\nc\nd\n").unwrap();
+        std::fs::write(&right_path, "a\nB\nc\nX\nY\nd\n").unwrap();
+        let mut view = super::TextView::new(left_path, right_path, &ca_ui::testing::context(), 1);
+        let ctx = egui::Context::default();
+        settle_frames(&mut view, &ctx);
+        assert_eq!(view.active, Side::Left);
+        let gap = view.data.model.next_section(view.caret).unwrap();
+        assert!(view.data.model.row(gap).unwrap().left.is_none());
+        view.run(Command::NextSection);
+        clipboard_frame(&ctx, &mut view, Vec::new());
+        assert_eq!(view.current_section_rows(), Some(gap..gap + 2));
+        view.run(Command::CopyToLeft);
+        assert_eq!(view.pane(Side::Left).buffer().text(), "a\nb\nc\nX\nY\nd\n");
+    }
+
+    /// Undo and Redo put the caret on the line they change and reveal it. The
+    /// current section then follows the caret as after any other caret move:
+    /// the section the caret is in, or the next one.
+    #[test]
+    fn undo_and_redo_make_the_section_at_the_changed_line_current() {
+        use super::Side;
+        use ca_ui::command::Command;
+        use ca_ui::view::SessionView;
+
+        let (mut view, ctx, _dir) = two_sections();
+        view.left_pane
+            .place(ca_ui::editor::Caret::new(SAME_LINE, 0), false);
+        view.left_pane.type_character('X');
+        view.note_edit();
+        settle_frames(&mut view, &ctx);
+        let edited = SAME_LINE as usize;
+        assert_eq!(view.current_section_rows(), Some(edited..edited + 1));
+        view.run(Command::PreviousSection);
+        clipboard_frame(&ctx, &mut view, Vec::new());
+        assert_eq!(
+            view.current_section_rows(),
+            Some(FIRST_SECTION..FIRST_SECTION + 1)
+        );
+
+        view.run(Command::Undo);
+        clipboard_frame(&ctx, &mut view, Vec::new());
+        assert_eq!(view.left_pane.caret().line, SAME_LINE);
+        assert_eq!(view.caret, edited);
+        let first = view.scroll.first_row();
+        assert!(
+            first <= edited && edited < first + view.viewport_rows,
+            "{first}"
+        );
+        settle_frames(&mut view, &ctx);
+        assert_eq!(view.caret, edited);
+        assert_eq!(
+            view.current_section_rows(),
+            Some(SECOND_SECTION..SECOND_SECTION + 1)
+        );
+        view.run(Command::CopyToRight);
+        assert_eq!(line_text(&view, Side::Right, SECOND_SECTION), "LEFT 150");
+        assert_eq!(line_text(&view, Side::Right, FIRST_SECTION), "right 20");
+        view.run(Command::Undo);
+        settle_frames(&mut view, &ctx);
+
+        view.run(Command::PreviousSection);
+        clipboard_frame(&ctx, &mut view, Vec::new());
+        view.active = Side::Left;
+        view.run(Command::Redo);
+        clipboard_frame(&ctx, &mut view, Vec::new());
+        assert_eq!(view.left_pane.caret().line, SAME_LINE);
+        settle_frames(&mut view, &ctx);
+        assert_eq!(view.caret, edited);
+        assert_eq!(view.current_section_rows(), Some(edited..edited + 1));
     }
 }
