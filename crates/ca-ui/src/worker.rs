@@ -15,6 +15,11 @@
 //!   without sending one, and a body that unwinds, both produce a synthetic
 //!   terminal message, so a view can never observe a job that neither finishes
 //!   nor reports why.
+//!
+//! A job is finished for its reader in the drain that takes its terminal
+//! message, not one wake-up later when the worker thread lets go of the
+//! channel. A caller that needs the body itself to have returned asks
+//! [`Job::has_returned`] or blocks in [`Job::wait_returned`].
 
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -146,7 +151,11 @@ impl<M: Terminal> Emitter<M> {
 pub struct Job<M> {
     receiver: Receiver<M>,
     cancel: Cancel,
+    /// Set by the drain that takes the terminal message, or by the disconnect.
     finished: bool,
+    /// Stored by the worker before it drops the sender, so a reader that has
+    /// seen the disconnect also sees this flag raised.
+    returned: Arc<AtomicBool>,
 }
 
 impl<M: Terminal> Job<M> {
@@ -175,6 +184,8 @@ impl<M: Terminal> Job<M> {
         let cancel = Cancel::new();
         let worker_cancel = cancel.clone();
         let finish_notify = notify.clone();
+        let returned = Arc::new(AtomicBool::new(false));
+        let worker_returned = Arc::clone(&returned);
         std::thread::spawn(move || {
             let emitter = Emitter {
                 sender,
@@ -189,6 +200,7 @@ impl<M: Terminal> Job<M> {
             let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
                 body(&emitter, &worker_cancel);
             }));
+            worker_returned.store(true, Ordering::SeqCst);
             if !emitter.terminated.load(Ordering::SeqCst) {
                 let closing = match outcome {
                     Ok(()) => M::cancelled(),
@@ -197,8 +209,8 @@ impl<M: Terminal> Job<M> {
                 emitter.send(closing);
             }
             drop(emitter);
-            // The disconnect that marks the job finished is silent, so the
-            // frame loop needs one more wake-up to observe it.
+            // The disconnect is silent, so a frame loop that waits for the
+            // body to return needs one more wake-up to observe it.
             if let Some(notify) = finish_notify {
                 notify();
             }
@@ -207,21 +219,32 @@ impl<M: Terminal> Job<M> {
             receiver,
             cancel,
             finished: false,
+            returned,
         }
+    }
+
+    /// Hand one received message to the reader, finishing the job when it is
+    /// terminal.
+    fn accept(&mut self, message: M, out: &mut Vec<M>) {
+        if message.is_terminal() {
+            self.finished = true;
+        }
+        out.push(if self.cancel.is_cancelled() {
+            message.after_cancel()
+        } else {
+            message
+        });
     }
 
     /// Take every message that has arrived since the last call.
     ///
-    /// Never blocks, so it is safe on the frame thread.
+    /// Never blocks, so it is safe on the frame thread. Messages queued behind
+    /// the terminal one are taken in the same call, in the order sent.
     pub fn drain(&mut self) -> Vec<M> {
         let mut out = Vec::new();
         loop {
             match self.receiver.try_recv() {
-                Ok(message) => out.push(if self.cancel.is_cancelled() {
-                    message.after_cancel()
-                } else {
-                    message
-                }),
+                Ok(message) => self.accept(message, &mut out),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     self.finished = true;
@@ -232,12 +255,12 @@ impl<M: Terminal> Job<M> {
         out
     }
 
-    /// Take every message until the job body returns, or until `limit`
-    /// passes.
+    /// Take every message until the terminal one, or until `limit` passes.
     ///
     /// Blocks the calling thread, so it is for a caller that must not go on
     /// before the job lands, such as the exit path. A frame uses
-    /// [`Job::drain`].
+    /// [`Job::drain`]. Work a body does after its terminal message may still
+    /// be running on return; [`Job::wait_returned`] waits for that too.
     pub fn wait(&mut self, limit: Duration) -> Vec<M> {
         let deadline = std::time::Instant::now() + limit;
         let mut out = Vec::new();
@@ -247,22 +270,57 @@ impl<M: Terminal> Job<M> {
                 break;
             }
             match self.receiver.recv_timeout(left) {
-                Ok(message) => out.push(if self.cancel.is_cancelled() {
-                    message.after_cancel()
-                } else {
-                    message
-                }),
+                Ok(message) => self.accept(message, &mut out),
                 Err(RecvTimeoutError::Timeout) => break,
                 Err(RecvTimeoutError::Disconnected) => self.finished = true,
+            }
+        }
+        out.extend(self.drain());
+        out
+    }
+
+    /// Take every message until the body has returned and every message has
+    /// been taken, or until `limit` passes.
+    ///
+    /// Blocks the calling thread. [`Job::has_returned`] tells the two
+    /// outcomes apart.
+    pub fn wait_returned(&mut self, limit: Duration) -> Vec<M> {
+        let deadline = std::time::Instant::now() + limit;
+        let mut out = Vec::new();
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            match self.receiver.recv_timeout(left) {
+                Ok(message) => self.accept(message, &mut out),
+                Err(RecvTimeoutError::Timeout) => break,
+                Err(RecvTimeoutError::Disconnected) => {
+                    self.finished = true;
+                    break;
+                }
             }
         }
         out
     }
 
-    /// True once the job body has returned and every message has been drained.
+    /// True once the reader holds everything the job will say: a terminal
+    /// message has been drained, or the body has returned and every message
+    /// has been drained.
+    ///
+    /// It does not say that the worker thread has ended; see
+    /// [`Job::has_returned`].
     #[must_use]
     pub fn is_finished(&self) -> bool {
         self.finished
+    }
+
+    /// True once the body has returned: every side effect it makes has
+    /// happened and every value it captured has been dropped. Messages, the
+    /// synthetic terminal one included, may still be queued.
+    #[must_use]
+    pub fn has_returned(&self) -> bool {
+        self.returned.load(Ordering::SeqCst)
     }
 
     /// Ask the job to stop.
@@ -304,8 +362,9 @@ fn panic_detail(payload: &(dyn std::any::Any + Send)) -> String {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::{Cancel, Emitter, Job, Terminal, QUEUE_CAPACITY};
+    use crate::testing::{job_held_after, wait_until as wait_for};
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{mpsc, Arc};
     use std::time::{Duration, Instant};
 
     #[derive(Debug, PartialEq, Eq)]
@@ -341,7 +400,7 @@ mod tests {
         false
     }
 
-    /// Drain until the body has returned and every message has been taken.
+    /// Drain until the terminal message has been taken.
     fn collect(job: &mut Job<Note>) -> Vec<Note> {
         let mut seen = Vec::new();
         assert!(wait_until(|| {
@@ -525,6 +584,120 @@ mod tests {
         assert!(ca_diff::Cancel::is_cancelled(&cancel));
     }
 
+    const LIMIT: Duration = Duration::from_secs(30);
+
+    #[test]
+    fn a_drained_terminal_message_finishes_the_job_while_the_body_still_runs() {
+        let (mut job, held) = job_held_after(vec![Note::Value(1), Note::Done]);
+        let seen = job.drain();
+        let finished = job.is_finished();
+        drop(held);
+        assert_eq!(seen, vec![Note::Value(1), Note::Done]);
+        assert!(finished, "the drain that takes Done must finish the job");
+    }
+
+    #[test]
+    fn a_finished_job_tells_whether_its_body_has_returned() {
+        let (mut job, held) = job_held_after(vec![Note::Done]);
+        job.drain();
+        let finished = job.is_finished();
+        let returned = job.has_returned();
+        drop(held);
+        assert!(finished);
+        assert!(!returned, "the body was still held");
+        assert!(wait_for(LIMIT, || job.has_returned()));
+    }
+
+    #[test]
+    fn messages_queued_behind_the_terminal_one_arrive_in_order_in_the_same_drain() {
+        let (mut job, held) = job_held_after(vec![
+            Note::Value(1),
+            Note::Done,
+            Note::Value(2),
+            Note::Value(3),
+        ]);
+        let seen = job.drain();
+        let finished = job.is_finished();
+        drop(held);
+        assert_eq!(
+            seen,
+            vec![Note::Value(1), Note::Done, Note::Value(2), Note::Value(3)]
+        );
+        assert!(finished);
+        assert!(job.drain().is_empty());
+        assert!(job.is_finished());
+    }
+
+    #[test]
+    fn dropping_a_finished_job_cuts_off_no_work_the_reader_needs() {
+        let written = Arc::new(AtomicUsize::new(0));
+        let cleaned = Arc::new(AtomicUsize::new(0));
+        let (release, held) = mpsc::channel::<()>();
+        let mut job: Job<Note> = {
+            let written = Arc::clone(&written);
+            let cleaned = Arc::clone(&cleaned);
+            Job::spawn(move |emitter: &Emitter<Note>, _| {
+                written.store(1, Ordering::SeqCst);
+                emitter.send(Note::Done);
+                let _ = held.recv_timeout(LIMIT);
+                cleaned.store(1, Ordering::SeqCst);
+            })
+        };
+        let flag = job.cancel_handle();
+        assert!(wait_for(LIMIT, || {
+            job.drain();
+            job.is_finished()
+        }));
+        assert_eq!(
+            written.load(Ordering::SeqCst),
+            1,
+            "work before the terminal message is complete when the job finishes"
+        );
+        drop(job);
+        assert!(flag.is_cancelled());
+        release.send(()).unwrap();
+        assert!(wait_for(LIMIT, || cleaned.load(Ordering::SeqCst) == 1));
+    }
+
+    #[test]
+    fn waiting_ends_at_the_terminal_message_while_the_body_still_runs() {
+        let (mut job, held) = job_held_after(vec![Note::Value(1), Note::Done]);
+        let started = Instant::now();
+        let seen = job.wait(LIMIT);
+        let waited = started.elapsed();
+        let finished = job.is_finished();
+        drop(held);
+        assert_eq!(seen, vec![Note::Value(1), Note::Done]);
+        assert!(finished);
+        assert!(waited < LIMIT, "the wait ran to its limit");
+    }
+
+    #[test]
+    fn waiting_for_the_return_ends_at_the_return_or_at_the_limit() {
+        let (mut job, held) = job_held_after(vec![Note::Value(1), Note::Done]);
+        let early = job.wait_returned(Duration::from_millis(20));
+        let returned_at_limit = job.has_returned();
+        drop(held);
+        let rest = job.wait_returned(LIMIT);
+        assert_eq!(early, vec![Note::Value(1), Note::Done]);
+        assert!(!returned_at_limit);
+        assert!(rest.is_empty());
+        assert!(job.has_returned());
+        assert!(job.is_finished());
+    }
+
+    #[test]
+    fn waiting_for_the_return_takes_the_synthetic_terminal_message() {
+        let mut job: Job<Note> = Job::spawn(|emitter: &Emitter<Note>, _| {
+            emitter.send(Note::Value(7));
+        });
+        assert_eq!(
+            job.wait_returned(LIMIT),
+            vec![Note::Value(7), Note::Cancelled]
+        );
+        assert!(job.has_returned());
+        assert!(job.is_finished());
+    }
     #[test]
     fn draining_a_finished_job_twice_is_stable() {
         let mut job: Job<Note> = Job::spawn(|emitter: &Emitter<Note>, _| {
