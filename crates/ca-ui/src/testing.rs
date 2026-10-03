@@ -8,8 +8,9 @@ pub mod probe;
 
 use crate::theme::{palette, Variant};
 use crate::view::ViewContext;
+use crate::worker::{Job, Terminal};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 /// The window size a frame is given when a test states none.
@@ -112,6 +113,36 @@ pub fn wait_until(budget: Duration, mut condition: impl FnMut() -> bool) -> bool
         }
         std::thread::sleep(Duration::from_millis(2));
     }
+}
+
+/// Keeps the body of a job made by [`job_held_after`] from returning until
+/// this guard is dropped.
+pub struct HeldBody {
+    _release: mpsc::Sender<()>,
+}
+
+/// How long a held body waits for its guard before it returns anyway.
+const HOLD_LIMIT: Duration = Duration::from_secs(60);
+
+/// A job whose body has queued `messages` and then holds its thread, and with
+/// it the sending end of the queue, until the returned guard is dropped.
+///
+/// A reader that drains it meets the state a frame meets between a terminal
+/// message and the end of the worker thread: every message is queued and the
+/// queue is still connected.
+#[must_use]
+pub fn job_held_after<M: Terminal>(messages: Vec<M>) -> (Job<M>, HeldBody) {
+    let (queued, queued_seen) = mpsc::channel();
+    let (release, held) = mpsc::channel::<()>();
+    let job = Job::spawn(move |emitter, _| {
+        for message in messages {
+            emitter.send(message);
+        }
+        let _ = queued.send(());
+        let _ = held.recv_timeout(HOLD_LIMIT);
+    });
+    let _ = queued_seen.recv_timeout(HOLD_LIMIT);
+    (job, HeldBody { _release: release })
 }
 
 /// Put a save that never ends in flight on both settings documents, for a
