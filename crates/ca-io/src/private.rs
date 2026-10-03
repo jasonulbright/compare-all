@@ -101,6 +101,15 @@ pub fn check_private_folder(folder: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// True when a new file can be created in `folder`.
+///
+/// The probe file has no name that stays behind: it is deleted when it
+/// closes, so the probe leaves the folder as it was.
+#[must_use]
+pub fn accepts_new_files(folder: &Path) -> bool {
+    tempfile::tempfile_in(folder).is_ok()
+}
+
 /// Create a new folder with an unpredictable name under `parent`, open only
 /// to the running user on Unix. The folder stays after the call.
 ///
