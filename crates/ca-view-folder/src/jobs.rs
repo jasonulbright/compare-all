@@ -981,10 +981,16 @@ pub fn spawn_extract(
 ) -> Job<ExtractMessage> {
     Job::spawn_notifying(
         move |emitter, cancel| {
-            let directory = ca_ui::paths::temporary_directory();
-            let message = match extract_pair(&sides, &rel, &directory, request, cancel) {
-                Ok(request) => ExtractMessage::Ready(Box::new(request)),
-                Err(reason) => ExtractMessage::Failed(reason),
+            let message = match ca_ui::paths::prepared_temporary_directory() {
+                Ok(directory) => match extract_pair(&sides, &rel, &directory, request, cancel) {
+                    Ok(request) => ExtractMessage::Ready(Box::new(request)),
+                    Err(reason) => ExtractMessage::Failed(reason),
+                },
+                Err(error) => ExtractMessage::Failed(format!(
+                    "{} could not be copied out: the folder for copies {} cannot be used: {error}",
+                    rel.display(),
+                    ca_ui::paths::temporary_directory().display()
+                )),
             };
             emitter.send(message);
         },
