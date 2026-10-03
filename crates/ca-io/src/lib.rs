@@ -13,6 +13,7 @@
 //! Ownership and other metadata remain unverified. Path races require separate
 //! coordination.
 
+pub mod host_command;
 pub mod private;
 
 use std::fs::{self, File};
