@@ -39,10 +39,12 @@ pub const JOURNAL_FOLDER: &str = "journals";
 /// The settings folder for this run.
 ///
 /// `COMPARE_ALL_SETTINGS_DIR` replaces the per-user folder while it holds a
-/// value, which is what keeps a test out of the real per-user folder.
+/// value, which is what keeps a test out of the real per-user folder. An
+/// environment that names no home yields the folder of this run that
+/// [`SettingsPaths::state_directory`] describes, never the working directory.
 #[must_use]
 pub fn settings_directory() -> PathBuf {
-    SettingsPaths::platform_per_user_directory().unwrap_or_else(|_| PathBuf::from("."))
+    SettingsPaths::state_directory().path
 }
 
 /// The folder the file operations write their journals to.
