@@ -383,6 +383,96 @@ fn a_failed_or_stopped_comparison_names_reload_as_the_way_out() {
     }
 }
 
+/// No command the view accepts carries a reason for refusing it.
+fn assert_no_reason_for_an_accepted_command(view: &TextView, state: &str) {
+    for command in Command::ALL {
+        let reason = view.refusal(*command);
+        assert!(
+            reason.is_none() || !view.accepts(*command),
+            "{state}: {command:?} is accepted and refused with {reason:?}"
+        );
+    }
+}
+
+#[test]
+fn a_copy_into_a_read_only_pane_names_that_pane() {
+    let mut fixture = Fixture::new(COPY_LEFT, COPY_RIGHT);
+    fixture.view.right_pane.set_read_only(true);
+    assert_no_reason_for_an_accepted_command(&fixture.view, "settled");
+    for command in [Command::CopyToRight, Command::CopyLineToRight] {
+        assert!(!fixture.view.accepts(command));
+        assert_eq!(
+            fixture.view.refusal(command),
+            Some(super::RIGHT_READ_ONLY),
+            "{command:?}"
+        );
+    }
+    assert_eq!(fixture.view.active, Side::Left);
+    assert_eq!(
+        fixture.view.refusal(Command::CopyToOtherSide),
+        Some(super::RIGHT_READ_ONLY)
+    );
+    assert!(fixture.view.accepts(Command::CopyToLeft));
+    assert_eq!(fixture.view.refusal(Command::CopyToLeft), None);
+
+    fixture.view.left_pane.place(Caret::new(0, 0), false);
+    fixture.view.left_pane.type_character('z');
+    fixture.view.note_edit();
+    assert_no_reason_for_an_accepted_command(&fixture.view, "after a left edit");
+    assert_eq!(
+        fixture.view.refusal(Command::CopyToRight),
+        Some(super::RIGHT_READ_ONLY)
+    );
+    assert_eq!(
+        fixture.view.refusal(Command::CopyToLeft),
+        Some(super::EDIT_NOT_COMPARED)
+    );
+
+    fixture.view.active = Side::Right;
+    fixture.view.right_pane.set_read_only(false);
+    fixture.view.left_pane.set_read_only(true);
+    assert_eq!(
+        fixture.view.refusal(Command::CopyToOtherSide),
+        Some(super::LEFT_READ_ONLY)
+    );
+    assert_eq!(
+        fixture.view.refusal(Command::CopyLineToLeft),
+        Some(super::LEFT_READ_ONLY)
+    );
+}
+
+#[test]
+fn a_copy_with_editing_off_names_the_read_only_pane_and_a_fixed_view_says_it_is_read_only() {
+    let mut fixture = Fixture::new(COPY_LEFT, COPY_RIGHT);
+    let mut settings = fixture.view.session_settings().clone();
+    settings.specs.disable_editing = true;
+    fixture.view.apply_session_settings(settings);
+    fixture.settle();
+    assert_no_reason_for_an_accepted_command(&fixture.view, "editing off");
+    assert_eq!(
+        fixture.view.refusal(Command::CopyToRight),
+        Some(super::RIGHT_READ_ONLY)
+    );
+    assert_eq!(
+        fixture.view.refusal(Command::CopyToLeft),
+        Some(super::LEFT_READ_ONLY)
+    );
+
+    fixture.view.locked = true;
+    assert_no_reason_for_an_accepted_command(&fixture.view, "locked");
+    for command in [
+        Command::CopyToRight,
+        Command::CopyLineToLeft,
+        Command::CopyToOtherSide,
+    ] {
+        assert_eq!(
+            fixture.view.refusal(command),
+            Some(super::LOCKED),
+            "{command:?}"
+        );
+    }
+}
+
 /// The reason a disabled row control gives is the one drawn while the pointer
 /// rests on it and the one its accessibility node describes.
 #[test]

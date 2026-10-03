@@ -83,6 +83,10 @@ const PENDING: &str = "Not available in this build";
 const NOT_COMPARED: &str = "Available once the comparison finishes";
 /// Reason shown on a control a read-only comparison does not offer.
 const LOCKED: &str = "This view is read-only";
+/// Reason shown on a copy into the left pane while that pane takes no edit.
+const LEFT_READ_ONLY: &str = "The left pane is read-only";
+/// Reason shown on a copy into the right pane while that pane takes no edit.
+const RIGHT_READ_ONLY: &str = "The right pane is read-only";
 /// Reason shown on a control that maps rows to lines while the comparison of
 /// an edit is still due.
 const EDIT_NOT_COMPARED: &str = "Available once the edit is compared";
@@ -4933,20 +4937,25 @@ impl SessionView for TextView {
     }
 
     fn refusal(&self, command: Command) -> Option<&'static str> {
-        let open = match command {
+        let target = match command {
             Command::NextDifference
             | Command::PreviousDifference
             | Command::NextSection
             | Command::PreviousSection
-            | Command::SelectSection => true,
-            Command::CopyToRight | Command::CopyLineToRight => !self.right_pane.is_read_only(),
-            Command::CopyToLeft | Command::CopyLineToLeft => !self.left_pane.is_read_only(),
-            Command::CopyToOtherSide => {
-                !self.locked && !self.pane(self.active.other()).is_read_only()
-            }
+            | Command::SelectSection => None,
+            Command::CopyToRight | Command::CopyLineToRight => Some(Side::Right),
+            Command::CopyToLeft | Command::CopyLineToLeft => Some(Side::Left),
+            Command::CopyToOtherSide => Some(self.active.other()),
             _ => return None,
         };
-        (open && !self.rows_current()).then(|| self.rows_reason())
+        if let Some(side) = target.filter(|side| self.pane(*side).is_read_only()) {
+            return Some(match (self.locked, side) {
+                (true, _) => LOCKED,
+                (false, Side::Left) => LEFT_READ_ONLY,
+                (false, Side::Right) => RIGHT_READ_ONLY,
+            });
+        }
+        (!self.rows_current()).then(|| self.rows_reason())
     }
 
     fn run(&mut self, command: Command) {
