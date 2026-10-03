@@ -13,6 +13,8 @@ Compare-All patches two limits in the SFTP client:
   entry text, and appends each page without recopying all earlier pages.
 - The unused wasm runtime adapter is removed; Compare-All is a native desktop
   application, and the adapter used unsafe code inside the vendored workspace.
+- The upstream `examples/` programs are removed. No build compiles them, and
+  the example server writes each login password to its log.
 
 The caller also wraps the SSH stream with the same packet-length ceiling. The
 duplicate check protects the allocation boundary if the dependency is changed
