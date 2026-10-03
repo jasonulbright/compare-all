@@ -41,6 +41,11 @@ pins=(
   https://github.com/pkgforge-dev/cross-libc-dlopen/releases/download/v0.2.7/cross-libc-dlopen-x86_64.tar
   5b4a9c799b4875e7687b9b4158105a64056031c6c8a8719cbf00fa20839c9cf3
 
+  # The runtime release 20251108 is commit dd6cebe and carries no license file.
+  LICENSE-type2-runtime.txt
+  https://raw.githubusercontent.com/AppImage/type2-runtime/dd6cebedcbddde9c82f89b011e8e1d40b6e43868/LICENSE
+  aa154fc9070614bbe7921f89db11efd1dba7a1f3a41685958110e2230f9c0ca1
+
   LICENSE-sharun.txt
   https://raw.githubusercontent.com/pkgforge-dev/Anylinux-sharun/b6be3cc56cc8dbe78b8fd0381d67f86fbd25120f/LICENSE
   ed1795c447be9b4ae96262f583b559f733a82f627b0265f860f22488c7f8b2ff

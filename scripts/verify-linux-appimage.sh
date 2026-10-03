@@ -376,6 +376,7 @@ if [[ "$CHECK_ALL" == 1 ]]; then
     usr/share/doc/compare-all/licenses/sharun/LICENSE
     usr/share/doc/compare-all/licenses/sharun/LICENSE-linuxdeploy-plugin-checkrt
     usr/share/doc/compare-all/licenses/cross-libc-dlopen/LICENSE
+    usr/share/doc/compare-all/licenses/type2-runtime/LICENSE
     "usr/share/metainfo/$APPSTREAM_ID.appdata.xml" usr/share/applications/compare-all.desktop
   )
   for path in "${required[@]}"; do
@@ -402,8 +403,9 @@ if [[ "$CHECK_ALL" == 1 ]]; then
     for package in glibc mesa libx11 libxkbcommon; do
       grep -q "^$package	" "$manifest" || fail "the package manifest lists no $package"
     done
-    while IFS=$'\t' read -r package version source terms; do
+    while IFS=$'\t' read -r package version source terms sum; do
       [[ "$package" == name ]] && continue
+      [[ "$sum" =~ ^[0-9a-f]{64}$ ]] || fail "the package manifest records no SHA-256 for $package $version ($source)"
       [[ -d "$licenses/$package" ]] && continue
       for term in $(tr '()' '  ' <<< "$terms"); do
         case "$term" in AND | OR | WITH | and | or | with) continue ;; esac
