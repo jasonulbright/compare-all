@@ -2727,11 +2727,13 @@ impl TextView {
             );
             let clicked = enabled && response.clicked();
             if ui.is_enabled() && !enabled {
-                let _ = response.on_hover_text(if self.status == Status::Ready {
+                let reason = if self.status == Status::Ready {
                     EDIT_NOT_COMPARED
                 } else {
                     NOT_COMPARED
-                });
+                };
+                widgets::describe_refusal(&response, reason);
+                let _ = response.on_hover_text(reason);
             }
             if clicked {
                 let start = self

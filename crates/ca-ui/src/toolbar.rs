@@ -538,10 +538,16 @@ pub fn show_for(
                     ..
                 } => {
                     if let Some(state) = checked {
-                        let response = ui.add_enabled(
-                            *enabled,
-                            widgets::IconButton::new(label, crate::icons::command_icon(*command))
+                        let response = widgets::disabled_reason(
+                            ui.add_enabled(
+                                *enabled,
+                                widgets::IconButton::new(
+                                    label,
+                                    crate::icons::command_icon(*command),
+                                )
                                 .selected(*state),
+                            ),
+                            reason,
                         );
                         if response.clicked() {
                             pressed = Some(*command);

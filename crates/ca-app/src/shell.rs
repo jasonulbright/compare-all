@@ -3678,7 +3678,9 @@ fn specs_of(settings: &SessionSettings) -> Option<ResolvedSpecs> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::{menus_for, specs_of, App, Entry, ACTIONS_MENU, NOT_YET, SIDES_UNSUPPORTED};
+    use super::{
+        menus_for, specs_of, App, Entry, ACTIONS_MENU, EDITABLE, NOT_YET, SIDES_UNSUPPORTED,
+    };
     use crate::cli::Startup;
     use crate::registry;
     use ca_session::options::LaunchCommand;
@@ -4646,6 +4648,47 @@ mod tests {
             shown,
             "the comparison of each edit landed before the menu opened"
         );
+    }
+
+    /// A disabled line of the menu bar shows its reason where the pointer
+    /// rests and names it to a screen reader; an enabled line shows none.
+    #[test]
+    fn a_disabled_menu_line_shows_its_reason_where_the_pointer_rests() {
+        use ca_ui::testing::probe::{painted_texts, Probe};
+        use std::cell::RefCell;
+
+        let line = |command: Command| match command.shortcut_in(MenuView::Other) {
+            Some(shortcut) => format!("{}\t{shortcut}", command.label_in(MenuView::Other)),
+            None => command.label_in(MenuView::Other).to_owned(),
+        };
+        let (_settings, app) = empty_app();
+        let app = RefCell::new(app);
+        let mut probe = Probe::new(1600.0, 900.0);
+        let mut run = |ctx: &egui::Context| app.borrow_mut().frame(ctx);
+        probe.idle(&mut run);
+        probe.idle(&mut run);
+
+        probe.click("Edit", &mut run).unwrap();
+        let copy = probe.find(&line(Command::CopyToRight)).unwrap();
+        assert!(!copy.enabled);
+        let output = probe.hover(copy.rect.center(), &mut run);
+        assert!(
+            painted_texts(&output).iter().any(|text| text == EDITABLE),
+            "painted {:?}",
+            painted_texts(&output)
+        );
+        let copy = probe.find(&line(Command::CopyToRight)).unwrap();
+        assert_eq!(copy.description.as_deref(), Some(EDITABLE));
+        probe.click("Edit", &mut run).unwrap();
+
+        probe.click("Session", &mut run).unwrap();
+        let unhovered = painted_texts(&probe.frame(Vec::new(), &mut run));
+        let open = probe.find(&line(Command::NewSession)).unwrap();
+        assert!(open.enabled);
+        let output = probe.hover(open.rect.center(), &mut run);
+        let open = probe.find(&line(Command::NewSession)).unwrap();
+        assert_eq!(open.description, None);
+        assert_eq!(painted_texts(&output), unhovered);
     }
 
     #[test]

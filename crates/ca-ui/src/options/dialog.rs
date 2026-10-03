@@ -471,11 +471,10 @@ impl OptionsDialog {
                     });
             });
             if let Some(reason) = blocked {
-                ui.add_enabled_ui(false, |ui| {
+                let shown = ui.add_enabled_ui(false, |ui| {
                     control(ui, field, &value);
-                })
-                .response
-                .on_hover_text(reason);
+                });
+                let _ = crate::widgets::disabled_reason(shown.response, reason);
                 return;
             }
             if let Some(edited) = control(ui, field, &value) {
