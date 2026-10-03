@@ -202,6 +202,37 @@ fn list_variables_lose_only_their_image_entries_in_order() {
 }
 
 #[test]
+fn a_user_loader_path_survives_for_a_host_child() {
+    let mut input = apprun_child();
+    input.insert(
+        "LD_LIBRARY_PATH".into(),
+        format!("/home/tester/userlib:{MOUNT}/lib;/opt/vendor/lib").into(),
+    );
+    input.insert(
+        "LD_PRELOAD".into(),
+        format!("/usr/lib/libgtk3-nocsd.so.0 {MOUNT}/lib/anylinux.so:anylinux.so /opt/libfoo.so")
+            .into(),
+    );
+    let cleaned = clean(&input);
+    assert_eq!(
+        cleaned.get(OsStr::new("LD_LIBRARY_PATH")),
+        Some(&OsString::from("/home/tester/userlib;/opt/vendor/lib"))
+    );
+    assert_eq!(
+        cleaned.get(OsStr::new("LD_PRELOAD")),
+        Some(&OsString::from(
+            "/usr/lib/libgtk3-nocsd.so.0 /opt/libfoo.so"
+        ))
+    );
+
+    input.insert("LD_LIBRARY_PATH".into(), format!("{MOUNT}/lib:").into());
+    input.insert("LD_PRELOAD".into(), "cross-libc-dlopen.so".into());
+    let cleaned = clean(&input);
+    assert!(!cleaned.contains_key(OsStr::new("LD_LIBRARY_PATH")));
+    assert!(!cleaned.contains_key(OsStr::new("LD_PRELOAD")));
+}
+
+#[test]
 fn a_new_variable_that_points_into_the_image_is_removed() {
     let mut input = apprun_child();
     input.insert(

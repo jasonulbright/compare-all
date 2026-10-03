@@ -47,10 +47,24 @@ const LAUNCHER_VARIABLES: &[&str] = &[
     "REAL_XDG_STATE_HOME",
 ];
 
-/// The loader's library path and preload. Inside an image they serve the
-/// bundled loader, and the host loader given them maps image libraries against
-/// the host C library.
-const LOADER_VARIABLES: &[&str] = &["LD_LIBRARY_PATH", "LD_PRELOAD"];
+/// Separators of the loader's library path; glibc reads both.
+const LIBRARY_PATH_SEPARATORS: &[u8] = b":;";
+
+/// Separators of the loader's preload list; glibc reads both.
+const PRELOAD_SEPARATORS: &[u8] = b": ";
+
+/// Separator of every other list variable.
+const LIST_SEPARATORS: &[u8] = b":";
+
+/// Preload libraries of sharun that a preload list can name without a folder.
+/// The host loader cannot find them and reports each one at every start.
+const IMAGE_PRELOADS: &[&str] = &[
+    "anylinux.so",
+    "cross-libc-dlopen.so",
+    "glycin-fix.so",
+    "gtk-fix-nonsense.so",
+    "path-mapping.so",
+];
 
 /// Resource overrides that sharun and its preload set for the bundled
 /// libraries. Each one is removed whole when any of its entries lies inside the
@@ -191,8 +205,10 @@ impl Image {
 
 /// The environment a host program started from `image` gets.
 ///
-/// - The launcher bookkeeping and the loader's library path and preload are
-///   removed.
+/// - The launcher bookkeeping is removed.
+/// - The loader's library path (entries split at `:` or `;`) and preload list
+///   (split at `:` or a space) lose the entries inside the image and the
+///   sharun preload libraries named without a folder; the user's entries stay.
 /// - A resource override that names an image path is removed whole.
 /// - A folder the launchers redirected for the image's own data is set back to
 ///   the value they kept. Portable mode (`<image>.home`, `<image>.config`
@@ -211,7 +227,24 @@ pub fn clean_environment(environment: &Environment, image: &Image) -> Environmen
             insert_filtered(&mut cleaned, image, name, value);
             continue;
         };
-        if LAUNCHER_VARIABLES.contains(&name_text) || LOADER_VARIABLES.contains(&name_text) {
+        if LAUNCHER_VARIABLES.contains(&name_text) {
+            continue;
+        }
+        if name_text == "LD_LIBRARY_PATH" {
+            insert_entries(
+                &mut cleaned,
+                name,
+                value,
+                LIBRARY_PATH_SEPARATORS,
+                |entry| image.contains(entry),
+            );
+            continue;
+        }
+        if name_text == "LD_PRELOAD" {
+            insert_entries(&mut cleaned, name, value, PRELOAD_SEPARATORS, |entry| {
+                image.contains(entry)
+                    || std::str::from_utf8(entry).is_ok_and(|text| IMAGE_PRELOADS.contains(&text))
+            });
             continue;
         }
         if RESOURCE_VARIABLES.contains(&name_text) && names_image(image, value) {
@@ -247,19 +280,49 @@ fn names_image(image: &Image, value: &OsStr) -> bool {
 /// Insert `value` without its image entries, or nothing when only image
 /// entries remain.
 fn insert_filtered(cleaned: &mut Environment, image: &Image, name: &OsStr, value: &OsStr) {
-    if !names_image(image, value) {
+    insert_entries(cleaned, name, value, LIST_SEPARATORS, |entry| {
+        image.contains(entry)
+    });
+}
+
+/// Insert `value` without the entries `drop` selects. A kept entry keeps the
+/// separator that preceded it, and the variable is left out when no non-empty
+/// entry remains, because an empty `PATH` entry searches the working folder.
+fn insert_entries(
+    cleaned: &mut Environment,
+    name: &OsStr,
+    value: &OsStr,
+    separators: &[u8],
+    drop: impl Fn(&[u8]) -> bool,
+) {
+    let bytes = value.as_encoded_bytes();
+    let mut entries: Vec<(Option<u8>, &[u8])> = Vec::new();
+    let mut start = 0;
+    let mut separator = None;
+    for (index, byte) in bytes.iter().enumerate() {
+        if separators.contains(byte) {
+            entries.push((separator, bytes.get(start..index).unwrap_or_default()));
+            separator = Some(*byte);
+            start = index + 1;
+        }
+    }
+    entries.push((separator, bytes.get(start..).unwrap_or_default()));
+    if !entries.iter().any(|(_, entry)| drop(entry)) {
         cleaned.insert(name.to_owned(), value.to_owned());
         return;
     }
-    let kept: Vec<&[u8]> = value
-        .as_encoded_bytes()
-        .split(|byte| *byte == b':')
-        .filter(|entry| !image.contains(entry))
-        .collect();
-    if kept.is_empty() {
+    entries.retain(|(_, entry)| !drop(entry));
+    if entries.iter().all(|(_, entry)| entry.is_empty()) {
         return;
     }
-    if let Some(joined) = from_bytes(&kept.join(&b':')) {
+    let mut joined = Vec::with_capacity(bytes.len());
+    for (index, (separator, entry)) in entries.iter().enumerate() {
+        if index > 0 {
+            joined.extend(separator.or_else(|| separators.first().copied()));
+        }
+        joined.extend_from_slice(entry);
+    }
+    if let Some(joined) = from_bytes(&joined) {
         cleaned.insert(name.to_owned(), joined);
     }
 }
