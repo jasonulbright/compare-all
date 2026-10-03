@@ -427,12 +427,18 @@ fn from_bytes(bytes: &[u8]) -> Option<OsString> {
 /// through this function. Off the image the command is the plain
 /// [`Command::new`].
 pub fn host_command(program: impl AsRef<OsStr>) -> Command {
+    command_with(program, host_environment())
+}
+
+/// A [`Command`] for `program` that inherits this process's environment when
+/// `environment` is `None` and gets exactly `environment` otherwise.
+fn command_with(program: impl AsRef<OsStr>, environment: Option<Environment>) -> Command {
     #[allow(
         clippy::disallowed_methods,
         reason = "the one place a host command is created"
     )]
     let mut command = Command::new(program);
-    if let Some(environment) = host_environment() {
+    if let Some(environment) = environment {
         command.env_clear().envs(environment);
     }
     command

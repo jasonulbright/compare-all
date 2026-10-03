@@ -517,11 +517,28 @@ fn a_root_given_through_a_link_or_relative_path_matches() {
 
 #[test]
 fn outside_an_image_a_host_command_inherits_the_environment() {
-    if super::host_environment().is_some() {
-        return;
-    }
-    let command = host_command("a-program");
+    let command = super::command_with("a-program", None);
     assert_eq!(command.get_envs().count(), 0);
+    assert_eq!(command.get_program(), OsStr::new("a-program"));
+
+    if super::host_environment().is_some() {
+        println!("this process runs from an image; the process-environment case is skipped");
+    } else {
+        let command = host_command("a-program");
+        assert_eq!(command.get_envs().count(), 0);
+        assert_eq!(command.get_program(), OsStr::new("a-program"));
+    }
+}
+
+#[test]
+fn inside_an_image_a_host_command_gets_exactly_the_cleaned_environment() {
+    let cleaned = clean(&apprun_child());
+    let command = super::command_with("a-program", Some(cleaned.clone()));
+    let given: Environment = command
+        .get_envs()
+        .filter_map(|(name, value)| Some((name.to_owned(), value?.to_owned())))
+        .collect();
+    assert_eq!(given, cleaned);
     assert_eq!(command.get_program(), OsStr::new("a-program"));
 }
 
