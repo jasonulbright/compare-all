@@ -252,3 +252,87 @@ fn row_controls_say_why_they_wait_for_the_comparison_of_an_edit() {
     }
     assert_eq!(fixture.text(Side::Right), "one\nTWO\nthree\nfour\nfive\n");
 }
+
+/// Sections at rows 1, 3..5 and 7; rows 3 and 4 hold no left line.
+const GAP_LEFT: &str = "a\nb\nc\nd\ne\nf\n";
+const GAP_RIGHT: &str = "a\nB\nc\nX\nY\nd\ne\nF\n";
+
+#[test]
+fn navigation_moves_past_a_section_the_active_pane_has_no_line_in() {
+    let mut fixture = Fixture::new(GAP_LEFT, GAP_RIGHT);
+    assert_eq!(fixture.view.active, Side::Left);
+    assert_eq!(fixture.view.current_row(), 1);
+    let mut starts = Vec::new();
+    for _ in 0..3 {
+        fixture.view.run(Command::NextSection);
+        fixture.frame(Vec::new());
+        starts.push(fixture.view.current_section_rows().map(|rows| rows.start));
+    }
+    assert_eq!(starts, [Some(3), Some(7), Some(1)]);
+    let mut rows = Vec::new();
+    for _ in 0..4 {
+        fixture.view.run(Command::NextDifference);
+        fixture.frame(Vec::new());
+        rows.push(fixture.view.current_row());
+    }
+    assert_eq!(rows, [3, 4, 7, 1]);
+    let mut back = Vec::new();
+    for _ in 0..3 {
+        fixture.view.run(Command::PreviousSection);
+        fixture.frame(Vec::new());
+        back.push(fixture.view.current_section_rows().map(|rows| rows.start));
+    }
+    assert_eq!(back, [Some(7), Some(3), Some(1)]);
+}
+
+#[test]
+fn a_caret_move_after_navigation_makes_the_caret_row_current_again() {
+    let mut fixture = Fixture::new(GAP_LEFT, GAP_RIGHT);
+    fixture.view.run(Command::NextSection);
+    fixture.frame(Vec::new());
+    assert_eq!(fixture.view.current_row(), 3);
+    fixture.frame(vec![egui::Event::Key {
+        key: egui::Key::ArrowDown,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::default(),
+    }]);
+    assert_eq!(fixture.view.pane(Side::Left).caret().line, 3);
+    assert_eq!(fixture.view.current_row(), 5);
+}
+
+/// Rows 0 and 1 hold no left line; the second section is row 4.
+const TOP_LEFT: &str = "c\nd\ne\n";
+const TOP_RIGHT: &str = "a\nb\nc\nd\nE\n";
+
+#[test]
+fn a_section_at_the_top_with_no_line_on_the_active_side_is_made_current() {
+    let mut fixture = Fixture::new(TOP_LEFT, TOP_RIGHT);
+    assert_eq!(
+        fixture.view.current_section_rows(),
+        Some(0..2),
+        "the load did not make the first difference current"
+    );
+    fixture.view.left_pane.place(Caret::new(2, 0), false);
+    fixture.frame(Vec::new());
+    assert_eq!(fixture.view.current_section_rows(), Some(4..5));
+    fixture.view.run(Command::PreviousSection);
+    fixture.frame(Vec::new());
+    assert_eq!(fixture.view.current_section_rows(), Some(0..2));
+    fixture.view.run(Command::CopyToLeft);
+    assert_eq!(fixture.text(Side::Left), "a\nb\nc\nd\ne\n");
+    fixture.undo_all(Side::Left);
+    assert_eq!(fixture.text(Side::Left), TOP_LEFT);
+
+    fixture.settle();
+    fixture.view.left_pane.place(Caret::new(2, 0), false);
+    fixture.frame(Vec::new());
+    fixture.view.run(Command::NextSection);
+    fixture.frame(Vec::new());
+    assert_eq!(
+        fixture.view.current_section_rows(),
+        Some(0..2),
+        "a wrap to the first section made another section current"
+    );
+}
