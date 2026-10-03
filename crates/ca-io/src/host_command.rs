@@ -67,10 +67,8 @@ const IMAGE_PRELOADS: &[&str] = &[
 ];
 
 /// Resource overrides that sharun and its preload set for the bundled
-/// libraries. Each one is removed whole when any of its entries lies inside the
-/// image, because the host entries sharun adds beside the image entry are
-/// defaults the user did not set. A value that names no image path is the
-/// user's own and is kept.
+/// libraries. They hold one path or a `:`-separated list of paths whatever
+/// their entries look like, and lose their image entries like `PATH`.
 const RESOURCE_VARIABLES: &[&str] = &[
     "ALSA_CONFIG_PATH",
     "AMDGPU_ASIC_ID_TABLE_PATHS",
@@ -212,13 +210,13 @@ impl Image {
 /// - The loader's library path (entries split at `:` or `;`) and preload list
 ///   (split at `:` or a space) lose the entries inside the image and the
 ///   sharun preload libraries named without a folder; the user's entries stay.
-/// - A resource override that names an image path is removed whole.
 /// - A folder the launchers redirected for the image's own data is set back to
 ///   the value they kept. Portable mode (`<image>.home`, `<image>.config`
 ///   beside the image file) holds the image application's data only, so a host
 ///   program gets the account's home folder and the default configuration
 ///   folder; with no account home known, `HOME` stays as it is.
-/// - In `PATH`, `XDG_DATA_DIRS`, `XDG_CONFIG_DIRS` and in every other value
+/// - In `PATH`, `XDG_DATA_DIRS`, `XDG_CONFIG_DIRS`, the resource overrides
+///   (`GCONV_PATH`, `LIBGL_DRIVERS_PATH`, `TERMINFO`, ...) and in every value
 ///   whose non-empty `:`-separated entries are all absolute paths, each entry
 ///   inside the image is dropped, the other entries keep their order, and a
 ///   variable left with no non-empty entry is removed. Any other value is kept
@@ -252,10 +250,7 @@ pub fn clean_environment(environment: &Environment, image: &Image) -> Environmen
             });
             continue;
         }
-        if RESOURCE_VARIABLES.contains(&name_text) && names_image(image, value) {
-            continue;
-        }
-        if PATH_LIST_VARIABLES.contains(&name_text) {
+        if PATH_LIST_VARIABLES.contains(&name_text) || RESOURCE_VARIABLES.contains(&name_text) {
             insert_filtered(&mut cleaned, image, name, value);
             continue;
         }
@@ -277,13 +272,6 @@ pub fn clean_environment(environment: &Environment, image: &Image) -> Environmen
         cleaned.remove(OsStr::new("XDG_CONFIG_HOME"));
     }
     cleaned
-}
-
-fn names_image(image: &Image, value: &OsStr) -> bool {
-    value
-        .as_encoded_bytes()
-        .split(|byte| *byte == b':')
-        .any(|entry| image.contains(entry))
 }
 
 /// Insert `value` without its image entries, or nothing when only image
