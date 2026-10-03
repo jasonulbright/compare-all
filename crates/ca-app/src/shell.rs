@@ -4093,6 +4093,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn menu_and_update_jobs_stop_counting_as_busy_in_the_poll_that_delivers_their_answer() {
+        let (_settings, mut app) = empty_app();
+        let (explorer, _explorer_held) =
+            ca_ui::testing::job_held_after(vec![crate::explorer::Message::Cancelled]);
+        app.explorer.job = Some(explorer);
+        let (update, _update_held) =
+            ca_ui::testing::job_held_after(vec![crate::update::Outcome::Current]);
+        app.update.job = Some(update);
+        assert!(app.explorer_menu_busy());
+        assert!(app.is_checking_for_updates());
+
+        app.poll_explorer();
+        app.poll_update();
+
+        assert!(
+            !app.explorer_menu_busy(),
+            "the menu reads as busy after its worker answered"
+        );
+        assert!(
+            !app.is_checking_for_updates(),
+            "the update check reads as running after it answered"
+        );
+    }
+
     /// A window holding nothing, over a settings directory of its own.
     fn empty_app() -> (tempfile::TempDir, App) {
         let dir = settings();

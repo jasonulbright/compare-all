@@ -703,4 +703,23 @@ mod tests {
             .child(crate::session_options::VERSION_STRING_GROUP)
             .is_some());
     }
+
+    #[test]
+    fn the_pipeline_stops_running_in_the_poll_that_delivers_the_terminal_message() {
+        let mut pipeline = super::Pipeline::new();
+        let (job, _held) = ca_ui::testing::job_held_after(vec![
+            RecordMessage::Progress(super::Stage::Comparing),
+            RecordMessage::Refused("the edit does not fit".to_owned()),
+        ]);
+        pipeline.start(job);
+        let messages = pipeline.poll();
+        assert!(matches!(
+            messages.as_slice(),
+            [RecordMessage::Progress(_), RecordMessage::Refused(_)]
+        ));
+        assert!(
+            !pipeline.is_running(),
+            "the pipeline still runs a job that has answered"
+        );
+    }
 }

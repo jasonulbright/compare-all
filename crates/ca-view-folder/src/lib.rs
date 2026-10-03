@@ -4023,6 +4023,35 @@ mod stale_results {
     }
 
     #[test]
+    fn scan_sort_and_picker_slots_are_let_go_in_the_poll_that_delivers_their_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut view = ready_view(dir.path());
+        assert!(poll_until(&mut view, |view| view.scan_job.is_none()));
+        let (scan, _scan_held) =
+            ca_ui::testing::job_held_after(vec![crate::jobs::ScanMessage::Cancelled]);
+        view.scan_job = Some(scan);
+        let (sort, _sort_held) =
+            ca_ui::testing::job_held_after(vec![crate::jobs::SortMessage::Cancelled]);
+        view.sort_job = Some(sort);
+        let (picker, _picker_held) =
+            ca_ui::testing::job_held_after(vec![ca_ui::dialog::DialogMessage::Dismissed]);
+        view.picker = Some(picker);
+
+        view.poll();
+
+        assert!(
+            view.picker.is_none(),
+            "Browse stays refused for a picker that has answered"
+        );
+        assert!(
+            view.scan_job.is_none(),
+            "the automatic refresh stays held back by a scan that has answered"
+        );
+        assert!(view.sort_job.is_none());
+        assert_eq!(view.status, super::Status::Cancelled);
+    }
+
+    #[test]
     fn a_result_tagged_with_an_earlier_comparison_is_dropped() {
         let dir = tempfile::tempdir().unwrap();
         let mut view = ready_view(dir.path());

@@ -1369,6 +1369,28 @@ mod tests {
     }
 
     #[test]
+    fn profile_actions_come_back_in_the_poll_that_delivers_the_answer() {
+        let folder = tempfile::tempdir().unwrap();
+        let mut manager = ProfileManager::open(folder.path(), Arc::new(|| {}));
+        wait_for_job(&mut manager);
+        let (job, _held) = ca_ui::testing::job_held_after(vec![ProfileMessage::Cancelled]);
+        manager.job = Some(job);
+        manager.job_kind = Some(ProfileJobKind::Saving);
+
+        manager.poll_job();
+
+        assert!(
+            manager.job.is_none(),
+            "the profile actions stay off for a job that has answered"
+        );
+        assert!(manager.job_kind.is_none());
+        assert_eq!(
+            manager.notice.as_deref(),
+            Some("The profile operation was stopped.")
+        );
+    }
+
+    #[test]
     fn exit_asks_before_dropping_an_unsaved_profile_draft() {
         let folder = tempfile::tempdir().unwrap();
         let mut manager = ProfileManager::open(folder.path(), Arc::new(|| {}));
