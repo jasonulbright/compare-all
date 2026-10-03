@@ -836,6 +836,13 @@ fn validate_url(url: &str) -> VfsResult<()> {
             "credentials in a Subversion URL are not allowed; use the profile username and the svn client's credential provider",
         ));
     }
+    // An svn client older than 1.9.7 hands an svn+ssh host to ssh as an
+    // argument, and ssh reads a leading hyphen as an option.
+    if authority.starts_with('-') {
+        return Err(VfsError::protocol(
+            "the Subversion profile URL names a host that starts with a hyphen",
+        ));
+    }
     Ok(())
 }
 
@@ -1379,6 +1386,35 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("not passed"));
+    }
+
+    #[test]
+    fn a_host_that_reads_as_an_option_is_refused() {
+        for url in [
+            "svn+ssh://-oProxyCommand=calc/repo",
+            "svn+ssh://-p22/repo",
+            "svn://-host/repo",
+        ] {
+            let mut configured = profile();
+            configured.url = url.to_owned();
+            assert!(
+                SubversionFs::with_runner(
+                    &configured,
+                    &RemoteContext::default(),
+                    Arc::new(FakeRunner::default())
+                )
+                .is_err(),
+                "{url}"
+            );
+        }
+        let mut configured = profile();
+        configured.url = "svn+ssh://svn-host.example.test/repo".to_owned();
+        assert!(SubversionFs::with_runner(
+            &configured,
+            &RemoteContext::default(),
+            Arc::new(FakeRunner::default())
+        )
+        .is_ok());
     }
 
     #[test]
