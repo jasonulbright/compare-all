@@ -2237,6 +2237,116 @@ fn named_settings_directory() -> Option<PathBuf> {
     Some(PathBuf::from(value))
 }
 
+/// Name of the application's folder inside a per-user folder.
+const APPLICATION_FOLDER: &str = "compare-all";
+
+/// The operating system conventions that name the per-user folder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlatformFamily {
+    /// `%APPDATA%`.
+    Windows,
+    /// `~/Library/Application Support`.
+    MacOs,
+    /// The XDG Base Directory layout.
+    OtherUnix,
+}
+
+impl PlatformFamily {
+    /// The family of the running build.
+    #[must_use]
+    pub fn running() -> Self {
+        if cfg!(windows) {
+            PlatformFamily::Windows
+        } else if cfg!(target_os = "macos") {
+            PlatformFamily::MacOs
+        } else {
+            PlatformFamily::OtherUnix
+        }
+    }
+
+    /// True when `value` is an absolute path under this family's rules.
+    ///
+    /// The text decides, not the host: a Windows host judges Unix values the
+    /// way a Unix host would, so the choice is testable everywhere.
+    fn is_absolute(self, value: &std::ffi::OsStr) -> bool {
+        let bytes = value.as_encoded_bytes();
+        match self {
+            PlatformFamily::Windows => {
+                matches!(bytes, [letter, b':', b'\\' | b'/', ..] if letter.is_ascii_alphabetic())
+                    || bytes.starts_with(br"\\")
+            }
+            PlatformFamily::MacOs | PlatformFamily::OtherUnix => bytes.first() == Some(&b'/'),
+        }
+    }
+}
+
+/// The environment values the per-user folder is named from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlatformEnvironment {
+    /// Whose conventions apply.
+    pub family: PlatformFamily,
+    /// `HOME`.
+    pub home: Option<std::ffi::OsString>,
+    /// `XDG_CONFIG_HOME`.
+    pub config_home: Option<std::ffi::OsString>,
+    /// `APPDATA`.
+    pub app_data: Option<std::ffi::OsString>,
+    /// `XDG_RUNTIME_DIR`.
+    pub runtime_directory: Option<std::ffi::OsString>,
+}
+
+impl PlatformEnvironment {
+    /// The values of the running process.
+    #[must_use]
+    pub fn from_process() -> Self {
+        Self {
+            family: PlatformFamily::running(),
+            home: std::env::var_os("HOME"),
+            config_home: std::env::var_os("XDG_CONFIG_HOME"),
+            app_data: std::env::var_os("APPDATA"),
+            runtime_directory: std::env::var_os("XDG_RUNTIME_DIR"),
+        }
+    }
+
+    /// A variable's value when it names an absolute path. An empty or
+    /// relative value counts as not set.
+    fn absolute(&self, value: Option<&std::ffi::OsString>) -> Option<PathBuf> {
+        value
+            .filter(|value| self.family.is_absolute(value))
+            .map(PathBuf::from)
+    }
+}
+
+/// The per-user folder, or why the environment names none.
+fn per_user_folder(
+    environment: &PlatformEnvironment,
+) -> std::result::Result<PathBuf, &'static str> {
+    const NO_HOME: &str = "HOME is not set to an absolute folder";
+    match environment.family {
+        PlatformFamily::Windows => environment
+            .absolute(environment.app_data.as_ref())
+            .map(|roaming| roaming.join(APPLICATION_FOLDER))
+            .ok_or("APPDATA is not set to an absolute folder"),
+        PlatformFamily::MacOs => environment
+            .absolute(environment.home.as_ref())
+            .map(|home| {
+                home.join("Library")
+                    .join("Application Support")
+                    .join(APPLICATION_FOLDER)
+            })
+            .ok_or(NO_HOME),
+        PlatformFamily::OtherUnix => environment
+            .absolute(environment.config_home.as_ref())
+            .or_else(|| {
+                environment
+                    .absolute(environment.home.as_ref())
+                    .map(|home| home.join(".config"))
+            })
+            .map(|config| config.join(APPLICATION_FOLDER))
+            .ok_or(NO_HOME),
+    }
+}
+
 /// Resolved locations of the stored documents.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SettingsPaths {
@@ -2307,22 +2417,16 @@ impl SettingsPaths {
     /// Returns [`Error::NoSettingsDirectory`] when the environment names no
     /// home or configuration folder.
     pub fn platform_directory() -> Result<PathBuf> {
-        let application = "compare-all";
-        if cfg!(windows) {
-            let roaming = std::env::var_os("APPDATA")
-                .ok_or(Error::NoSettingsDirectory("APPDATA is not set"))?;
-            return Ok(PathBuf::from(roaming).join(application));
-        }
-        let home = std::env::var_os("HOME").ok_or(Error::NoSettingsDirectory("HOME is not set"))?;
-        if cfg!(target_os = "macos") {
-            return Ok(PathBuf::from(home)
-                .join("Library")
-                .join("Application Support")
-                .join(application));
-        }
-        let config = std::env::var_os("XDG_CONFIG_HOME")
-            .map_or_else(|| PathBuf::from(home).join(".config"), PathBuf::from);
-        Ok(config.join(application))
+        Self::per_user_directory_in(&PlatformEnvironment::from_process())
+    }
+
+    /// The per-user settings folder `environment` names.
+    ///
+    /// # Errors
+    /// Returns [`Error::NoSettingsDirectory`] when the environment names no
+    /// home or configuration folder.
+    pub fn per_user_directory_in(environment: &PlatformEnvironment) -> Result<PathBuf> {
+        per_user_folder(environment).map_err(Error::NoSettingsDirectory)
     }
 
     /// The chosen directory.
@@ -3553,6 +3657,133 @@ mod tests {
         let paths = SettingsPaths::resolve(program.path(), real.clone());
         assert!(!paths.directory().path().starts_with(&real));
         assert!(!paths.directory().is_portable());
+    }
+
+    fn environment(family: PlatformFamily) -> PlatformEnvironment {
+        PlatformEnvironment {
+            family,
+            home: None,
+            config_home: None,
+            app_data: None,
+            runtime_directory: None,
+        }
+    }
+
+    #[allow(clippy::unnecessary_wraps)]
+    fn os(value: &str) -> Option<std::ffi::OsString> {
+        Some(std::ffi::OsString::from(value))
+    }
+
+    /// Existing users keep their folder: an ordinary environment of each
+    /// platform names the same folder it always named.
+    #[test]
+    fn an_ordinary_environment_names_the_folder_it_always_named() {
+        let linux = PlatformEnvironment {
+            home: os("/home/user"),
+            ..environment(PlatformFamily::OtherUnix)
+        };
+        assert_eq!(
+            SettingsPaths::per_user_directory_in(&linux).unwrap(),
+            Path::new("/home/user").join(".config").join("compare-all")
+        );
+        let linux_with_config = PlatformEnvironment {
+            config_home: os("/home/user/settings"),
+            ..linux.clone()
+        };
+        assert_eq!(
+            SettingsPaths::per_user_directory_in(&linux_with_config).unwrap(),
+            Path::new("/home/user/settings").join("compare-all")
+        );
+        let mac = PlatformEnvironment {
+            home: os("/Users/user"),
+            config_home: os("/Users/user/.config"),
+            ..environment(PlatformFamily::MacOs)
+        };
+        assert_eq!(
+            SettingsPaths::per_user_directory_in(&mac).unwrap(),
+            Path::new("/Users/user")
+                .join("Library")
+                .join("Application Support")
+                .join("compare-all")
+        );
+        let windows = PlatformEnvironment {
+            app_data: os(r"C:\Users\user\AppData\Roaming"),
+            home: os(r"C:\Users\user"),
+            ..environment(PlatformFamily::Windows)
+        };
+        assert_eq!(
+            SettingsPaths::per_user_directory_in(&windows).unwrap(),
+            Path::new(r"C:\Users\user\AppData\Roaming").join("compare-all")
+        );
+        let windows_share = PlatformEnvironment {
+            app_data: os(r"\\server\profiles\user"),
+            ..environment(PlatformFamily::Windows)
+        };
+        assert_eq!(
+            SettingsPaths::per_user_directory_in(&windows_share).unwrap(),
+            Path::new(r"\\server\profiles\user").join("compare-all")
+        );
+    }
+
+    /// The XDG Base Directory rule: a relative or empty value is ignored.
+    #[test]
+    fn an_empty_or_relative_config_home_falls_back_to_the_home_config_folder() {
+        for config_home in ["", "relative-config", "./config"] {
+            let linux = PlatformEnvironment {
+                home: os("/home/user"),
+                config_home: os(config_home),
+                ..environment(PlatformFamily::OtherUnix)
+            };
+            assert_eq!(
+                SettingsPaths::per_user_directory_in(&linux).unwrap(),
+                Path::new("/home/user").join(".config").join("compare-all"),
+                "XDG_CONFIG_HOME={config_home:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_or_relative_home_counts_as_not_set() {
+        for family in [PlatformFamily::OtherUnix, PlatformFamily::MacOs] {
+            for home in ["", "home/user", "~"] {
+                let unix = PlatformEnvironment {
+                    home: os(home),
+                    ..environment(family)
+                };
+                assert!(
+                    matches!(
+                        SettingsPaths::per_user_directory_in(&unix),
+                        Err(Error::NoSettingsDirectory(_))
+                    ),
+                    "{family:?} HOME={home:?}"
+                );
+            }
+        }
+        for app_data in ["", r"AppData\Roaming", r"C:AppData", r"\AppData"] {
+            let windows = PlatformEnvironment {
+                app_data: os(app_data),
+                ..environment(PlatformFamily::Windows)
+            };
+            assert!(
+                matches!(
+                    SettingsPaths::per_user_directory_in(&windows),
+                    Err(Error::NoSettingsDirectory(_))
+                ),
+                "APPDATA={app_data:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_absolute_config_home_is_used_without_a_home() {
+        let linux = PlatformEnvironment {
+            config_home: os("/srv/config"),
+            ..environment(PlatformFamily::OtherUnix)
+        };
+        assert_eq!(
+            SettingsPaths::per_user_directory_in(&linux).unwrap(),
+            Path::new("/srv/config").join("compare-all")
+        );
     }
 
     #[test]
