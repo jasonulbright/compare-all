@@ -124,6 +124,14 @@ if [[ -f "$hook" ]]; then
   rm -f "$hook"
 fi
 rm -f "$appdir/AppRun.lib"
+
+# anylinux.so removes the image's library and driver variables from the
+# environment of a host program only while APPDIR is set. sharun sets APPDIR
+# only when it runs as AppRun, so bin/ca and bin/compare-all started directly
+# take it from .env, with the value that AppRun gives it.
+# shellcheck disable=SC2016 # sharun expands ${SHARUN_DIR} when it reads .env
+grep -qx 'APPDIR=${SHARUN_DIR}' "$appdir/.env" 2> /dev/null ||
+  printf '%s\n' 'APPDIR=${SHARUN_DIR}' >> "$appdir/.env"
 set -- "$appdir"/bin/*.hook
 [[ ! -e "$1" ]] || die "quick-sharun.sh added start hooks that AppRun.sh does not run: $*"
 
