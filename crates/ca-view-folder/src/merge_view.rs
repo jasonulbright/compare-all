@@ -323,8 +323,13 @@ impl FolderMergeView {
     /// A merge over the folders a request names, journalling into the
     /// application's journal directory.
     #[must_use]
-    pub fn from_request(request: &OpenRequest, context: &ViewContext, salt: u64) -> Self {
-        Self::with_journal_directory(request, context, salt, ca_ui::paths::journal_directory())
+    pub fn from_request(request: &OpenRequest, context: &ViewContext, instance: u64) -> Self {
+        Self::with_journal_directory(
+            request,
+            context,
+            instance,
+            ca_ui::paths::journal_directory(),
+        )
     }
 
     /// A merge over the folders a request names, journalling into `journals`.
@@ -332,14 +337,14 @@ impl FolderMergeView {
     pub fn with_journal_directory(
         request: &OpenRequest,
         context: &ViewContext,
-        salt: u64,
+        instance: u64,
         journals: PathBuf,
     ) -> Self {
         let settings = FolderMergeSettings::default();
         let archive_masks = context.options.stored.archives.clone();
         let engine = engine_of(&settings, &archive_masks);
         let mut view = Self {
-            id: egui::Id::new(("folder-merge", salt)),
+            id: egui::Id::new(("folder-merge", instance)),
             notify: context.notify.clone(),
             folders: Folders {
                 left: request.left.clone(),
@@ -372,7 +377,7 @@ impl FolderMergeView {
             stage: Stage::Idle,
             report: ViewReport::new(
                 ReportKind::Folder,
-                egui::Id::new(("folder-merge-report", salt)),
+                egui::Id::new(("folder-merge-report", instance)),
                 context.notify.clone(),
             ),
             actions: Vec::new(),
@@ -1557,16 +1562,16 @@ fn compare_folders(
 }
 
 impl ca_ui::view::ViewFactory for FolderMergeView {
-    fn create(left: PathBuf, right: PathBuf, context: &ViewContext, salt: u64) -> Self {
+    fn create(left: PathBuf, right: PathBuf, context: &ViewContext, instance: u64) -> Self {
         Self::from_request(
             &OpenRequest::new(SessionKind::FolderMerge, left, right),
             context,
-            salt,
+            instance,
         )
     }
 
-    fn create_from(request: &OpenRequest, context: &ViewContext, salt: u64) -> Self {
-        Self::from_request(request, context, salt)
+    fn create_from(request: &OpenRequest, context: &ViewContext, instance: u64) -> Self {
+        Self::from_request(request, context, instance)
     }
 }
 

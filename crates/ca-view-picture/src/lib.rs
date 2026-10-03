@@ -204,11 +204,11 @@ pub struct PictureView {
 impl PictureView {
     /// A tab over the two sides.
     #[must_use]
-    pub fn new(left: PathBuf, right: PathBuf, context: &ViewContext, salt: u64) -> Self {
+    pub fn new(left: PathBuf, right: PathBuf, context: &ViewContext, instance: u64) -> Self {
         let mut view = Self {
             specs: ca_session::settings::SpecsSettings::default(),
             stored: ca_session::settings::binary::PictureCompareSettings::default(),
-            id: egui::Id::new(("picture", salt)),
+            id: egui::Id::new(("picture", instance)),
             left_field: left.display().to_string(),
             right_field: right.display().to_string(),
             left_path: left,
@@ -224,7 +224,7 @@ impl PictureView {
             right_image: None,
             report: ViewReport::new(
                 ReportKind::Picture,
-                egui::Id::new(("picture-compare", salt)),
+                egui::Id::new(("picture-compare", instance)),
                 context.notify.clone(),
             ),
             outcome: None,
@@ -2008,8 +2008,8 @@ fn f32_of_signed(value: i32) -> f32 {
 }
 
 impl ca_ui::view::ViewFactory for PictureView {
-    fn create(left: PathBuf, right: PathBuf, context: &ViewContext, salt: u64) -> Self {
-        Self::new(left, right, context, salt)
+    fn create(left: PathBuf, right: PathBuf, context: &ViewContext, instance: u64) -> Self {
+        Self::new(left, right, context, instance)
     }
 }
 

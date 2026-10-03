@@ -372,14 +372,14 @@ pub struct FolderView {
 impl FolderView {
     /// A comparison of two folders, with the scan already started.
     #[must_use]
-    pub fn new(left: PathBuf, right: PathBuf, context: &ViewContext, salt: u64) -> Self {
-        Self::in_mode(left, right, context, salt, Mode::Compare)
+    pub fn new(left: PathBuf, right: PathBuf, context: &ViewContext, instance: u64) -> Self {
+        Self::in_mode(left, right, context, instance, Mode::Compare)
     }
 
     /// A synchronisation of two folders, with the scan already started.
     #[must_use]
-    pub fn new_sync(left: PathBuf, right: PathBuf, context: &ViewContext, salt: u64) -> Self {
-        Self::in_mode(left, right, context, salt, Mode::Sync)
+    pub fn new_sync(left: PathBuf, right: PathBuf, context: &ViewContext, instance: u64) -> Self {
+        Self::in_mode(left, right, context, instance, Mode::Sync)
     }
 
     /// A comparison whose batches journal somewhere other than the settings
@@ -389,14 +389,14 @@ impl FolderView {
         left: PathBuf,
         right: PathBuf,
         context: &ViewContext,
-        salt: u64,
+        instance: u64,
         journal_directory: PathBuf,
     ) -> Self {
         Self::in_mode_with_journal_directory(
             left,
             right,
             context,
-            salt,
+            instance,
             Mode::Compare,
             journal_directory,
         )
@@ -409,14 +409,14 @@ impl FolderView {
         left: PathBuf,
         right: PathBuf,
         context: &ViewContext,
-        salt: u64,
+        instance: u64,
         journal_directory: PathBuf,
     ) -> Self {
         Self::in_mode_with_journal_directory(
             left,
             right,
             context,
-            salt,
+            instance,
             Mode::Sync,
             journal_directory,
         )
@@ -426,11 +426,11 @@ impl FolderView {
         left: PathBuf,
         right: PathBuf,
         context: &ViewContext,
-        salt: u64,
+        instance: u64,
         mode: Mode,
         journal_directory: PathBuf,
     ) -> Self {
-        let mut view = Self::bare(left, right, context, salt, mode);
+        let mut view = Self::bare(left, right, context, instance, mode);
         view.journal_directory = journal_directory;
         view.start_jobs();
         view
@@ -440,10 +440,10 @@ impl FolderView {
         left: PathBuf,
         right: PathBuf,
         context: &ViewContext,
-        salt: u64,
+        instance: u64,
         mode: Mode,
     ) -> Self {
-        let mut view = Self::bare(left, right, context, salt, mode);
+        let mut view = Self::bare(left, right, context, instance, mode);
         view.start_jobs();
         view
     }
@@ -457,9 +457,15 @@ impl FolderView {
         self.restart();
     }
 
-    fn bare(left: PathBuf, right: PathBuf, context: &ViewContext, salt: u64, mode: Mode) -> Self {
+    fn bare(
+        left: PathBuf,
+        right: PathBuf,
+        context: &ViewContext,
+        instance: u64,
+        mode: Mode,
+    ) -> Self {
         let mut view = Self {
-            id: egui::Id::new(("folder-compare", salt)),
+            id: egui::Id::new(("folder-compare", instance)),
             mode,
             left_field: left.display().to_string(),
             right_field: right.display().to_string(),
@@ -485,7 +491,7 @@ impl FolderView {
             pending_opens: Vec::new(),
             report: ViewReport::new(
                 ReportKind::Folder,
-                egui::Id::new(("folder-compare", salt)),
+                egui::Id::new(("folder-compare", instance)),
                 context.notify.clone(),
             ),
             arena: Arena::default(),
@@ -545,10 +551,10 @@ impl FolderView {
         left: PathBuf,
         right: PathBuf,
         context: &ViewContext,
-        salt: u64,
+        instance: u64,
         arena: Arena,
     ) -> Self {
-        let mut view = Self::new(left, right, context, salt);
+        let mut view = Self::new(left, right, context, instance);
         view.drop_jobs();
         view.arena = arena;
         view.expanded.expand_all(&view.arena);
@@ -566,10 +572,10 @@ impl FolderView {
         left: PathBuf,
         right: PathBuf,
         context: &ViewContext,
-        salt: u64,
+        instance: u64,
         tree: Box<Node>,
     ) -> Self {
-        let mut view = Self::bare(left, right, context, salt, Mode::Compare);
+        let mut view = Self::bare(left, right, context, instance, Mode::Compare);
         view.arena = Arena::from_root(&tree);
         view.compared_tree = Some(tree);
         view.expanded.expand_all(&view.arena);
@@ -3262,8 +3268,8 @@ fn folder_name(path: &Path) -> String {
 }
 
 impl ca_ui::view::ViewFactory for FolderView {
-    fn create(left: PathBuf, right: PathBuf, context: &ViewContext, salt: u64) -> Self {
-        Self::new(left, right, context, salt)
+    fn create(left: PathBuf, right: PathBuf, context: &ViewContext, instance: u64) -> Self {
+        Self::new(left, right, context, instance)
     }
 }
 
@@ -3280,8 +3286,8 @@ pub struct FolderSyncView {
 }
 
 impl ca_ui::view::ViewFactory for FolderSyncView {
-    fn create(left: PathBuf, right: PathBuf, context: &ViewContext, salt: u64) -> Self {
-        Self::from(FolderView::new_sync(left, right, context, salt))
+    fn create(left: PathBuf, right: PathBuf, context: &ViewContext, instance: u64) -> Self {
+        Self::from(FolderView::new_sync(left, right, context, instance))
     }
 }
 

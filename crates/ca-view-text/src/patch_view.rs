@@ -182,7 +182,7 @@ enum Picking {
 pub struct TextPatchView {
     id: egui::Id,
     context: ViewContext,
-    salt: u64,
+    instance: u64,
     patch_path: PathBuf,
     target_path: PathBuf,
     /// The settings the session last gave, reported with the sides replaced by
@@ -204,11 +204,11 @@ pub struct TextPatchView {
 impl TextPatchView {
     /// A view of the patch at `patch`, applied to `target` when one is named.
     #[must_use]
-    pub fn new(patch: PathBuf, target: PathBuf, context: &ViewContext, salt: u64) -> Self {
+    pub fn new(patch: PathBuf, target: PathBuf, context: &ViewContext, instance: u64) -> Self {
         let mut view = Self {
-            id: egui::Id::new(("text-patch", salt)),
+            id: egui::Id::new(("text-patch", instance)),
             context: context.clone(),
-            salt,
+            instance,
             patch_field: patch.display().to_string(),
             target_field: target.display().to_string(),
             patch_path: patch,
@@ -381,7 +381,7 @@ impl TextPatchView {
                             name.clone(),
                             name,
                             &self.context,
-                            self.salt,
+                            self.instance,
                             (data.original.clone(), data.patched.clone()),
                         ));
                         self.message = match (data.rejected.len(), data.moved.len()) {
@@ -549,8 +549,8 @@ impl TextPatchView {
 }
 
 impl ca_ui::view::ViewFactory for TextPatchView {
-    fn create(left: PathBuf, right: PathBuf, context: &ViewContext, salt: u64) -> Self {
-        Self::new(left, right, context, salt)
+    fn create(left: PathBuf, right: PathBuf, context: &ViewContext, instance: u64) -> Self {
+        Self::new(left, right, context, instance)
     }
 }
 

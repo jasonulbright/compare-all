@@ -176,11 +176,11 @@ pub struct ImportReportDialog {
 impl ImportReportDialog {
     /// A dialog over one report.
     #[must_use]
-    pub fn new(report: &ImportReport, salt: u64) -> Self {
+    pub fn new(report: &ImportReport, instance: u64) -> Self {
         Self {
             lines: report_lines(report),
             open: true,
-            id: egui::Id::new(("import-report", salt)),
+            id: egui::Id::new(("import-report", instance)),
         }
     }
 

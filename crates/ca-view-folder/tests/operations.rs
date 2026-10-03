@@ -908,12 +908,12 @@ fn every_synchronisation_preset_runs_the_plan_it_previewed() {
         fixture.write("left", "only-left.txt", b"from the left");
         fixture.write("right", "only-right.txt", b"from the right");
 
-        let salt = 100 + u64::try_from(index).unwrap();
+        let instance = 100 + u64::try_from(index).unwrap();
         let mut view = FolderView::sync_with_journal_directory(
             fixture.left(),
             fixture.right(),
             &context(),
-            salt,
+            instance,
             fixture.journals(),
         );
         view.form_mut().options.use_recycle_bin = false;

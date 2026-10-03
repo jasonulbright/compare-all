@@ -75,9 +75,9 @@ pub struct HomeView {
 impl HomeView {
     /// A launcher over a store the window already holds.
     #[must_use]
-    pub fn new(context: &ViewContext, salt: u64, store: SharedStore) -> Self {
+    pub fn new(context: &ViewContext, instance: u64, store: SharedStore) -> Self {
         Self {
-            id: egui::Id::new(("home", salt)),
+            id: egui::Id::new(("home", instance)),
             left: String::new(),
             right: String::new(),
             store,
@@ -99,25 +99,25 @@ impl HomeView {
     #[must_use]
     pub fn in_settings_directory(
         context: &ViewContext,
-        salt: u64,
+        instance: u64,
         settings_directory: PathBuf,
     ) -> Self {
         let store = Rc::new(RefCell::new(StoreHandle::open_in(
             settings_directory,
             context.notify.clone(),
         )));
-        Self::new(context, salt, store)
+        Self::new(context, instance, store)
     }
 
     /// A launcher that opens showing `notice`.
     #[must_use]
     pub fn with_notice(
         context: &ViewContext,
-        salt: u64,
+        instance: u64,
         store: SharedStore,
         notice: String,
     ) -> Self {
-        let mut view = Self::new(context, salt, store);
+        let mut view = Self::new(context, instance, store);
         view.notice = Some(notice);
         view
     }

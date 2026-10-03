@@ -281,15 +281,15 @@ pub struct HexView {
 impl HexView {
     /// A comparison of two files, with the work already started.
     #[must_use]
-    pub fn new(left: PathBuf, right: PathBuf, context: &ViewContext, salt: u64) -> Self {
-        let mut view = Self::empty(left, right, context, salt);
+    pub fn new(left: PathBuf, right: PathBuf, context: &ViewContext, instance: u64) -> Self {
+        let mut view = Self::empty(left, right, context, instance);
         view.restart();
         view
     }
 
-    fn empty(left: PathBuf, right: PathBuf, context: &ViewContext, salt: u64) -> Self {
+    fn empty(left: PathBuf, right: PathBuf, context: &ViewContext, instance: u64) -> Self {
         Self {
-            id: egui::Id::new(("hex-compare", salt)),
+            id: egui::Id::new(("hex-compare", instance)),
             specs: ca_session::settings::SpecsSettings::default(),
             read_only: false,
             left_field: left.display().to_string(),
@@ -365,7 +365,7 @@ impl HexView {
             input_pass: None,
             report: ViewReport::new(
                 ReportKind::Hex,
-                egui::Id::new(("hex-compare", salt)),
+                egui::Id::new(("hex-compare", instance)),
                 context.notify.clone(),
             ),
         }
@@ -377,10 +377,10 @@ impl HexView {
         left: PathBuf,
         right: PathBuf,
         context: &ViewContext,
-        salt: u64,
+        instance: u64,
         data: HexData,
     ) -> Self {
-        let mut view = Self::empty(left, right, context, salt);
+        let mut view = Self::empty(left, right, context, instance);
         view.auto_width = false;
         view.bytes_per_row = data.model.bytes_per_row();
         view.install(HexData {
@@ -2783,12 +2783,21 @@ fn file_name(path: &Path) -> String {
 }
 
 impl ca_ui::view::ViewFactory for HexView {
-    fn create(left: PathBuf, right: PathBuf, context: &ViewContext, salt: u64) -> Self {
-        Self::new(left, right, context, salt)
+    fn create(left: PathBuf, right: PathBuf, context: &ViewContext, instance: u64) -> Self {
+        Self::new(left, right, context, instance)
     }
 
-    fn create_from(request: &ca_ui::view::OpenRequest, context: &ViewContext, salt: u64) -> Self {
-        let mut view = Self::empty(request.left.clone(), request.right.clone(), context, salt);
+    fn create_from(
+        request: &ca_ui::view::OpenRequest,
+        context: &ViewContext,
+        instance: u64,
+    ) -> Self {
+        let mut view = Self::empty(
+            request.left.clone(),
+            request.right.clone(),
+            context,
+            instance,
+        );
         view.read_only = request.read_only;
         view.restart();
         view

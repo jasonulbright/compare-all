@@ -28,12 +28,12 @@ pub struct RestoreDialog {
 impl RestoreDialog {
     /// A wizard with nothing selected.
     #[must_use]
-    pub fn new(salt: u64) -> Self {
+    pub fn new(instance: u64) -> Self {
         Self {
             selection: RestoreSelection::default(),
             second_page: false,
             open: true,
-            id: egui::Id::new(("restore-defaults", salt)),
+            id: egui::Id::new(("restore-defaults", instance)),
         }
     }
 

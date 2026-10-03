@@ -321,16 +321,21 @@ pub fn with_sides(
 pub trait ViewFactory: SessionView + Sized + 'static {
     /// Build the view over the two sides.
     ///
-    /// `salt` distinguishes one tab's widget identifiers from another's.
-    fn create(left: PathBuf, right: PathBuf, context: &ViewContext, salt: u64) -> Self;
+    /// `instance` distinguishes one tab's widget identifiers from another's.
+    fn create(left: PathBuf, right: PathBuf, context: &ViewContext, instance: u64) -> Self;
 
     /// Build the view from a whole request.
     ///
     /// A view that reads more than the two paths overrides this. The default
     /// reads the two paths, which is what every two sided comparison needs.
     #[must_use]
-    fn create_from(request: &OpenRequest, context: &ViewContext, salt: u64) -> Self {
-        Self::create(request.left.clone(), request.right.clone(), context, salt)
+    fn create_from(request: &OpenRequest, context: &ViewContext, instance: u64) -> Self {
+        Self::create(
+            request.left.clone(),
+            request.right.clone(),
+            context,
+            instance,
+        )
     }
 }
 
@@ -341,9 +346,9 @@ pub trait ViewFactory: SessionView + Sized + 'static {
 pub fn build<V: ViewFactory>(
     request: &OpenRequest,
     context: &ViewContext,
-    salt: u64,
+    instance: u64,
 ) -> Box<dyn SessionView> {
-    let view: Box<dyn SessionView> = Box::new(V::create_from(request, context, salt));
+    let view: Box<dyn SessionView> = Box::new(V::create_from(request, context, instance));
     if request.temporaries.is_empty() {
         view
     } else {
@@ -541,7 +546,7 @@ mod tests {
     }
 
     impl ViewFactory for Blank {
-        fn create(_left: PathBuf, _right: PathBuf, _context: &ViewContext, _salt: u64) -> Self {
+        fn create(_left: PathBuf, _right: PathBuf, _context: &ViewContext, _instance: u64) -> Self {
             Self
         }
     }

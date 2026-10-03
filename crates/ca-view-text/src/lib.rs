@@ -452,8 +452,8 @@ enum Prompt {
 impl TextView {
     /// A comparison of two files, with the work already started.
     #[must_use]
-    pub fn new(left: PathBuf, right: PathBuf, context: &ViewContext, salt: u64) -> Self {
-        let mut view = Self::blank(left, right, context, salt);
+    pub fn new(left: PathBuf, right: PathBuf, context: &ViewContext, instance: u64) -> Self {
+        let mut view = Self::blank(left, right, context, instance);
         view.restart();
         view
     }
@@ -467,10 +467,10 @@ impl TextView {
         left: PathBuf,
         right: PathBuf,
         context: &ViewContext,
-        salt: u64,
+        instance: u64,
         texts: (String, String),
     ) -> Self {
-        let mut view = Self::blank(left, right, context, salt);
+        let mut view = Self::blank(left, right, context, instance);
         view.locked = true;
         view.status = Status::Running("Comparing");
         view.left_syntax.set_path(&view.left_path);
@@ -497,9 +497,9 @@ impl TextView {
         self.locked
     }
 
-    fn blank(left: PathBuf, right: PathBuf, context: &ViewContext, salt: u64) -> Self {
+    fn blank(left: PathBuf, right: PathBuf, context: &ViewContext, instance: u64) -> Self {
         Self {
-            id: egui::Id::new(("text-compare", salt)),
+            id: egui::Id::new(("text-compare", instance)),
             left_field: left.display().to_string(),
             right_field: right.display().to_string(),
             left_title: None,
@@ -589,7 +589,7 @@ impl TextView {
             first_difference_pending: false,
             report: ViewReport::new(
                 ReportKind::Text,
-                egui::Id::new(("text-compare", salt)),
+                egui::Id::new(("text-compare", instance)),
                 context.notify.clone(),
             ),
             locked: false,
@@ -603,10 +603,10 @@ impl TextView {
         left: PathBuf,
         right: PathBuf,
         context: &ViewContext,
-        salt: u64,
+        instance: u64,
         data: TextData,
     ) -> Self {
-        let mut view = Self::blank(left, right, context, salt);
+        let mut view = Self::blank(left, right, context, instance);
         view.left_syntax.set_path(&view.left_path);
         view.right_syntax.set_path(&view.right_path);
         let left = data.left.lines.join("\n");
@@ -4350,12 +4350,21 @@ fn file_name(path: &Path) -> String {
 }
 
 impl ca_ui::view::ViewFactory for TextView {
-    fn create(left: PathBuf, right: PathBuf, context: &ViewContext, salt: u64) -> Self {
-        Self::new(left, right, context, salt)
+    fn create(left: PathBuf, right: PathBuf, context: &ViewContext, instance: u64) -> Self {
+        Self::new(left, right, context, instance)
     }
 
-    fn create_from(request: &ca_ui::view::OpenRequest, context: &ViewContext, salt: u64) -> Self {
-        let mut view = Self::blank(request.left.clone(), request.right.clone(), context, salt);
+    fn create_from(
+        request: &ca_ui::view::OpenRequest,
+        context: &ViewContext,
+        instance: u64,
+    ) -> Self {
+        let mut view = Self::blank(
+            request.left.clone(),
+            request.right.clone(),
+            context,
+            instance,
+        );
         view.left_title.clone_from(&request.titles.left);
         view.right_title.clone_from(&request.titles.right);
         view.read_only = request.read_only;

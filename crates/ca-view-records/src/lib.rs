@@ -44,8 +44,8 @@ macro_rules! record_view {
         impl $name {
             /// A tab over the two sides, with the comparison already started.
             #[must_use]
-            pub fn new(left: PathBuf, right: PathBuf, context: &ViewContext, salt: u64) -> Self {
-                Self(RecordsView::new($flavor, left, right, context, salt))
+            pub fn new(left: PathBuf, right: PathBuf, context: &ViewContext, instance: u64) -> Self {
+                Self(RecordsView::new($flavor, left, right, context, instance))
             }
 
             /// Which kind of session this view answers for.
@@ -67,8 +67,8 @@ macro_rules! record_view {
         }
 
         impl ca_ui::view::ViewFactory for $name {
-            fn create(left: PathBuf, right: PathBuf, context: &ViewContext, salt: u64) -> Self {
-                Self::new(left, right, context, salt)
+            fn create(left: PathBuf, right: PathBuf, context: &ViewContext, instance: u64) -> Self {
+                Self::new(left, right, context, instance)
             }
         }
 

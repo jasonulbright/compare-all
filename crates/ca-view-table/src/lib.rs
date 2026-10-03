@@ -272,9 +272,9 @@ pub struct TableView {
 impl TableView {
     /// A tab over the two sides, with the comparison already started.
     #[must_use]
-    pub fn new(left: PathBuf, right: PathBuf, context: &ViewContext, salt: u64) -> Self {
+    pub fn new(left: PathBuf, right: PathBuf, context: &ViewContext, instance: u64) -> Self {
         let mut view = Self {
-            id: egui::Id::new(("table-compare", salt)),
+            id: egui::Id::new(("table-compare", instance)),
             specs: ca_session::settings::SpecsSettings::default(),
             read_only: false,
             left_field: left.display().to_string(),
@@ -307,7 +307,7 @@ impl TableView {
             line_spacing: 0,
             report: ViewReport::new(
                 ReportKind::Table,
-                egui::Id::new(("table-compare", salt)),
+                egui::Id::new(("table-compare", instance)),
                 context.notify.clone(),
             ),
             info_open: false,
@@ -2177,12 +2177,21 @@ fn file_name(path: &Path) -> String {
 }
 
 impl ca_ui::view::ViewFactory for TableView {
-    fn create(left: PathBuf, right: PathBuf, context: &ViewContext, salt: u64) -> Self {
-        Self::new(left, right, context, salt)
+    fn create(left: PathBuf, right: PathBuf, context: &ViewContext, instance: u64) -> Self {
+        Self::new(left, right, context, instance)
     }
 
-    fn create_from(request: &ca_ui::view::OpenRequest, context: &ViewContext, salt: u64) -> Self {
-        let mut view = Self::new(request.left.clone(), request.right.clone(), context, salt);
+    fn create_from(
+        request: &ca_ui::view::OpenRequest,
+        context: &ViewContext,
+        instance: u64,
+    ) -> Self {
+        let mut view = Self::new(
+            request.left.clone(),
+            request.right.clone(),
+            context,
+            instance,
+        );
         view.read_only = request.read_only;
         view
     }
