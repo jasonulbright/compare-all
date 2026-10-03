@@ -163,11 +163,21 @@ done < <(find "$appdir/lib" "$appdir/share" "$appdir/etc" \( -type f -o -type l 
   printf 'file\tpackage\n'
   sort "$work/owners"
 } > "$doc/bundled-files.tsv"
+tarball_sum() {
+  sha256sum < "$1" | cut -d ' ' -f 1
+}
 {
-  printf 'name\tversion\tsource\tlicenses\n'
+  printf 'name\tversion\tsource\tlicenses\tsha256\n'
   cut -f 2 "$work/owners" | sort -u > "$work/packages"
   while IFS= read -r package; do
     version="$(pacman -Q "$package" | cut -d ' ' -f 2)"
+    # The package file, by its SHA-256, identifies the input exactly; the
+    # Arch Linux Archive keeps every released file under its name.
+    package_file="/var/cache/pacman/pkg/$(pacman -Sp --print-format '%f' "$package")"
+    [[ -f "$package_file" ]] || pacman -Sw --noconfirm "$package" > /dev/null
+    [[ -f "$package_file" && "$package_file" == *"-$version-"* ]] ||
+      die "no package file of $package $version in the pacman cache"
+    package_sum="$(tarball_sum "$package_file")"
     terms="$(LC_ALL=C pacman -Qi "$package" | sed -n 's/^Licenses *: *//p')"
     # The package names only "LGPL"; the libxcrypt sources state LGPL 2.1 or
     # later.
@@ -191,10 +201,14 @@ done < <(find "$appdir/lib" "$appdir/share" "$appdir/etc" \( -type f -o -type l 
         die "no license text found for $term of $package"
       fi
     done
-    printf '%s\t%s\tArch Linux package\t%s\n' "$package" "$version" "$terms"
+    printf '%s\t%s\tArch Linux package %s\t%s\t%s\n' "$package" "$version" "${package_file##*/}" "$terms" "$package_sum"
   done < "$work/packages"
-  printf 'sharun\t3.5.0\tpkgforge-dev/Anylinux-sharun release\tMIT\n'
-  printf 'cross-libc-dlopen\tv0.2.7\tpkgforge-dev/cross-libc-dlopen release\tMIT\n'
+  printf 'sharun\t3.5.0\tpkgforge-dev/Anylinux-sharun release\tMIT\t%s\n' \
+    "$(tarball_sum "$tools/sharun+helper-libs-x86_64.tar")"
+  printf 'cross-libc-dlopen\tv0.2.7\tpkgforge-dev/cross-libc-dlopen release\tMIT\t%s\n' \
+    "$(tarball_sum "$tools/cross-libc-dlopen-x86_64.tar")"
+  printf 'type2-runtime\t20251108\tAppImage/type2-runtime release (the ELF part of the AppImage file)\tMIT\t%s\n' \
+    "$(tarball_sum "$tools/runtime-x86_64")"
 } > "$doc/bundled-packages.tsv"
 
 # anylinux.so in the sharun tarball contains code from
@@ -203,6 +217,7 @@ install -D -m 0644 "$tools/LICENSE-sharun.txt" "$licenses/sharun/LICENSE"
 install -D -m 0644 "$tools/LICENSE-linuxdeploy-plugin-checkrt.txt" "$licenses/sharun/LICENSE-linuxdeploy-plugin-checkrt"
 tar -xOf "$tools/cross-libc-dlopen-x86_64.tar" LICENSE > "$work/LICENSE-cross-libc-dlopen"
 install -D -m 0644 "$work/LICENSE-cross-libc-dlopen" "$licenses/cross-libc-dlopen/LICENSE"
+install -D -m 0644 "$tools/LICENSE-type2-runtime.txt" "$licenses/type2-runtime/LICENSE"
 
 if [[ -n "${HOST_UID:-}" && -n "${HOST_GID:-}" ]]; then
   chown -R "$HOST_UID:$HOST_GID" "$appdir"
