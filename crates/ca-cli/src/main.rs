@@ -161,6 +161,12 @@ fn run_desktop(request: &DesktopRequest) -> u8 {
 }
 
 fn main() -> ExitCode {
+    let code = run_arguments();
+    ca_session::SettingsPaths::remove_run_directory();
+    code
+}
+
+fn run_arguments() -> ExitCode {
     let arguments: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     if arguments
         .first()

@@ -1,17 +1,41 @@
 //! Where the application keeps its own files.
 //!
 //! The settings directory is resolved by the session crate, which owns it. This
-//! module adds the folders that hang off it and a fallback: every write-ahead
-//! record has to go somewhere, so an environment that names no home yields the
-//! temporary directory rather than leaving a caller without a path.
+//! module adds the folders that hang off it. An environment that names no home
+//! yields a folder private to the user for this run, with a notice that says
+//! so, rather than a fixed name in a shared folder.
 //!
 //! `COMPARE_ALL_SETTINGS_DIR` replaces the resolved directory while it holds a
 //! non-empty value. An unset variable leaves the result unchanged.
 
 use std::{path::PathBuf, sync::OnceLock};
 
-/// Folder name used when the environment names no home.
-const APPLICATION_FOLDER: &str = "compare-all";
+/// The settings directory and what a person has to be told about it.
+struct Resolved {
+    directory: PathBuf,
+    notice: Option<String>,
+}
+
+static RESOLVED: OnceLock<Resolved> = OnceLock::new();
+
+fn resolved() -> &'static Resolved {
+    RESOLVED.get_or_init(|| {
+        let executable_directory = std::env::current_exe()
+            .ok()
+            .and_then(|path| path.parent().map(std::path::Path::to_path_buf));
+        let mut notice = None;
+        let paths =
+            ca_session::SettingsPaths::resolve_with(executable_directory.as_deref(), || {
+                let state = ca_session::SettingsPaths::state_directory();
+                notice = state.notice;
+                state.path
+            });
+        Resolved {
+            directory: paths.directory().path().to_path_buf(),
+            notice,
+        }
+    })
+}
 
 /// The base directory for this application's own files.
 ///
@@ -19,25 +43,28 @@ const APPLICATION_FOLDER: &str = "compare-all";
 /// portable-marker checks off the frame thread and all callers on one directory.
 #[must_use]
 pub fn settings_directory() -> PathBuf {
-    static DIRECTORY: OnceLock<PathBuf> = OnceLock::new();
-    DIRECTORY
-        .get_or_init(|| {
-            let per_user = ca_session::SettingsPaths::platform_per_user_directory()
-                .unwrap_or_else(|_| std::env::temp_dir().join(APPLICATION_FOLDER));
-            let executable_directory = std::env::current_exe()
-                .ok()
-                .and_then(|path| path.parent().map(std::path::Path::to_path_buf));
-            executable_directory.map_or_else(
-                || per_user.clone(),
-                |directory| {
-                    ca_session::SettingsPaths::resolve(&directory, per_user.clone())
-                        .directory()
-                        .path()
-                        .to_path_buf()
-                },
-            )
-        })
-        .clone()
+    resolved().directory.clone()
+}
+
+/// What a person has to be told about the settings directory, such as that
+/// settings do not last because no home folder is known.
+///
+/// None until [`settings_directory`] has been resolved.
+#[must_use]
+pub fn settings_notice() -> Option<&'static str> {
+    RESOLVED
+        .get()
+        .and_then(|resolved| resolved.notice.as_deref())
+}
+
+/// The notice of [`settings_notice`] when `directory` is the resolved settings
+/// directory.
+#[must_use]
+pub fn settings_notice_for(directory: &std::path::Path) -> Option<&'static str> {
+    RESOLVED
+        .get()
+        .filter(|resolved| resolved.directory == directory)
+        .and_then(|resolved| resolved.notice.as_deref())
 }
 
 /// Folder the journals of file operations are written to.

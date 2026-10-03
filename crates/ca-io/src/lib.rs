@@ -13,6 +13,8 @@
 //! Ownership and other metadata remain unverified. Path races require separate
 //! coordination.
 
+pub mod private;
+
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
