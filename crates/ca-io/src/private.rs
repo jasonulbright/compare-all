@@ -207,8 +207,9 @@ mod tests {
     /// is checked where the test runs with that privilege.
     #[cfg(unix)]
     #[test]
-    fn a_folder_of_another_user_is_refused() {
+    fn a_folder_of_another_user_is_refused_when_run_as_root() {
         if rustix::process::geteuid().as_raw() != 0 {
+            println!("skipped: handing a folder to another user needs root");
             return;
         }
         let parent = tempfile::tempdir().unwrap();
