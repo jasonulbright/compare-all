@@ -6,9 +6,10 @@
 //! with characters of both. The line belongs to the earlier section, the
 //! holder; the later section, the lender, keeps a record of its characters
 //! on that line. A take that replaces the holder's line gives those
-//! characters back to the lender, and a take of the lender leaves them out
-//! while the holder still shows them, so no take loses or repeats a line of
-//! another section. Characters an edit removes are gone for every section.
+//! characters back to the lender. A take of the lender leaves them out while
+//! the holder still shows them, when its new text holds them; otherwise the
+//! take removes them from the holder's line. No take loses or repeats a line
+//! of another section. Characters an edit removes are gone for every section.
 
 use super::{automatic_len, MergeModel, Resolution, Section};
 use ca_text::AppliedEdit;
@@ -22,6 +23,17 @@ struct Run {
     owner: usize,
     place: usize,
     text: String,
+}
+
+/// Text a pane edit leaves on a line of an earlier section. `fresh` holds
+/// the characters that sat on the lender's own lines before the edit.
+struct NewRecord {
+    lender: usize,
+    holder: usize,
+    position: usize,
+    column: u32,
+    text: String,
+    fresh: String,
 }
 
 fn push_run(runs: &mut Vec<Run>, owner: usize, place: usize, text: &str) {
@@ -46,6 +58,44 @@ fn byte_at(text: &str, chars: usize) -> usize {
     text.char_indices()
         .nth(chars)
         .map_or(text.len(), |(index, _)| index)
+}
+
+/// Where a deletion of `removed` characters at `offset` of `text` starts
+/// when it is moved to a line start. A deletion leaves the same text at
+/// every offset it can slide to over equal characters; one that starts at a
+/// line start removes whole lines and keeps the characters of each kept
+/// line with that line's section, rather than joining the head of one line
+/// to the tail of another. Without such an offset, `offset` itself.
+fn slide_to_line_start(text: &str, line_starts: &[usize], offset: usize, removed: usize) -> usize {
+    if line_starts.contains(&offset) {
+        return offset;
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut left = offset;
+    while left > 0
+        && chars.get(left - 1).is_some()
+        && chars.get(left - 1) == chars.get(left - 1 + removed)
+    {
+        left -= 1;
+        if line_starts.contains(&left) {
+            break;
+        }
+    }
+    let mut right = offset;
+    while right + removed < chars.len() && chars.get(right) == chars.get(right + removed) {
+        right += 1;
+        if line_starts.contains(&right) {
+            break;
+        }
+    }
+    let left_fits = line_starts.contains(&left);
+    let right_fits = line_starts.contains(&right);
+    match (left_fits, right_fits) {
+        (true, true) if offset - left <= right - offset => left,
+        (_, true) => right,
+        (true, false) => left,
+        (false, false) => offset,
+    }
 }
 
 fn is_terminator_only(text: &str) -> bool {
@@ -140,6 +190,130 @@ impl MergeModel {
         Some(entry)
     }
 
+    /// After `removed` left `lender`: the records whose characters its
+    /// source carried now stand for their own text.
+    fn uncover_after(&mut self, lender: usize, removed: &super::Lent) {
+        if removed.source.is_none() {
+            return;
+        }
+        let Some(section) = self.sections.get(lender) else {
+            return;
+        };
+        let mut later: Vec<(u64, bool)> = section
+            .lent
+            .iter()
+            .filter(|entry| entry.seq > removed.seq)
+            .map(|entry| (entry.seq, entry.source.is_none()))
+            .collect();
+        later.sort_unstable();
+        let orphans: Vec<u64> = later
+            .iter()
+            .take_while(|(_, covered)| *covered)
+            .map(|(seq, _)| *seq)
+            .collect();
+        if orphans.is_empty() {
+            return;
+        }
+        self.touch(lender);
+        for entry in &mut self.sections[lender].lent {
+            if orphans.contains(&entry.seq) {
+                entry.source = Some(entry.text.clone());
+            }
+        }
+    }
+
+    /// A record no older record covers stands for its own text.
+    fn settle_sources(&mut self, lender: usize) {
+        let Some(section) = self.sections.get(lender) else {
+            return;
+        };
+        let oldest_covered = section
+            .lent
+            .iter()
+            .min_by_key(|entry| entry.seq)
+            .is_some_and(|entry| entry.source.is_none());
+        if !oldest_covered {
+            return;
+        }
+        let mut order: Vec<(u64, bool)> = section
+            .lent
+            .iter()
+            .map(|entry| (entry.seq, entry.source.is_none()))
+            .collect();
+        order.sort_unstable();
+        let orphans: Vec<u64> = order
+            .iter()
+            .take_while(|(_, covered)| *covered)
+            .map(|(seq, _)| *seq)
+            .collect();
+        self.touch(lender);
+        for entry in &mut self.sections[lender].lent {
+            if orphans.contains(&entry.seq) {
+                entry.source = Some(entry.text.clone());
+            }
+        }
+    }
+
+    /// Remove a record and its text from the holder's line, for a lender
+    /// whose new text does not hold that text. Other records on the line
+    /// keep their characters. The holder keeps its wait for review.
+    fn strip_lent(&mut self, lender: usize, seq: u64) {
+        let Some(record) = self.lent_record(lender, seq).cloned() else {
+            return;
+        };
+        let holder = record.holder;
+        let Some(range) = self.output_range(holder) else {
+            let _ = self.remove_lent(lender, seq, true);
+            return;
+        };
+        let line = (range.start + record.offset) as usize;
+        let text = self.output.get(line).cloned().unwrap_or_default();
+        let repair = self.output_repairs.get(line).copied().unwrap_or(0);
+        let own = &text[..text.len().saturating_sub(repair)];
+        let column = record.column as usize;
+        let start = byte_at(own, column);
+        let end = byte_at(own, column + record.text.chars().count());
+        if record.offset >= range.end - range.start || own.get(start..end) != Some(&record.text) {
+            if let Some(removed) = self.remove_lent(lender, seq, true) {
+                self.uncover_after(lender, &removed);
+            }
+            return;
+        }
+        let stripped = format!("{}{}", &own[..start], &own[end..]);
+        let removed_chars = record.text.chars().count();
+        let mut others = Vec::new();
+        for (other, other_seq, _, _) in self.records_on_line(holder, line) {
+            if (other, other_seq) == (lender, seq) {
+                continue;
+            }
+            if let Some(mut entry) = self.remove_lent(other, other_seq, false) {
+                if entry.column as usize > column {
+                    entry.column -= u32::try_from(removed_chars).unwrap_or(entry.column);
+                }
+                others.push((other, entry));
+            }
+        }
+        if let Some(removed) = self.remove_lent(lender, seq, false) {
+            self.uncover_after(lender, &removed);
+        }
+        let conflict = self.sections[holder].conflict;
+        let replacement = if stripped.is_empty() {
+            Vec::new()
+        } else {
+            vec![stripped]
+        };
+        let local = record.offset;
+        if !self.edit_output_range(holder, local..local + 1, replacement) {
+            return;
+        }
+        self.sections[holder].conflict = conflict;
+        self.refresh_section_totals(holder);
+        for (other, entry) in others {
+            self.add_lent(other, entry);
+        }
+        self.repair_output_seams(line..line + 1);
+    }
+
     fn add_lent(&mut self, lender: usize, entry: super::Lent) {
         self.touch(lender);
         let holder = entry.holder;
@@ -209,7 +383,9 @@ impl MergeModel {
                     entry.offset = offset - (range.end - range.start) + inserted;
                 }
             } else if offset >= range.start {
-                let _ = self.remove_lent(lender, seq, true);
+                if let Some(removed) = self.remove_lent(lender, seq, true) {
+                    self.uncover_after(lender, &removed);
+                }
             }
         }
     }
@@ -301,6 +477,12 @@ impl MergeModel {
     /// text. Returns the lender and the lines that received it.
     fn give_back(&mut self, lender: usize, seq: u64) -> Option<(usize, Range<u32>)> {
         let entry = self.remove_lent(lender, seq, false)?;
+        self.uncover_after(lender, &entry);
+        if entry.source.as_deref() != Some(entry.text.as_str()) {
+            // The text that comes back differs from what the lender lent, so
+            // the lender cannot return to its state before the lending.
+            self.sections[lender].restore = None;
+        }
         let range = self.output_range(lender)?;
         let mut chars = 0usize;
         let mut target = None;
@@ -439,7 +621,9 @@ impl MergeModel {
         for &holder in taken {
             for (lender, seq) in self.held_by(holder) {
                 if is_taken(&lender) {
-                    let _ = self.remove_lent(lender, seq, false);
+                    if let Some(removed) = self.remove_lent(lender, seq, false) {
+                        self.uncover_after(lender, &removed);
+                    }
                 } else if let Some(given) = self.give_back(lender, seq) {
                     returned.push(given);
                 }
@@ -461,8 +645,15 @@ impl MergeModel {
             let mut own: Vec<super::Lent> = fresh.lent.clone();
             own.sort_by_key(|entry| entry.seq);
             if !own.is_empty() {
-                let prefix: String = own.iter().map(|entry| entry.text.as_str()).collect();
-                if remove_prefix(&mut lines, &prefix) {
+                // The holders keep showing the lent text, so the new text
+                // leaves out the lender's characters it stands for, which
+                // start the new text when it holds them at all.
+                let covered = own.first().is_some_and(|entry| entry.source.is_some());
+                let prefix: String = own
+                    .iter()
+                    .filter_map(|entry| entry.source.as_deref())
+                    .collect();
+                if covered && remove_prefix(&mut lines, &prefix) {
                     let mut restore = fresh.clone();
                     restore.lent.clear();
                     restore.joined_through = None;
@@ -475,7 +666,7 @@ impl MergeModel {
                     }
                 } else {
                     for entry in own {
-                        let _ = self.remove_lent(index, entry.seq, false);
+                        self.strip_lent(index, entry.seq);
                     }
                 }
             }
@@ -538,6 +729,11 @@ impl MergeModel {
         if old_text[from..to] != edit.removed {
             return None;
         }
+        let offset = if edit.inserted.is_empty() && edit.removed.contains(['\n', '\r']) {
+            slide_to_line_start(&old_text, &line_starts, offset, removed)
+        } else {
+            offset
+        };
 
         let owner_at = |position: usize| -> Option<(usize, usize)> {
             let mut seen = 0usize;
@@ -649,7 +845,7 @@ impl MergeModel {
         };
         let mut previous = low;
         let mut assigned: BTreeMap<usize, Vec<String>> = BTreeMap::new();
-        let mut new_records: Vec<(usize, usize, usize, u32, String)> = Vec::new();
+        let mut new_records: Vec<NewRecord> = Vec::new();
         let mut lost: BTreeSet<usize> = BTreeSet::new();
         for (position, parts) in line_runs.iter().enumerate() {
             let lowest = parts.iter().map(|run| run.place).min().unwrap_or(previous);
@@ -665,16 +861,25 @@ impl MergeModel {
                 let count = u32::try_from(run.text.chars().count()).ok()?;
                 if run.owner > owner {
                     let continues = previous_run == Some(run.owner);
+                    let fresh = if run.place == run.owner {
+                        run.text.as_str()
+                    } else {
+                        ""
+                    };
                     match new_records.last_mut() {
-                        Some(record) if continues => record.4.push_str(&run.text),
+                        Some(record) if continues => {
+                            record.text.push_str(&run.text);
+                            record.fresh.push_str(fresh);
+                        }
                         _ => {
-                            new_records.push((
-                                run.owner,
-                                owner,
+                            new_records.push(NewRecord {
+                                lender: run.owner,
+                                holder: owner,
                                 position,
                                 column,
-                                run.text.clone(),
-                            ));
+                                text: run.text.clone(),
+                                fresh: fresh.to_owned(),
+                            });
                         }
                     }
                 } else if run.owner < owner {
@@ -695,7 +900,7 @@ impl MergeModel {
         let lenders_involved: BTreeSet<usize> = window_records
             .iter()
             .map(|(lender, _, _)| *lender)
-            .chain(new_records.iter().map(|(lender, ..)| *lender))
+            .chain(new_records.iter().map(|record| record.lender))
             .collect();
         let mut before: BTreeMap<usize, Section> = BTreeMap::new();
         for index in (span_low..=span_high).chain(lenders_involved.iter().copied()) {
@@ -703,15 +908,14 @@ impl MergeModel {
                 before.entry(index).or_insert_with(|| section.clone());
             }
         }
-        let mut previous_records: BTreeMap<(usize, usize), (u64, usize, String)> = BTreeMap::new();
+        let mut previous_records: BTreeMap<usize, Vec<super::Lent>> = BTreeMap::new();
         for (lender, seq, honored) in &window_records {
             if let Some(record) = self.remove_lent(*lender, *seq, !honored) {
-                previous_records.entry((*lender, record.holder)).or_insert((
-                    record.seq,
-                    record.insert_at,
-                    record.text,
-                ));
+                previous_records.entry(*lender).or_default().push(record);
             }
+        }
+        for records in previous_records.values_mut() {
+            records.sort_by_key(|record| record.seq);
         }
 
         for index in (span_low..=span_high).rev() {
@@ -730,33 +934,69 @@ impl MergeModel {
             }
         }
 
+        // The first new record of a lender carries the source of every
+        // record of that lender the window held, then the characters this
+        // edit moved off the lender's own lines, in output order.
+        let mut sources: BTreeMap<usize, Option<String>> = BTreeMap::new();
+        for record in &new_records {
+            sources.entry(record.lender).or_insert_with(|| {
+                let olds = previous_records.get(&record.lender);
+                let carried = olds.is_some_and(|olds| olds.iter().any(|old| old.source.is_some()));
+                let fresh: String = new_records
+                    .iter()
+                    .filter(|other| other.lender == record.lender)
+                    .map(|other| other.fresh.as_str())
+                    .collect();
+                if olds.is_some_and(|olds| !olds.is_empty()) && !carried && fresh.is_empty() {
+                    return None;
+                }
+                let mut source: String = olds
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|old| old.source.as_deref())
+                    .collect();
+                source.push_str(&fresh);
+                Some(source)
+            });
+        }
+        let mut used: BTreeMap<usize, usize> = BTreeMap::new();
         let mut lending: BTreeSet<usize> = BTreeSet::new();
-        for (lender, holder, position, column, tail) in new_records {
-            let holder_start = self.output_range(holder)?.start as usize;
-            let line = first + position;
+        for record in new_records {
+            let lender = record.lender;
+            let holder_start = self.output_range(record.holder)?.start as usize;
+            let line = first + record.position;
             let offset = u32::try_from(line.checked_sub(holder_start)?).ok()?;
-            let (seq, insert_at) =
-                if let Some((seq, insert_at, text)) = previous_records.remove(&(lender, holder)) {
-                    if text != tail {
-                        modified.insert(lender);
-                    }
-                    (seq, insert_at)
-                } else {
-                    self.lend_seq += 1;
-                    (self.lend_seq, 0)
-                };
+            let rank = used.entry(lender).or_insert(0);
+            let old = previous_records
+                .get(&lender)
+                .and_then(|olds| olds.get(*rank));
+            *rank += 1;
+            let (seq, insert_at) = if let Some(old) = old {
+                if old.text != record.text {
+                    modified.insert(lender);
+                }
+                (old.seq, old.insert_at)
+            } else {
+                self.lend_seq += 1;
+                (self.lend_seq, 0)
+            };
+            let source = sources.get_mut(&lender).and_then(Option::take);
             self.add_lent(
                 lender,
                 super::Lent {
-                    holder,
+                    holder: record.holder,
                     offset,
-                    column,
-                    text: tail,
+                    column: record.column,
+                    text: record.text,
                     seq,
                     insert_at,
+                    source,
                 },
             );
             lending.insert(lender);
+        }
+        for lender in &lenders_involved {
+            self.settle_sources(*lender);
         }
 
         for index in before.keys().copied().collect::<Vec<_>>() {

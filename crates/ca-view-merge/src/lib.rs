@@ -5138,9 +5138,9 @@ mod tests {
         view.absorb_output_edits();
         view.current = last;
         view.run(Command::TakeCenter);
-        assert_eq!(view.output_pane.buffer().text(), "a\nb\nc\n");
+        assert_eq!(view.output_pane.buffer().text(), "a\nb\n");
         assert_output_lines_match_pane(&view);
-        assert_eq!(save_and_read(&mut view, &dir), b"a\nb\nc\n");
+        assert_eq!(save_and_read(&mut view, &dir), b"a\nb\n");
     }
 
     /// Save, accepting markers when conflicts remain, and read the file back.
