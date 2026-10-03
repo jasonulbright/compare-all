@@ -42,9 +42,8 @@ fn candidate() -> Result<PathBuf, String> {
     if cfg!(target_os = "macos") {
         return Ok(PathBuf::from("/usr/bin/tar"));
     }
-    let path = ca_io::host_command::host_variable("PATH").unwrap_or_default();
-    std::env::split_paths(&path)
-        .filter(|dir| dir.is_absolute())
+    search_folders(ca_io::host_command::host_variable("PATH"))
+        .into_iter()
         .map(|dir| dir.join("bsdtar"))
         .find(|candidate| candidate.is_file())
         .ok_or_else(|| {
@@ -52,6 +51,14 @@ fn candidate() -> Result<PathBuf, String> {
              libarchive-tools package (Debian, Ubuntu) or the bsdtar package (Fedora)."
                 .to_owned()
         })
+}
+
+/// The absolute folders a host program search walks for `path`.
+fn search_folders(path: Option<OsString>) -> Vec<PathBuf> {
+    let path = path.unwrap_or_else(|| OsString::from(ca_io::host_command::DEFAULT_SEARCH_PATH));
+    std::env::split_paths(&path)
+        .filter(|dir| dir.is_absolute())
+        .collect()
 }
 
 /// The verified `bsdtar`, found once per process.
@@ -292,6 +299,19 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::panic)]
 
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unset_path_searches_the_default_folders() {
+        assert_eq!(
+            search_folders(None),
+            [PathBuf::from("/bin"), PathBuf::from("/usr/bin")]
+        );
+        assert_eq!(
+            search_folders(Some(OsString::from("/opt/x:relative:/usr/local/bin"))),
+            [PathBuf::from("/opt/x"), PathBuf::from("/usr/local/bin")]
+        );
+    }
 
     #[test]
     fn a_missing_program_is_an_error_not_a_panic() {
