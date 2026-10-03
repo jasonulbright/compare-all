@@ -4,12 +4,18 @@ pub use ca_ui::save::text as save;
 
 pub use ca_ui::find;
 pub mod edit;
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic)]
+mod edit_sequences;
 mod file_save;
 pub mod jobs;
 pub mod lines;
 pub mod model;
 pub mod patch_view;
 pub mod prettify;
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic)]
+mod row_commands;
 pub mod settings;
 pub mod sidecopy;
 pub mod structure;
@@ -77,6 +83,15 @@ const PENDING: &str = "Not available in this build";
 const NOT_COMPARED: &str = "Available once the comparison finishes";
 /// Reason shown on a control a read-only comparison does not offer.
 const LOCKED: &str = "This view is read-only";
+/// Reason shown on a control that maps rows to lines while the comparison of
+/// an edit is still due.
+const EDIT_NOT_COMPARED: &str = "Available once the edit is compared";
+/// What the message panel says when such a command arrives anyway.
+const WAIT_FOR_COMPARISON: &str =
+    "The comparison of the last edit is not finished. Try again when it is.";
+/// What the message panel says when the display filter shows no difference
+/// to move to.
+const FILTER_HIDES: &str = "The display filter hides every difference.";
 
 const fn command_is_save_or_overwrite(command: Command) -> bool {
     matches!(
@@ -256,6 +271,14 @@ pub struct TextView {
     context_lines: u32,
     visible: Visible,
     caret: usize,
+    /// The row a move made current, held while both text carets stay where
+    /// that move put them.
+    ///
+    /// A row the active pane has no line on is not the row of any text caret,
+    /// so the row caret cannot be derived from the caret there.
+    anchor: Option<RowAnchor>,
+    /// A copy that moves to the next difference once its comparison lands.
+    advance_after_copy: Option<PendingAdvance>,
     font: ca_ui::font::FontSize,
     /// Padding the options add between rows, read once per frame.
     line_spacing: u32,
@@ -373,6 +396,24 @@ pub struct TextView {
     /// The files are copies the tab owns, so neither pane takes an edit and
     /// nothing is saved.
     read_only: bool,
+}
+
+/// The row a move made current and the carets it left.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RowAnchor {
+    row: usize,
+    active: Side,
+    left: editor::Caret,
+    right: editor::Caret,
+}
+
+/// What a copy left behind, so the move after it runs only while nothing else
+/// changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingAdvance {
+    revision: u64,
+    side: Side,
+    caret: editor::Caret,
 }
 
 /// Where one difference section's copy arrow was drawn.
@@ -518,6 +559,8 @@ impl TextView {
             context_lines: 2,
             visible: Visible::All(0),
             caret: 0,
+            anchor: None,
+            advance_after_copy: None,
             font: ca_ui::font::FontSize::new(DEFAULT_FONT_SIZE),
             line_spacing: 0,
             navigation: ca_session::options::NextDifferenceOptions::default(),
@@ -700,6 +743,8 @@ impl TextView {
         self.data = TextData::default();
         self.visible = Visible::All(0);
         self.caret = 0;
+        self.anchor = None;
+        self.advance_after_copy = None;
         self.scroll = RowScroll::top();
         self.horizontal = 0.0;
         self.strip_stale = true;
@@ -1048,6 +1093,8 @@ impl TextView {
         self.right_edits = EditMarks::default();
         self.bookmarks.clear();
         self.caret = 0;
+        self.anchor = None;
+        self.advance_after_copy = None;
         self.scroll = RowScroll::top();
         self.horizontal = 0.0;
         self.strip_stale = true;
@@ -1102,6 +1149,16 @@ impl TextView {
             && self.job.is_none()
             && !self.rediff.is_running()
             && !self.rediff.is_stale()
+    }
+
+    /// True when the row map describes the text both panes hold now.
+    ///
+    /// After an edit the map of the text before it stays on screen until the
+    /// comparison that follows the edit is installed. A row of that map can
+    /// name a line that now holds other text, so a command that turns rows
+    /// into lines acts on it only when this holds.
+    fn rows_current(&self) -> bool {
+        self.status == Status::Ready && self.is_settled()
     }
 
     /// The colored runs of one line, for a test that checks what a frame paints.
@@ -1332,23 +1389,27 @@ impl TextView {
 
     /// Move to the next or the previous difference.
     ///
-    /// Where nothing lies in that direction the Next Difference page decides
-    /// what happens: the move continues from the other end, or it stops and the
-    /// message panel says why.
+    /// Only a row the display filter shows is a destination. Where nothing
+    /// lies in that direction the Next Difference page decides what happens:
+    /// the move continues from the other end, or it stops and the message
+    /// panel says why.
     fn navigate(&mut self, command: Command) {
-        let model = &self.data.model;
-        let target = match command {
-            Command::NextDifference => model.next_difference(self.caret),
-            Command::PreviousDifference => model.previous_difference(self.caret),
-            Command::NextSection => model.next_section(self.caret),
-            Command::PreviousSection => model.previous_section(self.caret),
-            _ => None,
-        };
-        if let Some(row) = target {
-            self.go_to_row(row);
+        if !self.rows_current() {
+            self.message = Some(WAIT_FOR_COMPARISON.to_owned());
             return;
         }
-        if self.navigation.wrap_around {
+        let model = &self.data.model;
+        let step = |row: usize| match command {
+            Command::NextDifference => model.next_difference(row),
+            Command::PreviousDifference => model.previous_difference(row),
+            Command::NextSection => model.next_section(row),
+            Command::PreviousSection => model.previous_section(row),
+            _ => None,
+        };
+        let target = self.first_shown(step(self.caret), step).or_else(|| {
+            if !self.navigation.wrap_around {
+                return None;
+            }
             let wrapped = match command {
                 Command::NextDifference => model.first_difference(),
                 Command::PreviousDifference => model.last_difference(),
@@ -1356,14 +1417,46 @@ impl TextView {
                 Command::PreviousSection => model.last_section(),
                 _ => None,
             };
-            if let Some(row) = wrapped {
-                self.go_to_row(row);
-                return;
-            }
+            self.first_shown(wrapped, step)
+        });
+        if let Some(row) = target {
+            self.move_to_row(row);
+            return;
         }
         if self.navigation.show_message_panel {
-            self.message = Some(LAST_DIFFERENCE.to_owned());
+            let hidden = model.counts().differences > 0
+                && self
+                    .first_shown(model.first_difference(), |row| model.next_difference(row))
+                    .is_none();
+            self.message = Some(
+                if hidden {
+                    FILTER_HIDES
+                } else {
+                    LAST_DIFFERENCE
+                }
+                .to_owned(),
+            );
         }
+    }
+
+    /// The first row of `start`, `step(start)`, `step(step(start))` and so on
+    /// that the display filter shows.
+    ///
+    /// Every navigation step moves strictly away from the row it starts at,
+    /// so the walk ends.
+    fn first_shown(
+        &self,
+        start: Option<usize>,
+        step: impl Fn(usize) -> Option<usize>,
+    ) -> Option<usize> {
+        let mut at = start;
+        while let Some(row) = at {
+            if self.visible.shows(row) {
+                return Some(row);
+            }
+            at = step(row);
+        }
+        None
     }
 
     fn jump_to_first_difference_once(&mut self) {
@@ -1372,8 +1465,11 @@ impl TextView {
         }
         if self.navigation.go_to_first_difference_on_load {
             if let Some(first) = self.first_difference() {
-                self.go_to_row(first);
-                self.place_carets_on_row(first);
+                if self.visible.shows(first) {
+                    self.move_to_row(first);
+                } else {
+                    self.go_to_row(first);
+                }
             }
         }
     }
@@ -1386,6 +1482,9 @@ impl TextView {
     fn install(&mut self, data: TextData, keep_carets: bool) {
         let mut data = data;
         data.model.set_ignore_unimportant(self.ignore_unimportant);
+        // Rows are numbered afresh, so a row the old map made current names
+        // another place in the new one.
+        self.anchor = None;
         if let Some(sources) = data.sources.take() {
             if let Some(generation) = self.rediff.generation() {
                 self.loaded_generation = generation;
@@ -1533,25 +1632,62 @@ impl TextView {
     }
 
     /// Put the row caret back on the line the text caret is on.
+    ///
+    /// A row a move made current stays current while both text carets are
+    /// where the move left them and the same pane is active; any other caret
+    /// position makes the caret's own row current.
     fn follow_caret(&mut self) {
-        if let Some(row) = self.caret_row() {
-            self.caret = row;
+        if let Some(anchor) = self.anchor {
+            let held = anchor.active == self.active
+                && anchor.left == self.left_pane.caret()
+                && anchor.right == self.right_pane.caret()
+                && anchor.row < self.data.model.row_count();
+            if held {
+                self.caret = anchor.row;
+            } else {
+                self.anchor = None;
+            }
+        }
+        if self.anchor.is_none() {
+            if let Some(row) = self.caret_row() {
+                self.caret = row;
+            }
         }
         self.scroll
             .clamp(self.viewport_height, self.row_height(), self.visible.len());
     }
 
-    /// Put both text carets on the lines a row shows.
-    fn place_carets_on_row(&mut self, row: usize) {
-        let Some(entry) = self.data.model.row(row).copied() else {
-            return;
-        };
-        if let Some(line) = entry.left {
-            self.left_pane.place(editor::Caret::new(line, 0), false);
+    /// Reveal `row`, make it current and put both text carets on it.
+    ///
+    /// A pane with no line on the row takes the nearest line above it that the
+    /// display filter shows, or with none above, the nearest shown line below;
+    /// with no shown line at all its caret stays where it is. The row stays
+    /// current while the carets stay where this leaves them, so the copy
+    /// commands act on the row's section even when the active pane's caret is
+    /// on a line of another row. The view scrolls back to the first column,
+    /// where the carets go.
+    fn move_to_row(&mut self, row: usize) {
+        self.go_to_row(row);
+        let row = self.caret;
+        for side in [Side::Left, Side::Right] {
+            let on_row = self
+                .data
+                .model
+                .row(row)
+                .and_then(|entry| side.line_of(entry));
+            let line = on_row.or_else(|| self.nearest_line(row, side).map(|(_, line)| line));
+            if let Some(line) = line {
+                self.pane_mut(side)
+                    .place(editor::Caret::new(line, 0), false);
+            }
         }
-        if let Some(line) = entry.right {
-            self.right_pane.place(editor::Caret::new(line, 0), false);
-        }
+        self.horizontal = 0.0;
+        self.anchor = Some(RowAnchor {
+            row,
+            active: self.active,
+            left: self.left_pane.caret(),
+            right: self.right_pane.caret(),
+        });
     }
 
     /// The difference section the caret is in, or the next one.
@@ -1651,6 +1787,8 @@ impl TextView {
     fn note_edit(&mut self) {
         self.revision = self.revision.saturating_add(1);
         self.rediff.mark_stale(Instant::now());
+        self.anchor = None;
+        self.advance_after_copy = None;
         for span in self.left_pane.take_changes() {
             self.bookmarks.shift(
                 span.start_line as usize,
@@ -1723,6 +1861,28 @@ impl TextView {
         }
         if finished {
             self.rediff.finish();
+        }
+    }
+
+    /// Run the move a copy asked for, once the copy is compared.
+    ///
+    /// The move is dropped when the text changed again, the active pane
+    /// changed or its caret moved since the copy, or the comparison failed.
+    fn advance_when_compared(&mut self) {
+        let Some(pending) = self.advance_after_copy else {
+            return;
+        };
+        let unchanged = pending.revision == self.revision
+            && pending.side == self.active
+            && pending.caret == self.pane(pending.side).caret()
+            && self.status == Status::Ready;
+        if !unchanged {
+            self.advance_after_copy = None;
+            return;
+        }
+        if self.rows_current() {
+            self.advance_after_copy = None;
+            self.navigate(Command::NextDifference);
         }
     }
 
@@ -1882,8 +2042,17 @@ impl TextView {
     }
 
     /// Copy the selection, or the current difference section, to `to`.
+    ///
+    /// The copy is compared at once rather than after the quiet period an edit
+    /// waits out, since a copy is one whole edit. The move to the next
+    /// difference that may follow it waits for that comparison, because it
+    /// reads the rows of the copied text.
     fn copy_to(&mut self, to: Side, line_only: bool) {
         if self.pane(to).is_read_only() {
+            return;
+        }
+        if !self.rows_current() {
+            self.message = Some(WAIT_FOR_COMPARISON.to_owned());
             return;
         }
         let from = to.other();
@@ -1909,8 +2078,15 @@ impl TextView {
         // after a copy reverses that copy.
         self.active = to;
         self.note_edit();
+        if self.job.is_none() {
+            self.start_rediff();
+        }
         if self.navigation.go_to_next_after_copy {
-            self.navigate(Command::NextDifference);
+            self.advance_after_copy = Some(PendingAdvance {
+                revision: self.revision,
+                side: to,
+                caret: self.pane(to).caret(),
+            });
         }
     }
 
@@ -1943,6 +2119,10 @@ impl TextView {
 
     /// Select every line of the difference section the caret is in.
     fn select_section(&mut self) {
+        if !self.rows_current() {
+            self.message = Some(WAIT_FOR_COMPARISON.to_owned());
+            return;
+        }
         let Some(rows) = self.current_section_rows() else {
             return;
         };
@@ -2053,6 +2233,12 @@ impl TextView {
     #[must_use]
     pub fn toolbar_items(&self) -> Vec<toolbar::Item> {
         let ready = self.status == Status::Ready;
+        let rows = self.rows_current();
+        let rows_reason = if ready {
+            EDIT_NOT_COMPARED
+        } else {
+            NOT_COMPARED
+        };
         vec![
             toolbar::Item::widget("home", 70.0),
             toolbar::Item::widget("sessions", 90.0),
@@ -2069,22 +2255,22 @@ impl TextView {
                 "copy",
                 Command::CopyToOtherSide,
                 "Copy",
-                ready && !self.locked,
-                if self.locked { LOCKED } else { NOT_COMPARED },
+                rows && !self.locked,
+                if self.locked { LOCKED } else { rows_reason },
             ),
             toolbar::Item::command(
                 "next-section",
                 Command::NextSection,
                 "Next Section",
-                ready,
-                NOT_COMPARED,
+                rows,
+                rows_reason,
             ),
             toolbar::Item::command(
                 "previous-section",
                 Command::PreviousSection,
                 "Prev Section",
-                ready,
-                NOT_COMPARED,
+                rows,
+                rows_reason,
             ),
             toolbar::Item::command("swap", Command::SwapSides, "Swap", !self.locked, LOCKED),
             toolbar::Item::command("reload", Command::Reload, "Reload", !self.locked, LOCKED),
@@ -2453,12 +2639,17 @@ impl TextView {
             return None;
         }
         let mut copy = None;
+        let enabled = ui.is_enabled() && self.rows_current();
         for arrow in &self.arrows {
             let response = ui.interact(
                 arrow.rect,
                 self.id
                     .with(("arrow", arrow.section, arrow.side == Side::Right)),
-                egui::Sense::click(),
+                if enabled {
+                    egui::Sense::click()
+                } else {
+                    egui::Sense::hover()
+                },
             );
             let icon = if arrow.side == Side::Left {
                 ca_ui::icons::Icon::CopyToRight
@@ -2471,19 +2662,27 @@ impl TextView {
                 "Copy to Left"
             };
             response.widget_info(|| {
-                egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
+                egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label)
             });
             icon.paint_in_row(
                 painter,
                 arrow.rect.center(),
                 arrow.rect.height(),
-                if response.hovered() {
+                if enabled && response.hovered() {
                     palette.important_text
                 } else {
                     palette.gutter_arrow
                 },
             );
-            if response.clicked() {
+            let clicked = enabled && response.clicked();
+            if ui.is_enabled() && !enabled {
+                let _ = response.on_hover_text(if self.status == Status::Ready {
+                    EDIT_NOT_COMPARED
+                } else {
+                    NOT_COMPARED
+                });
+            }
+            if clicked {
                 let start = self
                     .data
                     .model
@@ -3474,22 +3673,30 @@ impl TextView {
         let _ = response;
     }
 
-    /// The closest row at or above `from` that one side has a line on, falling
-    /// back to the closest row below it.
+    /// The closest shown row at or above `from` that one side has a line on,
+    /// falling back to the closest shown row below it.
+    ///
+    /// A line on a row the display filter hides is not painted, so a caret put
+    /// there would take keystrokes into text the user cannot see. The walk
+    /// steps through display positions, so hidden rows cost nothing.
     fn nearest_line(&self, from: usize, side: Side) -> Option<(usize, u32)> {
         let model = &self.data.model;
-        let line_of = |index: usize| model.row(index).and_then(|row| side.line_of(row));
-        for index in (0..=from).rev() {
-            if let Some(line) = line_of(index) {
-                return Some((index, line));
-            }
-        }
-        for index in from..model.row_count() {
-            if let Some(line) = line_of(index) {
-                return Some((index, line));
-            }
-        }
-        None
+        let visible = &self.visible;
+        let line_at = |position: usize| {
+            let index = visible.row_at(position)?;
+            let line = model.row(index).and_then(|row| side.line_of(row))?;
+            Some((index, line))
+        };
+        let below = visible.position_of(from).unwrap_or(visible.len());
+        let above = if visible.row_at(below) == Some(from) {
+            below + 1
+        } else {
+            below
+        };
+        (0..above)
+            .rev()
+            .find_map(line_at)
+            .or_else(|| (below..visible.len()).find_map(line_at))
     }
 
     /// Place or extend the caret from the pointer.
@@ -3565,6 +3772,7 @@ impl TextView {
             self.pane_mut(side).place_at_column(line, column, true);
         }
         self.caret = index;
+        self.anchor = None;
     }
 
     /// Turn the frame's keyboard events into caret moves and edits.
@@ -4440,6 +4648,7 @@ impl SessionView for TextView {
     fn tick(&mut self) {
         self.poll();
         self.poll_rediff();
+        self.advance_when_compared();
         self.poll_save();
         self.poll_find();
         self.left_syntax.poll(&self.notify);
@@ -4545,7 +4754,8 @@ impl SessionView for TextView {
             | Command::PreviousDifference
             | Command::NextSection
             | Command::PreviousSection
-            | Command::ShowAll
+            | Command::SelectSection => self.rows_current(),
+            Command::ShowAll
             | Command::ShowDifferences
             | Command::ShowSame
             | Command::ShowContext
@@ -4555,7 +4765,6 @@ impl SessionView for TextView {
             | Command::FindPrevious
             | Command::GoTo
             | Command::SelectAll
-            | Command::SelectSection
             | Command::Copy
             | Command::ToggleOverwrite
             | Command::ClearBookmarks
@@ -4569,7 +4778,7 @@ impl SessionView for TextView {
             | Command::Reload => true,
             Command::OpenFile => self.picker.is_none(),
             Command::CopyToOtherSide => {
-                self.status == Status::Ready && !self.pane(self.active.other()).is_read_only()
+                self.rows_current() && !self.pane(self.active.other()).is_read_only()
             }
             Command::Undo => {
                 !self.active_pane().is_read_only() && self.active_pane().buffer().can_undo()
@@ -4585,10 +4794,10 @@ impl SessionView for TextView {
                 self.status == Status::Ready && !self.active_pane().is_read_only()
             }
             Command::CopyToRight | Command::CopyLineToRight => {
-                self.status == Status::Ready && !self.right_pane.is_read_only()
+                self.rows_current() && !self.right_pane.is_read_only()
             }
             Command::CopyToLeft | Command::CopyLineToLeft => {
-                self.status == Status::Ready && !self.left_pane.is_read_only()
+                self.rows_current() && !self.left_pane.is_read_only()
             }
             Command::SaveFile => self.active_pane().is_modified() && self.save_job.is_none(),
             Command::SaveFileAs => {
@@ -6196,5 +6405,193 @@ mod tests {
             0,
             "the result of a comparison over replaced text was installed"
         );
+    }
+
+    /// Rows of the two difference sections of [`two_sections`].
+    const FIRST_SECTION: usize = 20;
+    const SECOND_SECTION: usize = 150;
+    /// A line that matches on both sides, between the two sections.
+    const SAME_LINE: u32 = 100;
+
+    /// A loaded view over 200 lines that differ on two rows, drawn in frames.
+    fn two_sections() -> (super::TextView, egui::Context, tempfile::TempDir) {
+        let side = |differing: &str| -> String {
+            (0..200)
+                .map(|line| {
+                    if line == FIRST_SECTION || line == SECOND_SECTION {
+                        format!("{differing} {line}\n")
+                    } else {
+                        format!("line {line}\n")
+                    }
+                })
+                .collect()
+        };
+        let (left, right) = (side("LEFT"), side("right"));
+        let dir = tempfile::tempdir().unwrap();
+        let left_path = dir.path().join("left.txt");
+        let right_path = dir.path().join("right.txt");
+        std::fs::write(&left_path, left).unwrap();
+        std::fs::write(&right_path, right).unwrap();
+        let mut view = super::TextView::new(left_path, right_path, &ca_ui::testing::context(), 1);
+        let ctx = egui::Context::default();
+        settle_frames(&mut view, &ctx);
+        (view, ctx, dir)
+    }
+
+    /// Draw frames until the view has no comparison left to run.
+    fn settle_frames(view: &mut super::TextView, ctx: &egui::Context) {
+        use ca_ui::view::SessionView;
+        use std::time::{Duration, Instant};
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            view.tick();
+            clipboard_frame(ctx, view, Vec::new());
+            if view.is_settled() {
+                return;
+            }
+            assert!(Instant::now() < deadline, "the comparison never settled");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// The text one side shows on `line`.
+    fn line_text(view: &super::TextView, side: super::Side, line: usize) -> String {
+        view.pane(side)
+            .buffer()
+            .text()
+            .lines()
+            .nth(line)
+            .unwrap_or_default()
+            .to_owned()
+    }
+
+    #[test]
+    fn a_section_reached_by_next_section_stays_current_for_the_copy() {
+        use super::Side;
+        use ca_ui::command::Command;
+        use ca_ui::view::SessionView;
+
+        let (mut view, ctx, _dir) = two_sections();
+        assert_eq!(
+            view.current_section_rows(),
+            Some(FIRST_SECTION..FIRST_SECTION + 1)
+        );
+        view.run(Command::NextSection);
+        clipboard_frame(&ctx, &mut view, Vec::new());
+        assert_eq!(
+            view.current_section_rows(),
+            Some(SECOND_SECTION..SECOND_SECTION + 1),
+            "a frame after Next Section moved the current section back"
+        );
+        view.run(Command::CopyToRight);
+        assert_eq!(line_text(&view, Side::Right, SECOND_SECTION), "LEFT 150");
+        assert_eq!(line_text(&view, Side::Right, FIRST_SECTION), "right 20");
+    }
+
+    #[test]
+    fn a_section_reached_by_previous_section_stays_current_for_the_copy() {
+        use super::Side;
+        use ca_ui::command::Command;
+        use ca_ui::view::SessionView;
+
+        let (mut view, ctx, _dir) = two_sections();
+        let second = u32::try_from(SECOND_SECTION).unwrap();
+        view.left_pane
+            .place(ca_ui::editor::Caret::new(second, 0), false);
+        clipboard_frame(&ctx, &mut view, Vec::new());
+        assert_eq!(
+            view.current_section_rows(),
+            Some(SECOND_SECTION..SECOND_SECTION + 1)
+        );
+        view.run(Command::PreviousSection);
+        clipboard_frame(&ctx, &mut view, Vec::new());
+        assert_eq!(
+            view.current_section_rows(),
+            Some(FIRST_SECTION..FIRST_SECTION + 1)
+        );
+        view.run(Command::CopyToLeft);
+        assert_eq!(line_text(&view, Side::Left, FIRST_SECTION), "right 20");
+        assert_eq!(line_text(&view, Side::Left, SECOND_SECTION), "LEFT 150");
+    }
+
+    #[test]
+    fn a_section_with_no_line_on_the_active_side_stays_current_for_the_copy() {
+        use super::Side;
+        use ca_ui::command::Command;
+        use ca_ui::view::SessionView;
+
+        let dir = tempfile::tempdir().unwrap();
+        let left_path = dir.path().join("left.txt");
+        let right_path = dir.path().join("right.txt");
+        std::fs::write(&left_path, "a\nb\nc\nd\n").unwrap();
+        std::fs::write(&right_path, "a\nB\nc\nX\nY\nd\n").unwrap();
+        let mut view = super::TextView::new(left_path, right_path, &ca_ui::testing::context(), 1);
+        let ctx = egui::Context::default();
+        settle_frames(&mut view, &ctx);
+        assert_eq!(view.active, Side::Left);
+        let gap = view.data.model.next_section(view.caret).unwrap();
+        assert!(view.data.model.row(gap).unwrap().left.is_none());
+        view.run(Command::NextSection);
+        clipboard_frame(&ctx, &mut view, Vec::new());
+        assert_eq!(view.current_section_rows(), Some(gap..gap + 2));
+        view.run(Command::CopyToLeft);
+        assert_eq!(view.pane(Side::Left).buffer().text(), "a\nb\nc\nX\nY\nd\n");
+    }
+
+    /// Undo and Redo put the caret on the line they change and reveal it. The
+    /// current section then follows the caret as after any other caret move:
+    /// the section the caret is in, or the next one.
+    #[test]
+    fn undo_and_redo_make_the_section_at_the_changed_line_current() {
+        use super::Side;
+        use ca_ui::command::Command;
+        use ca_ui::view::SessionView;
+
+        let (mut view, ctx, _dir) = two_sections();
+        view.left_pane
+            .place(ca_ui::editor::Caret::new(SAME_LINE, 0), false);
+        view.left_pane.type_character('X');
+        view.note_edit();
+        settle_frames(&mut view, &ctx);
+        let edited = SAME_LINE as usize;
+        assert_eq!(view.current_section_rows(), Some(edited..edited + 1));
+        view.run(Command::PreviousSection);
+        clipboard_frame(&ctx, &mut view, Vec::new());
+        assert_eq!(
+            view.current_section_rows(),
+            Some(FIRST_SECTION..FIRST_SECTION + 1)
+        );
+
+        view.run(Command::Undo);
+        clipboard_frame(&ctx, &mut view, Vec::new());
+        assert_eq!(view.left_pane.caret().line, SAME_LINE);
+        assert_eq!(view.caret, edited);
+        let first = view.scroll.first_row();
+        assert!(
+            first <= edited && edited < first + view.viewport_rows,
+            "{first}"
+        );
+        settle_frames(&mut view, &ctx);
+        assert_eq!(view.caret, edited);
+        assert_eq!(
+            view.current_section_rows(),
+            Some(SECOND_SECTION..SECOND_SECTION + 1)
+        );
+        view.run(Command::CopyToRight);
+        assert_eq!(line_text(&view, Side::Right, SECOND_SECTION), "LEFT 150");
+        assert_eq!(line_text(&view, Side::Right, FIRST_SECTION), "right 20");
+        view.run(Command::Undo);
+        settle_frames(&mut view, &ctx);
+
+        view.run(Command::PreviousSection);
+        clipboard_frame(&ctx, &mut view, Vec::new());
+        view.active = Side::Left;
+        view.run(Command::Redo);
+        clipboard_frame(&ctx, &mut view, Vec::new());
+        assert_eq!(view.left_pane.caret().line, SAME_LINE);
+        settle_frames(&mut view, &ctx);
+        assert_eq!(view.caret, edited);
+        assert_eq!(view.current_section_rows(), Some(edited..edited + 1));
     }
 }

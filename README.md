@@ -77,8 +77,8 @@ select Open.
 
 1. Install `rustup`. The file `rust-toolchain.toml` sets the Rust version.
    `rustup` installs that version at the first build.
-2. On Linux, install the GTK 3 development package. On Debian and Ubuntu, run
-   `sudo apt-get install libgtk-3-dev`.
+2. On Linux, install a C compiler. On Debian and Ubuntu, run
+   `sudo apt-get install build-essential`.
 3. Clone this repository.
 4. Run `cargo xtask build --workspace --release`.
 
