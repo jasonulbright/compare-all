@@ -45,7 +45,9 @@ fn read_offset() -> i32 {
 
 #[cfg(not(windows))]
 fn read_offset() -> i32 {
-    let output = std::process::Command::new("date").arg("+%z").output();
+    let output = ca_io::host_command::host_command("date")
+        .arg("+%z")
+        .output();
     let Ok(output) = output else {
         return 0;
     };
