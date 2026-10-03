@@ -17,7 +17,9 @@
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 
 /// An environment, by variable name.
 pub type Environment = BTreeMap<OsString, OsString>;
@@ -153,29 +155,48 @@ pub struct Image {
     /// The folders the image is mounted or extracted at, without a trailing
     /// separator.
     roots: Vec<Vec<u8>>,
+    /// Whether the AppImage runtime started this image, so `APPIMAGE` and the
+    /// portable folders beside it belong to it.
+    runtime: bool,
     /// The user's home folder from the account database, used when portable
     /// mode replaced `HOME` and no launcher kept the original.
     account_home: Option<OsString>,
 }
 
 impl Image {
-    /// The image `environment` names, or `None` when it names none.
+    /// The image `environment` names that `executable`, this process's own
+    /// program, runs from, or `None` when there is none.
+    ///
+    /// A root counts only when `executable` lies inside it, so a program that
+    /// inherited the variables of another image (a terminal started from an
+    /// AppImage) does not take that image for its own. With `executable`
+    /// unknown every named root counts: a host program given the image's
+    /// variables fails, while a variable of another image that is cleaned in
+    /// error names paths that are not this process's anyway.
     #[must_use]
-    pub fn detect(environment: &Environment) -> Option<Self> {
-        let sharun = value(environment, "SHARUN_DIR").and_then(root_of);
-        let appdir = value(environment, "APPDIR").and_then(root_of);
-        let from_runtime = sharun.is_some() || value(environment, "APPIMAGE").is_some();
+    pub fn detect(environment: &Environment, executable: Option<&Path>) -> Option<Self> {
+        let runs_from = |root: &Vec<u8>| {
+            executable.is_none_or(|program| inside(root, program.as_os_str().as_encoded_bytes()))
+        };
+        let sharun = value(environment, "SHARUN_DIR")
+            .and_then(root_of)
+            .filter(runs_from);
+        let from_runtime =
+            value(environment, "SHARUN_DIR").is_some() || value(environment, "APPIMAGE").is_some();
+        let appdir = value(environment, "APPDIR")
+            .and_then(root_of)
+            .filter(|root| from_runtime && runs_from(root));
+        let runtime = appdir.is_some() && value(environment, "APPIMAGE").is_some();
         let mut roots = Vec::new();
         roots.extend(sharun);
-        if from_runtime {
-            roots.extend(appdir);
-        }
+        roots.extend(appdir);
         roots.dedup();
         if roots.is_empty() {
             return None;
         }
         Some(Self {
             roots,
+            runtime,
             account_home: None,
         })
     }
@@ -191,17 +212,22 @@ impl Image {
     /// original, so only the account database can tell the user's home.
     #[must_use]
     pub fn needs_account_home(&self, environment: &Environment) -> bool {
-        value(environment, "REAL_HOME").is_none() && portable_folder(environment, "HOME", ".home")
+        self.runtime
+            && value(environment, "REAL_HOME").is_none()
+            && portable_folder(environment, "HOME", ".home")
     }
 
     fn contains(&self, entry: &[u8]) -> bool {
-        self.roots.iter().any(|root| {
-            entry.starts_with(root)
-                && entry
-                    .get(root.len())
-                    .is_none_or(|separator| *separator == b'/')
-        })
+        self.roots.iter().any(|root| inside(root, entry))
     }
+}
+
+/// Whether `path` is `root` or lies below it.
+fn inside(root: &[u8], path: &[u8]) -> bool {
+    path.starts_with(root)
+        && path
+            .get(root.len())
+            .is_none_or(|separator| *separator == b'/')
 }
 
 /// The environment a host program started from `image` gets.
@@ -261,12 +287,13 @@ pub fn clean_environment(environment: &Environment, image: &Image) -> Environmen
             cleaned.insert((*name).into(), original.to_owned());
         }
     }
-    if value(environment, "REAL_HOME").is_none() && portable_folder(environment, "HOME", ".home") {
+    if image.needs_account_home(environment) {
         if let Some(home) = &image.account_home {
             cleaned.insert("HOME".into(), home.clone());
         }
     }
-    if value(environment, "REAL_XDG_CONFIG_HOME").is_none()
+    if image.runtime
+        && value(environment, "REAL_XDG_CONFIG_HOME").is_none()
         && portable_folder(environment, "XDG_CONFIG_HOME", ".config")
     {
         cleaned.remove(OsStr::new("XDG_CONFIG_HOME"));
@@ -389,11 +416,20 @@ pub fn host_environment() -> Option<Environment> {
         return None;
     }
     let current: Environment = std::env::vars_os().collect();
-    let mut image = Image::detect(&current)?;
+    let mut image = Image::detect(&current, executable())?;
     if image.needs_account_home(&current) {
         image = image.with_account_home(account_home());
     }
     Some(clean_environment(&current, &image))
+}
+
+/// This process's own program as the kernel names it (`/proc/self/exe` on
+/// Linux), read once; `None` when it cannot be read.
+fn executable() -> Option<&'static Path> {
+    static EXECUTABLE: OnceLock<Option<PathBuf>> = OnceLock::new();
+    EXECUTABLE
+        .get_or_init(|| std::env::current_exe().ok())
+        .as_deref()
 }
 
 /// The home folder the local account database gives the real user.
