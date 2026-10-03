@@ -136,6 +136,9 @@ const RESOURCE_VARIABLES: &[&str] = &[
     "__EGL_VENDOR_LIBRARY_FILENAMES",
 ];
 
+/// Variables that hold `:`-separated paths whatever their entries look like.
+const PATH_LIST_VARIABLES: &[&str] = &["PATH", "XDG_CONFIG_DIRS", "XDG_DATA_DIRS"];
+
 /// Folders the image's launchers redirect for the image's own data, with the
 /// variable that keeps the user's value while the redirection is in force.
 const SAVED_ORIGINALS: &[(&str, &str)] = &[
@@ -215,16 +218,18 @@ impl Image {
 ///   beside the image file) holds the image application's data only, so a host
 ///   program gets the account's home folder and the default configuration
 ///   folder; with no account home known, `HOME` stays as it is.
-/// - In every other variable, each `:`-separated entry that lies inside the
-///   image is dropped, the other entries keep their order, and a variable left
-///   with no entry is removed. A variable that names no image path is kept
-///   byte for byte.
+/// - In `PATH`, `XDG_DATA_DIRS`, `XDG_CONFIG_DIRS` and in every other value
+///   whose non-empty `:`-separated entries are all absolute paths, each entry
+///   inside the image is dropped, the other entries keep their order, and a
+///   variable left with no non-empty entry is removed. Any other value is kept
+///   whole, also when an image path occurs inside it. A variable that names no
+///   image path is kept byte for byte.
 #[must_use]
 pub fn clean_environment(environment: &Environment, image: &Image) -> Environment {
     let mut cleaned = Environment::new();
     for (name, value) in environment {
         let Some(name_text) = name.to_str() else {
-            insert_filtered(&mut cleaned, image, name, value);
+            insert_other(&mut cleaned, image, name, value);
             continue;
         };
         if LAUNCHER_VARIABLES.contains(&name_text) {
@@ -250,7 +255,11 @@ pub fn clean_environment(environment: &Environment, image: &Image) -> Environmen
         if RESOURCE_VARIABLES.contains(&name_text) && names_image(image, value) {
             continue;
         }
-        insert_filtered(&mut cleaned, image, name, value);
+        if PATH_LIST_VARIABLES.contains(&name_text) {
+            insert_filtered(&mut cleaned, image, name, value);
+            continue;
+        }
+        insert_other(&mut cleaned, image, name, value);
     }
     for (name, saved) in SAVED_ORIGINALS {
         if let Some(original) = value(environment, saved) {
@@ -283,6 +292,21 @@ fn insert_filtered(cleaned: &mut Environment, image: &Image, name: &OsStr, value
     insert_entries(cleaned, name, value, LIST_SEPARATORS, |entry| {
         image.contains(entry)
     });
+}
+
+/// Insert a variable of no known kind: a list of absolute paths loses its image
+/// entries; any other value is kept whole, since a value such as
+/// `file:<path>` or `ssh -i <path>` cannot be repaired by dropping a part.
+fn insert_other(cleaned: &mut Environment, image: &Image, name: &OsStr, value: &OsStr) {
+    let is_path_list = value
+        .as_encoded_bytes()
+        .split(|byte| *byte == b':')
+        .all(|entry| entry.is_empty() || entry.first() == Some(&b'/'));
+    if is_path_list {
+        insert_filtered(cleaned, image, name, value);
+    } else {
+        cleaned.insert(name.to_owned(), value.to_owned());
+    }
 }
 
 /// Insert `value` without the entries `drop` selects. A kept entry keeps the
