@@ -25,7 +25,9 @@ pub mod search;
 pub mod transform;
 
 pub use binary::{inspect, looks_binary, BinaryHeuristic, BinaryVerdict};
-pub use buffer::{Change, EditError, EditKind, EditSnapshot, LineRange, TextBuffer, UndoGroup};
+pub use buffer::{
+    AppliedEdit, Change, EditError, EditKind, EditSnapshot, LineRange, TextBuffer, UndoGroup,
+};
 pub use encoding::{
     decode, detect, encode, encode_file, sniff_utf16, DecodeOptions, Decoded, Detection,
     DetectionSource, EncodeOutcome, EncodingSpec, TextEncoding, Unmappable,

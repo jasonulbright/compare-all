@@ -103,6 +103,20 @@ pub struct Change {
     pub inserted_lines: u32,
 }
 
+/// One edit as it was applied to the rope, with its text, for a reader that
+/// keeps its own copy of the lines in step.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct AppliedEdit {
+    /// The lines the edit replaced, as [`Change`] reports them.
+    pub change: Change,
+    /// Characters from the start of `change.start_line` to the edit.
+    pub offset: usize,
+    /// The text the edit removed.
+    pub removed: String,
+    /// The text the edit inserted.
+    pub inserted: String,
+}
+
 /// One recorded edit.
 ///
 /// Memory cost: an edit holds the removed and the inserted text in full, so a
@@ -134,6 +148,8 @@ pub struct TextBuffer {
     open_group: Option<EditGroup>,
     sealed: bool,
     changes: Vec<Change>,
+    /// Applied edits with their text, kept only after [`TextBuffer::track_applied_edits`].
+    applied: Option<Vec<AppliedEdit>>,
 }
 
 /// A content snapshot with its own edit history, prepared without copying the
@@ -189,7 +205,24 @@ impl TextBuffer {
             open_group: None,
             sealed: true,
             changes: Vec::new(),
+            applied: None,
         }
+    }
+
+    /// Keep every applied edit with its text until [`TextBuffer::take_applied_edits`].
+    /// Edits prepared on an [`EditSnapshot`] of this buffer are kept as well.
+    pub fn track_applied_edits(&mut self) {
+        if self.applied.is_none() {
+            self.applied = Some(Vec::new());
+        }
+    }
+
+    /// Takes the applied edits kept since the last call, oldest first.
+    pub fn take_applied_edits(&mut self) -> Vec<AppliedEdit> {
+        self.applied
+            .as_mut()
+            .map(std::mem::take)
+            .unwrap_or_default()
     }
 
     /// The underlying rope.
@@ -202,9 +235,13 @@ impl TextBuffer {
     /// Taking this snapshot does not walk the document or its undo records.
     #[must_use]
     pub fn edit_snapshot(&self) -> EditSnapshot {
+        let mut buffer = Self::from_rope(self.rope.clone());
+        if self.applied.is_some() {
+            buffer.track_applied_edits();
+        }
         EditSnapshot {
             base_revision: self.revision,
-            buffer: Box::new(Self::from_rope(self.rope.clone())),
+            buffer: Box::new(buffer),
         }
     }
 
@@ -235,6 +272,9 @@ impl TextBuffer {
             std::mem::swap(&mut self.changes, &mut prepared.changes);
         } else {
             self.changes.append(&mut prepared.changes);
+        }
+        if let (Some(live), Some(edits)) = (self.applied.as_mut(), prepared.applied.as_mut()) {
+            live.append(edits);
         }
         prepared.redo = std::mem::take(&mut self.redo);
         Ok(*snapshot.buffer)
@@ -460,17 +500,36 @@ impl TextBuffer {
             self.char_to_line(at),
             self.char_to_line(at.saturating_add(remove_chars)),
         );
+        let removed = self
+            .applied
+            .is_some()
+            .then(|| self.slice_text(at..at.saturating_add(remove_chars)));
         self.apply_raw(at, remove_chars, insert)?;
         let after = (
             self.char_to_line(at),
             self.char_to_line(at.saturating_add(insert.chars().count())),
         );
         let start_line = before.0.min(after.0);
-        Ok(Change {
+        let change = Change {
             start_line,
             removed_lines: before.1.saturating_sub(start_line),
             inserted_lines: after.1.saturating_sub(start_line),
-        })
+        };
+        if let (Some(applied), Some(removed)) = (self.applied.as_mut(), removed) {
+            // Text before the edit is unchanged, so the line start is the
+            // same in the rope before and after it.
+            let line_start = self
+                .rope
+                .try_line_to_char(start_line as usize)
+                .unwrap_or(at);
+            applied.push(AppliedEdit {
+                change,
+                offset: at.saturating_sub(line_start),
+                removed,
+                inserted: insert.to_owned(),
+            });
+        }
+        Ok(change)
     }
 
     /// Applies an edit to the rope, leaving it untouched when the range does not fit.
@@ -965,6 +1024,35 @@ mod tests {
         assert!(old_end <= old.len() && new_end <= new.len(), "{context}");
         assert_eq!(old[..start], new[..start], "{context}");
         assert_eq!(old[old_end..], new[new_end..], "{context}");
+    }
+
+    #[test]
+    fn applied_edits_carry_their_text_from_the_first_line_they_change() {
+        let mut buffer = TextBuffer::from_text("a\rb\nc\n");
+        assert!(buffer.take_applied_edits().is_empty());
+        buffer.track_applied_edits();
+        buffer.insert(2, "\n");
+        buffer.replace(4..6, "X");
+        assert!(buffer.undo().unwrap());
+        let edits = buffer.take_applied_edits();
+        assert_eq!(buffer.text(), "a\r\nb\nc\n");
+        assert_eq!(edits.len(), 3);
+        // The LF joins the lone CR before it, so the change starts a line
+        // above the insertion.
+        assert_eq!(edits[0].change.start_line, 0);
+        assert_eq!(edits[0].offset, 2);
+        assert_eq!(edits[0].removed, "");
+        assert_eq!(edits[0].inserted, "\n");
+        assert_eq!(edits[1].removed, "\nc");
+        assert_eq!(edits[1].inserted, "X");
+        assert_eq!(edits[2].removed, "X");
+        assert_eq!(edits[2].inserted, "\nc");
+        let mut snapshot = buffer.edit_snapshot();
+        snapshot.buffer_mut().insert(0, "Z");
+        assert!(buffer.apply_snapshot(snapshot).is_ok());
+        let edits = buffer.take_applied_edits();
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].inserted, "Z");
     }
 
     #[test]
