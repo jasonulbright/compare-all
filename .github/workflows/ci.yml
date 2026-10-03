@@ -54,13 +54,16 @@ jobs:
       - if: runner.os == 'Linux'
         run: |
           bash -n scripts/package-linux-appimage.sh
+          bash -n scripts/deploy-linux-appimage.sh
           bash -n scripts/fetch-appimage-tools.sh
           bash -n scripts/verify-linux-appimage.sh
+          sh -n assets/linux/AppRun.sh
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
 
-  # Builds the AppImage as the release does and starts it on a clean system,
-  # so a packaging fault shows before a release tag exists.
+  # Builds the AppImage as the release does and starts it on clean systems,
+  # so a packaging fault shows before a release tag exists. The deployment
+  # runs in the pinned archlinux container through the runner's Docker.
   appimage:
     name: check (appimage)
     if: >-
@@ -78,18 +81,16 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@9376cdc5a5e25b16da71af47712785cf06b0d6d4 # 1.94.1
       - run: >-
-          sudo apt-get update && sudo apt-get install -y desktop-file-utils libgtk-3-dev
-          libxkbcommon-x11-0 libxcb-xkb1 zsync
+          sudo apt-get update && sudo apt-get install -y desktop-file-utils libgtk-3-dev zsync
       - name: Build release binaries
         run: cargo xtask build -p ca-app -p ca-cli --release
       - name: Build the AppImage
         shell: bash
         run: |
           set -euo pipefail
-          bash scripts/fetch-appimage-tools.sh "$RUNNER_TEMP"
+          bash scripts/fetch-appimage-tools.sh "$RUNNER_TEMP/appimage-tools"
           version="$(target/release/ca --version | awk '{print $NF}')"
-          bash scripts/package-linux-appimage.sh "$version" \
-            "$RUNNER_TEMP/appimagetool-x86_64.AppImage" "$RUNNER_TEMP/runtime-x86_64"
+          bash scripts/package-linux-appimage.sh "$version" "$RUNNER_TEMP/appimage-tools"
           echo "version=$version" >> "$GITHUB_ENV"
       - name: Test the AppImage on a clean system
         shell: bash

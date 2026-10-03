@@ -175,13 +175,11 @@ jobs:
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@9376cdc5a5e25b16da71af47712785cf06b0d6d4 # 1.94.1
-      # The AppImage bundles libxkbcommon-x11 and libxcb-xkb, which
-      # libgtk-3-dev does not install. zsync puts zsyncmake on PATH, which
-      # appimagetool looks for to write the .zsync update file.
+      # zsync puts zsyncmake on PATH, which appimagetool looks for to write
+      # the .zsync update file.
       - if: runner.os == 'Linux'
         run: >-
-          sudo apt-get update && sudo apt-get install -y desktop-file-utils libgtk-3-dev
-          libxkbcommon-x11-0 libxcb-xkb1 zsync
+          sudo apt-get update && sudo apt-get install -y desktop-file-utils libgtk-3-dev zsync
 
       - name: Build release binaries
         run: cargo xtask build -p ca-app -p ca-cli --release
@@ -207,15 +205,16 @@ jobs:
           tar -C dist -czf "dist/$name.tar.gz" "$name"
           rm -r "dist/$name"
 
+      # The deployment runs in the pinned archlinux container through the
+      # runner's Docker; the binaries are the ones built above.
       - name: Build the AppImage
         if: runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
-          bash scripts/fetch-appimage-tools.sh "$RUNNER_TEMP"
+          bash scripts/fetch-appimage-tools.sh "$RUNNER_TEMP/appimage-tools"
           version="${GITHUB_REF_NAME#v}"
-          bash scripts/package-linux-appimage.sh "$version" \
-            "$RUNNER_TEMP/appimagetool-x86_64.AppImage" "$RUNNER_TEMP/runtime-x86_64"
+          bash scripts/package-linux-appimage.sh "$version" "$RUNNER_TEMP/appimage-tools"
 
       # A failed check stops the job before anything is signed or uploaded, so
       # the publish job never sees an AppImage that cannot start.

@@ -53,9 +53,10 @@ Open the Releases page of this repository. Each release has these files:
 - A Windows zip file: the programs without an installer.
 - Linux and macOS `.tar.gz` files.
 - `compare-all-<version>-x86_64.AppImage`: the Linux AppImage. It contains
-  the keyboard and window libraries that the program loads. The C library,
-  the graphics driver, and the core X11 and Wayland client libraries come
-  from the system.
+  its own C library, the X11, Wayland, and keyboard libraries, and the Mesa
+  OpenGL drivers with a software renderer. It starts on a system that has no
+  X11, OpenGL, or keyboard libraries. `usr/share/doc/compare-all` in the
+  AppImage lists the bundled packages and holds their license texts.
 - `compare-all-<version>-x86_64.AppImage.zsync`: the update file that AppImage
   update tools use.
 - A `.sha256` file for each download.
