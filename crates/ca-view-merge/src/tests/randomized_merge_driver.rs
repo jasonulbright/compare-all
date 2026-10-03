@@ -2,10 +2,16 @@ use super::*;
 use ca_ui::editor::Caret;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-const SEEDS: [u64; 10] = [
-    0x1001, 0x1002, 0x1003, 0x1004, 0x1005, 0x1006, 0x1007, 0x1008, 0x1009, 0x100a,
+const SEEDS: [u64; 20] = [
+    0x1001, 0x1002, 0x1003, 0x1004, 0x1005, 0x1006, 0x1007, 0x1008, 0x1009, 0x100a, 0x3001, 0x3002,
+    0x3003, 0x3004, 0x3005, 0x3006, 0x3007, 0x3008, 0x3009, 0x300a,
 ];
 const CASES: usize = 600;
+const CLAMP_COUNTERS: [&std::thread::LocalKey<std::cell::Cell<usize>>; 3] = [
+    &crate::model::SPLICE_CLAMPS,
+    &crate::model::REPLAY_START_CLAMPS,
+    &crate::model::REPLAY_END_CLAMPS,
+];
 const MAX_OPS: usize = 24;
 
 const ASSERTED: &[&str] = &[
@@ -30,25 +36,151 @@ const ASSERTED: &[&str] = &[
     "redo-path-differs-from-undo-path",
     "undo-all-state-differs-from-fresh",
     "take-after-undo-all-differs-from-fresh",
+    "take-changed-other-section-text",
+    "take-all-changed-conflict-text",
+    "ownership-changed-without-edit",
+    "lent-record-off-text",
+    "lent-record-invariant",
 ];
 
-fn tokens(text: &str) -> Vec<String> {
+/// Every token with its byte range in `text`.
+fn token_spans(text: &str) -> Vec<(String, usize, usize)> {
     let mut out = Vec::new();
+    let mut base = 0usize;
     let mut rest = text;
     while let Some(open) = rest.find('[') {
+        let inner_start = base + open + 1;
         let after = &rest[open + 1..];
         let Some(close) = after.find(']') else { break };
         let inner = &after[..close];
         if let Some(nested) = inner.rfind('[') {
+            base = inner_start + nested;
             rest = &after[nested..];
             continue;
         }
         if !inner.is_empty() && !inner.contains(['\r', '\n']) {
-            out.push(format!("[{inner}]"));
+            out.push((
+                format!("[{inner}]"),
+                inner_start - 1,
+                inner_start + close + 1,
+            ));
         }
+        base = inner_start + close;
         rest = &after[close..];
     }
     out
+}
+
+fn tokens(text: &str) -> Vec<String> {
+    token_spans(text)
+        .into_iter()
+        .map(|(token, _, _)| token)
+        .collect()
+}
+
+const NO_OWNER: usize = usize::MAX;
+
+/// The model's output text with the section that owns each byte: the
+/// section of the line, or the lender of a lent record on that line.
+struct Owned {
+    text: String,
+    owners: Vec<usize>,
+    problems: Vec<String>,
+}
+
+fn owned_text(view: &MergeView) -> Owned {
+    let model = view.model();
+    let lines: Vec<String> = model.output_lines().iter().cloned().collect();
+    let mut per_line: Vec<Vec<usize>> = lines
+        .iter()
+        .enumerate()
+        .map(|(index, line)| {
+            let owner = u32::try_from(index)
+                .ok()
+                .and_then(|index| model.section_of_output_line(index))
+                .unwrap_or(NO_OWNER);
+            vec![owner; line.chars().count()]
+        })
+        .collect();
+    let mut problems = Vec::new();
+    for (lender, section) in model.sections().iter().enumerate() {
+        for entry in section.lent_records() {
+            let Some(range) = model.output_range(entry.holder) else {
+                problems.push(format!(
+                    "s{lender} record on missing holder s{}",
+                    entry.holder
+                ));
+                continue;
+            };
+            let line = (range.start + entry.offset) as usize;
+            let column = entry.column as usize;
+            let count = entry.text.chars().count();
+            let here: String = lines
+                .get(line)
+                .map(|text| text.chars().skip(column).take(count).collect())
+                .unwrap_or_default();
+            if line >= range.end as usize || here != entry.text {
+                problems.push(format!(
+                    "s{lender} record {:?} at s{} line {line} column {column} finds {here:?}",
+                    entry.text, entry.holder
+                ));
+                continue;
+            }
+            for owner in per_line[line].iter_mut().skip(column).take(count) {
+                *owner = lender;
+            }
+        }
+    }
+    let mut text = String::new();
+    let mut owners = Vec::new();
+    for (line, own) in lines.iter().zip(&per_line) {
+        for (ch, owner) in line.chars().zip(own) {
+            owners.extend(std::iter::repeat_n(*owner, ch.len_utf8()));
+        }
+        text.push_str(line);
+    }
+    Owned {
+        text,
+        owners,
+        problems,
+    }
+}
+
+/// The one section that owns every byte of a span, if one does.
+fn single_owner(owners: &[usize]) -> Option<usize> {
+    let first = *owners.first()?;
+    (first != NO_OWNER && owners.iter().all(|owner| *owner == first)).then_some(first)
+}
+
+/// Each section's characters in output order, without line terminators.
+fn section_chars(owned: &Owned, sections: usize) -> Vec<String> {
+    let mut out = vec![String::new(); sections];
+    for (index, ch) in owned.text.char_indices() {
+        if ch == '\r' || ch == '\n' {
+            continue;
+        }
+        if let Some(text) = out.get_mut(owned.owners[index]) {
+            text.push(ch);
+        }
+    }
+    out
+}
+
+fn sorted_chars(text: &str) -> Vec<char> {
+    let mut chars: Vec<char> = text.chars().collect();
+    chars.sort_unstable();
+    chars
+}
+
+/// Tokens whose every character belongs to one section in `keep`.
+fn kept_tokens(owned: &Owned, keep: &dyn Fn(usize) -> bool) -> HashMap<String, usize> {
+    let mut map = HashMap::new();
+    for (token, start, end) in token_spans(&owned.text) {
+        if single_owner(&owned.owners[start..end]).is_some_and(keep) {
+            *map.entry(token).or_insert(0) += 1;
+        }
+    }
+    map
 }
 
 fn counts(text: &str) -> HashMap<String, usize> {
@@ -108,6 +240,7 @@ struct Stats {
     empty_inputs: usize,
     resyncs: usize,
     reabsorbs: usize,
+    clamps: usize,
     panics: usize,
 }
 
@@ -667,6 +800,9 @@ fn run_case(
     let mut flags_changed = false;
     crate::model::ownership::RESYNCS.with(|c| c.set(0));
     crate::model::ownership::REABSORBS.with(|c| c.set(0));
+    for counter in CLAMP_COUNTERS {
+        counter.with(|c| c.set(0));
+    }
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut local: Vec<(String, String)> = Vec::new();
         for _ in 0..len {
@@ -674,25 +810,32 @@ fn run_case(
             ops.push(op.clone());
             let before = pane_text(&view);
             let before_counts = counts(&before);
-            let owners = token_owner(&view);
+            let owned_before = owned_text(&view);
             let sections_before = view.model().sections().len();
             let taken: Option<HashSet<usize>> = match &op {
                 Op::Take(section, _, selection) => {
                     let section = (*section).min(sections_before - 1);
                     let mut set: HashSet<usize> = HashSet::new();
-                    if let Some((a, b)) = selection {
-                        let (start, end) = if a <= b { (a, b) } else { (b, a) };
-                        if start != end {
-                            let model = view.model();
-                            let last_line = if end.index == 0 && end.line > start.line {
-                                end.line - 1
-                            } else {
-                                end.line
-                            };
-                            let first = model.section_of_output_line(start.line).unwrap_or(0);
-                            let last = model.section_of_output_line(last_line).unwrap_or(first);
-                            set.extend(first..=last.max(first));
-                        }
+                    // The pane moves a caret inside a grapheme to its start,
+                    // so the selection the take sees can be empty.
+                    let snapped = selection.as_ref().and_then(|(a, b)| {
+                        view.output_pane.clear_selection();
+                        view.output_pane.place(*a, false);
+                        view.output_pane.place(*b, true);
+                        let snapped = view.output_pane.selection();
+                        view.output_pane.clear_selection();
+                        snapped
+                    });
+                    if let Some((start, end)) = snapped {
+                        let model = view.model();
+                        let last_line = if end.index == 0 && end.line > start.line {
+                            end.line - 1
+                        } else {
+                            end.line
+                        };
+                        let first = model.section_of_output_line(start.line).unwrap_or(0);
+                        let last = model.section_of_output_line(last_line).unwrap_or(first);
+                        set.extend(first..=last.max(first));
                     }
                     if set.is_empty() {
                         set.insert(section);
@@ -761,30 +904,63 @@ fn run_case(
             ) {
                 flags_changed = true;
             }
+            let owned_after = owned_text(&view);
+            if let Some(problem) = owned_after.problems.first() {
+                local.push((
+                    "lent-record-off-text".to_owned(),
+                    format!("after {}: {problem}", op_name(&op)),
+                ));
+            }
+            if let Some(problem) = view.model().lent_record_problems().first() {
+                local.push((
+                    "lent-record-invariant".to_owned(),
+                    format!("after {}: {problem}", op_name(&op)),
+                ));
+            }
+            if matches!(
+                op,
+                Op::Reload | Op::Rules(_) | Op::ToggleConflict(_) | Op::ToggleIgnored(_) | Op::Save
+            ) && view.model().sections().len() == sections_before
+            {
+                let old = section_chars(&owned_before, sections_before);
+                let new = section_chars(&owned_after, sections_before);
+                if let Some(index) = (0..sections_before).find(|index| old[*index] != new[*index]) {
+                    local.push((
+                        "ownership-changed-without-edit".to_owned(),
+                        format!(
+                            "after {}: s{index} {:?} -> {:?}; text {after:?}",
+                            op_name(&op),
+                            old[index],
+                            new[index]
+                        ),
+                    ));
+                }
+            }
             if let Some(taken) = &taken {
-                for (token, count) in &before_counts {
-                    let Some(&(owner, _)) = owners.get(token) else {
-                        continue;
-                    };
-                    if taken.contains(&owner) || *count == 0 {
-                        continue;
-                    }
-                    if after_counts.get(token).copied().unwrap_or(0) == 0 {
+                let untaken = |owner: usize| !taken.contains(&owner);
+                for (token, count) in kept_tokens(&owned_before, &untaken) {
+                    if after_counts.get(&token).copied().unwrap_or(0) < count {
                         local.push((
                             "take-lost-other-section-token".to_owned(),
-                            format!("{token} of s{owner}; before {before:?} after {after:?}"),
+                            format!("{token} x{count}; before {before:?} after {after:?}"),
                         ));
                     }
                 }
-                for (token, count) in &after_counts {
-                    let Some(&(owner, _)) = owners.get(token) else {
-                        continue;
-                    };
-                    if taken.contains(&owner) {
-                        continue;
+                let chars_before = section_chars(&owned_before, sections_before);
+                let chars_after = section_chars(&owned_after, sections_before);
+                // A token whose section kept its characters was spelled by
+                // removing other text between them; no character came back.
+                let mut grown: HashMap<String, usize> = HashMap::new();
+                for (token, start, end) in token_spans(&owned_after.text) {
+                    if let Some(owner) = single_owner(&owned_after.owners[start..end]) {
+                        if untaken(owner) && chars_before.get(owner) != chars_after.get(owner) {
+                            *grown.entry(token).or_insert(0) += 1;
+                        }
                     }
-                    let had = before_counts.get(token).copied().unwrap_or(0);
-                    if had < *count {
+                }
+                for (token, count) in grown {
+                    let had = before_counts.get(&token).copied().unwrap_or(0);
+                    if had < count {
                         let class = if had == 0 {
                             "take-resurrected-other-token"
                         } else {
@@ -792,9 +968,24 @@ fn run_case(
                         };
                         local.push((
                             class.to_owned(),
-                            format!("{token} of s{owner}; before {before:?} after {after:?}"),
+                            format!("{token}; before {before:?} after {after:?}"),
                         ));
                     }
+                }
+                for (index, (old, new)) in chars_before.iter().zip(&chars_after).enumerate() {
+                    if taken.contains(&index) || old == new {
+                        continue;
+                    }
+                    let class = if sorted_chars(old) == sorted_chars(new) {
+                        "take-reordered-other-section-text"
+                    } else {
+                        "take-changed-other-section-text"
+                    };
+                    local.push((
+                        class.to_owned(),
+                        format!("s{index} {old:?} -> {new:?}; before {before:?} after {after:?}"),
+                    ));
+                    break;
                 }
             }
             if let Some(line) = line_take_line {
@@ -815,17 +1006,24 @@ fn run_case(
                 }
             }
             if matches!(op, Op::TakeAll) {
-                for token in before_counts.keys() {
-                    let Some(&(owner, _)) = owners.get(token) else {
-                        continue;
-                    };
-                    if waiting.contains(&owner)
-                        && after_counts.get(token).copied().unwrap_or(0) == 0
-                    {
+                let waits = |owner: usize| waiting.contains(&owner);
+                for (token, count) in kept_tokens(&owned_before, &waits) {
+                    if after_counts.get(&token).copied().unwrap_or(0) < count {
                         local.push((
                             "take-all-lost-conflict-token".to_owned(),
-                            format!("{token} of s{owner}; before {before:?} after {after:?}"),
+                            format!("{token} x{count}; before {before:?} after {after:?}"),
                         ));
+                    }
+                }
+                let chars_before = section_chars(&owned_before, sections_before);
+                let chars_after = section_chars(&owned_after, sections_before);
+                for index in &waiting {
+                    if chars_before.get(*index) != chars_after.get(*index) {
+                        local.push((
+                            "take-all-changed-conflict-text".to_owned(),
+                            format!("s{index}; before {before:?} after {after:?}"),
+                        ));
+                        break;
                     }
                 }
                 for (token, count) in &after_counts {
@@ -863,6 +1061,13 @@ fn run_case(
                 local.push(("redo-to-top-model-pane".to_owned(), problem));
                 break;
             }
+            if let Some(problem) = view.model().lent_record_problems().first() {
+                local.push((
+                    "lent-record-invariant".to_owned(),
+                    format!("during the redo-to-top-model-pane pass: {problem}"),
+                ));
+                break;
+            }
         }
         let end_text = pane_text(&view);
         let mut undo_texts = vec![end_text.clone()];
@@ -870,6 +1075,13 @@ fn run_case(
             view.run(Command::Undo);
             if let Err(problem) = model_matches_pane(&view) {
                 local.push(("undo-model-pane".to_owned(), problem));
+                break;
+            }
+            if let Some(problem) = view.model().lent_record_problems().first() {
+                local.push((
+                    "lent-record-invariant".to_owned(),
+                    format!("during the undo-model-pane pass: {problem}"),
+                ));
                 break;
             }
             let text = pane_text(&view);
@@ -889,6 +1101,13 @@ fn run_case(
             view.run(Command::Redo);
             if let Err(problem) = model_matches_pane(&view) {
                 local.push(("redo-model-pane".to_owned(), problem));
+                break;
+            }
+            if let Some(problem) = view.model().lent_record_problems().first() {
+                local.push((
+                    "lent-record-invariant".to_owned(),
+                    format!("during the redo-model-pane pass: {problem}"),
+                ));
                 break;
             }
             let text = pane_text(&view);
@@ -953,6 +1172,9 @@ fn run_case(
     stats.cases += 1;
     stats.resyncs += crate::model::ownership::RESYNCS.with(std::cell::Cell::get);
     stats.reabsorbs += crate::model::ownership::REABSORBS.with(std::cell::Cell::get);
+    for counter in CLAMP_COUNTERS {
+        stats.clamps += counter.with(std::cell::Cell::get);
+    }
     let context = format!(
         "seed {seed:#x} case {case} inputs L={left:?} C={center:?} R={right:?} ops={ops:?}"
     );
@@ -1004,6 +1226,13 @@ fn run(frames: bool) {
             "reported"
         };
         println!("CLASS {class} ({asserted}): {} case(s)", list.len());
+        for set in ["seed 0x1", "seed 0x3"] {
+            let in_set = list
+                .iter()
+                .filter(|(_, text)| text.starts_with(set))
+                .count();
+            println!("  SET {set}: {in_set} case(s)");
+        }
         let mut shortest: Vec<&(usize, String)> = list.iter().collect();
         shortest.sort_by_key(|(ops, text)| (*ops, text.len()));
         for (_, example) in shortest.iter().take(3) {
@@ -1016,6 +1245,10 @@ fn run(frames: bool) {
         .map(|(class, list)| (class, list.len()))
         .collect();
     assert_eq!(stats.cases, SEEDS.len() * CASES);
+    assert_eq!(
+        (stats.panics, stats.resyncs, stats.reabsorbs, stats.clamps),
+        (0, 0, 0, 0)
+    );
     assert!(
         failing.is_empty(),
         "invariant classes with cases: {failing:?}"
@@ -1046,7 +1279,12 @@ fn replay(seed: u64, target: usize, frames: bool) {
             .iter()
             .any(|(_, text)| text.contains(&format!("case {target} ")))
         {
-            println!("REPLAY CLASS {class}");
+            for (_, text) in list
+                .iter()
+                .filter(|(_, text)| text.contains(&format!("case {target} ")))
+            {
+                println!("REPLAY CLASS {class}: {text}");
+            }
         }
     }
 }

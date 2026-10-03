@@ -21,6 +21,13 @@ use std::ops::Range;
 mod history;
 pub(crate) mod ownership;
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static SPLICE_CLAMPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static REPLAY_START_CLAMPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static REPLAY_END_CLAMPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 pub(crate) use history::Step;
 
 #[cfg(test)]
@@ -350,6 +357,11 @@ impl Section {
     #[cfg(test)]
     pub(crate) const fn holds_joined_lines(&self) -> bool {
         self.joined_through.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lent_records(&self) -> &[Lent] {
+        &self.lent
     }
 
     /// True when this section still needs review.
@@ -817,6 +829,10 @@ impl<T> ChunkedVec<T> {
     /// Replace a flat range with new lines or rows. A range past the end or
     /// running backwards is clamped to the items that exist.
     fn splice(&mut self, range: Range<usize>, replacement: Vec<T>) {
+        #[cfg(test)]
+        if range.start > range.end || range.end > self.len {
+            SPLICE_CLAMPS.with(|count| count.set(count.get() + 1));
+        }
         debug_assert!(range.start <= range.end);
         debug_assert!(range.end <= self.len);
         let start = range.start.min(self.len);
