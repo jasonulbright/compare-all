@@ -2424,6 +2424,44 @@ mod find_tests {
     }
 
     #[test]
+    fn find_copy_and_picker_jobs_give_back_their_commands_in_the_poll_that_delivers_their_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let (left, right) = testing::registry_pair(dir.path());
+        let mut view = RecordsView::new(Flavor::Registry, left, right, &context(), 919);
+        assert!(wait_until(Duration::from_secs(20), || {
+            view.poll();
+            view.has_comparison() && !view.pipeline.is_running()
+        }));
+        let (find, _find_held) =
+            ca_ui::testing::job_held_after(vec![crate::search::FindMessage::NotFound]);
+        view.find_job = Some(super::FindRun {
+            job: find,
+            revision: view.revision,
+            cursor: view.listing.cursor(),
+        });
+        let (copy, _copy_held) =
+            ca_ui::testing::job_held_after(vec![super::SelectionCopyMessage::Cancelled]);
+        view.copy_job = Some(super::SelectionCopyRun { job: copy });
+        let (picker, _picker_held) =
+            ca_ui::testing::job_held_after(vec![ca_ui::dialog::DialogMessage::Dismissed]);
+        view.picker = Some(picker);
+        assert!(view.accepts(Command::Cancel));
+        assert!(!view.accepts(Command::OpenFile));
+
+        view.poll();
+
+        assert_eq!(view.find_status.as_deref(), Some("No match found."));
+        assert!(
+            !view.accepts(Command::Cancel),
+            "Cancel stays on for jobs that have answered"
+        );
+        assert!(
+            view.accepts(Command::OpenFile),
+            "Open File stays off for a picker that has answered"
+        );
+    }
+
+    #[test]
     fn registry_compare_info_opens_a_window_after_the_comparison_finishes() {
         let dir = tempfile::tempdir().unwrap();
         let (left, right) = testing::registry_pair(dir.path());

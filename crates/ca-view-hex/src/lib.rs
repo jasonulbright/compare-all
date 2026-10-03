@@ -3413,4 +3413,35 @@ mod tests {
         );
         assert_eq!(view.caret_row(), 3);
     }
+
+    #[test]
+    fn a_find_and_a_picker_give_back_their_commands_in_the_poll_that_delivers_their_answer() {
+        let mut view = HexView::from_data(
+            PathBuf::from("left.bin"),
+            PathBuf::from("right.bin"),
+            &context(),
+            1,
+            crate::jobs::HexData::default(),
+        );
+        let (find, _find_held) =
+            ca_ui::testing::job_held_after(vec![crate::find::FindMessage::NotFound]);
+        view.find_job = Some(find);
+        let (picker, _picker_held) =
+            ca_ui::testing::job_held_after(vec![ca_ui::dialog::DialogMessage::Dismissed]);
+        view.picker = Some(picker);
+        assert!(view.accepts(Command::Cancel));
+        assert!(!view.accepts(Command::OpenFile));
+
+        view.tick();
+
+        assert_eq!(view.message.as_deref(), Some("Not found."));
+        assert!(
+            !view.accepts(Command::Cancel),
+            "Cancel stays on for a search that has answered"
+        );
+        assert!(
+            view.accepts(Command::OpenFile),
+            "Open File stays off for a picker that has answered"
+        );
+    }
 }

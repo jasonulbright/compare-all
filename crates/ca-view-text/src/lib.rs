@@ -956,9 +956,7 @@ impl TextView {
             return;
         };
         let messages = job.drain();
-        let finished =
-            job.is_finished() || messages.iter().any(ca_ui::worker::Terminal::is_terminal);
-        if finished {
+        if job.is_finished() {
             self.format_job = None;
         }
         for message in messages {
@@ -1143,9 +1141,8 @@ impl TextView {
             return;
         };
         let messages = job.drain();
-        let mut finished = job.is_finished();
+        let finished = job.is_finished();
         for message in messages {
-            finished |= ca_ui::worker::Terminal::is_terminal(&message);
             match message {
                 TextMessage::Progress(step) => self.status = Status::Running(step),
                 TextMessage::Failed(reason) => self.status = Status::Failed(reason),
@@ -1716,9 +1713,8 @@ impl TextView {
             return;
         };
         let messages = job.drain();
-        let mut finished = job.is_finished();
+        let finished = job.is_finished();
         for message in messages {
-            finished |= ca_ui::worker::Terminal::is_terminal(&message);
             match message {
                 TextMessage::Ready(data) => self.install(*data, true),
                 TextMessage::Failed(reason) => self.status = Status::Failed(reason),

@@ -635,7 +635,7 @@ impl Pipeline {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::{
-        read_side_with_open, spawn_load, spawn_recompare, FormatSettings, Pipeline, Side,
+        read_side_with_open, spawn_load, spawn_recompare, FormatSettings, Pipeline, Side, Stage,
         TableMessage, TableSettings,
     };
     use ca_table::compare::CellStatus;
@@ -1007,6 +1007,25 @@ mod tests {
         }
         assert_eq!(ready_count, 1, "only the newest request is observed");
         assert_eq!(pipeline.generation(), 2);
+    }
+
+    #[test]
+    fn the_pipeline_stops_running_in_the_poll_that_delivers_the_terminal_message() {
+        let mut pipeline = Pipeline::new();
+        let (job, _held) = ca_ui::testing::job_held_after(vec![
+            TableMessage::Progress(Stage::Comparing),
+            TableMessage::Cancelled,
+        ]);
+        pipeline.start(job);
+        let messages = pipeline.poll();
+        assert!(matches!(
+            messages.as_slice(),
+            [TableMessage::Progress(_), TableMessage::Cancelled]
+        ));
+        assert!(
+            !pipeline.is_running(),
+            "the pipeline still runs a job that has answered"
+        );
     }
 
     #[test]
