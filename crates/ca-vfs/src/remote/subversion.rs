@@ -8,7 +8,7 @@ use command_group::{CommandGroup, GroupChild};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::io::Read;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -338,7 +338,7 @@ impl CommandRunner for ProcessRunner {
         max_bytes: u64,
     ) -> VfsResult<OpenFile> {
         cancel.check()?;
-        let mut command = Command::new(&self.program);
+        let mut command = ca_io::host_command::host_command(&self.program);
         command
             .args(args)
             .stdin(Stdio::null())

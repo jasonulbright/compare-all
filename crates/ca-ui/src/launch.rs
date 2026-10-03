@@ -99,7 +99,7 @@ pub struct SystemSpawner;
 
 impl Spawner for SystemSpawner {
     fn spawn(&self, command: &LaunchCommand) -> Result<(), String> {
-        let mut process = std::process::Command::new(&command.program);
+        let mut process = ca_io::host_command::host_command(&command.program);
         process
             .args(&command.arguments)
             .stdin(std::process::Stdio::null())

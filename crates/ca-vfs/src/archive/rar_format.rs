@@ -42,7 +42,7 @@ fn candidate() -> Result<PathBuf, String> {
     if cfg!(target_os = "macos") {
         return Ok(PathBuf::from("/usr/bin/tar"));
     }
-    let path = std::env::var_os("PATH").unwrap_or_default();
+    let path = ca_io::host_command::host_variable("PATH").unwrap_or_default();
     std::env::split_paths(&path)
         .filter(|dir| dir.is_absolute())
         .map(|dir| dir.join("bsdtar"))
@@ -154,7 +154,7 @@ fn run<W: Write + Send + 'static>(
     deadline: Duration,
     cancel: &Cancel,
 ) -> VfsResult<W> {
-    let mut command = Command::new(program);
+    let mut command = ca_io::host_command::host_command(program);
     command
         .args(args)
         .stdin(Stdio::null())
