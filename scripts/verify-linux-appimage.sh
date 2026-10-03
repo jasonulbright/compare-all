@@ -2,7 +2,8 @@
 # Checks a built self-contained AppImage the way the AppImage catalog test
 # does, in clean Ubuntu 22.04 and 20.04 containers that have no network and
 # no X, GL or xkb package beyond Xvfb and the test tools. The 22.04 container
-# runs every check; the 20.04 container (glibc 2.31) repeats the start. Exit
+# runs every check; the 20.04 container (glibc 2.31) repeats the start. Both
+# check the environment of a host program that the application starts. Exit
 # status 0 means that every check passed; each failed check prints one line
 # that starts with FAIL:.
 set -euo pipefail
@@ -439,6 +440,8 @@ if [[ "$CHECK_ALL" == 1 ]]; then
       [[ -z "$problems" ]] || fail "${file#"$appdir"/} does not load from the AppDir alone: $problems"
     done < <(find "$appdir" -type f -print0)
     echo "ELF files that load through the bundled loader with every library inside the AppDir: $checked"
+  else
+    fail "lib/$LOADER is missing or not executable, so no ELF file can load through the bundled loader"
   fi
 fi
 
@@ -464,8 +467,104 @@ if [[ "$display_ready" != true ]]; then
   finish
 fi
 
-(cd "$work" && APPIMAGE="/input/$APPIMAGE_NAME" APPDIR="$appdir" OWD="$work" ARGV0="$APPIMAGE_NAME" \
-  exec "$appdir/AppRun") > /output/app.log 2>&1 &
+# The application runs `date +%z` through PATH once at start (the zone
+# offset), and bin/ca does so for a script run. A `date` first on the host
+# PATH records the environment that the host program receives. The
+# environment of the application itself (/proc/PID/environ) does not show the
+# variables that sharun sets after the start.
+spy=/tmp/spy
+mkdir -p "$spy"
+cat > "$spy/date" << 'SPY'
+#!/bin/sh
+out="$(cat /tmp/spy/.outdir)"
+mkdir -p "$out"
+tr '\0' '\n' < /proc/$$/environ > "$out/date.$$.env"
+printf '%s\n' "$0 $*" > "$out/date.$$.argv"
+echo +0000
+SPY
+chmod 0755 "$spy/date"
+host_path="$spy:$PATH"
+# Variables that point a host program into the image, or that tell it about
+# the image. Any other variable whose value names an image path also counts.
+IMAGE_VARIABLES=(
+  GCONV_PATH LIBGL_DRIVERS_PATH LIBVA_DRIVERS_PATH GBM_BACKENDS_PATH __EGL_VENDOR_LIBRARY_DIRS
+  TERMINFO AMDGPU_ASIC_ID_TABLE_PATHS CROSS_LIBC_DLOPEN_ROOT SHARUN_DIR APPDIR APPIMAGE ARGV0
+  OWD LD_LIBRARY_PATH LD_PRELOAD
+)
+# wait_child LABEL SECONDS: prints the environment file of the first date
+# child that the entry point LABEL started.
+wait_child() {
+  local file="" waited=0
+  while ((waited < $2)); do
+    file="$(find "/output/child-env/$1" -name 'date.*.env' -print -quit 2> /dev/null)"
+    [[ -n "$file" ]] && break
+    sleep 1
+    waited=$((waited + 1))
+  done
+  printf '%s\n' "$file"
+}
+# check_child LABEL ROOT...: the date child of entry point LABEL received no
+# image variable; each ROOT is a path prefix of the image at this start.
+check_child() {
+  local label="$1" file found="" name value root first
+  shift
+  file="$(wait_child "$label" 20)"
+  if [[ -z "$file" ]]; then
+    fail "the $label start ran no 'date' through PATH within 20 seconds, so its child environment is unchecked"
+    return
+  fi
+  if [[ -e "$appdir/bin/date" ]]; then
+    fail "the AppDir holds bin/date, which comes before the host's date on the child PATH"
+  fi
+  for name in "${IMAGE_VARIABLES[@]}"; do
+    if grep -q "^$name=" "$file"; then
+      found="$found $name"
+    fi
+  done
+  while IFS= read -r line; do
+    name="${line%%=*}"
+    value="${line#*=}"
+    [[ " ${IMAGE_VARIABLES[*]} " == *" $name "* ]] && continue
+    for root; do
+      if [[ "$value" == *"$root"* ]]; then
+        case "$name" in
+          PATH)
+            first="${value%%:*}"
+            if [[ "$first" == "$root"* ]]; then
+              found="$found PATH(starts with $first)"
+            else
+              found="$found PATH(holds $root)"
+            fi
+            ;;
+          *) found="$found $name" ;;
+        esac
+        break
+      fi
+    done
+  done < "$file"
+  if [[ -n "$found" ]]; then
+    fail "the host program 'date' started by the $label start receives image variables:$found"
+  else
+    echo "Child environment of the $label start: no image variable ($(grep -c . "$file") variables)"
+  fi
+}
+# stop_image_processes PREFIX: ends every process whose executable lies under
+# PREFIX.
+stop_image_processes() {
+  local entry signal
+  for signal in TERM KILL; do
+    for entry in /proc/[0-9]*; do
+      if [[ "$(readlink "$entry/exe" 2> /dev/null)" == "$1"* ]]; then
+        kill "-$signal" "${entry#/proc/}" 2> /dev/null || true
+      fi
+    done
+    sleep 1
+  done
+}
+
+echo /output/child-env/AppRun > "$spy/.outdir"
+(cd "$work" && PATH="$host_path" APPIMAGE="/input/$APPIMAGE_NAME" APPDIR="$appdir" OWD="$work" \
+  ARGV0="$APPIMAGE_NAME" exec "$appdir/AppRun") > /output/app.log 2>&1 &
 app_pid=$!
 sleep "$MIN_RUN_SECONDS"
 waited=$MIN_RUN_SECONDS
@@ -530,6 +629,7 @@ else
     echo "Libraries mapped by the running application: $(grep -c . <<< "$mapped"), all from the AppDir"
   fi
 fi
+check_child AppRun "$appdir"
 
 if [[ "$CHECK_ALL" == 1 ]]; then
   icewm > "$work/icewm.log" 2>&1 &
@@ -606,6 +706,28 @@ if [[ "$CHECK_ALL" == 1 ]]; then
   if [[ -n "$error_text" ]]; then
     fail "the screenshot shows error text: '$error_text'; remove the message from the start window"
   fi
+
+  # The other entry points: the two program files started directly, as from
+  # a mounted or extracted image, and the runtime's extract-and-run start.
+  stop_image_processes "$appdir/"
+  app_pid=""
+  echo /output/child-env/bin-compare-all > "$spy/.outdir"
+  (cd "$work" && PATH="$host_path" exec "$appdir/bin/compare-all") > /output/app-bin-compare-all.log 2>&1 &
+  check_child bin-compare-all "$appdir"
+  stop_image_processes "$appdir/"
+
+  printf '# reads the zone offset and does nothing else\n' > "$work/zone.script"
+  echo /output/child-env/bin-ca-script > "$spy/.outdir"
+  ca_status=0
+  (cd "$work" && PATH="$host_path" timeout 60 "$appdir/bin/ca" "@$work/zone.script") \
+    > /output/ca-script.log 2>&1 || ca_status=$?
+  echo "bin/ca @script exit status: $ca_status"
+  check_child bin-ca-script "$appdir"
+
+  echo /output/child-env/extract-and-run > "$spy/.outdir"
+  (cd "$work" && PATH="$host_path" APPIMAGE_EXTRACT_AND_RUN=1 exec "$target") > /output/app-extract-and-run.log 2>&1 &
+  check_child extract-and-run /tmp/appimage_extracted_ "$target"
+  stop_image_processes /tmp/appimage_extracted_
 fi
 
 finish
