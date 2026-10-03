@@ -2765,6 +2765,30 @@ mod tests {
     }
 
     #[test]
+    fn sizing_and_copy_jobs_give_back_their_commands_in_the_poll_that_delivers_their_answer() {
+        let mut view = view_over(Arc::new(FakeSource::new(&[RowStatus::Same], 2)));
+        let (fit, _fit_held) =
+            ca_ui::testing::job_held_after(vec![crate::auto_fit::Message::Cancelled]);
+        view.fit_job = Some(fit);
+        let (copy, _copy_held) =
+            ca_ui::testing::job_held_after(vec![super::SelectionCopyMessage::Cancelled]);
+        view.copy_job = Some(copy);
+        assert!(!view.accepts(Command::ResizeColumnsToFit));
+        assert!(view.accepts(Command::Cancel));
+
+        view.poll();
+
+        assert!(
+            view.accepts(Command::ResizeColumnsToFit),
+            "Resize Columns to Fit stays off for a sizing job that has answered"
+        );
+        assert!(
+            !view.accepts(Command::Cancel),
+            "Cancel stays on for jobs that have answered"
+        );
+    }
+
+    #[test]
     fn table_view_commands_toggle_its_existing_display_controls() {
         let source = FakeSource::new(&[RowStatus::Same], 2);
         let mut view = view_over(Arc::new(source));
