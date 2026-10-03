@@ -620,9 +620,32 @@ fn a_home_that_is_not_the_portable_folder_is_kept() {
     );
 }
 
+fn home_in(database: &[u8], uid: u32) -> Option<OsString> {
+    super::home_of(database, uid)
+}
+
+#[test]
+fn a_password_file_that_is_not_text_still_gives_the_home() {
+    let database = b"root:x:0:0:root:/root:/bin/bash\n\
+                     j\xf6rg:x:1001:1001:J\xf6rg M\xfcller:/home/j\xf6rg:/bin/sh\n\
+                     tester:x:1000:1000:Tester:/home/tester:/bin/sh\n";
+    assert_eq!(
+        home_in(database, 1000),
+        Some(OsString::from("/home/tester"))
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        assert_eq!(
+            home_in(database, 1001),
+            Some(OsStr::from_bytes(b"/home/j\xf6rg").to_owned())
+        );
+    }
+}
+
 #[test]
 fn the_account_home_is_read_from_a_password_line() {
-    let database = "root:x:0:0:root:/root:/bin/bash\n\
+    let database = b"root:x:0:0:root:/root:/bin/bash\n\
                     # comment\n\
                     tester:x:1000:1000:Tester,,,:/home/tester:/bin/sh\n\
                     broken\n";
@@ -632,5 +655,5 @@ fn the_account_home_is_read_from_a_password_line() {
     );
     assert_eq!(super::home_of(database, 0), Some(OsString::from("/root")));
     assert_eq!(super::home_of(database, 4242), None);
-    assert_eq!(super::home_of("nohome:x:7:7:::/bin/sh\n", 7), None);
+    assert_eq!(super::home_of(b"nohome:x:7:7:::/bin/sh\n", 7), None);
 }
