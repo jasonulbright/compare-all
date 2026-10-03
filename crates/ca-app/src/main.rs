@@ -14,6 +14,15 @@ use std::sync::Arc;
 const EXIT_DELETE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 fn main() -> eframe::Result {
+    // A version request is answered before the settings directory is
+    // resolved, so it writes nothing and needs no display. On Windows this
+    // binary has no console to print to, so the request stays a refused
+    // command line shown in the launcher.
+    #[cfg(not(windows))]
+    if cli::asks_for_version(&std::env::args_os().skip(1).collect::<Vec<_>>()) {
+        println!("{}", ca_app::VERSION);
+        return Ok(());
+    }
     // Portable mode is resolved before a window can start its first frame.
     let _ = ca_ui::paths::settings_directory();
     // A refused command line is carried into the launcher and shown there: on
