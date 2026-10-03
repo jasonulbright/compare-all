@@ -210,3 +210,70 @@ fn a_reload_keeps_the_terminator_the_pane_shows_after_the_next_line_was_deleted(
     view.run(Command::Undo);
     assert_output_lines_match_pane(&view);
 }
+
+#[test]
+fn a_paste_over_lines_of_several_sections_keeps_the_character_before_it_with_the_pasted_text() {
+    let (mut view, _dir) = open(
+        "[s3]\n[s4]\n[u5]\n[u6]\n[u7]\n[c8]\n\n[l11]\n[u12]\n[u13]\n",
+        Some("[c1]\n[c2]\n[u5]\n[u6]\n[u7]\n[c8]\n\n[c10]\n[u12]\n[u13]\n"),
+        "[s3]\n[s4]\n[u5]\n[u6]\n[u7]\n[r9]\n\n[u12]\n[u13]\n",
+    );
+    run_until_ready(&mut view);
+    view.output_pane.place(Caret::new(1, 1), false);
+    view.output_pane.place(Caret::new(8, 1), true);
+    view.output_pane.paste("[p1a]\n~\n[p1b]");
+    absorb(&mut view);
+    assert_eq!(view.output_text(), "[s3]\n[[p1a]\n~\n[p1b]u12]\n[u13]\n");
+    // The removed text ends with the "[" the selection kept, so the deletion
+    // keeps the line "[u12]" whole and the paste follows that line's "[".
+    take_at(&mut view, 0, Command::TakeLeftThenRight);
+    assert_eq!(
+        view.output_text(),
+        "[s3]\n[s4]\n[s3]\n[s4]\n[[p1a]\n~\n[p1b]u12]\n[u13]\n"
+    );
+    undo_all(&mut view);
+    assert_eq!(
+        view.output_text(),
+        "[s3]\n[s4]\n[u5]\n[u6]\n[u7]\n[c8]\n\n[c10]\n[u12]\n[u13]\n"
+    );
+}
+
+#[test]
+fn swap_sides_that_gives_text_back_to_a_holder_keeps_its_records_on_their_text() {
+    let (mut view, _dir) = open(
+        "[c1]\n[u3]\n[l5]\n[u8]\n[u9]\n[u10]\n[l11]\n[l12]\n[u13]\n[l16]\n[u17]\n[u18]\n",
+        Some("[c1]\n[u3]\n[c4]\n[u8]\n[u9]\n[u10]\n[u13]\n[c14]\n[c15]\n[u17]\n[u18]\n"),
+        "[r2]\n[u3]\n[r6]\n[r7]\n[u8]\n[u9]\n[u10]\n[u13]\n[c14]\n[c15]\n[u17]\n[u18]",
+    );
+    run_until_ready(&mut view);
+    view.output_pane.place(Caret::new(5, 5), false);
+    view.output_pane.place(Caret::new(11, 0), true);
+    view.output_pane.paste("[p1a]\n~\n[p1b]");
+    absorb(&mut view);
+    view.output_pane.place(Caret::new(2, 2), false);
+    view.output_pane.place(Caret::new(4, 3), true);
+    view.output_pane.backspace();
+    absorb(&mut view);
+    view.output_pane.place(Caret::new(4, 0), false);
+    view.output_pane.backspace();
+    absorb(&mut view);
+    assert_eq!(
+        view.output_text(),
+        "[c1]\n[u3]\n[c]\n[u10][p1a]~\n[p1b][u18]\n"
+    );
+    view.run(Command::SwapSides);
+    run_until_ready(&mut view);
+    assert_output_lines_match_pane(&view);
+    assert_eq!(view.model().lent_record_problems(), Vec::<String>::new());
+    println!("after swap: {:?}", view.output_text());
+    let holder = view
+        .model()
+        .sections()
+        .iter()
+        .position(crate::model::Section::holds_joined_lines)
+        .unwrap();
+    take_at(&mut view, holder, Command::TakeLeft);
+    println!("after holder take: {:?}", view.output_text());
+    assert_eq!(view.model().lent_record_problems(), Vec::<String>::new());
+    assert_eq!(view.output_text().matches("[u18]").count(), 1);
+}
