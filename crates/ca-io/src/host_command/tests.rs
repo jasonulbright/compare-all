@@ -644,6 +644,15 @@ fn a_password_file_that_is_not_text_still_gives_the_home() {
 }
 
 #[test]
+fn the_account_database_is_read_once() {
+    use std::sync::atomic::Ordering;
+    let first = super::account_home();
+    let second = super::account_home();
+    assert_eq!(first, second);
+    assert_eq!(super::ACCOUNT_READS.load(Ordering::SeqCst), 1);
+}
+
+#[test]
 fn the_account_home_is_read_from_a_password_line() {
     let database = b"root:x:0:0:root:/root:/bin/bash\n\
                     # comment\n\
