@@ -150,6 +150,10 @@ fn without_a_home_the_runtime_folder_is_preferred() -> Result<()> {
     let probe = Probe::new()?;
     let runtime = probe.folder.path().join("runtime");
     std::fs::create_dir(&runtime)?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700))?;
+    }
     let mut command = probe.command("read");
     command.env("XDG_RUNTIME_DIR", &runtime);
     let lines = Probe::run(&mut command)?;
@@ -159,6 +163,31 @@ fn without_a_home_the_runtime_folder_is_preferred() -> Result<()> {
     );
     let notice = value(&lines, "notice");
     assert!(notice.contains("until you log out"), "{notice}");
+    Ok(())
+}
+
+/// A runtime folder open to others, such as the shared temporary folder, can
+/// hold an application folder another user made in advance.
+#[cfg(unix)]
+#[test]
+fn without_a_home_an_open_runtime_folder_is_not_used() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let probe = Probe::new()?;
+    let runtime = probe.folder.path().join("open-runtime");
+    let planted = runtime.join("compare-all");
+    std::fs::create_dir_all(&planted)?;
+    std::fs::set_permissions(&planted, std::fs::Permissions::from_mode(0o777))?;
+    std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o1777))?;
+    let shared = probe.folder.path().join("shared-temporary");
+    std::fs::create_dir(&shared)?;
+    let mut command = probe.command("write");
+    command.env("XDG_RUNTIME_DIR", &runtime);
+    temporary_variables(&mut command, &shared);
+    let lines = Probe::run(&mut command)?;
+    let settings = PathBuf::from(value(&lines, "settings"));
+    assert!(!settings.starts_with(&runtime), "{}", settings.display());
+    assert!(settings.starts_with(&shared), "{}", settings.display());
+    assert!(std::fs::read_dir(&planted)?.next().is_none());
     Ok(())
 }
 

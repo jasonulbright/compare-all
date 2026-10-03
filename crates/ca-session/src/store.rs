@@ -2479,7 +2479,7 @@ impl SettingsPaths {
     /// for this run when the environment names none.
     ///
     /// The fallback is `$XDG_RUNTIME_DIR/compare-all` when that variable names
-    /// an absolute folder of the running user, and otherwise a folder with an
+    /// an absolute folder private to the running user, and otherwise a folder with an
     /// unpredictable name in the temporary folder, made once per process and
     /// open only to the running user. Either way the result carries the
     /// notice a person has to see.
@@ -2508,15 +2508,24 @@ impl SettingsPaths {
     }
 
     /// `$XDG_RUNTIME_DIR/compare-all` when the variable names an absolute
-    /// folder the running user owns.
+    /// folder the running user owns and no one else can open, as the XDG
+    /// Base Directory rule requires of that folder.
+    ///
+    /// The application folder inside it is created or accepted only as a
+    /// folder of the running user, never a link, with access narrowed to that
+    /// user. A runtime folder that is open to others, such as the shared
+    /// temporary folder, can hold an application folder another user made in
+    /// advance, so it is refused before anything inside it is looked at.
     #[must_use]
     pub fn runtime_directory_in(environment: &PlatformEnvironment) -> Option<PathBuf> {
         if environment.family == PlatformFamily::Windows {
             return None;
         }
         let runtime = environment.absolute(environment.runtime_directory.as_ref())?;
-        ca_io::private::check_owned_folder(&runtime).ok()?;
-        Some(runtime.join(APPLICATION_FOLDER))
+        ca_io::private::check_private_folder(&runtime).ok()?;
+        let folder = runtime.join(APPLICATION_FOLDER);
+        ca_io::private::create_owned_folder(&folder).ok()?;
+        Some(folder)
     }
 
     /// Chooses between the two directories without reading the environment.
@@ -3954,6 +3963,8 @@ mod tests {
         assert_eq!(SettingsPaths::runtime_directory_in(&running), None);
         #[cfg(unix)]
         {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(runtime.path(), fs::Permissions::from_mode(0o700)).unwrap();
             let linux = PlatformEnvironment {
                 runtime_directory: Some(runtime.path().as_os_str().to_owned()),
                 ..environment(PlatformFamily::OtherUnix)
@@ -3963,6 +3974,102 @@ mod tests {
                 Some(runtime.path().join("compare-all"))
             );
         }
+    }
+
+    #[cfg(unix)]
+    fn runtime_environment(runtime: &Path) -> PlatformEnvironment {
+        PlatformEnvironment {
+            runtime_directory: Some(runtime.as_os_str().to_owned()),
+            ..environment(PlatformFamily::OtherUnix)
+        }
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// The XDG rule: the runtime folder is owned by the user and open to no
+    /// one else, and the application folder inside it is a private folder of
+    /// the user, never a link or a file.
+    #[cfg(unix)]
+    #[test]
+    fn the_runtime_folder_counts_only_when_it_is_private_to_this_user() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let runtime = TempDir::new().unwrap();
+        let application = runtime.path().join("compare-all");
+        let set_mode = |path: &Path, mode: u32| {
+            fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+        };
+
+        set_mode(runtime.path(), 0o777);
+        assert_eq!(
+            SettingsPaths::runtime_directory_in(&runtime_environment(runtime.path())),
+            None,
+            "a runtime folder open to others"
+        );
+        assert!(!application.exists(), "made inside an open runtime folder");
+
+        set_mode(runtime.path(), 0o700);
+        fs::write(&application, b"x").unwrap();
+        assert_eq!(
+            SettingsPaths::runtime_directory_in(&runtime_environment(runtime.path())),
+            None,
+            "a file in place of the application folder"
+        );
+        fs::remove_file(&application).unwrap();
+
+        let elsewhere = TempDir::new().unwrap();
+        set_mode(elsewhere.path(), 0o700);
+        std::os::unix::fs::symlink(elsewhere.path(), &application).unwrap();
+        assert_eq!(
+            SettingsPaths::runtime_directory_in(&runtime_environment(runtime.path())),
+            None,
+            "a link in place of the application folder"
+        );
+        fs::remove_file(&application).unwrap();
+
+        fs::create_dir(&application).unwrap();
+        set_mode(&application, 0o777);
+        assert_eq!(
+            SettingsPaths::runtime_directory_in(&runtime_environment(runtime.path())),
+            Some(application.clone())
+        );
+        assert_eq!(mode_of(&application), 0o700, "an open folder of the user");
+        fs::remove_dir(&application).unwrap();
+
+        assert_eq!(
+            SettingsPaths::runtime_directory_in(&runtime_environment(runtime.path())),
+            Some(application.clone())
+        );
+        assert_eq!(mode_of(&application), 0o700, "a new folder");
+    }
+
+    /// Only a privileged run can hand a folder to another user, so the case
+    /// checks nothing unless the test runs with that privilege.
+    #[cfg(unix)]
+    #[test]
+    fn a_runtime_child_of_another_user_is_refused_when_run_as_root() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let runtime = TempDir::new().unwrap();
+        fs::set_permissions(runtime.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let application = runtime.path().join("compare-all");
+        fs::create_dir(&application).unwrap();
+        fs::set_permissions(&application, fs::Permissions::from_mode(0o777)).unwrap();
+        if std::os::unix::fs::chown(&application, Some(65534), Some(65534)).is_err() {
+            println!("skipped: handing a folder to another user needs root");
+            return;
+        }
+        assert_eq!(
+            SettingsPaths::runtime_directory_in(&runtime_environment(runtime.path())),
+            None
+        );
+        assert_eq!(
+            mode_of(&application),
+            0o777,
+            "a folder of another user changed"
+        );
     }
 
     #[test]
