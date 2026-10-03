@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
-# Runs the checks of the AppImage catalog test against a built AppImage inside
-# a clean Ubuntu 22.04 container that has no network. Exit status 0 means that
-# every check passed; each failed check prints one line that starts with FAIL:.
+# Checks a built self-contained AppImage the way the AppImage catalog test
+# does, in clean Ubuntu 22.04 and 20.04 containers that have no network and
+# no X, GL or xkb package beyond Xvfb and the test tools. The 22.04 container
+# runs every check; the 20.04 container (glibc 2.31) repeats the start. Exit
+# status 0 means that every check passed; each failed check prints one line
+# that starts with FAIL:.
 set -euo pipefail
 
 if [[ $# -lt 1 || $# -gt 2 ]]; then
@@ -27,8 +30,6 @@ else
 fi
 echo "Output folder: $output"
 
-image=compare-all-appimage-check:22.04
-container="compare-all-appimage-check-$$"
 failures=0
 fail() {
   echo "FAIL: $*"
@@ -49,28 +50,48 @@ else
   stem="$(sed -E 's/\.appimage$//I; s/[-_.]?(x86[-_]64|amd64|linux)//Ig; s/[-_.]v?[0-9].*$//' <<< "$file_name")"
 fi
 
-IFS= read -r -d '' dockerfile <<'EOF' || true
-FROM ubuntu:22.04
-RUN apt-get update \
-  && DEBIAN_FRONTEND=noninteractive apt-get install -y \
-    xvfb icewm x11-utils x11-apps netpbm xdotool xterm xsel stalonetray \
-    libgl1-mesa-dri libgl1-mesa-dev mesa-utils libosmesa6 libsdl1.2-dev libsdl2-2.0-0 \
-    libfuse2 desktop-file-utils libfile-mimeinfo-perl xmlstarlet imagemagick \
-    fonts-wqy-microhei tesseract-ocr tesseract-ocr-eng \
-    libasound2-dev pulseaudio-utils alsa-utils alsa-oss libjack0 \
-    file binutils \
-  && rm -rf /var/lib/apt/lists/* \
-  && mkdir -p /tmp/.X11-unix \
-  && chmod 1777 /tmp/.X11-unix
-EOF
-recipe="$(printf '%s' "$dockerfile" | sha256sum | cut -d ' ' -f 1)"
-built="$(docker image inspect --format '{{ index .Config.Labels "compare-all.recipe" }}' "$image" 2> /dev/null || true)"
-if [[ "$built" != "$recipe" ]]; then
-  echo "Building the check image $image"
-  printf '%s\n' "$dockerfile" | docker build --quiet --label "compare-all.recipe=$recipe" --tag "$image" - > /dev/null
+# The AppImage catalog converts the AppStream file with this build of
+# appstreamcli, which is older than the one in Ubuntu 22.04.
+appstreamcli_url=https://github.com/AppImage/appimage.github.io/releases/download/deps/appstreamcli-x86_64.AppImage
+appstreamcli_sum=0b567ce75945bea2ba047533290ab85fb62749b025ef8bfbf8726e8b28c3e35f
+cache="${XDG_CACHE_HOME:-$HOME/.cache}/compare-all-appimage-check"
+mkdir -p "$cache"
+catalog_appstreamcli="$cache/appstreamcli-x86_64.AppImage"
+if ! printf '%s  %s\n' "$appstreamcli_sum" "$catalog_appstreamcli" | sha256sum --check --status 2> /dev/null; then
+  curl --fail --location --retry 3 --silent --show-error "$appstreamcli_url" --output "$catalog_appstreamcli.part"
+  if ! printf '%s  %s\n' "$appstreamcli_sum" "$catalog_appstreamcli.part" | sha256sum --check --status; then
+    rm -f "$catalog_appstreamcli.part"
+    echo "SHA-256 sum of $appstreamcli_url is not $appstreamcli_sum" >&2
+    exit 1
+  fi
+  mv -f "$catalog_appstreamcli.part" "$catalog_appstreamcli"
 fi
 
-IFS= read -r -d '' check_script <<'CHECK' || true
+# Xvfb, a window manager, window tools, screenshot and OCR tools, and the
+# lint tools. --no-install-recommends keeps Mesa drivers and X client
+# libraries that these do not need out of the container.
+tools=(
+  xvfb icewm x11-utils xdotool imagemagick tesseract-ocr tesseract-ocr-eng
+  desktop-file-utils appstream file binutils
+)
+check_image() {
+  local release="$1" image="compare-all-appimage-check:$1" dockerfile recipe built
+  dockerfile="FROM ubuntu:$release
+RUN apt-get update \\
+  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ${tools[*]} \\
+  && rm -rf /var/lib/apt/lists/* \\
+  && mkdir -p /tmp/.X11-unix \\
+  && chmod 1777 /tmp/.X11-unix"
+  recipe="$(printf '%s' "$dockerfile" | sha256sum | cut -d ' ' -f 1)"
+  built="$(docker image inspect --format '{{ index .Config.Labels "compare-all.recipe" }}' "$image" 2> /dev/null || true)"
+  if [[ "$built" != "$recipe" ]]; then
+    echo "Building the check image $image" >&2
+    printf '%s\n' "$dockerfile" | docker build --quiet --label "compare-all.recipe=$recipe" --tag "$image" - > /dev/null
+  fi
+  printf '%s\n' "$image"
+}
+
+IFS= read -r -d '' check_script << 'CHECK' || true
 set -euo pipefail
 
 MIN_RUN_SECONDS=10
@@ -78,19 +99,8 @@ WINDOW_TIMEOUT_SECONDS=30
 FLAT_COLOR_PERCENT=90
 MIN_TEXT_WORDS=5
 ERROR_WORDS='error|errors|failed|failure|panic|panicked|cannot|could not|unable to|fatal|exception|traceback|segmentation fault|core dumped|not found|permission denied|no such file'
-EXCLUDED_LIBRARIES=(
-  ld-linux.so.2 ld-linux-x86-64.so.2 libanl.so.1 libBrokenLocale.so.1 libcidn.so.1
-  libc.so.6 libdl.so.2 libm.so.6 libmvec.so.1 libnss_compat.so.2 libnss_dns.so.2
-  libnss_files.so.2 libnss_hesiod.so.2 libnss_nisplus.so.2 libnss_nis.so.2
-  libpthread.so.0 libresolv.so.2 librt.so.1 libthread_db.so.1 libutil.so.1
-  libstdc++.so.6 libGL.so.1 libEGL.so.1 libGLdispatch.so.0 libGLX.so.0
-  libOpenGL.so.0 libdrm.so.2 libglapi.so.0 libgbm.so.1 libxcb.so.1 libX11.so.6
-  libX11-xcb.so.1 libwayland-client.so.0 libasound.so.2 libfontconfig.so.1
-  libfreetype.so.6 libharfbuzz.so.0 libcom_err.so.2 libexpat.so.1 libgcc_s.so.1
-  libgpg-error.so.0 libICE.so.6 libSM.so.6 libusb-1.0.so.0 libuuid.so.1 libz.so.1
-  libjack.so.0 libpipewire-0.3.so.0 libxcb-dri3.so.0 libxcb-dri2.so.0
-  libfribidi.so.0 libgmp.so.10
-)
+LOADER=ld-linux-x86-64.so.2
+APPSTREAM_ID=io.github.jasonulbright.compare_all
 
 failures=0
 fail() {
@@ -98,7 +108,7 @@ fail() {
   failures=$((failures + 1))
 }
 finish() {
-  echo "Failed checks in the container: $failures"
+  echo "Failed checks in the $CHECK_HOST container: $failures"
   if ((failures > 0)); then
     exit 1
   fi
@@ -106,6 +116,13 @@ finish() {
 }
 hex() {
   od -An -tx1 -j "$2" -N "$3" "$1" | tr -d ' \n'
+}
+is_elf() {
+  [[ "$(hex "$1" 0 4 2> /dev/null)" == 7f454c46 ]]
+}
+is_dynamic() {
+  readelf -lW "$1" 2> /dev/null | grep -q 'Requesting program interpreter' ||
+    readelf -dW "$1" 2> /dev/null | grep -q '(NEEDED)'
 }
 normalize() {
   tr '[:upper:]' '[:lower:]' <<< "$1" | tr -cd '[:lower:][:digit:]'
@@ -147,7 +164,7 @@ target="$work/test.AppImage"
 cp "/input/$APPIMAGE_NAME" "$target"
 chmod 0755 "$target"
 
-if [[ "$(hex "$target" 0 4)" != 7f454c46 ]]; then
+if ! is_elf "$target"; then
   fail "the file is not an ELF executable; build it with appimagetool"
   finish
 fi
@@ -171,157 +188,261 @@ if ! (cd "$work" && ./test.AppImage --appimage-extract > "$work/extract.log" 2>&
 fi
 appdir="$work/squashfs-root"
 
-if [[ ! -e "$appdir/AppRun" ]]; then
-  fail "AppRun is missing at the AppDir root; add an executable AppRun"
-elif [[ ! -x "$appdir/AppRun" ]]; then
-  fail "AppRun is not executable; set mode 0755 on AppRun before packaging"
-fi
-
-dir_icon="$appdir/.DirIcon"
-if [[ ! -e "$dir_icon" && ! -L "$dir_icon" ]]; then
-  fail ".DirIcon is missing at the AppDir root; add it as a PNG copy of the icon or a relative symlink to it"
-else
-  if [[ -L "$dir_icon" ]]; then
-    link="$(readlink "$dir_icon")"
-    resolved="$(readlink -m "$dir_icon")"
-    if [[ "$link" == /* ]]; then
-      fail ".DirIcon is a symlink to the absolute path '$link'; make the link relative"
-    elif [[ "$resolved" != "$appdir"/* ]]; then
-      fail ".DirIcon is a symlink to '$link', outside the AppDir; point it at an icon inside the AppDir"
-    elif [[ ! -f "$resolved" ]]; then
-      fail ".DirIcon is a symlink to '$link', which does not exist; point it at the icon file"
-    fi
-  fi
-  if [[ -f "$dir_icon" && "$(file -bL --mime-type "$dir_icon")" != image/png ]]; then
-    fail ".DirIcon is $(file -bL --mime-type "$dir_icon"), not a PNG; use a PNG icon"
-  fi
-fi
-
-shopt -s nullglob
-desktops=("$appdir"/*.desktop)
-shopt -u nullglob
-desktop=""
-if ((${#desktops[@]} != 1)); then
-  fail "the AppDir root holds ${#desktops[@]} .desktop files, not exactly one; keep one .desktop file at the root"
-else
-  desktop="${desktops[0]}"
-fi
-
-if [[ -n "$desktop" ]]; then
-  validate_status=0
-  validate_output="$(desktop-file-validate "$desktop" 2>&1)" || validate_status=$?
-  validate_problems="$(grep -E ': (error|warning): ' <<< "$validate_output" | head -n 3 | tr '\n' ' ' || true)"
-  if ((validate_status != 0)) || [[ -n "$validate_problems" ]]; then
-    fail "desktop-file-validate reports problems in $(basename "$desktop"): ${validate_problems:-status $validate_status}"
-  fi
-  for key in Icon Categories; do
-    count="$(desktop_key_count "$key" "$desktop")"
-    if [[ "$count" != 1 ]]; then
-      fail "$key appears $count times in [Desktop Entry] of $(basename "$desktop"); set it exactly once"
-    fi
-  done
-  if [[ "$(desktop_value Terminal "$desktop")" == true ]]; then
-    fail "the desktop file sets Terminal=true; this check starts graphical applications only"
+if [[ "$CHECK_ALL" == 1 ]]; then
+  if [[ ! -e "$appdir/AppRun" ]]; then
+    fail "AppRun is missing at the AppDir root; add an executable AppRun"
+  elif [[ ! -x "$appdir/AppRun" ]]; then
+    fail "AppRun is not executable; set mode 0755 on AppRun before packaging"
   fi
 
-  icon_name="$(desktop_value Icon "$desktop")"
-  icon_file=""
-  if [[ -n "$icon_name" ]]; then
-    icon_file="$(find "$appdir" -path '*/scalable/*' -name "$icon_name.svg*" -print -quit)"
-    for size in 128x128 256x256 512x512; do
-      [[ -n "$icon_file" ]] && break
-      icon_file="$(find "$appdir" -path "*/$size/*" -name "$icon_name.png" -print -quit)"
-    done
-    for extension in svg svgz png xpm; do
-      [[ -n "$icon_file" ]] && break
-      icon_file="$(find "$appdir" -maxdepth 1 -name "$icon_name.$extension" -print -quit)"
-    done
-  fi
-  if [[ -z "$icon_file" && -e "$dir_icon" ]]; then
-    icon_file="$dir_icon"
-  fi
-  if [[ -z "$icon_file" ]]; then
-    fail "no icon file matches Icon=$icon_name; add $icon_name.png at the AppDir root"
+  dir_icon="$appdir/.DirIcon"
+  if [[ ! -e "$dir_icon" && ! -L "$dir_icon" ]]; then
+    fail ".DirIcon is missing at the AppDir root; add it as a PNG copy of the icon or a relative symlink to it"
   else
-    icon_type="$(file -bL "$icon_file")"
-    if [[ "$icon_type" == PNG* ]]; then
-      if [[ ! "$icon_type" =~ [0-9]+\ x\ [0-9]+ ]]; then
-        fail "the size of the icon ${icon_file#"$appdir"/} cannot be read; use a valid PNG"
+    if [[ -L "$dir_icon" ]]; then
+      link="$(readlink "$dir_icon")"
+      resolved="$(readlink -m "$dir_icon")"
+      if [[ "$link" == /* ]]; then
+        fail ".DirIcon is a symlink to the absolute path '$link'; make the link relative"
+      elif [[ "$resolved" != "$appdir"/* ]]; then
+        fail ".DirIcon is a symlink to '$link', outside the AppDir; point it at an icon inside the AppDir"
+      elif [[ ! -f "$resolved" ]]; then
+        fail ".DirIcon is a symlink to '$link', which does not exist; point it at the icon file"
       fi
-    elif [[ "$icon_file" != *.svg && "$icon_file" != *.svgz ]]; then
-      fail "the icon ${icon_file#"$appdir"/} is '$icon_type', not a PNG; use a PNG icon"
+    fi
+    if [[ -f "$dir_icon" && "$(file -bL --mime-type "$dir_icon")" != image/png ]]; then
+      fail ".DirIcon is $(file -bL --mime-type "$dir_icon"), not a PNG; use a PNG icon"
     fi
   fi
 
-  app_name="$(desktop_value Name "$desktop")"
-  stem_key="$(normalize "$APP_STEM")"
-  name_key="$(normalize "$app_name")"
-  desktop_key="$(normalize "$(basename "$desktop" .desktop)")"
-  if ! names_agree "$stem_key" "$name_key" || ! names_agree "$stem_key" "$desktop_key"; then
-    fail "the names disagree: file name '$APP_STEM', desktop Name '$app_name', desktop file '$(basename "$desktop")'; use one application name"
+  shopt -s nullglob
+  desktops=("$appdir"/*.desktop)
+  shopt -u nullglob
+  desktop=""
+  if ((${#desktops[@]} != 1)); then
+    fail "the AppDir root holds ${#desktops[@]} .desktop files, not exactly one; keep one .desktop file at the root"
+  else
+    desktop="${desktops[0]}"
   fi
-fi
 
-bundled="$(find "$appdir" -printf '%f\n' | sort -u)"
-for library in "${EXCLUDED_LIBRARIES[@]}"; do
-  if grep -qxF "$library" <<< "$bundled"; then
-    fail "the AppDir bundles $library, which is on the AppImage excludelist; remove it from the AppDir"
-  fi
-done
-
-update_info=""
-read -r update_offset update_size < <(readelf -SW "$target" \
-  | sed -E 's/^ *\[ *[0-9]+\] *//' | awk '$1 == ".upd_info" { print $4, $5 }') || true
-if [[ -n "${update_offset:-}" && -n "${update_size:-}" ]]; then
-  update_end=$((16#$update_offset + 16#$update_size))
-  update_info="$(head -c "$update_end" "$target" | tail -c "$((16#$update_size))" | tr -d '\000' \
-    | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
-fi
-if [[ -z "$update_info" ]]; then
-  fail "the AppImage has no update information; pass -u 'gh-releases-zsync|<owner>|<repo>|latest|<name>-*-x86_64.AppImage.zsync' to appimagetool"
-else
-  echo "Update information: $update_info"
-  IFS='|' read -r -a update_fields <<< "$update_info"
-  if [[ "${update_fields[0]}" != gh-releases-zsync || ${#update_fields[@]} -ne 5 ]]; then
-    fail "the update information '$update_info' is not of the form gh-releases-zsync|<owner>|<repo>|<tag>|<file pattern>"
-  fi
-fi
-
-container_glibc="$(ldd --version | awk 'NR == 1 { print $NF }')"
-library_path=""
-if grep -q LD_LIBRARY_PATH "$appdir/AppRun" 2> /dev/null; then
-  for folder in usr/lib/x86_64-linux-gnu usr/lib usr/lib64 lib/x86_64-linux-gnu lib lib64; do
-    if [[ -d "$appdir/$folder" ]]; then
-      library_path="${library_path:+$library_path:}$appdir/$folder"
+  if [[ -n "$desktop" ]]; then
+    validate_status=0
+    validate_output="$(desktop-file-validate "$desktop" 2>&1)" || validate_status=$?
+    validate_problems="$(grep -E ': (error|warning): ' <<< "$validate_output" | head -n 3 | tr '\n' ' ' || true)"
+    if ((validate_status != 0)) || [[ -n "$validate_problems" ]]; then
+      fail "desktop-file-validate reports problems in $(basename "$desktop"): ${validate_problems:-status $validate_status}"
     fi
+    for key in Icon Categories; do
+      count="$(desktop_key_count "$key" "$desktop")"
+      if [[ "$count" != 1 ]]; then
+        fail "$key appears $count times in [Desktop Entry] of $(basename "$desktop"); set it exactly once"
+      fi
+    done
+    if [[ "$(desktop_value Terminal "$desktop")" == true ]]; then
+      fail "the desktop file sets Terminal=true; this check starts graphical applications only"
+    fi
+
+    icon_name="$(desktop_value Icon "$desktop")"
+    icon_file=""
+    if [[ -n "$icon_name" ]]; then
+      icon_file="$(find "$appdir" -path '*/scalable/*' -name "$icon_name.svg*" -print -quit)"
+      for size in 128x128 256x256 512x512; do
+        [[ -n "$icon_file" ]] && break
+        icon_file="$(find "$appdir" -path "*/$size/*" -name "$icon_name.png" -print -quit)"
+      done
+      for extension in svg svgz png xpm; do
+        [[ -n "$icon_file" ]] && break
+        icon_file="$(find "$appdir" -maxdepth 1 -name "$icon_name.$extension" -print -quit)"
+      done
+    fi
+    if [[ -z "$icon_file" && -e "$dir_icon" ]]; then
+      icon_file="$dir_icon"
+    fi
+    if [[ -z "$icon_file" ]]; then
+      fail "no icon file matches Icon=$icon_name; add $icon_name.png at the AppDir root"
+    else
+      icon_type="$(file -bL "$icon_file")"
+      if [[ "$icon_type" == PNG* ]]; then
+        if [[ ! "$icon_type" =~ [0-9]+\ x\ [0-9]+ ]]; then
+          fail "the size of the icon ${icon_file#"$appdir"/} cannot be read; use a valid PNG"
+        fi
+      elif [[ "$icon_file" != *.svg && "$icon_file" != *.svgz ]]; then
+        fail "the icon ${icon_file#"$appdir"/} is '$icon_type', not a PNG; use a PNG icon"
+      fi
+    fi
+
+    app_name="$(desktop_value Name "$desktop")"
+    stem_key="$(normalize "$APP_STEM")"
+    name_key="$(normalize "$app_name")"
+    desktop_key="$(normalize "$(basename "$desktop" .desktop)")"
+    if ! names_agree "$stem_key" "$name_key" || ! names_agree "$stem_key" "$desktop_key"; then
+      fail "the names disagree: file name '$APP_STEM', desktop Name '$app_name', desktop file '$(basename "$desktop")'; use one application name"
+    fi
+  fi
+
+  # The catalog lint reads only usr/share/metainfo/*appdata.xml and runs
+  # appstreamcli validate-tree once it finds one.
+  shopt -s nullglob
+  appdata=("$appdir"/usr/share/metainfo/*appdata.xml)
+  shopt -u nullglob
+  if ((${#appdata[@]} == 0)); then
+    fail "usr/share/metainfo holds no *appdata.xml file; add $APPSTREAM_ID.appdata.xml"
+  else
+    validate_status=0
+    appstreamcli validate-tree --no-net "$appdir" > "$work/appstream.log" 2>&1 || validate_status=$?
+    appstream_problems="$(grep -E '^ *[EW]: ' "$work/appstream.log" | head -n 3 | tr -s ' ' | tr '\n' ' ' || true)"
+    if ((validate_status != 0)) || [[ -n "$appstream_problems" ]]; then
+      fail "appstreamcli validate-tree reports problems: ${appstream_problems:-status $validate_status}"
+    else
+      echo "AppStream: $(tail -n 1 "$work/appstream.log")"
+    fi
+    converter="$work/catalog-appstreamcli"
+    mkdir -p "$converter"
+    cp /tools/appstreamcli-x86_64.AppImage "$converter/"
+    chmod 0755 "$converter/appstreamcli-x86_64.AppImage"
+    if ! (cd "$converter" && ./appstreamcli-x86_64.AppImage --appimage-extract > /dev/null 2>&1) \
+      || ! APPDIR="$converter/squashfs-root" "$converter/squashfs-root/AppRun" \
+        convert "${appdata[0]}" "$work/appdata.yaml" > "$work/convert.log" 2>&1 \
+      || ! grep -q "^ID: $APPSTREAM_ID\$" "$work/appdata.yaml"; then
+      fail "the catalog's appstreamcli cannot convert $(basename "${appdata[0]}"): $(tail -n 1 "$work/convert.log" 2> /dev/null)"
+    fi
+  fi
+
+  update_info=""
+  read -r update_offset update_size < <(readelf -SW "$target" \
+    | sed -E 's/^ *\[ *[0-9]+\] *//' | awk '$1 == ".upd_info" { print $4, $5 }') || true
+  if [[ -n "${update_offset:-}" && -n "${update_size:-}" ]]; then
+    update_end=$((16#$update_offset + 16#$update_size))
+    update_info="$(head -c "$update_end" "$target" | tail -c "$((16#$update_size))" | tr -d '\000' \
+      | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+  fi
+  if [[ -z "$update_info" ]]; then
+    fail "the AppImage has no update information; pass -u 'gh-releases-zsync|<owner>|<repo>|latest|<name>-*-x86_64.AppImage.zsync' to appimagetool"
+  else
+    echo "Update information: $update_info"
+    IFS='|' read -r -a update_fields <<< "$update_info"
+    if [[ "${update_fields[0]}" != gh-releases-zsync || ${#update_fields[@]} -ne 5 ]]; then
+      fail "the update information '$update_info' is not of the form gh-releases-zsync|<owner>|<repo>|<tag>|<file pattern>"
+    fi
+  fi
+
+  # The catalog rates an AppImage self-contained when the payload ships a
+  # dynamic loader and a C library (or holds no dynamic ELF file at all) and
+  # the runtime is static.
+  elf_files=0
+  dynamic_files=0
+  while IFS= read -r -d '' file; do
+    is_elf "$file" || continue
+    elf_files=$((elf_files + 1))
+    is_dynamic "$file" && dynamic_files=$((dynamic_files + 1))
+  done < <(find "$appdir" -type f -print0)
+  loader_found="$(find "$appdir" \( -name 'ld-linux*.so*' -o -name 'ld-2.*.so' -o -name 'ld-musl-*.so.1' \) -print -quit)"
+  libc_found="$(find "$appdir" \( -name 'libc.so.6' -o -name 'libc.musl-*.so.1' -o -name 'ld-musl-*.so.1' \) -print -quit)"
+  if ((elf_files > 0 && dynamic_files == 0)); then
+    libc_mode=none
+  elif [[ -n "$loader_found" && -n "$libc_found" ]]; then
+    libc_mode=bundled
+  else
+    libc_mode=host
+  fi
+  if is_dynamic "$target"; then
+    runtime_mode=dynamic
+  else
+    runtime_mode=static
+  fi
+  self_contained=false
+  if [[ "$libc_mode" != host && "$runtime_mode" == static ]]; then
+    self_contained=true
+  fi
+  echo "X-AppImage-Libc=$libc_mode X-AppImage-Runtime=$runtime_mode X-AppImage-Self-Contained=$self_contained"
+  if [[ "$self_contained" != true ]]; then
+    fail "the catalog rates the AppImage X-AppImage-Self-Contained=false (libc $libc_mode, runtime $runtime_mode); bundle the loader and libc.so.6 and use the static type2 runtime"
+  fi
+
+  # The files a start on a host without X, GL or xkb libraries needs.
+  required=(
+    AppRun AppRun.sh sharun lib/lib.path "lib/$LOADER" lib/libc.so.6 lib/libm.so.6
+    lib/libgcc_s.so.1 lib/libanl.so.1 lib/libcrypt.so.1
+    lib/libX11.so.6 lib/libX11-xcb.so.1 lib/libxcb.so.1 lib/libXcursor.so.1 lib/libXi.so.6
+    lib/libXrender.so.1 lib/libxkbcommon.so.0 lib/libxkbcommon-x11.so.0
+    lib/libwayland-client.so.0 lib/libwayland-cursor.so.0 lib/libwayland-egl.so.1
+    lib/libGL.so.1 lib/libGLX.so.0 lib/libGLX_mesa.so.0 lib/libEGL.so.1 lib/libEGL_mesa.so.0
+    lib/libGLdispatch.so.0 share/glvnd/egl_vendor.d/50_mesa.json share/X11/xkb/rules/evdev
+    lib/sharun-preload/anylinux.so lib/sharun-preload/cross-libc-dlopen.so
+    shared/bin/compare-all shared/bin/ca bin/compare-all bin/ca
+    usr/share/doc/compare-all/LICENSE usr/share/doc/compare-all/THIRD-PARTY-NOTICES.md
+    usr/share/doc/compare-all/bundled-packages.tsv usr/share/doc/compare-all/bundled-files.tsv
+    usr/share/doc/compare-all/licenses/sharun/LICENSE
+    usr/share/doc/compare-all/licenses/sharun/LICENSE-linuxdeploy-plugin-checkrt
+    usr/share/doc/compare-all/licenses/cross-libc-dlopen/LICENSE
+    "usr/share/metainfo/$APPSTREAM_ID.appdata.xml" usr/share/applications/compare-all.desktop
+  )
+  for path in "${required[@]}"; do
+    [[ -e "$appdir/$path" ]] || fail "the AppDir lacks $path, which a start on a bare host needs"
   done
-fi
-: > "$work/glibc-versions"
-elf_count=0
-while IFS= read -r -d '' elf; do
-  [[ "$(hex "$elf" 0 4)" == 7f454c46 ]] || continue
-  [[ "$(readelf -dW "$elf" 2> /dev/null)" == *"(NEEDED)"* ]] || continue
-  elf_count=$((elf_count + 1))
-  linked="$(LD_LIBRARY_PATH="$library_path" ldd "$elf" 2>&1 || true)"
-  missing="$(awk '/=> not found/ { print $1 }' <<< "$linked" | sort -u | tr '\n' ' ')"
-  if [[ -n "$missing" ]]; then
-    fail "${elf#"$appdir"/} needs ${missing% } that neither the AppDir nor a clean Ubuntu 22.04 provides; bundle it"
+  shopt -s nullglob
+  gallium=("$appdir"/lib/libgallium-*.so)
+  hooks=("$appdir"/bin/*.hook)
+  shopt -u nullglob
+  ((${#gallium[@]} > 0)) || fail "the AppDir lacks lib/libgallium-*.so, the Mesa driver with the software renderer"
+  ((${#hooks[@]} == 0)) || fail "the AppDir holds start hooks that AppRun.sh does not run: ${hooks[*]#"$appdir"/}"
+  for link in AppRun bin/compare-all bin/ca; do
+    cmp -s "$appdir/sharun" "$appdir/$link" || fail "$link is not sharun; sharun starts the programs on the bundled loader"
+  done
+  absolute="$(find "$appdir" -type l -lname '/*' -printf '%P ' | head -c 300)"
+  [[ -z "$absolute" ]] || fail "symlinks with absolute targets: $absolute"
+  dangling="$(find "$appdir" -xtype l -printf '%P ' | head -c 300)"
+  [[ -z "$dangling" ]] || fail "dangling symlinks: $dangling"
+
+  # Every bundled package has its license texts in the AppDir.
+  manifest="$appdir/usr/share/doc/compare-all/bundled-packages.tsv"
+  licenses="$appdir/usr/share/doc/compare-all/licenses"
+  if [[ -f "$manifest" ]]; then
+    for package in glibc mesa libx11 libxkbcommon; do
+      grep -q "^$package	" "$manifest" || fail "the package manifest lists no $package"
+    done
+    while IFS=$'\t' read -r package version source terms; do
+      [[ "$package" == name ]] && continue
+      [[ -d "$licenses/$package" ]] && continue
+      for term in $(tr '()' '  ' <<< "$terms"); do
+        case "$term" in AND | OR | WITH | and | or | with) continue ;; esac
+        [[ -f "$licenses/spdx/$term.txt" ]] || fail "no license text for $term of $package $version"
+      done
+    done < "$manifest"
+    glibc_version="$(awk -F '\t' '$1 == "glibc" { print $2 }' "$manifest")"
+    echo "Bundled packages: $(($(wc -l < "$manifest") - 1)); glibc $glibc_version; $(awk -F '\t' '$1 == "mesa" { print "mesa " $2 }' "$manifest")"
   fi
-  objdump -T "$elf" 2> /dev/null | awk '/\*UND\*/' | grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' >> "$work/glibc-versions" || true
-done < <(find "$appdir" -type f -print0)
-if [[ "$(readelf -lW "$target" 2> /dev/null)" == *"program interpreter"* ]]; then
-  objdump -T "$target" 2> /dev/null | awk '/\*UND\*/' | grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' >> "$work/glibc-versions" || true
-fi
-newest_glibc="$(sort -uV "$work/glibc-versions" | tail -n 1)"
-echo "Dynamically linked ELF files: $elf_count; newest glibc symbol: ${newest_glibc:-none}; container glibc: $container_glibc"
-if [[ -n "$newest_glibc" ]]; then
-  required="${newest_glibc#GLIBC_}"
-  if [[ "$(printf '%s\n%s\n' "$required" "$container_glibc" | sort -V | tail -n 1)" != "$container_glibc" ]]; then
-    fail "the AppImage needs $newest_glibc, newer than glibc $container_glibc of Ubuntu 22.04; build on an older distribution"
+
+  # Every dynamic ELF file loads through the bundled loader on sharun's
+  # library path, with every library found inside the AppDir.
+  library_path="$appdir/lib"
+  if [[ -f "$appdir/lib/lib.path" ]]; then
+    while IFS= read -r entry; do
+      case "$entry" in
+        +/*) library_path="$library_path:$appdir/lib${entry#+}" ;;
+      esac
+    done < "$appdir/lib/lib.path"
+  fi
+  checked=0
+  if [[ -x "$appdir/lib/$LOADER" ]]; then
+    while IFS= read -r -d '' file; do
+      is_elf "$file" || continue
+      is_dynamic "$file" || continue
+      [[ "$file" == "$appdir/lib/$LOADER" ]] && continue
+      checked=$((checked + 1))
+      listing="$("$appdir/lib/$LOADER" --inhibit-cache --library-path "$library_path" --list "$file" 2>&1 || true)"
+      problems="$(awk -v root="$appdir/" '
+        /=> not found/ { print $1; next }
+        /=>/ && $3 ~ /^\// && index($3, root) != 1 { print $1 " from " $3; next }
+        /not found|error while loading|cannot open/ { print }
+      ' <<< "$listing" | sort -u | tr '\n' ' ')"
+      [[ -z "$problems" ]] || fail "${file#"$appdir"/} does not load from the AppDir alone: $problems"
+    done < <(find "$appdir" -type f -print0)
+    echo "ELF files that load through the bundled loader with every library inside the AppDir: $checked"
   fi
 fi
 
-export DISPLAY=:99 LANG=C LC_ALL=C LIBGL_ALWAYS_SOFTWARE=1
+export DISPLAY=:99 LANG=C LC_ALL=C
 unset WAYLAND_DISPLAY
 mkdir -p "$HOME/.icewm" "$HOME/.local/share/appimagekit"
 printf '%s\n' 'ShowTaskBar = 0' > "$HOME/.icewm/preferences"
@@ -377,7 +498,7 @@ if [[ -n "$startup_error" ]]; then
   import -window root /output/screen.png 2> /dev/null || true
   echo "Last lines of the application output (app.log in the output folder):"
   tail -n 20 /output/app.log | sed 's/^/  | /'
-  cause="$(grep -m 1 'error while loading shared libraries' /output/app.log || true)"
+  cause="$(grep -m 1 -E 'error while loading shared libraries|version .GLIBC_[0-9.]+. not found' /output/app.log || true)"
   if [[ -z "$cause" ]]; then
     cause="$(grep -iE -m 1 '(xkbcommon|xcb|libX[A-Za-z0-9-]*|libEGL|libGL)[^ ]*\.so' /output/app.log || true)"
   fi
@@ -388,106 +509,144 @@ if [[ -n "$startup_error" ]]; then
   fi
   finish
 fi
-echo "A visible window appeared after $waited seconds"
+echo "A visible window appeared after $waited seconds on $CHECK_HOST (glibc $(getconf GNU_LIBC_VERSION | awk '{ print $NF }'))"
 
-icewm > "$work/icewm.log" 2>&1 &
-icewm_pid=$!
-sleep 2
-screen_width=800
-screen_height=600
-read -r screen_width screen_height < <(timeout 5 xdotool getdisplaygeometry 2> /dev/null) || true
-largest=""
-largest_area=0
-largest_geometry=""
-for id in $(timeout 5 xdotool search --onlyvisible --name '.' 2> /dev/null || true); do
-  geometry="$(timeout 5 xdotool getwindowgeometry --shell "$id" 2> /dev/null || true)"
-  width="$(sed -n 's/^WIDTH=//p' <<< "$geometry")"
-  height="$(sed -n 's/^HEIGHT=//p' <<< "$geometry")"
-  [[ "$width" =~ ^[0-9]+$ && "$height" =~ ^[0-9]+$ ]] || continue
-  if ((width * height > largest_area)); then
-    largest="$id"
-    largest_area=$((width * height))
-    largest_geometry="$width $height"
+# sharun keeps its own file as the executable of the program it starts.
+process=""
+for entry in /proc/[0-9]*; do
+  if [[ "$(readlink "$entry/exe" 2> /dev/null)" == "$appdir/bin/compare-all" ]]; then
+    process="${entry#/proc/}"
   fi
 done
-if [[ -n "$largest" ]]; then
-  read -r width height <<< "$largest_geometry"
-  timeout 5 xdotool windowmove "$largest" 0 0 2> /dev/null || true
-  fit_width=$width
-  fit_height=$height
-  ((width > screen_width - 4)) && fit_width=$((screen_width - 4))
-  ((height > screen_height - 30)) && fit_height=$((screen_height - 30))
-  if ((fit_width != width || fit_height != height)); then
-    echo "Resizing the window from ${width}x${height} to ${fit_width}x${fit_height} to fit the screen"
-    timeout 5 xdotool windowsize "$largest" "$fit_width" "$fit_height" 2> /dev/null || true
-    sleep 2
+if [[ -z "$process" ]]; then
+  fail "no running process has $appdir/bin/compare-all as its executable"
+else
+  mapped="$(awk '$6 ~ /\.so/ { print $6 }' "/proc/$process/maps" | sort -u)"
+  printf '%s\n' "$mapped" > /output/mapped-libraries.txt
+  host_mapped="$(grep -v "^$appdir/" <<< "$mapped" | tr '\n' ' ' || true)"
+  if [[ -n "$host_mapped" ]]; then
+    fail "the running application maps libraries of the host: $host_mapped; bundle them"
+  else
+    echo "Libraries mapped by the running application: $(grep -c . <<< "$mapped"), all from the AppDir"
   fi
 fi
 
-screenshot=/output/screenshot.png
-rm -f "$screenshot"
-active="$(timeout 5 xdotool getactivewindow 2> /dev/null || true)"
-if [[ -n "$active" ]] && timeout 30 import -window "$active" "$screenshot" 2> /dev/null; then
-  echo "Screenshot of the active window $active"
-elif [[ -n "$largest" ]] && timeout 30 import -window "$largest" "$screenshot" 2> /dev/null; then
-  echo "Screenshot of the largest window $largest"
-else
-  timeout 30 import -window root "$screenshot" 2> /dev/null || true
-  echo "Screenshot of the whole screen"
-fi
-import -window root /output/screen.png 2> /dev/null || true
+if [[ "$CHECK_ALL" == 1 ]]; then
+  icewm > "$work/icewm.log" 2>&1 &
+  icewm_pid=$!
+  sleep 2
+  screen_width=800
+  screen_height=600
+  read -r screen_width screen_height < <(timeout 5 xdotool getdisplaygeometry 2> /dev/null) || true
+  largest=""
+  largest_area=0
+  largest_geometry=""
+  for id in $(timeout 5 xdotool search --onlyvisible --name '.' 2> /dev/null || true); do
+    geometry="$(timeout 5 xdotool getwindowgeometry --shell "$id" 2> /dev/null || true)"
+    width="$(sed -n 's/^WIDTH=//p' <<< "$geometry")"
+    height="$(sed -n 's/^HEIGHT=//p' <<< "$geometry")"
+    [[ "$width" =~ ^[0-9]+$ && "$height" =~ ^[0-9]+$ ]] || continue
+    if ((width * height > largest_area)); then
+      largest="$id"
+      largest_area=$((width * height))
+      largest_geometry="$width $height"
+    fi
+  done
+  if [[ -n "$largest" ]]; then
+    read -r width height <<< "$largest_geometry"
+    timeout 5 xdotool windowmove "$largest" 0 0 2> /dev/null || true
+    fit_width=$width
+    fit_height=$height
+    ((width > screen_width - 4)) && fit_width=$((screen_width - 4))
+    ((height > screen_height - 30)) && fit_height=$((screen_height - 30))
+    if ((fit_width != width || fit_height != height)); then
+      echo "Resizing the window from ${width}x${height} to ${fit_width}x${fit_height} to fit the screen"
+      timeout 5 xdotool windowsize "$largest" "$fit_width" "$fit_height" 2> /dev/null || true
+      sleep 2
+    fi
+  fi
 
-if ! kill -0 "$app_pid" 2> /dev/null; then
-  app_pid=""
-  fail "the application exited while the screenshot was taken; read app.log in the output folder"
-fi
+  screenshot=/output/screenshot.png
+  rm -f "$screenshot"
+  active="$(timeout 5 xdotool getactivewindow 2> /dev/null || true)"
+  if [[ -n "$active" ]] && timeout 30 import -window "$active" "$screenshot" 2> /dev/null; then
+    echo "Screenshot of the active window $active"
+  elif [[ -n "$largest" ]] && timeout 30 import -window "$largest" "$screenshot" 2> /dev/null; then
+    echo "Screenshot of the largest window $largest"
+  else
+    timeout 30 import -window root "$screenshot" 2> /dev/null || true
+    echo "Screenshot of the whole screen"
+  fi
+  import -window root /output/screen.png 2> /dev/null || true
 
-if [[ "$(file -b --mime-type "$screenshot" 2> /dev/null)" != image/png ]]; then
-  fail "no PNG screenshot of the window could be taken"
-  finish
-fi
-read -r shot_width shot_height < <(identify -format '%w %h\n' "$screenshot")
-top_count="$(convert "$screenshot" -alpha off -depth 8 -format %c histogram:info:- \
-  | awk -F: '{ gsub(/ /, "", $1); if ($1 + 0 > top) top = $1 + 0 } END { print top + 0 }')"
-share=$((100 * top_count / (shot_width * shot_height)))
-text="$(convert "$screenshot" -resize 200% -colorspace Gray png:- \
-  | OMP_THREAD_LIMIT=1 timeout 60 tesseract stdin stdout -l eng --psm 11 2> /dev/null \
-  | tr -s '[:space:]' ' ' || true)"
-printf '%s\n' "$text" > /output/screenshot.txt
-words="$(tr '[:upper:]' '[:lower:]' <<< "$text" | tr -cs '[:lower:]' '\n' | awk 'length($0) >= 3' \
-  | grep -cvxE 'file|edit|view|help|tools|window|options|settings|search|about|preferences|menu' || true)"
-echo "Screenshot: ${shot_width}x${shot_height}, ${share}% one color, ${words} words of text"
-if ((share >= FLAT_COLOR_PERCENT && words < MIN_TEXT_WORDS)); then
-  fail "the window is ${share}% one color with $words words of text; show content at start without arguments and without network"
-fi
-error_text="$(grep -oiE ".{0,40}\\b(${ERROR_WORDS})\\b.{0,40}" <<< "$text" | head -n 1 || true)"
-if [[ -n "$error_text" ]]; then
-  fail "the screenshot shows error text: '$error_text'; remove the message from the start window"
+  if ! kill -0 "$app_pid" 2> /dev/null; then
+    app_pid=""
+    fail "the application exited while the screenshot was taken; read app.log in the output folder"
+  fi
+
+  if [[ "$(file -b --mime-type "$screenshot" 2> /dev/null)" != image/png ]]; then
+    fail "no PNG screenshot of the window could be taken"
+    finish
+  fi
+  read -r shot_width shot_height < <(identify -format '%w %h\n' "$screenshot")
+  top_count="$(convert "$screenshot" -alpha off -depth 8 -format %c histogram:info:- \
+    | awk -F: '{ gsub(/ /, "", $1); if ($1 + 0 > top) top = $1 + 0 } END { print top + 0 }')"
+  share=$((100 * top_count / (shot_width * shot_height)))
+  text="$(convert "$screenshot" -resize 200% -colorspace Gray png:- \
+    | OMP_THREAD_LIMIT=1 timeout 60 tesseract stdin stdout -l eng --psm 11 2> /dev/null \
+    | tr -s '[:space:]' ' ' || true)"
+  printf '%s\n' "$text" > /output/screenshot.txt
+  words="$(tr '[:upper:]' '[:lower:]' <<< "$text" | tr -cs '[:lower:]' '\n' | awk 'length($0) >= 3' \
+    | grep -cvxE 'file|edit|view|help|tools|window|options|settings|search|about|preferences|menu' || true)"
+  echo "Screenshot: ${shot_width}x${shot_height}, ${share}% one color, ${words} words of text"
+  if ((share >= FLAT_COLOR_PERCENT && words < MIN_TEXT_WORDS)); then
+    fail "the window is ${share}% one color with $words words of text; show content at start without arguments and without network"
+  fi
+  error_text="$(grep -oiE ".{0,40}\\b(${ERROR_WORDS})\\b.{0,40}" <<< "$text" | head -n 1 || true)"
+  if [[ -n "$error_text" ]]; then
+    fail "the screenshot shows error text: '$error_text'; remove the message from the start window"
+  fi
 fi
 
 finish
 CHECK
 
-trap 'docker rm -f "$container" > /dev/null 2>&1 || true' EXIT
-status=0
-# --mount instead of -v: -v splits its argument on ':'.
-docker run --rm --name "$container" --network none \
-  --user "$(id -u):$(id -g)" \
-  --env HOME=/tmp/home \
-  --env APPIMAGE_NAME="$file_name" \
-  --env APP_STEM="$stem" \
-  --mount "type=bind,source=$appimage,target=/input/$file_name,readonly" \
-  --mount "type=bind,source=$output,target=/output" \
-  "$image" bash -c "$check_script" check 2>&1 | tee "$output/check.log" || status=$?
+container=""
+trap 'if [[ -n "$container" ]]; then docker rm -f "$container" > /dev/null 2>&1 || true; fi' EXIT
+# run_check RELEASE CHECK_ALL: runs the check script in the Ubuntu RELEASE
+# container; its log and files land in OUTPUT/ubuntu-RELEASE.
+run_check() {
+  local release="$1" check_all="$2" image folder status=0 found
+  image="$(check_image "$release")"
+  folder="$output/ubuntu-$release"
+  mkdir -p "$folder"
+  container="compare-all-appimage-check-$$-${release//./}"
+  echo "== Ubuntu $release"
+  # --mount instead of -v: -v splits its argument on ':'.
+  docker run --rm --name "$container" --network none \
+    --user "$(id -u):$(id -g)" \
+    --env HOME=/tmp/home \
+    --env APPIMAGE_NAME="$file_name" \
+    --env APP_STEM="$stem" \
+    --env CHECK_ALL="$check_all" \
+    --env CHECK_HOST="Ubuntu $release" \
+    --mount "type=bind,source=$appimage,target=/input/$file_name,readonly" \
+    --mount "type=bind,source=$catalog_appstreamcli,target=/tools/appstreamcli-x86_64.AppImage,readonly" \
+    --mount "type=bind,source=$folder,target=/output" \
+    "$image" bash -c "$check_script" check 2>&1 | tee "$folder/check.log" || status=$?
+  container=""
+  found="$(grep -c '^FAIL:' "$folder/check.log" || true)"
+  failures=$((failures + found))
+  if ((status != 0 && found == 0)); then
+    fail "the Ubuntu $release check container stopped with status $status before it reported a result; read $folder/check.log"
+  fi
+  if [[ -f "$folder/screenshot.png" ]]; then
+    echo "Screenshot: $folder/screenshot.png"
+  fi
+}
+run_check 22.04 1
+run_check 20.04 0
 
-container_failures="$(grep -c '^FAIL:' "$output/check.log" || true)"
-failures=$((failures + container_failures))
-if ((status != 0 && container_failures == 0)); then
-  fail "the check container stopped with status $status before it reported a result; read check.log in the output folder"
-fi
-if [[ -f "$output/screenshot.png" ]]; then
-  echo "Screenshot: $output/screenshot.png"
-fi
 if ((failures > 0)); then
   echo "Result: fail. Failed checks: $failures. AppImage: $file_name"
   exit 1
