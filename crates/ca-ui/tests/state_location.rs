@@ -76,7 +76,21 @@ impl Probe {
     }
 
     fn run(command: &mut Command) -> Result<Vec<(String, String)>> {
-        let child = command.output()?;
+        // A child forked by a parallel test while a copy of the binary is
+        // still open for writing inherits that handle, and executing the copy
+        // then fails with "text file busy" until the child has started.
+        let mut attempts = 0;
+        let child = loop {
+            match command.output() {
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::ExecutableFileBusy && attempts < 100 =>
+                {
+                    attempts += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                outcome => break outcome?,
+            }
+        };
         let stdout = String::from_utf8(child.stdout)?;
         assert!(
             child.status.success(),
