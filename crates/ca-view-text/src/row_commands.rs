@@ -337,6 +337,94 @@ fn a_section_at_the_top_with_no_line_on_the_active_side_is_made_current() {
     );
 }
 
+/// Compare again with no edit: change one importance rule, let that
+/// comparison land, then change the rule back and let it land.
+fn recompare_without_an_edit(fixture: &mut Fixture) {
+    for _ in 0..2 {
+        let mut rules = fixture.view.rules();
+        rules.case_unimportant = !rules.case_unimportant;
+        fixture.view.set_rules(rules);
+        fixture.settle();
+    }
+}
+
+#[test]
+fn a_top_section_stays_current_through_a_comparison_with_no_edit() {
+    let mut fixture = Fixture::new(TOP_LEFT, TOP_RIGHT);
+    fixture.view.left_pane.place(Caret::new(2, 0), false);
+    fixture.frame(Vec::new());
+    fixture.view.run(Command::PreviousSection);
+    fixture.frame(Vec::new());
+    assert_eq!(fixture.view.current_section_rows(), Some(0..2));
+    recompare_without_an_edit(&mut fixture);
+    assert_eq!(
+        fixture.view.current_section_rows(),
+        Some(0..2),
+        "a comparison with no edit moved the current section"
+    );
+    fixture.view.run(Command::CopyToLeft);
+    assert_eq!(fixture.text(Side::Left), "a\nb\nc\nd\ne\n");
+}
+
+#[test]
+fn a_gap_section_under_show_differences_stays_current_through_a_comparison_with_no_edit() {
+    let mut fixture = Fixture::new(GAP_LEFT, GAP_RIGHT);
+    fixture.view.run(Command::ShowDifferences);
+    fixture.view.run(Command::NextSection);
+    fixture.frame(Vec::new());
+    assert_eq!(fixture.view.current_section_rows(), Some(3..5));
+    recompare_without_an_edit(&mut fixture);
+    assert_eq!(
+        fixture.view.current_section_rows(),
+        Some(3..5),
+        "a comparison with no edit moved the current section"
+    );
+    fixture.view.run(Command::CopyToLeft);
+    assert_eq!(fixture.text(Side::Left), "a\nb\nc\nX\nY\nd\ne\nf\n");
+}
+
+#[test]
+fn next_section_after_a_comparison_with_no_edit_moves_on_from_the_section_reached() {
+    let mut fixture = Fixture::new(GAP_LEFT, GAP_RIGHT);
+    fixture.view.run(Command::NextSection);
+    fixture.frame(Vec::new());
+    assert_eq!(fixture.view.current_section_rows(), Some(3..5));
+    recompare_without_an_edit(&mut fixture);
+    fixture.view.run(Command::NextSection);
+    fixture.frame(Vec::new());
+    assert_eq!(
+        fixture.view.current_section_rows().map(|rows| rows.start),
+        Some(7)
+    );
+}
+
+/// A rule change can turn the section a move reached into matching text. The
+/// row of the line the move reached stays current, and the copy commands act
+/// on the next section below it, as they do for a caret on a matching line.
+#[test]
+fn a_section_a_rule_change_removes_leaves_its_row_current_and_the_next_section_to_copy() {
+    let mut fixture = Fixture::new("a\nb\nc\nd\ne\n", "a\nB\nc\nX\ne\n");
+    let mut rules = fixture.view.rules();
+    rules.case_unimportant = false;
+    fixture.view.set_rules(rules);
+    fixture.settle();
+    fixture.view.set_ignore_unimportant(true);
+    fixture.view.left_pane.place(Caret::new(0, 0), false);
+    fixture.frame(Vec::new());
+    fixture.view.run(Command::NextSection);
+    fixture.frame(Vec::new());
+    assert_eq!(fixture.view.current_section_rows(), Some(1..2));
+
+    rules.case_unimportant = true;
+    fixture.view.set_rules(rules);
+    fixture.settle();
+    assert_eq!(fixture.view.data.model.section_of(1), None);
+    assert_eq!(fixture.view.current_row(), 1);
+    assert_eq!(fixture.view.current_section_rows(), Some(3..4));
+    fixture.view.run(Command::CopyToLeft);
+    assert_eq!(fixture.text(Side::Left), "a\nb\nc\nX\ne\n");
+}
+
 /// 300 lines that differ on lines 20 and 150.
 fn long_pair() -> (String, String) {
     let side = |differing: &str| -> String {
