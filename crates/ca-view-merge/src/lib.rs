@@ -1068,55 +1068,69 @@ impl MergeView {
         self.absorb_edits(true);
     }
 
-    /// With `remember`, the change is recorded under the pane's undo group,
-    /// so Undo and Redo of that group restore every section exactly.
+    /// With `remember`, the change of each undo group is recorded under that
+    /// group, so Undo and Redo of one group restore every section exactly,
+    /// however many groups one fold covers.
     fn absorb_edits(&mut self, remember: bool) {
         let spans = self.output_pane.take_changes();
         let edits = self.output_pane.buffer_mut().take_applied_edits();
         if edits.is_empty() {
             return;
         }
-        self.data.model.begin_journal();
         let mut owner = None;
-        for (index, edit) in edits.iter().enumerate() {
-            if let Some(section) = self.data.model.apply_pane_edit(edit) {
-                owner = Some(section);
-                continue;
+        let mut layout = false;
+        let mut start = 0;
+        while start < edits.len() {
+            let group = edits[start].group;
+            let end = edits[start..]
+                .iter()
+                .position(|edit| edit.group != group)
+                .map_or(edits.len(), |count| start + count);
+            self.data.model.begin_journal();
+            let mut fitted = true;
+            for (index, edit) in edits.iter().enumerate().take(end).skip(start) {
+                if let Some(section) = self.data.model.apply_pane_edit(edit) {
+                    owner = Some(section);
+                    continue;
+                }
+                // The model's lines no longer match the edit: put the pane's
+                // lines of every remaining edit in place.
+                let rest: Vec<_> = edits[index..].iter().map(|edit| edit.change).collect();
+                let window = edited_window_of(&rest).or_else(|| edited_window(&spans));
+                if let Some((first, old_end, new_end)) = window {
+                    let output_len =
+                        u32::try_from(self.data.model.output_lines().len()).unwrap_or(u32::MAX);
+                    let new_end = if old_end >= output_len {
+                        self.output_pane.line_count()
+                    } else {
+                        new_end
+                    };
+                    let lines = self.buffer_lines(first, new_end.max(first));
+                    owner = self
+                        .data
+                        .model
+                        .resync_window(first, old_end.min(output_len), &lines);
+                }
+                fitted = false;
+                break;
             }
-            // The model's lines no longer match the edit: put the pane's
-            // lines of every remaining edit in place.
-            let rest: Vec<_> = edits[index..].iter().map(|edit| edit.change).collect();
-            let window = edited_window_of(&rest).or_else(|| edited_window(&spans));
-            if let Some((first, old_end, new_end)) = window {
-                let output_len =
-                    u32::try_from(self.data.model.output_lines().len()).unwrap_or(u32::MAX);
-                let new_end = if old_end >= output_len {
-                    self.output_pane.line_count()
-                } else {
-                    new_end
-                };
-                let lines = self.buffer_lines(first, new_end.max(first));
-                owner = self
-                    .data
-                    .model
-                    .resync_window(first, old_end.min(output_len), &lines);
+            let step = self.data.model.end_journal();
+            layout |= step.as_ref().is_none_or(model::Step::changes_layout);
+            if let (true, Some(step)) = (remember, step) {
+                self.keep_step(group, step, false);
             }
-            break;
+            if !fitted {
+                break;
+            }
+            start = end;
         }
-        let step = self.data.model.end_journal();
         if let Some(section) = owner {
             self.current = section;
         }
-        let layout = step.as_ref().is_none_or(model::Step::changes_layout);
         if layout {
             self.touched();
         } else {
             self.strip_stale = true;
-        }
-        if let (true, Some(step)) = (remember, step) {
-            if let Some(id) = self.output_pane.buffer().undo_group_id() {
-                self.keep_step(id, step, false);
-            }
         }
     }
 
