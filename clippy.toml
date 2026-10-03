@@ -1,1 +1,4 @@
 doc-valid-idents = ["AppImage", ".."]
+disallowed-methods = [
+    { path = "std::process::Command::new", reason = "a program of the host is started with ca_io::host_command::host_command, which removes the image's loader, preload and resource variables" },
+]

@@ -1,6 +1,10 @@
 //! Switch parsing, the quick comparison exit codes, and script runs.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+    clippy::disallowed_methods,
+    reason = "the program under test is started directly, not as a host program"
+)]
 
 use std::path::{Path, PathBuf};
 

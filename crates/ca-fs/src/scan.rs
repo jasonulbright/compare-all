@@ -773,6 +773,10 @@ fn attributes(meta: &Metadata, name: &str) -> Attributes {
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "test setup runs a platform tool directly"
+)]
 mod tests {
     use super::{scan, scan_with, Cancel, LinkKind, ScanOptions, ScanProgress};
     use std::path::{Path, PathBuf};

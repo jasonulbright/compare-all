@@ -4,6 +4,11 @@
 //! Each case runs this test binary again with a changed environment, so the
 //! test process itself never changes a variable.
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "the program under test is started directly, not as a host program"
+)]
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
