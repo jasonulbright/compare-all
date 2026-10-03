@@ -2406,18 +2406,32 @@ fn unsaved_notice(reason: &str, detail: &str) -> String {
 /// The folder the private folder of a run is made in.
 ///
 /// A relative temporary folder would resolve against the working directory,
-/// so it is replaced by `/tmp` on Unix and refused elsewhere.
+/// and a missing one takes no folder, so either is replaced by `/tmp` on Unix
+/// when that exists and refused elsewhere.
 fn temporary_parent(family: PlatformFamily) -> std::result::Result<PathBuf, String> {
-    let temporary = std::env::temp_dir();
-    if family.is_absolute(temporary.as_os_str()) {
+    temporary_parent_from(family, std::env::temp_dir())
+}
+
+/// [`temporary_parent`] for the temporary folder `temporary`.
+fn temporary_parent_from(
+    family: PlatformFamily,
+    temporary: PathBuf,
+) -> std::result::Result<PathBuf, String> {
+    let absolute = family.is_absolute(temporary.as_os_str());
+    if absolute && temporary.is_dir() {
         return Ok(temporary);
     }
+    let problem = if absolute {
+        "the temporary folder does not exist"
+    } else {
+        "the temporary folder is not absolute"
+    };
+    let fallback = Path::new("/tmp");
     match family {
-        PlatformFamily::Windows => Err(format!(
-            "{}: the temporary folder is not absolute",
-            temporary.display()
-        )),
-        PlatformFamily::MacOs | PlatformFamily::OtherUnix => Ok(PathBuf::from("/tmp")),
+        PlatformFamily::MacOs | PlatformFamily::OtherUnix if fallback.is_dir() => {
+            Ok(fallback.to_path_buf())
+        }
+        _ => Err(format!("{}: {problem}", temporary.display())),
     }
 }
 
@@ -4083,6 +4097,38 @@ mod tests {
             0o777,
             "a folder of another user changed"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_temporary_folder_falls_back_to_tmp() {
+        let missing = TempDir::new().unwrap().path().join("missing");
+        for family in [PlatformFamily::OtherUnix, PlatformFamily::MacOs] {
+            assert_eq!(
+                temporary_parent_from(family, missing.clone()),
+                Ok(PathBuf::from("/tmp")),
+                "{family:?}"
+            );
+        }
+        let file = TempDir::new().unwrap();
+        let file = file.path().join("file");
+        fs::write(&file, b"x").unwrap();
+        assert_eq!(
+            temporary_parent_from(PlatformFamily::OtherUnix, file),
+            Ok(PathBuf::from("/tmp"))
+        );
+        let present = TempDir::new().unwrap();
+        assert_eq!(
+            temporary_parent_from(PlatformFamily::OtherUnix, present.path().to_path_buf()),
+            Ok(present.path().to_path_buf())
+        );
+    }
+
+    #[test]
+    fn a_missing_temporary_folder_on_windows_is_refused() {
+        let missing = PathBuf::from(r"C:\compare-all-no-such-temporary-folder");
+        assert!(temporary_parent_from(PlatformFamily::Windows, missing).is_err());
+        assert!(temporary_parent_from(PlatformFamily::Windows, PathBuf::from("temp")).is_err());
     }
 
     #[test]

@@ -193,6 +193,27 @@ fn without_a_home_an_open_runtime_folder_is_not_used() -> Result<()> {
 
 #[cfg(unix)]
 #[test]
+fn without_a_home_a_missing_temporary_folder_falls_back_to_tmp() -> Result<()> {
+    let probe = Probe::new()?;
+    let missing = probe.folder.path().join("missing");
+    let mut command = probe.command("read");
+    command.env("TMPDIR", &missing);
+    let lines = Probe::run(&mut command)?;
+    let settings = PathBuf::from(value(&lines, "settings"));
+    let made = settings.is_dir() && settings.starts_with("/tmp");
+    if made {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&settings)?.permissions().mode() & 0o777;
+        std::fs::remove_dir_all(&settings)?;
+        assert_eq!(mode, 0o700, "{mode:o}");
+    }
+    assert!(made, "{}", settings.display());
+    assert!(!missing.exists());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
 fn without_a_home_relative_folders_never_reach_the_working_directory() -> Result<()> {
     let probe = Probe::new()?;
     let working = probe.folder.path().join("working");
