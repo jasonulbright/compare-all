@@ -1,3 +1,24 @@
+# v2026.10.04.0004
+
+## Text Compare copies after an edit: 0 text errors in 1600 random test sequences
+
+### Fixes
+
+- Stop a copy made right after an edit from duplicating or losing a line.
+- Hold the copy and section commands until the comparison of the last edit finishes.
+- Let Next Section pass a section that has no line in the active pane.
+- Make a section at the top of the file current when a move reaches it.
+- Keep the current section after a rule or option change.
+- Move only to differences that the display filter shows.
+- Stop Next Section from reading every section on each press.
+- Show the reason on disabled menu lines, toolbar buttons and dialog controls.
+- Add the reason of a disabled control to its accessibility description.
+- Give the true reason when a view refuses a copy.
+- Enable commands as soon as a background job delivers its result.
+- Say that Registry Compare reads export files only on Linux and macOS.
+
+Full changelog: CHANGELOG.md
+
 # v2026.10.03.0003
 
 ## AppImage starts on 9 of 9 tested Linux distributions, was 6 of 9
