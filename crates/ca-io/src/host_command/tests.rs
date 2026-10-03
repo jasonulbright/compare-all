@@ -130,6 +130,10 @@ fn a_host_child_of_a_normal_start_gets_no_image_variable() {
                 "XDG_DATA_DIRS",
                 "/home/tester/.local/share:/usr/local/share:/usr/share:/run/opengl-driver/share:/run/current-system/sw/share:/etc",
             ),
+            (
+                "AMDGPU_ASIC_ID_TABLE_PATHS",
+                "/usr/local/share/libdrm:/usr/share/libdrm",
+            ),
         ])
     );
 }
@@ -145,10 +149,7 @@ fn a_host_child_of_the_command_line_entry_gets_no_image_variable() {
         "GCONV_PATH",
         "LIBGL_DRIVERS_PATH",
         "LIBVA_DRIVERS_PATH",
-        "GBM_BACKENDS_PATH",
-        "__EGL_VENDOR_LIBRARY_DIRS",
         "TERMINFO",
-        "AMDGPU_ASIC_ID_TABLE_PATHS",
         "CROSS_LIBC_DLOPEN_ROOT",
         "SHARUN_DIR",
         "LD_LIBRARY_PATH",
@@ -156,10 +157,27 @@ fn a_host_child_of_the_command_line_entry_gets_no_image_variable() {
     ] {
         assert!(!cleaned.contains_key(OsStr::new(removed)), "{removed}");
     }
-    assert_eq!(
-        cleaned.get(OsStr::new("PATH")),
-        Some(&OsString::from("/opt/spy:/usr/local/bin:/usr/bin:/bin"))
-    );
+    for (name, host_entries) in [
+        ("PATH", "/opt/spy:/usr/local/bin:/usr/bin:/bin"),
+        (
+            "GBM_BACKENDS_PATH",
+            "/usr/lib/x86_64-linux-gnu/gbm:/usr/lib64/gbm:/usr/lib/gbm:/run/opengl-driver/lib/gbm",
+        ),
+        (
+            "__EGL_VENDOR_LIBRARY_DIRS",
+            "/usr/share/glvnd/egl_vendor.d:/etc/glvnd/egl_vendor.d",
+        ),
+        (
+            "AMDGPU_ASIC_ID_TABLE_PATHS",
+            "/usr/local/share/libdrm:/usr/share/libdrm",
+        ),
+    ] {
+        assert_eq!(
+            cleaned.get(OsStr::new(name)),
+            Some(&OsString::from(host_entries)),
+            "{name}"
+        );
+    }
     for kept in [
         "HOME",
         "USER",
@@ -261,6 +279,29 @@ fn a_value_that_is_not_a_path_list_is_kept_byte_for_byte() {
             "{name}"
         );
     }
+}
+
+#[test]
+fn a_resource_variable_keeps_the_user_entries() {
+    let mut input = apprun_child();
+    input.insert(
+        "GST_PLUGIN_PATH".into(),
+        format!("/home/tester/gst:{MOUNT}/lib/gstreamer-1.0").into(),
+    );
+    input.insert(
+        "TERMINFO_DIRS".into(),
+        format!("/home/tester/.terminfo:{MOUNT}/share/terminfo").into(),
+    );
+    let cleaned = clean(&input);
+    assert_eq!(
+        cleaned.get(OsStr::new("GST_PLUGIN_PATH")),
+        Some(&OsString::from("/home/tester/gst"))
+    );
+    assert_eq!(
+        cleaned.get(OsStr::new("TERMINFO_DIRS")),
+        Some(&OsString::from("/home/tester/.terminfo"))
+    );
+    assert!(!cleaned.contains_key(OsStr::new("TERMINFO")));
 }
 
 #[test]
