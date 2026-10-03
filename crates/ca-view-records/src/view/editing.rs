@@ -62,6 +62,21 @@ pub const EDIT_COMMANDS: &[Command] = &[
 /// switch of the session is on.
 const EDITING_OFF: &str = "Editing is turned off for this session";
 
+/// Why a copy waits for the comparison.
+const NOT_COMPARED: &str = "Available once the comparison finishes";
+/// Why a copy is refused after the comparison failed.
+const FAILED: &str = "The comparison failed. Use Reload to compare again";
+/// Why a copy is refused after the comparison was stopped.
+const STOPPED: &str = "The comparison was stopped. Use Reload to compare again";
+/// Why a copy is refused while a side read from the clipboard is shown.
+const CLIPBOARD_SIDE: &str = "A side comes from the clipboard, so no side takes an edit";
+/// Why a copy waits for a save, an export or a write to a live key.
+const WRITING: &str = "Available once the current write finishes";
+/// Why a copy waits for an answer.
+const QUESTION_OPEN: &str = "Answer the open question first";
+/// Why a copy has nothing to act on.
+const NOTHING_CHOSEN: &str = "Select the items to copy first";
+
 /// Commands that change a side or write one.
 const CHANGES_A_SIDE: &[Command] = &[
     Command::Undo,
@@ -657,6 +672,32 @@ impl RecordsView {
             Command::SaveBoth => self.can_save() && self.edit.history.is_any_modified(),
             _ => false,
         }
+    }
+
+    /// Why a copy line of a registry comparison is refused now.
+    ///
+    /// A view of another kind takes no edit, which the line of the bar says.
+    pub(super) fn copy_refusal(&self, command: Command) -> Option<&'static str> {
+        let copy = matches!(
+            command,
+            Command::CopyToRight | Command::CopyToLeft | Command::CopyToOtherSide
+        );
+        if !copy || !self.is_editable_kind() || self.accepts_edit(command) {
+            return None;
+        }
+        Some(match &self.progress {
+            super::Progress::Running(_) => NOT_COMPARED,
+            super::Progress::Failed(_) => FAILED,
+            super::Progress::Cancelled => STOPPED,
+            super::Progress::Ready if self.clipboard_input.iter().any(Option::is_some) => {
+                CLIPBOARD_SIDE
+            }
+            super::Progress::Ready if self.editing_off() => EDITING_OFF,
+            super::Progress::Ready if self.edit.work.is_some() => WRITING,
+            super::Progress::Ready if self.edit.prompt.is_some() => QUESTION_OPEN,
+            super::Progress::Ready if self.edit.origin.is_none() => NOT_COMPARED,
+            super::Progress::Ready => NOTHING_CHOSEN,
+        })
     }
 
     fn can_save(&self) -> bool {
@@ -1768,6 +1809,102 @@ mod tests {
         });
         assert!(view.prompt().is_none());
         assert!(view.message().unwrap().contains("nothing to write"));
+    }
+
+    #[test]
+    fn a_refused_registry_copy_says_what_stops_it() {
+        const COPIES: [Command; 3] = [
+            Command::CopyToRight,
+            Command::CopyToLeft,
+            Command::CopyToOtherSide,
+        ];
+        let reasons = |view: &RecordsView| -> Vec<Option<&'static str>> {
+            COPIES
+                .iter()
+                .map(|command| {
+                    let reason = view.refusal(*command);
+                    assert!(
+                        reason.is_none() || !view.accepts(*command),
+                        "{command:?} is accepted and refused with {reason:?}"
+                    );
+                    reason
+                })
+                .collect()
+        };
+        let every = |reason: &'static str| vec![Some(reason); COPIES.len()];
+
+        let dir = tempfile::tempdir().unwrap();
+        let (left, right) = testing::registry_pair(dir.path());
+        let mut view = RecordsView::new(Flavor::Registry, left, right, &context(), 34);
+        assert_eq!(reasons(&view), every(super::NOT_COMPARED));
+        assert!(wait_until(Duration::from_secs(30), || {
+            view.poll();
+            view.has_comparison()
+        }));
+        assert!(COPIES.iter().all(|command| view.accepts(*command)));
+        assert_eq!(reasons(&view), vec![None; COPIES.len()]);
+
+        view.edit.prompt = Some(Prompt::Closing);
+        assert_eq!(reasons(&view), every(super::QUESTION_OPEN));
+        view.edit.prompt = None;
+
+        let mut settings = view.settings().unwrap();
+        settings.specs_mut().unwrap().disable_editing = true;
+        view.apply_settings(&settings);
+        assert_eq!(reasons(&view), every(super::EDITING_OFF));
+        settings.specs_mut().unwrap().disable_editing = false;
+        view.apply_settings(&settings);
+        assert_eq!(reasons(&view), vec![None; COPIES.len()]);
+
+        view.clipboard_input[0] = Some(String::new());
+        assert_eq!(reasons(&view), every(super::CLIPBOARD_SIDE));
+        view.clipboard_input[0] = None;
+
+        view.edit.work = Some(ca_ui::worker::Job::spawn_notifying(
+            |_, _| {},
+            Arc::new(|| {}),
+        ));
+        assert_eq!(reasons(&view), every(super::WRITING));
+        view.edit.work = None;
+
+        view.progress = super::super::Progress::Failed("unreadable".to_owned());
+        assert_eq!(reasons(&view), every(super::FAILED));
+        view.progress = super::super::Progress::Cancelled;
+        assert_eq!(reasons(&view), every(super::STOPPED));
+    }
+
+    #[test]
+    fn a_registry_copy_with_no_row_to_act_on_asks_for_a_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let empty = "Windows Registry Editor Version 5.00\r\n\r\n";
+        let left = dir.path().join("left.reg");
+        let right = dir.path().join("right.reg");
+        std::fs::write(&left, empty).unwrap();
+        std::fs::write(&right, empty).unwrap();
+        let mut view = RecordsView::new(Flavor::Registry, left, right, &context(), 36);
+        assert!(wait_until(Duration::from_secs(30), || {
+            view.poll();
+            view.has_comparison()
+        }));
+        for command in [Command::CopyToRight, Command::CopyToOtherSide] {
+            assert!(!view.accepts(command));
+            assert_eq!(
+                view.refusal(command),
+                Some(super::NOTHING_CHOSEN),
+                "{command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_version_comparison_leaves_the_copy_reason_to_the_bar() {
+        let dir = tempfile::tempdir().unwrap();
+        let (left, right) = testing::registry_pair(dir.path());
+        let view = RecordsView::new(Flavor::Version, left, right, &context(), 35);
+        for command in [Command::CopyToRight, Command::CopyToOtherSide] {
+            assert!(!view.accepts(command));
+            assert_eq!(view.refusal(command), None, "{command:?}");
+        }
     }
 
     #[test]
