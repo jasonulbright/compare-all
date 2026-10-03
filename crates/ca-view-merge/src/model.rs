@@ -808,12 +808,15 @@ impl<T> ChunkedVec<T> {
             .collect()
     }
 
-    /// Replace a flat range with new lines or rows.
+    /// Replace a flat range with new lines or rows. A range past the end or
+    /// running backwards is clamped to the items that exist.
     fn splice(&mut self, range: Range<usize>, replacement: Vec<T>) {
         debug_assert!(range.start <= range.end);
         debug_assert!(range.end <= self.len);
-        let (before, tail) = split_nodes(self.root.take(), range.start);
-        let (removed, after) = split_nodes(tail, range.end - range.start);
+        let start = range.start.min(self.len);
+        let end = range.end.clamp(start, self.len);
+        let (before, tail) = split_nodes(self.root.take(), start);
+        let (removed, after) = split_nodes(tail, end - start);
         drop(removed);
         #[cfg(test)]
         SEQUENCE_ITEMS_TOUCHED.with(|items| {
