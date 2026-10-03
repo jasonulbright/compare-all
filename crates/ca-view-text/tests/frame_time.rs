@@ -140,6 +140,99 @@ fn all_differing(rows: u32, line: impl Fn(u32, bool) -> String) -> TextData {
     }
 }
 
+/// A comparison of `sections` difference sections, each one changed line
+/// after one matching line.
+fn alternating(sections: u32) -> TextData {
+    let mut hunks = Vec::new();
+    let mut left = Vec::new();
+    let mut right = Vec::new();
+    for index in 0..sections {
+        let same = 2 * index;
+        hunks.push(ClassifiedHunk {
+            hunk: Hunk {
+                kind: HunkKind::Same,
+                left: same..same + 1,
+                right: same..same + 1,
+            },
+            importance: None,
+            left_lines: Vec::new(),
+            right_lines: Vec::new(),
+        });
+        hunks.push(ClassifiedHunk {
+            hunk: Hunk {
+                kind: HunkKind::Changed,
+                left: same + 1..same + 2,
+                right: same + 1..same + 2,
+            },
+            importance: Some(Importance::Important),
+            left_lines: vec![Importance::Important],
+            right_lines: vec![Importance::Important],
+        });
+        left.push(format!("same {index}"));
+        left.push(format!("left {index}"));
+        right.push(format!("same {index}"));
+        right.push(format!("right {index}"));
+    }
+    let mut data = all_differing(0, |_, _| String::new());
+    data.left.metrics = left.iter().map(|text| lines::measure(text)).collect();
+    data.right.metrics = right.iter().map(|text| lines::measure(text)).collect();
+    data.left.lines = Arc::new(left);
+    data.right.lines = Arc::new(right);
+    data.model = model::build(&hunks);
+    data
+}
+
+/// One press of a difference or section move, under each display filter, from
+/// both ends of a comparison of many sections, including the presses that
+/// wrap. A display filter that hides every difference leaves nothing to move
+/// to, which a walk over the sections must not take a frame to find out.
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "wall-clock budget holds for release builds"
+)]
+fn a_move_between_many_sections_stays_inside_the_budget_under_every_filter() {
+    use ca_ui::command::Command;
+
+    const SECTIONS: u32 = 40_000;
+    let mut view = text_view(alternating(SECTIONS));
+    assert_eq!(view.model().sections().len(), SECTIONS as usize);
+    worst_frame(&mut view, "text view, 40,000 sections", |_| {});
+    let mut worst = Duration::ZERO;
+    for filter in [
+        Command::ShowSame,
+        Command::ShowAll,
+        Command::ShowDifferences,
+        Command::ShowContext,
+    ] {
+        view.run(filter);
+        // From the first difference, Previous wraps to the last section and
+        // the Next presses after it wrap back.
+        for command in [
+            Command::PreviousSection,
+            Command::NextSection,
+            Command::PreviousDifference,
+            Command::NextDifference,
+        ] {
+            let mut slowest = Duration::ZERO;
+            for _ in 0..4 {
+                let started = Instant::now();
+                view.run(command);
+                slowest = slowest.max(started.elapsed());
+            }
+            println!(
+                "{filter:?} {command:?} over {SECTIONS} sections: slowest press {:.3} ms",
+                slowest.as_secs_f64() * 1_000.0
+            );
+            worst = worst.max(slowest);
+        }
+    }
+    assert!(
+        worst <= BUDGET,
+        "the slowest move took {worst:?}, over the budget of {BUDGET:?}"
+    );
+}
+
 fn text_view(data: TextData) -> TextView {
     named_text_view(data, "txt")
 }

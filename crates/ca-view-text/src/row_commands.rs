@@ -483,6 +483,65 @@ fn navigation_under_show_differences_leaves_the_caret_on_a_shown_line() {
     }
 }
 
+/// One single-line difference after each of `sections` matching lines.
+fn alternating_pair(sections: usize) -> (String, String) {
+    use std::fmt::Write as _;
+
+    let mut left = String::new();
+    let mut right = String::new();
+    for index in 0..sections {
+        let _ = write!(left, "same {index}\nL {index}\n");
+        let _ = write!(right, "same {index}\nR {index}\n");
+    }
+    (left, right)
+}
+
+/// One move reads a number of sections that grows with the logarithm of the
+/// section count, under every filter, from either end and from the middle,
+/// whether or not it wraps.
+#[test]
+fn one_section_move_reads_few_sections_under_every_filter() {
+    use super::DisplayFilter;
+
+    const SECTIONS: usize = 1_000;
+    let (left, right) = alternating_pair(SECTIONS);
+    let mut fixture = Fixture::new(&left, &right);
+    assert_eq!(fixture.view.data.model.sections().len(), SECTIONS);
+    let rows = fixture.view.data.model.row_count();
+    let bound = 2 * (SECTIONS.ilog2() as usize + 2);
+    for filter in [
+        DisplayFilter::All,
+        DisplayFilter::Differences,
+        DisplayFilter::Same,
+        DisplayFilter::Context(2),
+        DisplayFilter::None,
+    ] {
+        fixture.view.set_filter(filter);
+        for wrap in [true, false] {
+            fixture.view.navigation.wrap_around = wrap;
+            for command in [
+                Command::NextSection,
+                Command::PreviousSection,
+                Command::NextDifference,
+                Command::PreviousDifference,
+            ] {
+                for start in [0, rows / 2, rows - 1] {
+                    fixture.view.caret = start;
+                    fixture.view.anchor = None;
+                    let _ = fixture.view.data.model.take_section_reads();
+                    fixture.view.run(command);
+                    let reads = fixture.view.data.model.take_section_reads();
+                    assert!(
+                        reads <= bound,
+                        "{command:?} from row {start} under {filter:?}, wrap {wrap}, \
+                         read {reads} sections of {SECTIONS}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn navigation_shows_the_start_of_the_line_it_moves_to() {
     let mut fixture = Fixture::new(GAP_LEFT, GAP_RIGHT);

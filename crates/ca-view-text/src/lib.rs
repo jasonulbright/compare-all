@@ -1417,6 +1417,21 @@ impl TextView {
             return;
         }
         let model = &self.data.model;
+        // Every destination is a difference row, and these filters show none,
+        // so the walk below would read every section only to find nothing.
+        if matches!(self.filter, DisplayFilter::Same | DisplayFilter::None) {
+            if self.navigation.show_message_panel {
+                self.message = Some(
+                    if model.counts().differences > 0 {
+                        FILTER_HIDES
+                    } else {
+                        LAST_DIFFERENCE
+                    }
+                    .to_owned(),
+                );
+            }
+            return;
+        }
         let step = |row: usize| match command {
             Command::NextDifference => model.next_difference(row),
             Command::PreviousDifference => model.previous_difference(row),

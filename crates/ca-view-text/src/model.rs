@@ -129,6 +129,21 @@ pub struct RowModel {
     groups: Vec<u32>,
     next_group: u32,
     ignore_unimportant: bool,
+    #[cfg(test)]
+    section_reads: SectionReads,
+}
+
+/// How many section entries the navigation searches read, for a test that
+/// bounds the reads of one move.
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct SectionReads(std::sync::atomic::AtomicUsize);
+
+#[cfg(test)]
+impl Clone for SectionReads {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
 }
 
 /// Build the rows for a classified comparison.
@@ -374,14 +389,17 @@ impl RowModel {
 
     /// The first row of the next difference section after the one holding
     /// `from`, or after `from` when it sits on a matching row.
+    ///
+    /// The sections are in row order and never overlap, which is what lets
+    /// this and [`Self::previous_section`] search them by halves.
     #[must_use]
     pub fn next_section(&self, from: usize) -> Option<usize> {
         #[allow(clippy::cast_possible_truncation)]
         let from = from as u32;
-        self.sections
-            .iter()
-            .find(|range| range.start > from)
-            .map(|range| range.start as usize)
+        let after = self
+            .sections
+            .partition_point(|range| self.section_start(range) <= from);
+        self.sections.get(after).map(|range| range.start as usize)
     }
 
     /// The first row of the previous difference section.
@@ -389,11 +407,29 @@ impl RowModel {
     pub fn previous_section(&self, from: usize) -> Option<usize> {
         #[allow(clippy::cast_possible_truncation)]
         let from = from as u32;
-        self.sections
-            .iter()
-            .rev()
-            .find(|range| range.start < from)
-            .map(|range| range.start as usize)
+        let before = self
+            .sections
+            .partition_point(|range| self.section_start(range) < from);
+        let index = before.checked_sub(1)?;
+        self.sections.get(index).map(|range| range.start as usize)
+    }
+
+    /// The first row of one section, as a navigation search reads it.
+    #[cfg_attr(not(test), allow(clippy::unused_self))]
+    fn section_start(&self, range: &Range<u32>) -> u32 {
+        #[cfg(test)]
+        self.section_reads
+            .0
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        range.start
+    }
+
+    /// The section entries the navigation searches read since the last call.
+    #[cfg(test)]
+    pub(crate) fn take_section_reads(&self) -> usize {
+        self.section_reads
+            .0
+            .swap(0, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The first differing row, where the comparison has one.
