@@ -111,7 +111,9 @@ fn sharun_child() -> Environment {
 }
 
 fn clean(environment: &Environment) -> Environment {
-    let image = Image::detect(environment, None, &unresolved).expect("an image environment");
+    let image = Image::detect(environment, None, &unresolved)
+        .expect("an image environment")
+        .with_triplet(Some("x86_64-linux-gnu"));
     clean_environment(environment, &image)
 }
 
@@ -131,14 +133,6 @@ fn a_host_child_of_a_normal_start_gets_no_image_variable() {
             ("LANG", "C"),
             ("SHELL", "/bin/sh"),
             ("PWD", "/home/tester"),
-            (
-                "XDG_DATA_DIRS",
-                "/home/tester/.local/share:/usr/local/share:/usr/share:/run/opengl-driver/share:/run/current-system/sw/share:/etc",
-            ),
-            (
-                "AMDGPU_ASIC_ID_TABLE_PATHS",
-                "/usr/local/share/libdrm:/usr/share/libdrm",
-            ),
         ])
     );
 }
@@ -159,30 +153,17 @@ fn a_host_child_of_the_command_line_entry_gets_no_image_variable() {
         "SHARUN_DIR",
         "LD_LIBRARY_PATH",
         "LD_PRELOAD",
+        "GBM_BACKENDS_PATH",
+        "__EGL_VENDOR_LIBRARY_DIRS",
+        "AMDGPU_ASIC_ID_TABLE_PATHS",
+        "XDG_DATA_DIRS",
     ] {
         assert!(!cleaned.contains_key(OsStr::new(removed)), "{removed}");
     }
-    for (name, host_entries) in [
-        ("PATH", "/opt/spy:/usr/local/bin:/usr/bin:/bin"),
-        (
-            "GBM_BACKENDS_PATH",
-            "/usr/lib/x86_64-linux-gnu/gbm:/usr/lib64/gbm:/usr/lib/gbm:/run/opengl-driver/lib/gbm",
-        ),
-        (
-            "__EGL_VENDOR_LIBRARY_DIRS",
-            "/usr/share/glvnd/egl_vendor.d:/etc/glvnd/egl_vendor.d",
-        ),
-        (
-            "AMDGPU_ASIC_ID_TABLE_PATHS",
-            "/usr/local/share/libdrm:/usr/share/libdrm",
-        ),
-    ] {
-        assert_eq!(
-            cleaned.get(OsStr::new(name)),
-            Some(&OsString::from(host_entries)),
-            "{name}"
-        );
-    }
+    assert_eq!(
+        cleaned.get(OsStr::new("PATH")),
+        Some(&OsString::from("/opt/spy:/usr/local/bin:/usr/bin:/bin"))
+    );
     for kept in [
         "HOME",
         "USER",
@@ -634,6 +615,314 @@ fn a_home_that_is_not_the_portable_folder_is_kept() {
     assert_eq!(
         clean_environment(&input, &image).get(OsStr::new("HOME")),
         Some(&OsString::from("/srv/elsewhere"))
+    );
+}
+
+/// The lists that sharun builds in this image's start.
+const BUILT: &[&str] = &[
+    "XDG_DATA_DIRS",
+    "GBM_BACKENDS_PATH",
+    "LIBVA_DRIVERS_PATH",
+    "AMDGPU_ASIC_ID_TABLE_PATHS",
+    "__EGL_VENDOR_LIBRARY_DIRS",
+];
+
+/// sharun's `add_to_env`: `folder` is prepended unless the value holds it.
+fn sharun_add(environment: &mut Environment, name: &str, folder: &str) {
+    let old = environment
+        .get(OsStr::new(name))
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_owned();
+    if old.is_empty() {
+        environment.insert(name.into(), folder.into());
+    } else if old != folder
+        && !old.starts_with(&format!("{folder}:"))
+        && !old.ends_with(&format!(":{folder}"))
+        && !old.contains(&format!(":{folder}:"))
+    {
+        environment.insert(name.into(), format!("{folder}:{old}").into());
+    }
+}
+
+/// The environment of this image's process after sharun started it from
+/// `host`, on an `x86_64` host without the NVIDIA module, where the vendor
+/// folders `vendor_folders` exist besides the image's own.
+fn sharun_start(host: &Environment, root: &str, vendor_folders: &[&str]) -> Environment {
+    let mut started = host.clone();
+    started.insert("SHARUN_DIR".into(), root.into());
+    started.insert("CROSS_LIBC_DLOPEN_ROOT".into(), root.into());
+    sharun_add(&mut started, "PATH", &format!("{root}/bin"));
+    sharun_add(&mut started, "GCONV_PATH", &format!("{root}/lib/gconv"));
+    started.insert(
+        "LIBGL_DRIVERS_PATH".into(),
+        format!("{root}/lib/dri").into(),
+    );
+    sharun_add(
+        &mut started,
+        "LIBVA_DRIVERS_PATH",
+        &format!("{root}/lib/dri"),
+    );
+    for folder in [
+        "/run/opengl-driver/lib/gbm",
+        "/usr/lib/gbm",
+        "/usr/lib64/gbm",
+        "/usr/lib/x86_64-linux-gnu/gbm",
+        &format!("{root}/lib/gbm"),
+    ] {
+        sharun_add(&mut started, "GBM_BACKENDS_PATH", folder);
+    }
+    let home = host
+        .get(OsStr::new("HOME"))
+        .and_then(|home| home.to_str())
+        .unwrap_or_default();
+    for folder in [
+        "/etc",
+        "/run/current-system/sw/share",
+        "/run/opengl-driver/share",
+        "/usr/share",
+        "/usr/local/share",
+        &format!("{home}/.local/share"),
+        &format!("{root}/share"),
+    ] {
+        sharun_add(&mut started, "XDG_DATA_DIRS", folder);
+    }
+    let data_folders = started
+        .get(OsStr::new("XDG_DATA_DIRS"))
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_owned();
+    for folder in data_folders.rsplit(':') {
+        let vendor = Path::new(folder)
+            .join("glvnd/egl_vendor.d")
+            .to_string_lossy()
+            .replace('\\', "/");
+        if vendor.starts_with(root) || vendor_folders.contains(&vendor.as_str()) {
+            sharun_add(&mut started, "__EGL_VENDOR_LIBRARY_DIRS", &vendor);
+        }
+    }
+    started.insert("TERMINFO".into(), format!("{root}/share/terminfo").into());
+    for folder in [
+        &format!("{root}/share/libdrm"),
+        "/usr/share/libdrm",
+        "/usr/local/share/libdrm",
+    ] {
+        sharun_add(&mut started, "AMDGPU_ASIC_ID_TABLE_PATHS", folder);
+    }
+    started
+}
+
+const HOST_VENDOR_FOLDERS: &[&str] = &["/usr/share/glvnd/egl_vendor.d", "/etc/glvnd/egl_vendor.d"];
+
+fn host_session(pairs: &[(&str, &str)]) -> Environment {
+    let mut host = environment(&[
+        ("HOME", "/tmp/home"),
+        ("PATH", "/usr/local/bin:/usr/bin:/bin"),
+        ("LANG", "C.UTF-8"),
+    ]);
+    host.extend(environment(pairs));
+    host
+}
+
+#[test]
+fn a_host_child_gets_no_list_that_sharun_built_from_nothing() {
+    let root = "/tmp/.mount_comparOIliDD";
+    let input = environment(&[
+        ("SHARUN_DIR", root),
+        ("HOME", "/tmp/home"),
+        (
+            "GBM_BACKENDS_PATH",
+            "/tmp/.mount_comparOIliDD/lib/gbm:/usr/lib/x86_64-linux-gnu/gbm:/usr/lib64/gbm:/usr/lib/gbm:/run/opengl-driver/lib/gbm",
+        ),
+        (
+            "AMDGPU_ASIC_ID_TABLE_PATHS",
+            "/usr/local/share/libdrm:/usr/share/libdrm:/tmp/.mount_comparOIliDD/share/libdrm",
+        ),
+        (
+            "XDG_DATA_DIRS",
+            "/tmp/.mount_comparOIliDD/share:/tmp/home/.local/share:/usr/local/share:/usr/share:/run/opengl-driver/share:/run/current-system/sw/share:/etc",
+        ),
+        (
+            "__EGL_VENDOR_LIBRARY_DIRS",
+            "/tmp/.mount_comparOIliDD/share/glvnd/egl_vendor.d:/usr/share/glvnd/egl_vendor.d:/etc/glvnd/egl_vendor.d",
+        ),
+    ]);
+    let cleaned = clean(&input);
+    for name in BUILT {
+        assert_eq!(cleaned.get(OsStr::new(name)), None, "{name}");
+    }
+    assert_eq!(
+        cleaned.get(OsStr::new("HOME")),
+        Some(&OsString::from("/tmp/home"))
+    );
+}
+
+#[test]
+fn a_host_child_gets_the_lists_of_the_host_session() {
+    let root = "/tmp/.mount_comparOIliDD";
+    for host in [
+        host_session(&[]),
+        host_session(&[("GBM_BACKENDS_PATH", "/opt/gbm")]),
+        host_session(&[("GBM_BACKENDS_PATH", "/usr/lib/gbm:/opt/gbm")]),
+        host_session(&[("XDG_DATA_DIRS", "/usr/local/share:/usr/share:/opt/share")]),
+        host_session(&[("XDG_DATA_DIRS", "/usr/share")]),
+        host_session(&[("XDG_DATA_DIRS", "/opt/share/:/usr/share")]),
+        host_session(&[("AMDGPU_ASIC_ID_TABLE_PATHS", "/usr/share/libdrm")]),
+        host_session(&[("LIBVA_DRIVERS_PATH", "/opt/va:/usr/lib/dri")]),
+        host_session(&[("__EGL_VENDOR_LIBRARY_DIRS", "/usr/share/glvnd/egl_vendor.d")]),
+        host_session(&[
+            ("XDG_DATA_DIRS", "/opt/share"),
+            ("__EGL_VENDOR_LIBRARY_DIRS", "/home/u/egl"),
+        ]),
+    ] {
+        let mut vendor_folders = HOST_VENDOR_FOLDERS.to_vec();
+        vendor_folders.push("/opt/share/glvnd/egl_vendor.d");
+        let started = sharun_start(&host, root, &vendor_folders);
+        let cleaned = clean(&started);
+        for name in BUILT {
+            assert_eq!(
+                cleaned.get(OsStr::new(name)),
+                host.get(OsStr::new(name)),
+                "{name} of {host:?} from {:?}",
+                started.get(OsStr::new(name))
+            );
+        }
+        assert_eq!(names_inside(&cleaned, root), Vec::<String>::new());
+    }
+}
+
+#[test]
+fn a_user_list_in_the_form_sharun_gives_it_keeps_the_user_entries() {
+    let mut input = sharun_child();
+    input.insert(
+        "GBM_BACKENDS_PATH".into(),
+        "/tmp/.mount_comparOIliDD/lib/gbm:/usr/lib/x86_64-linux-gnu/gbm:/usr/lib64/gbm:/usr/lib/gbm:/run/opengl-driver/lib/gbm:/opt/gbm"
+            .into(),
+    );
+    input.insert("HOME".into(), "/tmp/home".into());
+    input.insert(
+        "XDG_DATA_DIRS".into(),
+        "/tmp/.mount_comparOIliDD/share:/tmp/home/.local/share:/run/opengl-driver/share:/run/current-system/sw/share:/etc:/usr/local/share:/usr/share:/opt/share"
+            .into(),
+    );
+    let cleaned = clean(&input);
+    assert_eq!(
+        cleaned.get(OsStr::new("GBM_BACKENDS_PATH")),
+        Some(&OsString::from("/opt/gbm"))
+    );
+    assert_eq!(
+        cleaned.get(OsStr::new("XDG_DATA_DIRS")),
+        Some(&OsString::from("/usr/local/share:/usr/share:/opt/share"))
+    );
+}
+
+#[test]
+fn a_user_list_that_sharun_leaves_byte_identical_reads_as_unset() {
+    let root = "/tmp/.mount_comparOIliDD";
+    let unset = sharun_start(&host_session(&[]), root, HOST_VENDOR_FOLDERS);
+    let user_set = sharun_start(
+        &host_session(&[("GBM_BACKENDS_PATH", "/run/opengl-driver/lib/gbm")]),
+        root,
+        HOST_VENDOR_FOLDERS,
+    );
+    assert_eq!(
+        unset.get(OsStr::new("GBM_BACKENDS_PATH")),
+        user_set.get(OsStr::new("GBM_BACKENDS_PATH"))
+    );
+    assert_eq!(clean(&user_set).get(OsStr::new("GBM_BACKENDS_PATH")), None);
+}
+
+#[test]
+fn a_list_that_sharun_did_not_build_loses_only_its_image_entries() {
+    let mut input = sharun_child();
+    input.insert(
+        "XDG_DATA_DIRS".into(),
+        "/tmp/.mount_comparOIliDD/share:/usr/local/share:/usr/share".into(),
+    );
+    input.insert(
+        "GBM_BACKENDS_PATH".into(),
+        "/usr/lib/x86_64-linux-gnu/gbm:/usr/lib64/gbm".into(),
+    );
+    input.insert(
+        "LIBVA_DRIVERS_PATH".into(),
+        "/tmp/.mount_comparOIliDD/lib/dri:/usr/lib/x86_64-linux-gnu/dri".into(),
+    );
+    let cleaned = clean(&input);
+    for (name, value) in [
+        ("XDG_DATA_DIRS", "/usr/local/share:/usr/share"),
+        (
+            "GBM_BACKENDS_PATH",
+            "/usr/lib/x86_64-linux-gnu/gbm:/usr/lib64/gbm",
+        ),
+        ("LIBVA_DRIVERS_PATH", "/usr/lib/x86_64-linux-gnu/dri"),
+    ] {
+        assert_eq!(
+            cleaned.get(OsStr::new(name)),
+            Some(&OsString::from(value)),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn the_driver_folders_sharun_adds_for_nvidia_are_removed() {
+    let mut input = sharun_child();
+    input.insert(
+        "LIBVA_DRIVERS_PATH".into(),
+        "/tmp/.mount_comparOIliDD/lib/dri:/usr/lib/x86_64-linux-gnu/dri:/usr/lib64/dri:/usr/lib/dri:/run/opengl-driver/lib/dri:/opt/va"
+            .into(),
+    );
+    input.insert(
+        "__EGL_VENDOR_LIBRARY_FILENAMES".into(),
+        "/usr/share/glvnd/egl_vendor.d/10_nvidia.json:/tmp/.mount_comparOIliDD/share/glvnd/egl_vendor.d/50_mesa.json"
+            .into(),
+    );
+    let cleaned = clean(&input);
+    assert_eq!(
+        cleaned.get(OsStr::new("LIBVA_DRIVERS_PATH")),
+        Some(&OsString::from("/opt/va"))
+    );
+    assert!(!cleaned.contains_key(OsStr::new("__EGL_VENDOR_LIBRARY_FILENAMES")));
+
+    input.insert(
+        "__EGL_VENDOR_LIBRARY_FILENAMES".into(),
+        "/usr/share/glvnd/egl_vendor.d/10_nvidia.json".into(),
+    );
+    assert_eq!(
+        clean(&input).get(OsStr::new("__EGL_VENDOR_LIBRARY_FILENAMES")),
+        Some(&OsString::from(
+            "/usr/share/glvnd/egl_vendor.d/10_nvidia.json"
+        ))
+    );
+}
+
+#[test]
+fn the_lists_sharun_derives_from_the_data_folders_are_removed() {
+    let mut input = sharun_child();
+    input.insert(
+        "XDG_DATA_DIRS".into(),
+        "/tmp/.mount_comparOIliDD/share:/home/tester/.local/share:/usr/local/share:/usr/share:/run/opengl-driver/share:/run/current-system/sw/share:/etc:/opt/share"
+            .into(),
+    );
+    input.insert(
+        "GSETTINGS_SCHEMA_DIR".into(),
+        "/tmp/.mount_comparOIliDD/share/glib-2.0/schemas:/usr/share/glib-2.0/schemas:/opt/share/glib-2.0/schemas:/home/tester/schemas"
+            .into(),
+    );
+    input.insert(
+        "VK_DRIVER_FILES".into(),
+        "/tmp/.mount_comparOIliDD/share/vulkan/icd.d:/usr/share/vulkan/icd.d/nvidia_icd.json:/usr/share/vulkan/icd.d/nouveau_icd.x86_64.json"
+            .into(),
+    );
+    let cleaned = clean(&input);
+    assert_eq!(
+        cleaned.get(OsStr::new("GSETTINGS_SCHEMA_DIR")),
+        Some(&OsString::from("/home/tester/schemas"))
+    );
+    assert!(!cleaned.contains_key(OsStr::new("VK_DRIVER_FILES")));
+    assert_eq!(
+        cleaned.get(OsStr::new("XDG_DATA_DIRS")),
+        Some(&OsString::from("/opt/share"))
     );
 }
 

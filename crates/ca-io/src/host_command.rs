@@ -6,7 +6,9 @@
 //! `LIBGL_DRIVERS_PATH`, `TERMINFO`, `PATH`, `XDG_DATA_DIRS`, ...) into the
 //! image. A host program that inherits them loads the image's modules against
 //! the host C library and fails, or reads image files that stop existing when
-//! the image unmounts while the program still runs. [`host_command`] builds a
+//! the image unmounts while the program still runs. sharun also puts host
+//! folders in front of lists such as `XDG_DATA_DIRS` and `GBM_BACKENDS_PATH`,
+//! which replace a host program's own defaults. [`host_command`] builds a
 //! [`Command`] whose environment has those variables removed or cleaned, and
 //! leaves every other variable exactly as it is.
 //!
@@ -151,6 +153,83 @@ const RESOURCE_VARIABLES: &[&str] = &[
 /// Variables that hold `:`-separated paths whatever their entries look like.
 const PATH_LIST_VARIABLES: &[&str] = &["PATH", "XDG_CONFIG_DIRS", "XDG_DATA_DIRS"];
 
+/// A folder that sharun adds to a list it builds for the image.
+#[derive(Debug, Clone, Copy)]
+enum Added {
+    /// A fixed folder of the host.
+    Folder(&'static str),
+    /// `/usr/lib/<multiarch triplet>/<name>`, added only on an architecture
+    /// with a triplet.
+    Multiarch(&'static str),
+    /// `<HOME>/<path>`, with the `HOME` that sharun read.
+    Home(&'static str),
+    /// A folder inside the image.
+    Image,
+}
+
+/// The adds of sharun to each list it builds, in the order it makes them, in
+/// groups it makes all or none of. Each add prepends the folder unless the
+/// value already holds it, so the user's own value is the tail behind the
+/// added folders. The lists mirror what the deployment tool adds; a mismatch
+/// leaves an added folder in a host child's environment.
+const BUILT_LISTS: &[(&str, &[&[Added]])] = &[
+    (
+        "XDG_DATA_DIRS",
+        &[&[
+            Added::Folder("/etc"),
+            Added::Folder("/run/current-system/sw/share"),
+            Added::Folder("/run/opengl-driver/share"),
+            Added::Folder("/usr/share"),
+            Added::Folder("/usr/local/share"),
+            Added::Home(".local/share"),
+            Added::Image,
+        ]],
+    ),
+    (
+        "GBM_BACKENDS_PATH",
+        &[&[
+            Added::Folder("/run/opengl-driver/lib/gbm"),
+            Added::Folder("/usr/lib/gbm"),
+            Added::Folder("/usr/lib64/gbm"),
+            Added::Multiarch("gbm"),
+            Added::Image,
+        ]],
+    ),
+    (
+        "LIBVA_DRIVERS_PATH",
+        &[
+            &[
+                Added::Folder("/run/opengl-driver/lib/dri"),
+                Added::Folder("/usr/lib/dri"),
+                Added::Folder("/usr/lib64/dri"),
+                Added::Multiarch("dri"),
+            ],
+            &[Added::Image],
+        ],
+    ),
+    (
+        "AMDGPU_ASIC_ID_TABLE_PATHS",
+        &[&[
+            Added::Image,
+            Added::Folder("/usr/share/libdrm"),
+            Added::Folder("/usr/local/share/libdrm"),
+        ]],
+    ),
+];
+
+/// Lists that sharun builds from `XDG_DATA_DIRS`: for each of its folders,
+/// last first, `<folder>/<path>` is prepended where it exists, and for
+/// `VK_DRIVER_FILES` also the files in it whose names hold one of the words.
+const DATA_FOLDER_LISTS: &[(&str, &str, &[&str])] = &[
+    ("__EGL_VENDOR_LIBRARY_DIRS", "glvnd/egl_vendor.d", &[]),
+    ("GSETTINGS_SCHEMA_DIR", "glib-2.0/schemas", &[]),
+    ("VK_DRIVER_FILES", "vulkan/icd.d", &["nvidia", "nouveau"]),
+];
+
+/// Lists that sharun sets only when the user left them unset; one that names
+/// an image path is sharun's whole.
+const SET_WHEN_UNSET: &[&str] = &["__EGL_VENDOR_LIBRARY_FILENAMES"];
+
 /// Folders the image's launchers redirect for the image's own data, with the
 /// variable that keeps the user's value while the redirection is in force.
 const SAVED_ORIGINALS: &[(&str, &str)] = &[
@@ -173,6 +252,8 @@ pub struct Image {
     /// The user's home folder from the account database, used when portable
     /// mode replaced `HOME` and no launcher kept the original.
     account_home: Option<OsString>,
+    /// The multiarch triplet of the image's architecture, as sharun names it.
+    triplet: Option<&'static str>,
 }
 
 impl Image {
@@ -239,7 +320,15 @@ impl Image {
             roots,
             runtime,
             account_home: None,
+            triplet: multiarch_triplet(),
         })
+    }
+
+    /// The same image built for the architecture with multiarch `triplet`.
+    #[cfg(test)]
+    fn with_triplet(mut self, triplet: Option<&'static str>) -> Self {
+        self.triplet = triplet;
+        self
     }
 
     /// The same image with the account database's home folder known.
@@ -260,6 +349,163 @@ impl Image {
 
     fn contains(&self, entry: &[u8]) -> bool {
         self.roots.iter().any(|root| inside(root, entry))
+    }
+
+    /// The groups of adds sharun made to `name`, oldest first, or `None` when
+    /// sharun does not build `name` from host folders.
+    fn adds_to(&self, name: &str, environment: &Environment) -> Option<Vec<Group>> {
+        let text = |variable: &str| {
+            environment
+                .get(OsStr::new(variable))
+                .and_then(|value| value.to_str())
+                .unwrap_or_default()
+        };
+        if let Some((_, groups)) = BUILT_LISTS.iter().find(|(built, _)| *built == name) {
+            let groups = groups
+                .iter()
+                .map(|adds| Group {
+                    steps: adds
+                        .iter()
+                        .filter_map(|add| match add {
+                            Added::Folder(folder) => Some(Step::Entry(folder.as_bytes().to_vec())),
+                            Added::Multiarch(subfolder) => self.triplet.map(|triplet| {
+                                Step::Entry(format!("/usr/lib/{triplet}/{subfolder}").into_bytes())
+                            }),
+                            Added::Home(path) => {
+                                Some(Step::Entry(format!("{}/{path}", text("HOME")).into_bytes()))
+                            }
+                            Added::Image => Some(Step::Image),
+                        })
+                        .collect(),
+                    whole: true,
+                })
+                .collect();
+            return Some(groups);
+        }
+        let (_, path, words) = DATA_FOLDER_LISTS
+            .iter()
+            .find(|(derived, _, _)| *derived == name)?;
+        let groups = text("XDG_DATA_DIRS")
+            .rsplit(':')
+            .map(|folder| Group {
+                steps: vec![Step::Below {
+                    folder: joined(folder.as_bytes(), path),
+                    words,
+                }],
+                whole: false,
+            })
+            .collect();
+        Some(groups)
+    }
+}
+
+/// Adds that sharun makes together: all of them or, when `whole` is false,
+/// each one on its own condition.
+struct Group {
+    steps: Vec<Step>,
+    whole: bool,
+}
+
+/// One add of sharun, as the entries it can put at the front of a list.
+enum Step {
+    /// Exactly this entry.
+    Entry(Vec<u8>),
+    /// An entry inside the image.
+    Image,
+    /// `folder` itself, or a file directly in it whose name holds one of
+    /// `words`; one add each.
+    Below {
+        folder: Vec<u8>,
+        words: &'static [&'static str],
+    },
+}
+
+impl Step {
+    fn matches(&self, entry: &[u8], image: &Image) -> bool {
+        match self {
+            Self::Entry(added) => entry == added.as_slice(),
+            Self::Image => image.contains(entry),
+            Self::Below { folder, words } => {
+                entry == folder.as_slice()
+                    || entry
+                        .strip_prefix(folder.as_slice())
+                        .and_then(|rest| rest.strip_prefix(b"/"))
+                        .is_some_and(|name| {
+                            !name.contains(&b'/')
+                                && words.iter().any(|word| {
+                                    name.windows(word.len()).any(|part| part == word.as_bytes())
+                                })
+                        })
+            }
+        }
+    }
+
+    fn repeats(&self) -> bool {
+        matches!(self, Self::Below { words, .. } if !words.is_empty())
+    }
+}
+
+/// `path` below `folder` as `Path::join` forms it.
+fn joined(folder: &[u8], path: &str) -> Vec<u8> {
+    let mut joined = folder.to_vec();
+    if !joined.is_empty() && !joined.ends_with(b"/") {
+        joined.push(b'/');
+    }
+    joined.extend_from_slice(path.as_bytes());
+    joined
+}
+
+/// How many leading entries of `entries` the adds in `groups` put there.
+///
+/// The adds are undone newest first. An add put its entry at the front only
+/// when the list did not hold it yet, so the front entry is removed when the
+/// add matches it and the rest of the list does not hold it again. A whole
+/// group whose adds do not all account for an entry was not made by sharun
+/// and removes nothing. A list with no image entry was not built by sharun.
+fn added_prefix(entries: &[&[u8]], groups: &[Group], image: &Image) -> usize {
+    if !entries.iter().any(|entry| image.contains(entry)) {
+        return 0;
+    }
+    let mut start = 0;
+    for group in groups.iter().rev() {
+        let before = start;
+        for step in group.steps.iter().rev() {
+            let mut removed = false;
+            while let Some((first, rest)) = entries.get(start..).and_then(<[_]>::split_first) {
+                if !step.matches(first, image) || rest.contains(first) {
+                    break;
+                }
+                start += 1;
+                removed = true;
+                if !step.repeats() {
+                    break;
+                }
+            }
+            let accounted = removed
+                || entries
+                    .get(start..)
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|entry| step.matches(entry, image));
+            if group.whole && !accounted {
+                start = before;
+                break;
+            }
+        }
+    }
+    start
+}
+
+/// The multiarch triplet sharun uses for this architecture.
+fn multiarch_triplet() -> Option<&'static str> {
+    match std::env::consts::ARCH {
+        "x86_64" => Some("x86_64-linux-gnu"),
+        "aarch64" => Some("aarch64-linux-gnu"),
+        "riscv64" => Some("riscv64-linux-gnu"),
+        "loongarch64" => Some("loongarch64-linux-gnu"),
+        "powerpc64" if cfg!(target_endian = "big") => Some("powerpc64-linux-gnu"),
+        "powerpc64" => Some("powerpc64le-linux-gnu"),
+        _ => None,
     }
 }
 
@@ -282,7 +528,15 @@ fn inside(root: &[u8], path: &[u8]) -> bool {
 ///   beside the image file) holds the image application's data only, so a host
 ///   program gets the account's home folder and the default configuration
 ///   folder; with no account home known, `HOME` stays as it is.
-/// - In `PATH`, `XDG_DATA_DIRS`, `XDG_CONFIG_DIRS`, the resource overrides
+/// - A list that sharun builds from host folders (`XDG_DATA_DIRS`,
+///   `GBM_BACKENDS_PATH`, `LIBVA_DRIVERS_PATH`, `AMDGPU_ASIC_ID_TABLE_PATHS`,
+///   `__EGL_VENDOR_LIBRARY_DIRS`, `GSETTINGS_SCHEMA_DIR`, `VK_DRIVER_FILES`)
+///   is set back to the user's value: the folders sharun put in front of it
+///   and its image entries are removed, and a list the user did not set is
+///   removed. A list that
+///   sharun sets only when it is unset (`__EGL_VENDOR_LIBRARY_FILENAMES`) is
+///   removed when it names an image path.
+/// - In `PATH`, `XDG_CONFIG_DIRS`, the resource overrides
 ///   (`GCONV_PATH`, `LIBGL_DRIVERS_PATH`, `TERMINFO`, ...) and in every value
 ///   whose non-empty `:`-separated entries are all absolute paths, each entry
 ///   inside the image is dropped, the other entries keep their order, and a
@@ -317,6 +571,18 @@ pub fn clean_environment(environment: &Environment, image: &Image) -> Environmen
             });
             continue;
         }
+        if let Some(groups) = image.adds_to(name_text, environment) {
+            insert_unbuilt(&mut cleaned, image, name, value, &groups);
+            continue;
+        }
+        if SET_WHEN_UNSET.contains(&name_text)
+            && value
+                .as_encoded_bytes()
+                .split(|byte| *byte == b':')
+                .any(|entry| image.contains(entry))
+        {
+            continue;
+        }
         if PATH_LIST_VARIABLES.contains(&name_text) || RESOURCE_VARIABLES.contains(&name_text) {
             insert_filtered(&mut cleaned, image, name, value);
             continue;
@@ -348,6 +614,36 @@ fn insert_filtered(cleaned: &mut Environment, image: &Image, name: &OsStr, value
     insert_entries(cleaned, name, value, LIST_SEPARATORS, |entry| {
         image.contains(entry)
     });
+}
+
+/// Insert the user's own part of a list that sharun built with `groups` of
+/// adds, without its image entries, or nothing when no user entry remains.
+fn insert_unbuilt(
+    cleaned: &mut Environment,
+    image: &Image,
+    name: &OsStr,
+    value: &OsStr,
+    groups: &[Group],
+) {
+    let bytes = value.as_encoded_bytes();
+    let entries: Vec<&[u8]> = bytes.split(|byte| *byte == b':').collect();
+    let added = added_prefix(&entries, groups, image);
+    if added == 0 {
+        insert_filtered(cleaned, image, name, value);
+        return;
+    }
+    let own = entries.get(added..).unwrap_or_default();
+    if own.iter().all(|entry| entry.is_empty()) {
+        return;
+    }
+    let offset: usize = entries
+        .iter()
+        .take(added)
+        .map(|entry| entry.len() + 1)
+        .sum();
+    if let Some(own) = bytes.get(offset..).and_then(from_bytes) {
+        insert_filtered(cleaned, image, name, &own);
+    }
 }
 
 /// Insert a variable of no known kind: a list of absolute paths loses its image
