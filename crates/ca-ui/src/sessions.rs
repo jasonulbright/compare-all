@@ -39,8 +39,10 @@ pub enum StoreMessage {
         /// The store, empty when no document existed.
         store: Box<SessionStore>,
         /// The claim on the settings directory, absent when another instance
-        /// holds it.
+        /// holds it or the directory cannot be written.
         lock: Option<SettingsLock>,
+        /// True when another instance holds the settings directory.
+        read_mostly: bool,
         /// Something about the load a person has to be told.
         notice: Option<String>,
     },
@@ -243,9 +245,10 @@ impl StoreHandle {
             StoreMessage::Loaded {
                 store,
                 lock,
+                read_mostly,
                 notice,
             } => {
-                self.read_mostly = lock.is_none();
+                self.read_mostly = read_mostly;
                 self.lock = lock;
                 self.store = Some(*store);
                 self.state = StoreState::Ready;
@@ -379,33 +382,68 @@ fn merge_notice(outcome: SaveOutcome) -> String {
 fn spawn_load(paths: SettingsPaths, notify: Arc<dyn Fn() + Send + Sync>) -> Job<StoreMessage> {
     Job::spawn_notifying(
         move |emitter, _| {
-            let lock = match SettingsLock::acquire(paths.directory().path()) {
-                Ok(LockOutcome::Acquired(lock)) => Some(lock),
-                Ok(LockOutcome::Held { .. }) | Err(_) => None,
+            let directory = paths.directory().path();
+            let (lock, claim) = match SettingsLock::acquire(directory) {
+                Ok(LockOutcome::Acquired(lock)) => (Some(lock), Claim::Taken),
+                Ok(LockOutcome::Held { .. }) => (None, Claim::HeldElsewhere),
+                Err(error) => (
+                    None,
+                    Claim::Unwritable(unwritable_notice(directory, &error)),
+                ),
             };
-            let announced = crate::paths::settings_notice_for(paths.directory().path());
+            let announced = crate::paths::settings_notice_for(directory);
             let message = match SessionStore::load(&paths.sessions_file()) {
                 Ok(outcome) => {
-                    let notice = load_notice(announced, &outcome, lock.is_none());
+                    let read_mostly = claim == Claim::HeldElsewhere;
+                    let notice = load_notice(announced, &outcome, claim);
                     StoreMessage::Loaded {
                         store: Box::new(outcome.store),
                         lock,
+                        read_mostly,
                         notice,
                     }
                 }
-                Err(error) => StoreMessage::Failed {
-                    store: Some(Box::new(SessionStore::default())),
-                    reason: announced.map_or_else(
-                        || format!("The sessions document could not be read: {error}"),
-                        |announced| {
-                            format!("{announced} The sessions document could not be read: {error}")
-                        },
-                    ),
-                },
+                Err(error) => {
+                    let mut parts: Vec<String> = announced.into_iter().map(str::to_owned).collect();
+                    if let Claim::Unwritable(text) = claim {
+                        parts.push(text);
+                    }
+                    parts.push(format!("The sessions document could not be read: {error}"));
+                    StoreMessage::Failed {
+                        store: Some(Box::new(SessionStore::default())),
+                        reason: parts.join(" "),
+                    }
+                }
             };
             emitter.send(message);
         },
         notify,
+    )
+}
+
+/// How the claim on the settings directory went.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Claim {
+    /// This instance holds it.
+    Taken,
+    /// Another instance holds it.
+    HeldElsewhere,
+    /// The folder or its lock file cannot be created or written; the text
+    /// says which and why.
+    Unwritable(String),
+}
+
+/// The line shown when the settings directory cannot be claimed because it
+/// cannot be created or written.
+fn unwritable_notice(directory: &std::path::Path, error: &ca_session::Error) -> String {
+    let cause = match error {
+        ca_session::Error::Io { path, source } if path == directory => source.to_string(),
+        ca_session::Error::Io { path, source } => format!("{}: {source}", path.display()),
+        other => other.to_string(),
+    };
+    format!(
+        "The settings folder {} cannot be created or written ({cause}). Settings and sessions are not saved.",
+        directory.display()
     )
 }
 
@@ -414,7 +452,7 @@ fn spawn_load(paths: SettingsPaths, notify: Arc<dyn Fn() + Send + Sync>) -> Job<
 fn load_notice(
     announced: Option<&str>,
     outcome: &ca_session::LoadOutcome,
-    read_mostly: bool,
+    claim: Claim,
 ) -> Option<String> {
     let mut parts: Vec<String> = announced.into_iter().map(str::to_owned).collect();
     if let Some(backup) = &outcome.recovered_backup {
@@ -434,11 +472,13 @@ fn load_notice(
             outcome.repairs.duplicate_ids, outcome.repairs.kinds_corrected
         ));
     }
-    if read_mostly {
-        parts.push(
+    match claim {
+        Claim::Taken => {}
+        Claim::HeldElsewhere => parts.push(
             "Another instance holds the settings directory. Changes made here are combined with that instance's when they are saved."
                 .to_owned(),
-        );
+        ),
+        Claim::Unwritable(text) => parts.push(text),
     }
     (!parts.is_empty()).then(|| parts.join(" "))
 }
@@ -533,6 +573,41 @@ mod tests {
             second.notice().is_some(),
             "the second instance says nothing"
         );
+    }
+
+    /// A folder under a regular file cannot be created on any platform, and
+    /// even a privileged user meets the same refusal there.
+    #[test]
+    fn a_settings_folder_that_cannot_be_created_is_named_as_the_cause() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("not-a-folder");
+        std::fs::write(&file, b"x").unwrap();
+        let settings = file.join("compare-all");
+        let mut handle = handle(&settings);
+        settle(&mut handle);
+        let notice = handle.notice().unwrap_or_default().to_owned();
+        assert!(!notice.contains("Another instance"), "{notice}");
+        assert!(notice.contains("cannot be created or written"), "{notice}");
+        assert!(notice.contains(&settings.display().to_string()), "{notice}");
+        assert!(!handle.is_read_mostly());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_home_is_named_as_the_cause() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let settings = home.path().join(".config").join("compare-all");
+        let writable = std::fs::create_dir(home.path().join("probe")).is_ok();
+        if !writable {
+            let mut handle = handle(&settings);
+            settle(&mut handle);
+            let notice = handle.notice().unwrap_or_default().to_owned();
+            assert!(!notice.contains("Another instance"), "{notice}");
+            assert!(notice.contains("cannot be created or written"), "{notice}");
+        }
+        std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     /// Neither instance's work is dropped: a save that meets a replaced
