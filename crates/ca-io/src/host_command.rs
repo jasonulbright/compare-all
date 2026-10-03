@@ -468,10 +468,22 @@ fn executable() -> Option<&'static Path> {
         .as_deref()
 }
 
-/// The home folder the local account database gives the real user.
-#[cfg(unix)]
+/// The home folder the local account database gives the real user, read at
+/// most once per process.
 fn account_home() -> Option<OsString> {
+    static HOME: OnceLock<Option<OsString>> = OnceLock::new();
+    HOME.get_or_init(read_account_home).clone()
+}
+
+/// How many times the password database was read.
+#[cfg(test)]
+static ACCOUNT_READS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(unix)]
+fn read_account_home() -> Option<OsString> {
     use std::io::Read;
+    #[cfg(test)]
+    ACCOUNT_READS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let mut database = Vec::new();
     std::fs::File::open("/etc/passwd")
         .ok()?
@@ -486,7 +498,9 @@ fn account_home() -> Option<OsString> {
 const MAX_PASSWORD_BYTES: u64 = 16 * 1024 * 1024;
 
 #[cfg(not(unix))]
-fn account_home() -> Option<OsString> {
+fn read_account_home() -> Option<OsString> {
+    #[cfg(test)]
+    ACCOUNT_READS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     None
 }
 
