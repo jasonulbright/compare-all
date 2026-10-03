@@ -21,6 +21,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
+/// The folders a program search walks when `PATH` is unset: the value glibc's
+/// `execvp` takes from `confstr(_CS_PATH)`. A host program whose cleaned
+/// environment has no `PATH` is searched for here.
+pub const DEFAULT_SEARCH_PATH: &str = "/bin:/usr/bin";
+
 /// An environment, by variable name.
 pub type Environment = BTreeMap<OsString, OsString>;
 
