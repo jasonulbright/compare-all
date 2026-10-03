@@ -155,9 +155,91 @@ thread_local! {
     pub(crate) static RESYNCS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(crate) static REABSORBS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(crate) static PANE_EDITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static FILTER_PASSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 impl MergeModel {
+    /// Every way the lent records break their invariants: each record sits
+    /// on a line of an earlier section, holds characters that line shows at
+    /// its column and overlaps no other record; order numbers are unique and
+    /// issued; the oldest record of a lender carries a source; and each
+    /// section names the last lender it holds text of.
+    #[cfg(test)]
+    pub(crate) fn lent_record_problems(&self) -> Vec<String> {
+        let mut problems = Vec::new();
+        let mut spans: BTreeMap<usize, Vec<(usize, usize, usize)>> = BTreeMap::new();
+        let mut last_lender: BTreeMap<usize, usize> = BTreeMap::new();
+        for (lender, section) in self.sections.iter().enumerate() {
+            let mut seqs = BTreeSet::new();
+            for entry in &section.lent {
+                if !seqs.insert(entry.seq) || entry.seq > self.lend_seq {
+                    problems.push(format!("s{lender} order number {} reused", entry.seq));
+                }
+                if entry.holder >= lender {
+                    problems.push(format!("s{lender} lends to s{}", entry.holder));
+                    continue;
+                }
+                let Some(range) = self.output_range(entry.holder) else {
+                    problems.push(format!("s{lender} lends to missing s{}", entry.holder));
+                    continue;
+                };
+                last_lender
+                    .entry(entry.holder)
+                    .and_modify(|last| *last = (*last).max(lender))
+                    .or_insert(lender);
+                let line = (range.start + entry.offset) as usize;
+                let count = entry.text.chars().count();
+                let here: String = self
+                    .output
+                    .get(line)
+                    .map(|text| {
+                        text.chars()
+                            .skip(entry.column as usize)
+                            .take(count)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if entry.offset >= range.end - range.start || count == 0 || here != entry.text {
+                    problems.push(format!(
+                        "s{lender} record {:?} on s{} line {line} column {} finds {here:?}",
+                        entry.text, entry.holder, entry.column
+                    ));
+                    continue;
+                }
+                let start = entry.column as usize;
+                spans
+                    .entry(line)
+                    .or_default()
+                    .push((start, start + count, lender));
+            }
+            let oldest = section.lent.iter().min_by_key(|entry| entry.seq);
+            if oldest.is_some_and(|entry| entry.source.is_none()) {
+                problems.push(format!("s{lender} oldest record has no source"));
+            }
+        }
+        for (line, mut list) in spans {
+            list.sort_unstable();
+            for pair in list.windows(2) {
+                if pair[1].0 < pair[0].1 {
+                    problems.push(format!(
+                        "line {line}: records of s{} and s{} overlap",
+                        pair[0].2, pair[1].2
+                    ));
+                }
+            }
+        }
+        for (index, section) in self.sections.iter().enumerate() {
+            let expected = last_lender.get(&index).copied();
+            if section.joined_through != expected {
+                problems.push(format!(
+                    "s{index} names s{:?} as its last lender, holds text of s{expected:?}",
+                    section.joined_through
+                ));
+            }
+        }
+        problems
+    }
+
     /// The lent records `holder`'s lines hold, as `(lender, seq)`.
     fn held_by(&self, holder: usize) -> Vec<(usize, u64)> {
         let Some(through) = self.sections.get(holder).and_then(|s| s.joined_through) else {

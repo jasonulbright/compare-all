@@ -1282,6 +1282,8 @@ impl MergeView {
     /// Record that the model changed: the strip is redrawn and the filter
     /// applied again.
     fn touched(&mut self) {
+        #[cfg(test)]
+        model::ownership::FILTER_PASSES.with(|count| count.set(count.get() + 1));
         self.strip_stale = true;
         self.visible = filter::visible(&self.data.model, self.filter);
         self.marks_changed = self.waiting_sections() != self.written_marks;
