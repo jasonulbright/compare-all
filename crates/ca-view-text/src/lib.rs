@@ -4,6 +4,9 @@ pub use ca_ui::save::text as save;
 
 pub use ca_ui::find;
 pub mod edit;
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic)]
+mod edit_sequences;
 mod file_save;
 pub mod jobs;
 pub mod lines;
