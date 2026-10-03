@@ -2686,8 +2686,8 @@ impl App {
         }
     }
 
-    /// Why the shell refuses `command` this frame, where the reason is more
-    /// specific than the one its menu line carries.
+    /// Why the shell or the active view refuses `command` this frame, where
+    /// the reason is more specific than the one its menu line carries.
     #[must_use]
     pub fn refusal(&self, command: Command) -> Option<&'static str> {
         match command {
@@ -2700,8 +2700,17 @@ impl App {
             {
                 Some(TEMPORARIES)
             }
-            _ => None,
+            _ => self
+                .tabs
+                .get(self.active)
+                .and_then(|tab| tab.refusal(command)),
         }
+    }
+
+    /// The reason a disabled menu line shows: the shell's or the active
+    /// view's own, else the one the bar declares for the line.
+    fn line_reason(&self, command: Command, declared: &'static str) -> &'static str {
+        self.refusal(command).unwrap_or(declared)
     }
 
     /// True while the active tab reads copies made for it alone.
@@ -3141,7 +3150,7 @@ impl App {
                             }
                             Entry::Run(command, reason) => {
                                 let enabled = self.line_enabled(*command);
-                                let reason: &str = self.refusal(*command).unwrap_or(reason);
+                                let reason = self.line_reason(*command, reason);
                                 if widgets::command_item_in(ui, view, *command, enabled, reason) {
                                     self.run(*command, context);
                                 }
@@ -4529,6 +4538,114 @@ mod tests {
         assert!(specs.right.is_none());
         assert_eq!(app.tab_sessions[0], None);
         assert_eq!(app.settings_notice(), None);
+    }
+
+    /// The reason the line of `command` in the active bar shows when it is
+    /// disabled.
+    fn menu_reason(app: &App, command: Command) -> Option<&'static str> {
+        menus_for(app.menu_view())
+            .iter()
+            .flat_map(|(_, entries)| entries.iter())
+            .find_map(|entry| match entry {
+                Entry::Run(listed, declared) if *listed == command => {
+                    Some(app.line_reason(command, declared))
+                }
+                _ => None,
+            })
+    }
+
+    /// The accessible label of the line of `command` in the text bar.
+    fn text_line_label(command: Command) -> String {
+        match command.shortcut_in(MenuView::Text) {
+            Some(shortcut) => format!("{}\t{shortcut}", command.label_in(MenuView::Text)),
+            None => command.label_in(MenuView::Text).to_owned(),
+        }
+    }
+
+    /// While an edit waits for its comparison, the Edit and Search menu lines
+    /// that turn rows into lines are disabled and give the reason the toolbar
+    /// gives, not a claim that the view has no editable pane.
+    #[test]
+    fn row_command_lines_say_they_wait_for_the_comparison_of_an_edit() {
+        use ca_ui::testing::probe::Probe;
+        use std::cell::RefCell;
+
+        const WAITING: &str = "Available once the edit is compared";
+        let context = context();
+        let dir = tempfile::tempdir().unwrap();
+        let left = dir.path().join("left.txt");
+        let right = dir.path().join("right.txt");
+        std::fs::write(&left, "one\nTWO\nthree\n").unwrap();
+        std::fs::write(&right, "one\ntwo\nthree\n").unwrap();
+        let (_settings, mut app) = empty_app();
+        assert!(ca_ui::testing::wait_until(
+            std::time::Duration::from_secs(10),
+            || {
+                app.poll_store();
+                app.store().borrow().is_ready()
+            }
+        ));
+        app.open_kind(&SessionKind::TextCompare, left, right, &context);
+        assert!(ca_ui::testing::wait_until(
+            std::time::Duration::from_secs(20),
+            || {
+                app.tabs[0].tick();
+                app.tabs[0].is_ready()
+            }
+        ));
+        let app = RefCell::new(app);
+        let mut probe = Probe::new(1600.0, 900.0);
+        let mut run = |ctx: &egui::Context| app.borrow_mut().frame(ctx);
+        probe.idle(&mut run);
+        probe.idle(&mut run);
+        assert!(app.borrow().tabs[0].accepts(Command::CopyToRight));
+
+        let rows = [
+            Command::CopyToRight,
+            Command::CopyLineToRight,
+            Command::CopyToLeft,
+            Command::CopyLineToLeft,
+            Command::CopyToOtherSide,
+            Command::SelectSection,
+            Command::NextSection,
+            Command::PreviousSection,
+            Command::NextDifference,
+            Command::PreviousDifference,
+        ];
+        // A frame lets the comparison of the edit start once the quiet period
+        // has passed, so a slow frame can see it land; each attempt types again.
+        let mut shown = false;
+        for _ in 0..5 {
+            let _ = probe.frame(vec![egui::Event::Text("z".to_owned())], &mut run);
+            assert!(app.borrow().tabs[0].holds_unwritten_edits());
+            for command in rows {
+                assert!(!app.borrow().tabs[0].accepts(command), "{command:?}");
+                assert_eq!(
+                    menu_reason(&app.borrow(), command),
+                    Some(WAITING),
+                    "{command:?}"
+                );
+            }
+            probe.click("Edit", &mut run).unwrap();
+            if app.borrow().tabs[0].accepts(Command::CopyToRight) {
+                probe.click("Edit", &mut run).unwrap();
+                continue;
+            }
+            for command in [
+                Command::CopyToRight,
+                Command::CopyToLeft,
+                Command::SelectSection,
+            ] {
+                let line = probe.find(&text_line_label(command)).unwrap();
+                assert!(!line.enabled, "{command:?} is enabled over a stale row map");
+            }
+            shown = true;
+            break;
+        }
+        assert!(
+            shown,
+            "the comparison of each edit landed before the menu opened"
+        );
     }
 
     #[test]
