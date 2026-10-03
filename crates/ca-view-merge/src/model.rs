@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::ops::Range;
 
 mod history;
-mod ownership;
+pub(crate) mod ownership;
 
 pub(crate) use history::Step;
 
