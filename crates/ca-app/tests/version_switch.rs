@@ -5,6 +5,10 @@
 //! refused command line there and this file holds no test.
 
 #![cfg(not(windows))]
+#![allow(
+    clippy::disallowed_methods,
+    reason = "the program under test is started directly, not as a host program"
+)]
 
 use std::io::Read as _;
 use std::time::{Duration, Instant};

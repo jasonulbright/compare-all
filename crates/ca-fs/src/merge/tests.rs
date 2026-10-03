@@ -3,6 +3,10 @@
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::expect_used)]
 #![allow(clippy::panic)]
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test setup runs a platform tool directly"
+)]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};

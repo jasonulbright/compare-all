@@ -3,6 +3,11 @@
 //! from their SVG; `package` builds the Windows installer from the release
 //! binaries.
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "build tasks run the toolchain directly on the build machine"
+)]
+
 mod icon;
 mod notices;
 mod package;

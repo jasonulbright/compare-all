@@ -1,5 +1,10 @@
 //! The running application resolves its settings beside a portable executable.
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "the program under test is started directly, not as a host program"
+)]
+
 use std::path::{Path, PathBuf};
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 

@@ -3,6 +3,11 @@
 //! The case runs this test binary again with a changed environment, so the
 //! test process itself never changes a variable.
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "the test binary is started directly with an exact environment"
+)]
+
 use std::path::PathBuf;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;

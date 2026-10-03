@@ -1,3 +1,8 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test setup runs a platform tool directly"
+)]
+
 use super::*;
 
 fn names(directory: &Path) -> Vec<std::ffi::OsString> {

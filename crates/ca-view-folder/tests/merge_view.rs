@@ -4,6 +4,10 @@
 //! output folder, and a text conflict opens in the text merge.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test setup runs a platform tool directly"
+)]
 
 use ca_fs::{Change, MergeStatus, Pane, Resolution};
 use ca_session::SessionKind;
