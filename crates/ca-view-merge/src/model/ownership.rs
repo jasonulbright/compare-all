@@ -314,6 +314,64 @@ impl MergeModel {
         self.repair_output_seams(line..line + 1);
     }
 
+    /// Make the separator a composition added to output line `line` part of
+    /// that line's section once the line after it no longer calls for that
+    /// separator. The pane holds the separator as text, and a later
+    /// composition, a reload for one, would otherwise drop it.
+    fn claim_stale_repair(&mut self, line: usize) {
+        let repair = self.output_repairs.get(line).copied().unwrap_or(0);
+        if repair == 0 {
+            return;
+        }
+        let Some(text) = self.output.get(line).cloned() else {
+            return;
+        };
+        let bare = &text[..text.len().saturating_sub(repair)];
+        let ending = self
+            .output_ending
+            .unwrap_or_else(ca_text::EolStyle::platform)
+            .as_str();
+        let next = self.output.get(line + 1);
+        let mut needed = String::new();
+        if next.is_some() && !bare.ends_with(['\r', '\n']) {
+            needed.push_str(ending);
+        }
+        if format!("{bare}{needed}").ends_with('\r') && next.is_some_and(|n| n.starts_with('\n')) {
+            needed.push('\n');
+        }
+        if text[bare.len()..] == needed {
+            return;
+        }
+        let Ok(at) = u32::try_from(line) else {
+            return;
+        };
+        let Some(owner) = self.section_of_output_line(at) else {
+            return;
+        };
+        let Some(range) = self.output_range(owner) else {
+            return;
+        };
+        let local = at - range.start;
+        let held: Vec<(usize, super::Lent)> = self
+            .records_on_line(owner, line)
+            .into_iter()
+            .filter_map(|(lender, seq, _, _)| {
+                self.remove_lent(lender, seq, false)
+                    .map(|entry| (lender, entry))
+            })
+            .collect();
+        let conflict = self.sections[owner].conflict;
+        self.touch(owner);
+        self.sections[owner].restore = None;
+        if self.edit_output_range(owner, local..local + 1, vec![text]) {
+            self.sections[owner].conflict = conflict;
+            self.refresh_section_totals(owner);
+        }
+        for (lender, entry) in held {
+            self.add_lent(lender, entry);
+        }
+    }
+
     fn add_lent(&mut self, lender: usize, entry: super::Lent) {
         self.touch(lender);
         let holder = entry.holder;
@@ -1022,6 +1080,9 @@ impl MergeModel {
                 self.sections[index].restore = Some(Box::new(restore));
             }
             self.apply_restore(index);
+        }
+        for line in first.saturating_sub(1)..first + line_runs.len() {
+            self.claim_stale_repair(line);
         }
         Some(inserter.1)
     }
