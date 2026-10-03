@@ -25,6 +25,10 @@ struct Run {
     text: String,
 }
 
+/// Characters of an inserted text on one line, as `(local line, column,
+/// text)`.
+type Piece = (u32, u32, String);
+
 /// Text a pane edit leaves on a line of an earlier section. `fresh` holds
 /// the characters that sat on the lender's own lines before the edit.
 struct NewRecord {
@@ -100,24 +104,6 @@ fn slide_to_line_start(text: &str, line_starts: &[usize], offset: usize, removed
 
 fn is_terminator_only(text: &str) -> bool {
     !text.is_empty() && text.chars().all(|c| c == '\r' || c == '\n')
-}
-
-/// Insert `text` `at` characters into the text `lines` hold, keeping the
-/// lines split as a pane splits them.
-pub(super) fn insert_text(lines: &mut Vec<String>, at: usize, text: &str) {
-    let mut remaining = at;
-    for index in 0..lines.len() {
-        let count = lines[index].chars().count();
-        if remaining < count || (remaining == count && index + 1 == lines.len()) {
-            let split = byte_at(&lines[index], remaining);
-            let merged = format!("{}{text}{}", &lines[index][..split], &lines[index][split..]);
-            let parts = super::split(&merged);
-            lines.splice(index..=index, parts);
-            return;
-        }
-        remaining -= count;
-    }
-    lines.extend(super::split(text));
 }
 
 /// Remove `prefix` from the start of the text `lines` hold. Returns false,
@@ -312,7 +298,7 @@ impl MergeModel {
     }
 
     /// A record no older record covers stands for its own text.
-    fn settle_sources(&mut self, lender: usize) {
+    pub(super) fn settle_sources(&mut self, lender: usize) {
         let Some(section) = self.sections.get(lender) else {
             return;
         };
@@ -358,17 +344,23 @@ impl MergeModel {
         let line = (range.start + record.offset) as usize;
         let text = self.output.get(line).cloned().unwrap_or_default();
         let repair = self.output_repairs.get(line).copied().unwrap_or(0);
-        let own = &text[..text.len().saturating_sub(repair)];
         let column = record.column as usize;
-        let start = byte_at(own, column);
-        let end = byte_at(own, column + record.text.chars().count());
-        if record.offset >= range.end - range.start || own.get(start..end) != Some(&record.text) {
+        let start = byte_at(&text, column);
+        let end = byte_at(&text, column + record.text.chars().count());
+        if record.offset >= range.end - range.start || text.get(start..end) != Some(&record.text) {
             if let Some(removed) = self.remove_lent(lender, seq, true) {
                 self.uncover_after(lender, &removed);
             }
             return;
         }
-        let stripped = format!("{}{}", &own[..start], &own[end..]);
+        // A separator the composition added stays a separator: the seam
+        // repair below adds it again when the line still needs one.
+        let own_end = text.len().saturating_sub(repair);
+        let stripped = if end <= own_end {
+            format!("{}{}", &text[..start], &text[end..own_end])
+        } else {
+            format!("{}{}", &text[..start], &text[end..])
+        };
         let removed_chars = record.text.chars().count();
         let mut others = Vec::new();
         for (other, other_seq, _, _) in self.records_on_line(holder, line) {
@@ -620,87 +612,223 @@ impl MergeModel {
         (runs, true)
     }
 
-    /// Give lent text back to its lender, at its place in the lender's own
-    /// text. Returns the lender and the lines that received it.
+    /// The output line and column where a record's text starts.
+    fn record_at(&self, record: &super::Lent) -> Option<(usize, u32)> {
+        let range = self.output_range(record.holder)?;
+        Some(((range.start + record.offset) as usize, record.column))
+    }
+
+    /// The record of `lender`, other than `seq`, whose text comes first
+    /// after output position `at`.
+    fn next_record(&self, lender: usize, seq: u64, at: (usize, u32)) -> Option<super::Lent> {
+        self.sections
+            .get(lender)?
+            .lent
+            .iter()
+            .filter(|entry| entry.seq != seq)
+            .filter_map(|entry| Some((self.record_at(entry)?, entry)))
+            .filter(|(position, _)| *position > at)
+            .min_by_key(|(position, _)| *position)
+            .map(|(_, entry)| entry.clone())
+    }
+
+    /// Give `text` the line terminators it needs to stay a line of its own
+    /// in front of `following`, a character of the same lender. Text whose
+    /// break an edit removed would otherwise join that character's line,
+    /// a line no input holds.
+    fn end_before(&self, text: &mut String, following: Option<char>) {
+        if following.is_none() {
+            return;
+        }
+        if !text.ends_with(['\r', '\n']) {
+            text.push_str(
+                self.output_ending
+                    .unwrap_or_else(ca_text::EolStyle::platform)
+                    .as_str(),
+            );
+        }
+        if text.ends_with('\r') && following == Some('\n') {
+            text.push('\n');
+        }
+    }
+
+    /// Insert `text` at character `column` of line `local` of section
+    /// `index`. The records on that line stay on their characters, and the
+    /// section keeps its wait for review. Returns how many lines replace the
+    /// line, and the characters of `text` each of them holds, as
+    /// `(local line, column, text)`.
+    fn insert_into_line(
+        &mut self,
+        index: usize,
+        local: u32,
+        column: usize,
+        text: &str,
+    ) -> Option<(u32, Vec<Piece>)> {
+        let range = self.output_range(index)?;
+        let line = (range.start + local) as usize;
+        let old = self.output.get(line)?.clone();
+        let split = byte_at(&old, column);
+        let merged = format!("{}{text}{}", &old[..split], &old[split..]);
+        let parts = super::split(&merged);
+        let count = u32::try_from(parts.len()).ok()?;
+        let added = text.chars().count();
+        let lengths: Vec<usize> = parts.iter().map(|part| part.chars().count()).collect();
+        let locate = |mut at: usize| -> (usize, usize) {
+            for (part, length) in lengths.iter().enumerate() {
+                if at < *length || part + 1 == lengths.len() {
+                    return (part, at);
+                }
+                at -= length;
+            }
+            (0, at)
+        };
+        let mut moved = Vec::new();
+        for (lender, seq, record_column, _) in self.records_on_line(index, line) {
+            if let Some(record) = self.remove_lent(lender, seq, false) {
+                let mut at = record_column as usize;
+                if at >= column {
+                    at += added;
+                }
+                moved.push((lender, record, locate(at)));
+            }
+        }
+        let mut pieces = Vec::new();
+        let mut start = 0usize;
+        for (part, (part_text, length)) in parts.iter().zip(&lengths).enumerate() {
+            let low = column.max(start);
+            let high = (column + added).min(start + length);
+            if low < high {
+                let piece: String = part_text
+                    .chars()
+                    .skip(low - start)
+                    .take(high - low)
+                    .collect();
+                pieces.push((
+                    local + u32::try_from(part).ok()?,
+                    u32::try_from(low - start).ok()?,
+                    piece,
+                ));
+            }
+            start += length;
+        }
+        let conflict = self.sections[index].conflict;
+        if !self.edit_output_range(index, local..local + 1, parts) {
+            return None;
+        }
+        self.sections[index].conflict = conflict;
+        self.refresh_section_totals(index);
+        for (lender, mut record, (part, at)) in moved {
+            record.offset = local + u32::try_from(part).ok()?;
+            record.column = u32::try_from(at).ok()?;
+            self.add_lent(lender, record);
+        }
+        Some((count, pieces))
+    }
+
+    /// Mend the seams of lines `local` of section `index` at once, so a
+    /// later change that moves those lines does not leave a line without
+    /// its separator.
+    fn repair_local(&mut self, index: usize, local: &Range<u32>) {
+        if let Some(range) = self.output_range(index) {
+            let start = (range.start + local.start) as usize;
+            let end = (range.start + local.end).min(range.end) as usize;
+            self.repair_output_seams(start..end.max(start));
+        }
+    }
+
+    /// Give lent text back to its lender. The text goes in front of the
+    /// lender's next character in output order: on a later holder's line
+    /// as lent text again, or in front of the lender's own text. The
+    /// lender's characters keep their order. Returns the section and the
+    /// lines that received the text.
     fn give_back(&mut self, lender: usize, seq: u64) -> Option<(usize, Range<u32>)> {
+        let record = self.lent_record(lender, seq)?.clone();
+        let next = self
+            .record_at(&record)
+            .and_then(|at| self.next_record(lender, seq, at));
         let entry = self.remove_lent(lender, seq, false)?;
+        match next {
+            Some(next) => self.lend_before(lender, entry, &next),
+            None => self.return_to_lender(lender, entry),
+        }
+    }
+
+    /// Put the text of `entry`, a record of `lender` no line holds now, in
+    /// front of `next`, another record of `lender`, as lent text of the
+    /// same order number and source.
+    pub(super) fn lend_before(
+        &mut self,
+        lender: usize,
+        entry: super::Lent,
+        next: &super::Lent,
+    ) -> Option<(usize, Range<u32>)> {
+        let mut text = entry.text.clone();
+        self.end_before(&mut text, next.text.chars().next());
+        let (count, pieces) =
+            self.insert_into_line(next.holder, next.offset, next.column as usize, &text)?;
+        let mut first = Some((entry.seq, entry.source));
+        for (offset, column, piece) in pieces {
+            let (seq, source) = first.take().unwrap_or_else(|| {
+                self.lend_seq += 1;
+                (self.lend_seq, None)
+            });
+            self.add_lent(
+                lender,
+                super::Lent {
+                    holder: next.holder,
+                    offset,
+                    column,
+                    text: piece,
+                    seq,
+                    source,
+                },
+            );
+        }
+        let lines = next.offset..next.offset + count;
+        self.repair_local(next.holder, &lines);
+        Some((next.holder, lines))
+    }
+
+    /// Put the text of `entry`, a record of `lender` no line holds now, in
+    /// front of the lender's own text.
+    pub(super) fn return_to_lender(
+        &mut self,
+        lender: usize,
+        entry: super::Lent,
+    ) -> Option<(usize, Range<u32>)> {
         self.uncover_after(lender, &entry);
         if entry.source.as_deref() != Some(entry.text.as_str()) {
             // The text that comes back differs from what the lender lent, so
             // the lender cannot return to its state before the lending.
+            self.touch(lender);
             self.sections[lender].restore = None;
         }
         let range = self.output_range(lender)?;
-        let mut chars = 0usize;
         let mut target = None;
         for local in 0..range.end - range.start {
             let line = (range.start + local) as usize;
-            let text = self.output.get(line)?.clone();
+            let text = self.output.get(line)?;
             let repair = self.output_repairs.get(line).copied().unwrap_or(0);
+            let limit = text.chars().count().saturating_sub(repair);
             let records = self.records_on_line(lender, line);
-            let (runs, _) = Self::split_line(lender, &text, &records);
-            let own: usize = runs
-                .iter()
-                .filter(|run| run.owner == lender)
-                .map(|run| run.text.chars().count())
-                .sum::<usize>()
-                .saturating_sub(repair);
-            if entry.insert_at < chars + own {
-                let mut wanted = entry.insert_at - chars;
-                let mut column = 0usize;
-                for run in &runs {
-                    let count = run.text.chars().count();
-                    if run.owner == lender {
-                        if wanted <= count {
-                            column += wanted;
-                            wanted = 0;
-                            break;
-                        }
-                        wanted -= count;
-                    }
-                    column += count;
+            let (runs, _) = Self::split_line(lender, text, &records);
+            let mut column = 0usize;
+            for run in &runs {
+                if run.owner == lender && column < limit {
+                    target = Some((local, column, text[byte_at(text, column)..].chars().next()));
+                    break;
                 }
-                target = Some((local, column + wanted, records));
+                column += run.text.chars().count();
+            }
+            if target.is_some() {
                 break;
             }
-            chars += own;
         }
         let conflict = self.sections[lender].conflict;
-        let inserted = if let Some((local, column, records)) = target {
-            let line = (range.start + local) as usize;
-            let text = self.output.get(line)?.clone();
-            let split = byte_at(&text, column);
-            let merged = format!("{}{}{}", &text[..split], entry.text, &text[split..]);
-            let parts = super::split(&merged);
-            let count = u32::try_from(parts.len()).ok()?;
-            let added = entry.text.chars().count();
-            let mut moved = Vec::new();
-            for (other_lender, record_seq, record_column, _) in &records {
-                if let Some(record) = self.remove_lent(*other_lender, *record_seq, false) {
-                    let mut at = *record_column as usize;
-                    if at >= column {
-                        at += added;
-                    }
-                    let mut part = 0usize;
-                    for (index, text) in parts.iter().enumerate() {
-                        let length = text.chars().count();
-                        if at < length || index + 1 == parts.len() {
-                            part = index;
-                            break;
-                        }
-                        at -= length;
-                    }
-                    moved.push((*other_lender, record, part, at));
-                }
-            }
-            if !self.edit_output_range(lender, local..local + 1, parts) {
-                return None;
-            }
-            for (owner, mut record, part, at) in moved {
-                record.offset = local + u32::try_from(part).ok()?;
-                record.column = u32::try_from(at).ok()?;
-                self.add_lent(owner, record);
-            }
+        let lines = if let Some((local, column, following)) = target {
+            let mut text = entry.text;
+            self.end_before(&mut text, following);
+            let (count, _) = self.insert_into_line(lender, local, column, &text)?;
             local..local + count
         } else {
             let parts = super::split(&entry.text);
@@ -709,36 +837,31 @@ impl MergeModel {
             if !self.edit_output_range(lender, len..len, parts) {
                 return None;
             }
+            self.sections[lender].conflict = conflict;
+            self.refresh_section_totals(lender);
             len..len + count
         };
-        self.sections[lender].conflict = conflict;
-        self.refresh_section_totals(lender);
-        let moved_chars = entry.text.chars().count();
-        for other in &mut self.sections[lender].lent {
-            if other.insert_at > entry.insert_at
-                || (other.insert_at == entry.insert_at && other.seq > entry.seq)
-            {
-                other.insert_at += moved_chars;
-            }
-        }
+        self.repair_local(lender, &lines);
         self.apply_restore(lender);
-        Some((lender, inserted))
+        Some((lender, lines))
     }
+
     /// Give back the text lent to line `local` of `holder`, before that
     /// line is replaced.
     pub(super) fn give_back_line(&mut self, holder: usize, local: u32) -> Vec<(usize, Range<u32>)> {
-        let records: Vec<(usize, u64)> = self
+        let mut records: Vec<(u32, usize, u64)> = self
             .held_by(holder)
             .into_iter()
-            .filter(|&(lender, seq)| {
-                self.lent_record(lender, seq)
-                    .is_some_and(|record| record.offset == local)
+            .filter_map(|(lender, seq)| {
+                let record = self.lent_record(lender, seq)?;
+                (record.offset == local).then_some((record.column, lender, seq))
             })
             .collect();
+        records.sort_unstable();
         records
             .into_iter()
             .rev()
-            .filter_map(|(lender, seq)| self.give_back(lender, seq))
+            .filter_map(|(_, lender, seq)| self.give_back(lender, seq))
             .collect()
     }
 
@@ -765,15 +888,27 @@ impl MergeModel {
     ) -> usize {
         let is_taken = |index: &usize| taken.binary_search(index).is_ok();
         let mut returned = Vec::new();
+        let mut giving: Vec<((usize, u32), usize, u64)> = Vec::new();
         for &holder in taken {
             for (lender, seq) in self.held_by(holder) {
                 if is_taken(&lender) {
                     if let Some(removed) = self.remove_lent(lender, seq, false) {
                         self.uncover_after(lender, &removed);
                     }
-                } else if let Some(given) = self.give_back(lender, seq) {
-                    returned.push(given);
+                } else if let Some(at) = self
+                    .lent_record(lender, seq)
+                    .and_then(|record| self.record_at(record))
+                {
+                    giving.push((at, lender, seq));
                 }
+            }
+        }
+        // The last text in output order goes back first, so each text finds
+        // the lender's later characters already in their place.
+        giving.sort_unstable();
+        for (_, lender, seq) in giving.into_iter().rev() {
+            if let Some(given) = self.give_back(lender, seq) {
+                returned.push(given);
             }
         }
         for &index in taken {
@@ -808,9 +943,6 @@ impl MergeModel {
                     section.restore = Some(Box::new(restore));
                     section.resolution = Resolution::Edited;
                     section.conflict = false;
-                    for entry in &mut section.lent {
-                        entry.insert_at = 0;
-                    }
                 } else {
                     for entry in own {
                         self.strip_lent(index, entry.seq);
@@ -1120,14 +1252,14 @@ impl MergeModel {
                 .get(&lender)
                 .and_then(|olds| olds.get(*rank));
             *rank += 1;
-            let (seq, insert_at) = if let Some(old) = old {
+            let seq = if let Some(old) = old {
                 if old.text != record.text {
                     modified.insert(lender);
                 }
-                (old.seq, old.insert_at)
+                old.seq
             } else {
                 self.lend_seq += 1;
-                (self.lend_seq, 0)
+                self.lend_seq
             };
             let source = sources.get_mut(&lender).and_then(Option::take);
             self.add_lent(
@@ -1138,7 +1270,6 @@ impl MergeModel {
                     column: record.column,
                     text: record.text,
                     seq,
-                    insert_at,
                     source,
                 },
             );
