@@ -293,6 +293,19 @@ pub struct Section {
     /// True when the display rules or the ignored mark count this section as
     /// unchanged. Derived from the fields above and the model's rules.
     suppressed: bool,
+    /// Leading lines this section gave to the edited text of an earlier
+    /// section, oldest first. A take that replaces the holder's text gives
+    /// them back; without them that take drops this section's text.
+    lent: Vec<Lent>,
+    /// The last later section that lent lines to this section's text.
+    joined_through: Option<usize>,
+}
+
+/// Lines one section lent to the edited text of an earlier section.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Lent {
+    holder: usize,
+    lines: Vec<String>,
 }
 
 impl Section {
@@ -310,7 +323,16 @@ impl Section {
             ignored: false,
             unimportant: false,
             suppressed: false,
+            lent: Vec::new(),
+            joined_through: None,
         }
+    }
+
+    /// True when an edit moved lines of later sections into this section's
+    /// text, so a take here gives them back to those sections.
+    #[must_use]
+    pub fn holds_joined_lines(&self) -> bool {
+        self.joined_through.is_some()
     }
 
     /// True when this section still needs review.
@@ -895,10 +917,12 @@ type Fingerprint = (String, String, String);
 /// What a user decided about one section, carried across a reload.
 #[derive(Debug, Clone)]
 struct Decision {
+    index: usize,
     resolution: Resolution,
     edited: Vec<String>,
     conflict: bool,
     ignored: bool,
+    lent: Vec<Lent>,
 }
 
 /// How many sections before this one hold `print`, counting this one in.
@@ -1271,13 +1295,90 @@ impl MergeModel {
             if !matches!(resolution, Resolution::Edited) {
                 entry.edited.clear();
                 entry.edited_from_output = false;
+                entry.lent.clear();
             }
             changed = true;
             changed_sections.push(section);
         }
         if changed {
+            if !matches!(resolution, Resolution::Edited) {
+                let returned = self.give_back_all(&changed_sections);
+                changed_sections.extend(returned);
+            }
             self.rebuild_changed_sections(&changed_sections, true);
         }
+    }
+
+    /// The sections a take of `sections` changes: those sections and every
+    /// later section whose lent lines one of them holds.
+    pub(crate) fn sections_a_take_changes(&self, sections: &[usize]) -> Vec<usize> {
+        let mut all = sections.to_vec();
+        all.sort_unstable();
+        all.dedup();
+        let taken = all.clone();
+        for &holder in &taken {
+            all.extend(
+                self.borrowers(holder)
+                    .filter(|index| taken.binary_search(index).is_err()),
+            );
+        }
+        all.sort_unstable();
+        all.dedup();
+        all
+    }
+
+    /// The later sections holding lines lent to `holder`'s text.
+    fn borrowers(&self, holder: usize) -> impl Iterator<Item = usize> + '_ {
+        let through = self
+            .sections
+            .get(holder)
+            .and_then(|section| section.joined_through)
+            .map_or(0, |through| through.saturating_add(1))
+            .min(self.sections.len());
+        (holder.saturating_add(1)..through).filter(move |&index| {
+            self.sections[index]
+                .lent
+                .iter()
+                .any(|entry| entry.holder == holder)
+        })
+    }
+
+    /// Give the lines lent to each of `retaken`, whose text a take just
+    /// replaced, back to the sections that lent them. A lender that is itself
+    /// retaken gets its whole input back and needs none. Returns the
+    /// sections given lines.
+    ///
+    /// Reads output ranges, so it runs before the changed sections rebuild.
+    fn give_back_all(&mut self, retaken: &[usize]) -> Vec<usize> {
+        let mut sorted = retaken.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        let mut returned = Vec::new();
+        for &holder in &sorted {
+            returned.extend(
+                self.borrowers(holder)
+                    .filter(|index| sorted.binary_search(index).is_err()),
+            );
+            if let Some(section) = self.sections.get_mut(holder) {
+                section.joined_through = None;
+            }
+        }
+        returned.sort_unstable();
+        returned.dedup();
+        for &index in &returned {
+            let entries = std::mem::take(&mut self.sections[index].lent);
+            let (back, kept): (Vec<Lent>, Vec<Lent>) = entries
+                .into_iter()
+                .partition(|entry| sorted.binary_search(&entry.holder).is_ok());
+            let mut lines: Vec<String> = back.into_iter().flat_map(|entry| entry.lines).collect();
+            lines.extend(self.contribution(index, &self.sections[index]));
+            let section = &mut self.sections[index];
+            section.lent = kept;
+            section.resolution = Resolution::Edited;
+            section.edited = lines;
+            section.edited_from_output = false;
+        }
+        returned
     }
 
     /// Replace one section's output with typed text.
@@ -1405,6 +1506,79 @@ impl MergeModel {
         self.totals.replace(previous, current);
         self.section_totals[index] = current;
         true
+    }
+
+    /// Replace output lines `first..last` with `lines`, the pane's lines in
+    /// their place after an edit that reached more than one section. Returns
+    /// the section that holds the changed lines.
+    ///
+    /// Lines equal at either end of the window stay with the sections that
+    /// hold them, so the comparison reads only the window. The changed lines
+    /// between go to the section of the first of them. A later section whose
+    /// leading lines are among them keeps a copy of those lines and takes it
+    /// back when a take replaces the holder's text.
+    pub(crate) fn absorb_output_window(
+        &mut self,
+        first: u32,
+        last: u32,
+        mut lines: Vec<String>,
+    ) -> Option<usize> {
+        let last = (last as usize).min(self.output.len());
+        let first = (first as usize).min(last);
+        let old_len = last - first;
+        let mut prefix = 0;
+        while prefix < old_len.min(lines.len())
+            && self.output.get(first + prefix) == lines.get(prefix)
+        {
+            prefix += 1;
+        }
+        let mut suffix = 0;
+        while suffix < (old_len - prefix).min(lines.len() - prefix)
+            && self.output.get(last - 1 - suffix) == lines.get(lines.len() - 1 - suffix)
+        {
+            suffix += 1;
+        }
+        lines.truncate(lines.len() - suffix);
+        let middle = lines.split_off(prefix);
+        let start = first + prefix;
+        let end = last - suffix;
+        let line = |value: usize| u32::try_from(value).ok();
+        let owner = if start < end || start == first {
+            self.section_of_output_line(line(start)?)?
+        } else {
+            self.section_of_output_line(line(start - 1)?)?
+        };
+        let lender_last = if start < end {
+            self.section_of_output_line(line(end - 1)?)?.max(owner)
+        } else {
+            owner
+        };
+        for index in (owner + 1..=lender_last).rev() {
+            let range = self.output_range(index)?;
+            let taken_end = range.end.min(line(end)?);
+            if taken_end <= range.start {
+                continue;
+            }
+            let lent = self.unrepaired_lines(range.start as usize..taken_end as usize);
+            if !self.edit_output_range(index, 0..taken_end - range.start, Vec::new()) {
+                return None;
+            }
+            self.sections[index].lent.push(Lent {
+                holder: owner,
+                lines: lent,
+            });
+        }
+        let range = self.output_range(owner)?;
+        let local_start = line(start)?.checked_sub(range.start)?;
+        let local_end = line(end)?.min(range.end).checked_sub(range.start)?;
+        if !self.edit_output_range(owner, local_start..local_end.max(local_start), middle) {
+            return None;
+        }
+        if lender_last > owner {
+            let through = &mut self.sections[owner].joined_through;
+            *through = Some(through.map_or(lender_last, |through| through.max(lender_last)));
+        }
+        Some(owner)
     }
 
     /// Replace one output line with the line an input shows on the same row.
@@ -1573,6 +1747,12 @@ impl MergeModel {
 
     /// Resolve every section that does not wait for review from its own side.
     pub fn take_all_non_conflicting(&mut self) -> Vec<(usize, Range<u32>)> {
+        self.take_all_non_conflicting_counted().0
+    }
+
+    /// [`Self::take_all_non_conflicting`], with the number of sections that
+    /// were given back lines they lent to a taken section.
+    pub(crate) fn take_all_non_conflicting_counted(&mut self) -> (Vec<(usize, Range<u32>)>, usize) {
         let mut changed = Vec::new();
         for index in 0..self.sections.len() {
             let section = &self.sections[index];
@@ -1590,11 +1770,19 @@ impl MergeModel {
             section.resolution = resolution;
             section.edited.clear();
             section.edited_from_output = false;
+            section.lent.clear();
             changed.push((index, output));
         }
-        let indices: Vec<_> = changed.iter().map(|(index, _)| *index).collect();
+        let mut indices: Vec<_> = changed.iter().map(|(index, _)| *index).collect();
+        let returned = self.give_back_all(&indices);
+        for &index in &returned {
+            if let Some(output) = self.output_range(index) {
+                changed.push((index, output));
+            }
+        }
+        indices.extend(returned.iter().copied());
         self.rebuild_changed_sections(&indices, true);
-        changed
+        (changed, returned.len())
     }
 
     /// Resolve every unresolved conflict from one side.
@@ -1605,14 +1793,18 @@ impl MergeModel {
             Pane::Center => Resolution::Center,
             Pane::Output => return,
         };
-        for section in &mut self.sections {
+        let mut retaken = Vec::new();
+        for (index, section) in self.sections.iter_mut().enumerate() {
             if section.is_unresolved_conflict() {
                 section.resolution = resolution;
                 section.edited.clear();
                 section.edited_from_output = false;
                 section.conflict = false;
+                section.lent.clear();
+                retaken.push(index);
             }
         }
+        let _ = self.give_back_all(&retaken);
         self.rebuild();
     }
 
@@ -1764,14 +1956,17 @@ impl MergeModel {
             kept.insert(
                 (print, occurrence),
                 Decision {
+                    index,
                     resolution,
                     edited: previous.edited_content(index, section),
                     conflict: section.conflict,
                     ignored: section.ignored,
+                    lent: section.lent.clone(),
                 },
             );
         }
         let mut changed = false;
+        let mut moved: HashMap<usize, usize> = HashMap::new();
         let mut seen: HashMap<Fingerprint, usize> = HashMap::new();
         for index in 0..self.sections.len() {
             let print = self.fingerprint(&self.sections[index]);
@@ -1779,6 +1974,7 @@ impl MergeModel {
             let Some(decision) = kept.get(&(print, occurrence)) else {
                 continue;
             };
+            moved.insert(decision.index, index);
             let rules = self.rules;
             let section = &mut self.sections[index];
             section.resolution = decision.resolution;
@@ -1786,11 +1982,47 @@ impl MergeModel {
             section.edited_from_output = false;
             section.conflict = decision.conflict;
             section.ignored = decision.ignored;
+            section.lent.clone_from(&decision.lent);
             section.refresh(rules);
             changed = true;
         }
         if changed {
+            self.carry_lent_lines(&moved);
             self.rebuild();
+        }
+    }
+
+    /// Point lent lines at the carried sections that hold them. Lines whose
+    /// holder was not carried go back to their section at once, because the
+    /// reload replaced the holder's text with its input.
+    fn carry_lent_lines(&mut self, moved: &HashMap<usize, usize>) {
+        for index in 0..self.sections.len() {
+            if self.sections[index].lent.is_empty() {
+                continue;
+            }
+            let entries = std::mem::take(&mut self.sections[index].lent);
+            let mut back = Vec::new();
+            let mut kept = Vec::new();
+            for entry in entries {
+                match moved.get(&entry.holder) {
+                    Some(&holder) if holder < index => kept.push(Lent {
+                        holder,
+                        lines: entry.lines,
+                    }),
+                    _ => back.extend(entry.lines),
+                }
+            }
+            for entry in &kept {
+                let through = &mut self.sections[entry.holder].joined_through;
+                *through = Some(through.map_or(index, |through| through.max(index)));
+            }
+            if !back.is_empty() {
+                back.extend(self.contribution(index, &self.sections[index]));
+                let section = &mut self.sections[index];
+                section.resolution = Resolution::Edited;
+                section.edited = back;
+            }
+            self.sections[index].lent = kept;
         }
     }
 
@@ -1823,21 +2055,25 @@ impl MergeModel {
         }
     }
 
+    /// Output lines without the separators a source composition added.
+    fn unrepaired_lines(&self, range: Range<usize>) -> Vec<String> {
+        let start = range.start;
+        let mut lines = self.output.copy_range(range);
+        for (offset, line) in lines.iter_mut().enumerate() {
+            let repair = self
+                .output_repairs
+                .get(start + offset)
+                .copied()
+                .unwrap_or(0);
+            line.truncate(line.len().saturating_sub(repair));
+        }
+        lines
+    }
+
     fn edited_content(&self, index: usize, section: &Section) -> Vec<String> {
         if section.edited_from_output {
             let lines = self.output_range(index).map_or_else(Vec::new, |range| {
-                let mut lines = self
-                    .output
-                    .copy_range(range.start as usize..range.end as usize);
-                for (offset, line) in lines.iter_mut().enumerate() {
-                    let repair = self
-                        .output_repairs
-                        .get(range.start as usize + offset)
-                        .copied()
-                        .unwrap_or(0);
-                    line.truncate(line.len().saturating_sub(repair));
-                }
-                lines
+                self.unrepaired_lines(range.start as usize..range.end as usize)
             });
             #[cfg(test)]
             EDITED_OUTPUT_READS.with(|reads| {
