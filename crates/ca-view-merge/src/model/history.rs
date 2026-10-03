@@ -329,7 +329,8 @@ impl MergeModel {
     }
 
     fn replay_lines(&mut self, at: usize, removed: usize, lines: &[(String, usize)]) {
-        let range = at..at.saturating_add(removed).min(self.output.len());
+        let len = self.output.len();
+        let range = at.min(len)..at.saturating_add(removed).min(len);
         let (texts, repairs): (Vec<String>, Vec<usize>) = lines.iter().cloned().unzip();
         self.output_repairs.splice(range.clone(), repairs);
         self.output.splice(range, texts);
