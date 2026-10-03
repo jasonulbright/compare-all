@@ -119,9 +119,43 @@ pub fn sweep_temporary() -> std::io::Result<usize> {
     Ok(sweep_temporary_in(&root, &own))
 }
 
-/// Create `folder` and lock the marker file inside it.
+/// The folder of this process for copies, created when missing.
+///
+/// Performs disk I/O; call it on a worker.
+///
+/// # Errors
+///
+/// Returns an error when the folder or the shared one above it cannot be
+/// created or is not fit for private copies.
+pub fn prepared_temporary_directory() -> std::io::Result<PathBuf> {
+    prepared_temporary_directory_in(&temporary_root(), process_folder_name())
+}
+
+/// The folder `own` under `root`, created when missing.
+///
+/// On Unix both folders are open only to the running user, and a `root` that
+/// another user owns is refused before anything is created in it: that user
+/// could read every copy or replace one between its write and its read.
+fn prepared_temporary_directory_in(
+    root: &std::path::Path,
+    own: impl AsRef<std::path::Path>,
+) -> std::io::Result<PathBuf> {
+    ca_io::private::create_owned_folder(root)?;
+    let folder = root.join(own);
+    ca_io::private::create_owned_folder(&folder)?;
+    Ok(folder)
+}
+
+/// Create `folder` as the folder of a process under its shared root, then lock
+/// the marker file inside it.
 fn claim(folder: &std::path::Path) -> std::io::Result<std::fs::File> {
-    std::fs::create_dir_all(folder)?;
+    let (Some(root), Some(own)) = (folder.parent(), folder.file_name()) else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} names no folder under a root", folder.display()),
+        ));
+    };
+    prepared_temporary_directory_in(root, own)?;
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -231,6 +265,63 @@ mod tests {
         drop(held);
         assert_eq!(super::sweep_temporary_in(root.path(), own), 1);
         assert!(!live.exists());
+    }
+
+    /// The copies hold file content, so the folders above them are open only
+    /// to the user who made them.
+    #[cfg(unix)]
+    #[test]
+    fn the_folder_of_a_process_and_its_root_are_open_only_to_their_user() {
+        use std::os::unix::fs::PermissionsExt;
+        let settings = tempfile::tempdir().unwrap();
+        let root = settings.path().join("temporary");
+        let own = root.join("process-1");
+        let held = super::claim(&own).unwrap();
+        for folder in [&root, &own] {
+            let mode = std::fs::metadata(folder).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "{} {mode:o}", folder.display());
+        }
+        drop(held);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_open_root_left_by_an_earlier_build_is_narrowed() {
+        use std::os::unix::fs::PermissionsExt;
+        let settings = tempfile::tempdir().unwrap();
+        let root = settings.path().join("temporary");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let own = super::prepared_temporary_directory_in(&root, "process-2").unwrap();
+        let mode = std::fs::metadata(&root).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "{mode:o}");
+        let mode = std::fs::metadata(&own).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "{mode:o}");
+    }
+
+    /// Only a privileged run can hand a folder to another user, so the case
+    /// is checked where the test runs with that privilege.
+    #[cfg(unix)]
+    #[test]
+    fn a_root_of_another_user_is_not_used() {
+        let settings = tempfile::tempdir().unwrap();
+        let root = settings.path().join("temporary");
+        std::fs::create_dir(&root).unwrap();
+        if std::os::unix::fs::chown(&root, Some(65534), Some(65534)).is_err() {
+            return;
+        }
+        let own = root.join("process-1");
+        assert!(super::claim(&own).is_err());
+        assert!(!own.exists());
+        assert!(super::prepared_temporary_directory_in(&root, "process-1").is_err());
+    }
+
+    #[test]
+    fn a_root_that_is_a_file_is_not_used() {
+        let settings = tempfile::tempdir().unwrap();
+        let root = settings.path().join("temporary");
+        std::fs::write(&root, b"x").unwrap();
+        assert!(super::prepared_temporary_directory_in(&root, "process-1").is_err());
     }
 
     #[test]
