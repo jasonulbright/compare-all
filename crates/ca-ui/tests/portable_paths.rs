@@ -5,6 +5,8 @@
     reason = "the program under test is started directly, not as a host program"
 )]
 
+mod support;
+
 use std::path::{Path, PathBuf};
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -40,7 +42,7 @@ fn portable_settings_are_selected_by_the_running_application() -> Result<()> {
         if let Some(path) = override_path {
             command.env(ca_session::SETTINGS_DIRECTORY_VARIABLE, path);
         }
-        let child = command.output()?;
+        let child = support::output(&mut command)?;
         assert!(
             child.status.success(),
             "{}",
