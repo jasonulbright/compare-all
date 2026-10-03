@@ -64,6 +64,9 @@ const NO_OUTPUT: &str = "This session names no output file";
 /// editing switch of the session is on.
 const EDITING_OFF: &str = "Editing is turned off for this session";
 
+const GIVEN_BACK: &str =
+    "Lines that an edit joined into the taken text went back to their sections";
+
 /// Commands that change the output or write it.
 const CHANGES_OUTPUT: &[Command] = &[
     Command::TakeLeft,
@@ -1079,29 +1082,23 @@ impl MergeView {
             .section_of_output_line(last.saturating_sub(1).max(first))
             .unwrap_or(from)
             .max(from);
-        let Some(start) = self.data.model.output_range(from).map(|range| range.start) else {
-            return;
-        };
-        let Some(end_before) = self.data.model.output_range(to).map(|range| range.end) else {
-            return;
-        };
-        let end = if end_before >= output_len {
+        // A window that reaches the output end reads every pane line after
+        // it: the pane's empty line after a final terminator is no model line.
+        let new_end = if old_end >= output_len {
             self.output_pane.line_count()
         } else {
-            u32::try_from(i64::from(end_before) + i64::from(new_end) - i64::from(old_end))
-                .unwrap_or(start)
+            new_end
         };
-        let lines = self.buffer_lines(start, end.max(start));
+        let lines = self.buffer_lines(first, new_end.max(first));
         let touched: Vec<_> = (from..=to).collect();
         let before = recorded.then(|| self.data.model.history_sections(&touched));
-        for section in (from + 1)..=to {
-            self.data.model.set_edited(section, Vec::new());
-        }
-        self.data.model.set_edited(from, lines);
+        let Some(owner) = self.data.model.absorb_output_window(first, last, lines) else {
+            return;
+        };
         if let Some(before) = before {
             self.remember_edit(before);
         }
-        self.current = from;
+        self.current = owner;
         self.touched();
     }
 
@@ -1173,7 +1170,8 @@ impl MergeView {
         if sections.is_empty() {
             return;
         }
-        let changed: Vec<_> = sections
+        let affected = self.data.model.sections_a_take_changes(&sections);
+        let changed: Vec<_> = affected
             .iter()
             .filter_map(|&index| {
                 self.data
@@ -1183,12 +1181,20 @@ impl MergeView {
             })
             .collect();
         let before_id = self.output_pane.buffer().undo_group_id();
-        let before = self.data.model.history_sections(&sections);
+        let before = self.data.model.history_sections(&affected);
         self.data.model.set_resolutions(&sections, resolution);
         self.current = sections[0];
         self.touched();
         self.replace_output_sections(&changed);
         self.remember_take(before_id, before);
+        self.report_given_back(affected.len().saturating_sub(sections.len()));
+    }
+
+    /// Tell the user that a take changed sections outside the ones it named.
+    fn report_given_back(&mut self, sections: usize) {
+        if sections > 0 {
+            self.message = Some(format!("{GIVEN_BACK} ({sections} section(s))"));
+        }
     }
 
     /// Take one input's version of the current line into the output.
@@ -2617,12 +2623,13 @@ impl SessionView for MergeView {
                 let indices: Vec<_> = (0..self.data.model.sections().len()).collect();
                 let before_id = self.output_pane.buffer().undo_group_id();
                 let before = self.data.model.history_sections(&indices);
-                let changed = self.data.model.take_all_non_conflicting();
+                let (changed, given_back) = self.data.model.take_all_non_conflicting_counted();
                 self.touched();
                 self.replace_output_sections(&changed);
                 if !changed.is_empty() {
                     self.remember_take(before_id, before);
                 }
+                self.report_given_back(given_back);
             }
             Command::FavorLeft => self.rules.favor_left = !self.rules.favor_left,
             Command::FavorRight => self.rules.favor_right = !self.rules.favor_right,
@@ -2873,7 +2880,8 @@ impl ca_ui::view::ViewFactory for MergeView {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
-    use super::{MergeView, Question};
+    use super::{MergeView, Question, GIVEN_BACK};
+    use crate::model::Resolution;
     use ca_ui::command::Command;
     use ca_ui::testing::{context, raw_input};
     use ca_ui::view::SessionView;
@@ -3303,6 +3311,171 @@ mod tests {
         assert_output_lines_match_pane(&view);
     }
 
+    /// A conflict between `a` and `c`, an unchanged section from `c` to `i`,
+    /// a left change `X` and an unchanged `f`.
+    fn open_conflict_before_a_change() -> (MergeView, tempfile::TempDir) {
+        let (mut view, dir) = open(
+            "a\nL\nc\nd\ng\nh\ni\nX\nf\n",
+            Some("a\nb\nc\nd\ng\nh\ni\ne\nf\n"),
+            "a\nR\nc\nd\ng\nh\ni\ne\nf\n",
+        );
+        run_until_ready(&mut view);
+        assert_eq!(view.model().sections().len(), 5);
+        (view, dir)
+    }
+
+    type ViewState = (String, Vec<crate::model::Section>);
+
+    fn state(view: &MergeView) -> ViewState {
+        let all: Vec<_> = (0..view.model().sections().len()).collect();
+        let sections = view.model().history_sections(&all);
+        (
+            view.output_text(),
+            sections.into_iter().map(|entry| entry.section).collect(),
+        )
+    }
+
+    fn assert_undo_and_redo_restore(
+        view: &mut MergeView,
+        dir: &tempfile::TempDir,
+        states: &[ViewState],
+    ) {
+        for expected in states.iter().rev().skip(1) {
+            view.run(Command::Undo);
+            assert_eq!(&state(view), expected);
+            assert_output_lines_match_pane(view);
+        }
+        assert_eq!(view.model().totals().conflicts_remaining, 1);
+        assert!(save_with_markers(view, dir).contains("<<<<<<<"));
+        assert_eq!(view.exit_code(), Some(14));
+        for expected in states.iter().skip(1) {
+            view.run(Command::Redo);
+            assert_eq!(&state(view), expected);
+            assert_output_lines_match_pane(view);
+        }
+    }
+
+    #[test]
+    fn a_take_after_an_edit_joined_the_next_section_keeps_that_sections_lines() {
+        for (command, taken) in [
+            (Command::TakeLeft, "L\n"),
+            (Command::TakeCenter, "b\n"),
+            (Command::TakeRight, "R\n"),
+            (Command::TakeLeftThenRight, "L\nR\n"),
+        ] {
+            let (mut view, dir) = open_conflict_before_a_change();
+            let original = state(&view);
+            view.output_pane
+                .place(ca_ui::editor::Caret::new(2, 0), false);
+            view.output_pane.backspace();
+            view.absorb_output_edits();
+            assert_eq!(view.output_text(), "a\nbc\nd\ng\nh\ni\nX\nf\n");
+            assert_output_lines_match_pane(&view);
+            assert_eq!(view.model().output_range(1), Some(1..2), "{command:?}");
+            assert_eq!(view.model().output_range(2), Some(2..6), "{command:?}");
+            assert!(view.model().sections()[1].holds_joined_lines());
+            let joined = state(&view);
+            view.current = 1;
+            view.run(command);
+            assert!(!view.model().sections()[1].holds_joined_lines());
+            assert_eq!(
+                view.output_text(),
+                format!("a\n{taken}c\nd\ng\nh\ni\nX\nf\n"),
+                "{command:?}"
+            );
+            assert_output_lines_match_pane(&view);
+            assert_eq!(
+                view.model().sections()[3].resolution,
+                Resolution::Left,
+                "{command:?}"
+            );
+            assert!(view
+                .message
+                .as_deref()
+                .is_some_and(|message| message.starts_with(GIVEN_BACK)));
+            let taken = state(&view);
+            assert_undo_and_redo_restore(&mut view, &dir, &[original, joined, taken]);
+        }
+    }
+
+    #[test]
+    fn taking_a_joined_section_before_the_one_holding_its_line_keeps_every_line() {
+        let (mut view, _dir) = open_conflict_before_a_change();
+        view.output_pane
+            .place(ca_ui::editor::Caret::new(2, 0), false);
+        view.output_pane.backspace();
+        view.absorb_output_edits();
+        view.current = 2;
+        view.run(Command::TakeCenter);
+        assert_eq!(view.output_text(), "a\nbc\nc\nd\ng\nh\ni\nX\nf\n");
+        assert_output_lines_match_pane(&view);
+        view.current = 1;
+        view.run(Command::TakeLeft);
+        assert_eq!(view.output_text(), "a\nL\nc\nd\ng\nh\ni\nX\nf\n");
+        assert_eq!(view.message, None);
+        assert_output_lines_match_pane(&view);
+    }
+
+    #[test]
+    fn a_take_after_a_paste_over_three_sections_keeps_their_lines() {
+        let (mut view, dir) = open_conflict_before_a_change();
+        let original = state(&view);
+        view.output_pane
+            .place(ca_ui::editor::Caret::new(1, 1), false);
+        view.output_pane
+            .place(ca_ui::editor::Caret::new(7, 0), true);
+        view.output_pane.paste("Z\nY");
+        view.absorb_output_edits();
+        assert_eq!(view.output_text(), "a\nbZ\nYX\nf\n");
+        assert_output_lines_match_pane(&view);
+        let pasted = state(&view);
+        view.current = 1;
+        view.run(Command::TakeLeft);
+        assert_eq!(view.output_text(), "a\nL\nc\nd\ng\nh\ni\nX\nf\n");
+        assert_output_lines_match_pane(&view);
+        assert_eq!(
+            view.model().sections()[4].resolution,
+            Resolution::Center,
+            "a section outside the edit stays as it was"
+        );
+        let taken = state(&view);
+        assert_undo_and_redo_restore(&mut view, &dir, &[original, pasted, taken]);
+    }
+
+    #[test]
+    fn taking_all_non_conflicting_after_a_join_with_a_conflict_keeps_its_lines() {
+        let (mut view, dir) = open("a\nL\nc\n", Some("a\nb\nc\n"), "a\nR\nc\n");
+        run_until_ready(&mut view);
+        let original = state(&view);
+        view.output_pane
+            .place(ca_ui::editor::Caret::new(1, 0), false);
+        view.output_pane.backspace();
+        view.absorb_output_edits();
+        assert_eq!(view.output_text(), "ab\nc\n");
+        let joined = state(&view);
+        view.run(Command::TakeAllNonConflicting);
+        assert_eq!(view.output_text(), "a\nb\nc\n");
+        assert_output_lines_match_pane(&view);
+        let taken = state(&view);
+        assert_undo_and_redo_restore(&mut view, &dir, &[original, joined, taken]);
+    }
+
+    #[test]
+    fn a_take_after_a_reload_keeps_the_lines_an_earlier_edit_joined() {
+        let (mut view, _dir) = open_conflict_before_a_change();
+        view.output_pane
+            .place(ca_ui::editor::Caret::new(2, 0), false);
+        view.output_pane.backspace();
+        view.absorb_output_edits();
+        view.run(Command::Reload);
+        run_until_ready(&mut view);
+        assert_eq!(view.output_text(), "a\nbc\nd\ng\nh\ni\nX\nf\n");
+        view.current = 1;
+        view.run(Command::TakeLeft);
+        assert_eq!(view.output_text(), "a\nL\nc\nd\ng\nh\ni\nX\nf\n");
+        assert_output_lines_match_pane(&view);
+    }
+
     #[test]
     fn undo_and_redo_of_a_take_keep_an_ignored_mark_toggled_after_it() {
         let (mut view, _dir) = open("a\nL\nc\n", Some("a\nb\nc\n"), "a\nR\nc\n");
@@ -3628,6 +3801,36 @@ mod tests {
             "shared 10000\n"
         );
         assert_eq!(crate::model::MergeModel::edited_output_read_count(), 0);
+    }
+
+    #[test]
+    fn joining_a_conflict_with_a_large_unchanged_section_moves_only_the_joined_lines() {
+        use std::fmt::Write as _;
+        let mut shared = String::with_capacity(20_000 * 16);
+        for index in 0..20_000 {
+            let _ = writeln!(shared, "shared {index}");
+        }
+        let (mut view, _dir) = open(
+            &format!("a\nL\n{shared}"),
+            Some(&format!("a\nb\n{shared}")),
+            &format!("a\nR\n{shared}"),
+        );
+        run_until_ready(&mut view);
+        crate::model::MergeModel::reset_rebuild_visit_counts();
+        view.output_pane
+            .place(ca_ui::editor::Caret::new(2, 0), false);
+        view.output_pane.backspace();
+        view.absorb_output_edits();
+        let touched = crate::model::MergeModel::sequence_items_touched();
+        assert!(touched < 10_000, "{touched} output items moved");
+        assert_eq!(view.model().output_lines()[1].as_str(), "bshared 0\n");
+        assert_output_lines_match_pane(&view);
+        view.current = 1;
+        view.run(Command::TakeLeft);
+        assert_eq!(view.model().output_lines()[1].as_str(), "L\n");
+        assert_eq!(view.model().output_lines()[2].as_str(), "shared 0\n");
+        assert_eq!(view.model().output_lines().len(), 20_002);
+        assert_output_lines_match_pane(&view);
     }
 
     #[test]
