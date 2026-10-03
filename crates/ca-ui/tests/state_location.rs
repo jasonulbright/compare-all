@@ -200,14 +200,14 @@ fn without_a_home_a_missing_temporary_folder_falls_back_to_tmp() -> Result<()> {
     command.env("TMPDIR", &missing);
     let lines = Probe::run(&mut command)?;
     let settings = PathBuf::from(value(&lines, "settings"));
-    let made = settings.is_dir() && settings.starts_with("/tmp");
-    if made {
+    let created = settings.is_dir() && settings.starts_with("/tmp");
+    if created {
         use std::os::unix::fs::PermissionsExt;
         let mode = std::fs::metadata(&settings)?.permissions().mode() & 0o777;
         std::fs::remove_dir_all(&settings)?;
         assert_eq!(mode, 0o700, "{mode:o}");
     }
-    assert!(made, "{}", settings.display());
+    assert!(created, "{}", settings.display());
     assert!(!missing.exists());
     Ok(())
 }
