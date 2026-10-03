@@ -64,8 +64,15 @@ const NO_OUTPUT: &str = "This session names no output file";
 /// editing switch of the session is on.
 const EDITING_OFF: &str = "Editing is turned off for this session";
 
-const GIVEN_BACK: &str =
-    "Lines that an edit joined into the taken text went back to their sections";
+const GIVEN_BACK: &str = "The take returned joined text to";
+
+fn given_back_message(sections: usize) -> String {
+    if sections == 1 {
+        format!("{GIVEN_BACK} 1 other section")
+    } else {
+        format!("{GIVEN_BACK} {sections} other sections")
+    }
+}
 
 /// Commands that change the output or write it.
 const CHANGES_OUTPUT: &[Command] = &[
@@ -231,17 +238,13 @@ pub struct WidgetRect {
     pub rect: egui::Rect,
 }
 
-struct TakeHistory {
-    before: Vec<model::HistorySection>,
-    after: Vec<model::HistorySection>,
-}
-
 /// The three way merge tab.
 #[allow(clippy::struct_excessive_bools)]
 pub struct MergeView {
-    take_history: std::collections::HashMap<u64, TakeHistory>,
-    /// Undo group of the pane edit last folded into the sections.
-    absorbed_group: Option<u64>,
+    /// Steps of takes and of edits that changed several sections, by undo group.
+    take_history: std::collections::HashMap<u64, model::Step>,
+    /// Steps of edits that changed one section, by undo group.
+    edit_history: std::collections::HashMap<u64, model::Step>,
     id: egui::Id,
     paths: MergePaths,
     /// The session's settings, which the merge options are derived from.
@@ -255,6 +258,13 @@ pub struct MergeView {
     saving_output: Option<String>,
     saving_revision: Option<u64>,
     saving_conflicts: Option<u32>,
+    saving_marks: Option<Vec<usize>>,
+    /// The sections that waited for review in the output last written, or
+    /// in the merge as it loaded before any write. A save writes markers for
+    /// exactly these, so a different set is an unsaved change.
+    written_marks: Vec<usize>,
+    /// True while the sections that wait for review differ from `written_marks`.
+    marks_changed: bool,
     output_pane: ca_ui::editor::Pane,
     scroll: RowScroll,
     horizontal: f32,
@@ -394,6 +404,30 @@ fn edited_window(spans: &[ca_ui::editor::EditSpan]) -> Option<(u32, u32, u32)> {
     Some((line(low), line(high - shifted), line(high)))
 }
 
+/// [`edited_window`] for the changes the text buffer reports.
+fn edited_window_of(changes: &[ca_text::Change]) -> Option<(u32, u32, u32)> {
+    let spans: Vec<ca_ui::editor::EditSpan> = changes
+        .iter()
+        .map(|change| ca_ui::editor::EditSpan {
+            start_line: change.start_line,
+            removed_lines: change.removed_lines,
+            inserted_lines: change.inserted_lines,
+        })
+        .collect();
+    edited_window(&spans)
+}
+
+/// The sections of `model` that wait for review.
+fn waiting_in(model: &model::MergeModel) -> Vec<usize> {
+    model
+        .sections()
+        .iter()
+        .enumerate()
+        .filter(|(_, section)| section.is_unresolved_conflict())
+        .map(|(index, _)| index)
+        .collect()
+}
+
 fn empty_text() -> ca_text::LoadedText {
     ca_text::LoadedText::load(b"", &ca_text::DecodeOptions::default())
 }
@@ -428,7 +462,7 @@ impl MergeView {
     pub fn over(paths: MergePaths, titles: Titles, context: &ViewContext, instance: u64) -> Self {
         let mut view = Self {
             take_history: std::collections::HashMap::new(),
-            absorbed_group: None,
+            edit_history: std::collections::HashMap::new(),
             id: egui::Id::new(("merge", instance)),
             paths,
             titles,
@@ -453,6 +487,9 @@ impl MergeView {
             saving_output: None,
             saving_revision: None,
             saving_conflicts: None,
+            saving_marks: None,
+            written_marks: Vec::new(),
+            marks_changed: false,
             output_pane: ca_ui::editor::Pane::default(),
             scroll: RowScroll::top(),
             horizontal: 0.0,
@@ -629,7 +666,12 @@ impl MergeView {
     /// or, before the first write, from the output the merge run produced.
     #[must_use]
     pub fn is_modified(&self) -> bool {
-        self.output_changed_on_load || self.output_pane.is_modified()
+        self.output_changed_on_load || self.output_pane.is_modified() || self.marks_changed
+    }
+
+    /// The sections that wait for review, which a save writes as markers.
+    fn waiting_sections(&self) -> Vec<usize> {
+        waiting_in(&self.data.model)
     }
 
     /// What a caller that started this merge learns from it.
@@ -857,6 +899,7 @@ impl MergeView {
         let saved_output = self.saving_output.take();
         let saving_revision = self.saving_revision.take();
         let saving_conflicts = self.saving_conflicts.take();
+        let saving_marks = self.saving_marks.take();
         self.consent = SaveConsent::default();
         let conflict_backup = match &outcome {
             SaveOutcome::SavedWithConflict { backup, .. } => Some(backup.display().to_string()),
@@ -867,6 +910,10 @@ impl MergeView {
                 self.output_baseline = Baseline::Present(stamp);
                 self.saved_output = saved_output;
                 self.saved_conflicts = saving_conflicts;
+                if let Some(marks) = saving_marks {
+                    self.written_marks = marks;
+                    self.marks_changed = self.waiting_sections() != self.written_marks;
+                }
                 self.output_changed_on_load = false;
                 if let Some(revision) = saving_revision {
                     self.output_pane.buffer_mut().mark_saved_revision(revision);
@@ -899,6 +946,8 @@ impl MergeView {
     /// Take a finished merge, keeping decisions whose region did not change.
     fn adopt(&mut self, mut data: MergeData) {
         let generated_output = data.model.output_text();
+        data.model.set_rules(self.rules);
+        let generated_marks: Vec<usize> = waiting_in(&data.model);
         if std::mem::take(&mut self.swapped) {
             data.model.carry_over_swapped(&self.data.model);
         } else {
@@ -906,14 +955,24 @@ impl MergeView {
         }
         let baseline = self.saved_output.as_deref().unwrap_or(&generated_output);
         self.output_changed_on_load = !output_lines_equal_text(data.model.output_lines(), baseline);
-        data.model.set_rules(self.rules);
         // The baseline of the output is taken once. A later run must not adopt
         // the state of a file that was written after the session started.
         if self.output_baseline == Baseline::Unchecked {
             self.output_baseline = data.output_baseline;
         }
+        let marks_were_changed = self.marks_changed;
         self.data = data;
         self.status = Status::Ready;
+        // Before the first write the merge as it loads is the baseline. After
+        // a write, section numbers do not survive a new merge run, so a run
+        // keeps only whether the marks differed from the written ones.
+        self.written_marks = if self.saved_output.is_none() {
+            generated_marks
+        } else if marks_were_changed {
+            vec![usize::MAX]
+        } else {
+            self.waiting_sections()
+        };
         self.touched();
         self.current = self
             .current
@@ -924,34 +983,23 @@ impl MergeView {
 
     fn reset_output_buffer(&mut self) {
         self.take_history.clear();
-        self.absorbed_group = None;
+        self.edit_history.clear();
         let column = self.output_pane.caret_column();
         let line = self.output_pane.caret().line;
-        self.output_pane
-            .reset(TextBuffer::from_text(&self.data.model.output_text()));
+        let mut buffer = TextBuffer::from_text(&self.data.model.output_text());
+        buffer.track_applied_edits();
+        self.output_pane.reset(buffer);
         self.output_pane.set_read_only(self.editing_off());
         let last = self.output_pane.line_count().saturating_sub(1);
         self.output_pane
             .place(Caret::new(line.min(last), column), false);
-        let _ = self.output_pane.take_changes();
+        self.discard_pane_changes();
     }
 
-    /// Synchronize only the sections a take changed, keeping the output pane's
-    /// saved point and undo history intact.
-    fn replace_output_sections(&mut self, changed: &[(usize, Range<u32>)]) {
-        if changed.is_empty() {
-            return;
-        }
-        let ranges: Vec<_> = changed
-            .iter()
-            .filter_map(|(section, old)| {
-                self.data
-                    .model
-                    .output_range(*section)
-                    .map(|new| (old.clone(), new))
-            })
-            .collect();
-        self.replace_output_ranges(&ranges);
+    /// Drop the pane's change records of edits the model already holds.
+    fn discard_pane_changes(&mut self) {
+        let _ = self.output_pane.take_changes();
+        let _ = self.output_pane.buffer_mut().take_applied_edits();
     }
 
     /// Synchronize changed output spans while keeping the pane's undo history.
@@ -1003,7 +1051,7 @@ impl MergeView {
         self.output_pane.buffer_mut().end_group();
         self.output_pane
             .place(Caret::new(caret_line, caret.index), false);
-        let _ = self.output_pane.take_changes();
+        self.discard_pane_changes();
     }
 
     /// True while the editing switch of the session is on: the output takes
@@ -1020,117 +1068,56 @@ impl MergeView {
         self.absorb_edits(true);
     }
 
-    /// With `remember`, an edit that moves lines between sections keeps the
-    /// sections it touched under its undo group, so undoing it returns them
-    /// to the ranges an earlier recorded step expects.
+    /// With `remember`, the change is recorded under the pane's undo group,
+    /// so Undo and Redo of that group restore every section exactly.
     fn absorb_edits(&mut self, remember: bool) {
         let spans = self.output_pane.take_changes();
-        let Some((first, old_end, new_end)) = edited_window(&spans) else {
+        let edits = self.output_pane.buffer_mut().take_applied_edits();
+        if edits.is_empty() {
             return;
-        };
-        let recorded = remember && self.begins_group();
-        if remember && !recorded {
-            self.forget_extended_history();
         }
-        // The pane counts an empty line after a final terminator; the model
-        // holds no line there.
-        let output_len = u32::try_from(self.data.model.output_lines().len()).unwrap_or(u32::MAX);
-        let last = old_end.min(output_len);
-        if let Some(section) = self.data.model.section_of_output_line(first) {
-            if let Some(section_range) = self.data.model.output_range(section) {
-                if section_range.start <= first && last <= section_range.end {
-                    let replacement = self.buffer_lines(first, new_end);
-                    let local_start = first - section_range.start;
-                    let local_end = last - section_range.start;
-                    let status = self.data.model.sections()[section].status();
-                    let row_count = self
-                        .data
-                        .model
-                        .section_row_range(section)
-                        .map_or(0, |range| range.len());
-                    if self.data.model.edit_output_range(
-                        section,
-                        local_start..local_end,
-                        replacement,
-                    ) {
-                        if remember {
-                            self.forget_extended_history();
-                        }
-                        self.current = section;
-                        let entry = &self.data.model.sections()[section];
-                        let rows_changed = self
-                            .data
-                            .model
-                            .section_row_range(section)
-                            .is_some_and(|range| range.len() != row_count);
-                        if entry.status() != status || rows_changed {
-                            self.touched();
-                        } else {
-                            self.strip_stale = true;
-                        }
-                        return;
-                    }
-                }
+        self.data.model.begin_journal();
+        let mut owner = None;
+        for (index, edit) in edits.iter().enumerate() {
+            if let Some(section) = self.data.model.apply_pane_edit(edit) {
+                owner = Some(section);
+                continue;
+            }
+            // The model's lines no longer match the edit: put the pane's
+            // lines of every remaining edit in place.
+            let rest: Vec<_> = edits[index..].iter().map(|edit| edit.change).collect();
+            let window = edited_window_of(&rest).or_else(|| edited_window(&spans));
+            if let Some((first, old_end, new_end)) = window {
+                let output_len =
+                    u32::try_from(self.data.model.output_lines().len()).unwrap_or(u32::MAX);
+                let new_end = if old_end >= output_len {
+                    self.output_pane.line_count()
+                } else {
+                    new_end
+                };
+                let lines = self.buffer_lines(first, new_end.max(first));
+                owner = self
+                    .data
+                    .model
+                    .resync_window(first, old_end.min(output_len), &lines);
+            }
+            break;
+        }
+        let step = self.data.model.end_journal();
+        if let Some(section) = owner {
+            self.current = section;
+        }
+        let layout = step.as_ref().is_none_or(model::Step::changes_layout);
+        if layout {
+            self.touched();
+        } else {
+            self.strip_stale = true;
+        }
+        if let (true, Some(step)) = (remember, step) {
+            if let Some(id) = self.output_pane.buffer().undo_group_id() {
+                self.keep_step(id, step, false);
             }
         }
-        let Some(from) = self.data.model.section_of_output_line(first) else {
-            return;
-        };
-        let to = self
-            .data
-            .model
-            .section_of_output_line(last.saturating_sub(1).max(first))
-            .unwrap_or(from)
-            .max(from);
-        // A window that reaches the output end reads every pane line after
-        // it: the pane's empty line after a final terminator is no model line.
-        let new_end = if old_end >= output_len {
-            self.output_pane.line_count()
-        } else {
-            new_end
-        };
-        let lines = self.buffer_lines(first, new_end.max(first));
-        let touched: Vec<_> = (from..=to).collect();
-        let before = recorded.then(|| self.data.model.history_sections(&touched));
-        let Some(owner) = self.data.model.absorb_output_window(first, last, lines) else {
-            return;
-        };
-        if let Some(before) = before {
-            self.remember_edit(before);
-        }
-        self.current = owner;
-        self.touched();
-    }
-
-    /// True when no earlier edit of the pane's current undo group was folded
-    /// into the sections. Sections recorded at a later step of a group hold
-    /// the text of its earlier steps, which undoing the group removes from
-    /// the pane.
-    fn begins_group(&mut self) -> bool {
-        let id = self.output_pane.buffer().undo_group_id();
-        let first = id != self.absorbed_group;
-        self.absorbed_group = id;
-        first
-    }
-
-    /// An edit typed into the group a recorded step belongs to leaves that
-    /// step's after state stale; replaying it then drops the later text.
-    fn forget_extended_history(&mut self) {
-        if let Some(id) = self.output_pane.buffer().undo_group_id() {
-            self.take_history.remove(&id);
-        }
-    }
-
-    fn remember_edit(&mut self, before: Vec<model::HistorySection>) {
-        let Some(id) = self.output_pane.buffer().undo_group_id() else {
-            return;
-        };
-        if self.take_history.remove(&id).is_some() {
-            return;
-        }
-        let indices: Vec<_> = before.iter().map(|entry| entry.index).collect();
-        let after = self.data.model.history_sections(&indices);
-        self.keep_history(id, before, after);
     }
 
     /// The buffer's lines in a range, each with the terminator the buffer
@@ -1170,30 +1157,39 @@ impl MergeView {
         if sections.is_empty() {
             return;
         }
-        let affected = self.data.model.sections_a_take_changes(&sections);
-        let changed: Vec<_> = affected
-            .iter()
-            .filter_map(|&index| {
-                self.data
-                    .model
-                    .output_range(index)
-                    .map(|range| (index, range))
-            })
-            .collect();
-        let before_id = self.output_pane.buffer().undo_group_id();
-        let before = self.data.model.history_sections(&affected);
-        self.data.model.set_resolutions(&sections, resolution);
+        self.data.model.begin_journal();
+        let given_back = self
+            .data
+            .model
+            .set_resolutions_counted(&sections, resolution);
+        let step = self.data.model.end_journal();
         self.current = sections[0];
+        self.finish_take(step);
+        self.report_given_back(given_back);
+    }
+
+    /// Show a take in the pane and record it as one undo step. A take that
+    /// changed nothing leaves no step.
+    fn finish_take(&mut self, step: Option<model::Step>) {
+        let Some(step) = step else {
+            return;
+        };
         self.touched();
-        self.replace_output_sections(&changed);
-        self.remember_take(before_id, before);
-        self.report_given_back(affected.len().saturating_sub(sections.len()));
+        let windows = step.windows();
+        let before_id = self.output_pane.buffer().undo_group_id();
+        self.replace_output_ranges(&windows);
+        if self.output_pane.buffer().undo_group_id() == before_id {
+            self.output_pane.buffer_mut().record_metadata_command();
+        }
+        if let Some(id) = self.output_pane.buffer().undo_group_id() {
+            self.keep_step(id, step, true);
+        }
     }
 
     /// Tell the user that a take changed sections outside the ones it named.
     fn report_given_back(&mut self, sections: usize) {
         if sections > 0 {
-            self.message = Some(format!("{GIVEN_BACK} ({sections} section(s))"));
+            self.message = Some(given_back_message(sections));
         }
     }
 
@@ -1203,59 +1199,32 @@ impl MergeView {
             return;
         }
         let row = self.row;
-        let sections: Vec<_> = self.data.model.section_of_row(row).into_iter().collect();
-        let before_id = self.output_pane.buffer().undo_group_id();
-        let before = self.data.model.history_sections(&sections);
-        if let Some((section, old, new)) = self.data.model.take_line_with_range(row, pane) {
+        self.data.model.begin_journal();
+        let taken = self.data.model.take_line_with_range(row, pane);
+        let step = self.data.model.end_journal();
+        if let Some((section, _, _)) = taken {
             self.current = section;
-            self.touched();
-            self.replace_output_ranges(&[(old, new)]);
-            self.remember_take(before_id, before);
+            self.finish_take(step);
         } else {
             self.message = Some("The output already holds that line".to_owned());
         }
     }
 
-    fn remember_take(&mut self, before_id: Option<u64>, before: Vec<model::HistorySection>) {
-        let indices: Vec<_> = before.iter().map(|entry| entry.index).collect();
-        let after = self.data.model.history_sections(&indices);
-        if before
-            .iter()
-            .zip(&after)
-            .all(|(old, new)| old.section == new.section)
-        {
-            return;
-        }
-        if self.output_pane.buffer().undo_group_id() == before_id {
-            self.output_pane.buffer_mut().record_metadata_command();
-        }
-        if let Some(id) = self
-            .output_pane
-            .buffer()
-            .undo_group_id()
-            .filter(|id| Some(*id) != before_id)
-        {
-            self.keep_history(id, before, after);
-        }
-    }
-
-    /// Keep the changed sections of one undo group and release the history
-    /// of every group the pane can no longer replay.
-    fn keep_history(
-        &mut self,
-        id: u64,
-        before: Vec<model::HistorySection>,
-        after: Vec<model::HistorySection>,
-    ) {
-        let (before, after): (Vec<_>, Vec<_>) = before
-            .into_iter()
-            .zip(after)
-            .filter(|(old, new)| old.section != new.section)
-            .unzip();
+    /// Keep the step of one undo group and release the steps of every group
+    /// the pane can no longer replay. A later fold into the same group
+    /// extends its step.
+    fn keep_step(&mut self, id: u64, step: model::Step, take: bool) {
         let live: std::collections::HashSet<u64> = self.output_pane.buffer().group_ids().collect();
         self.take_history.retain(|id, _| live.contains(id));
-        if !before.is_empty() {
-            self.take_history.insert(id, TakeHistory { before, after });
+        self.edit_history.retain(|id, _| live.contains(id));
+        if let Some(known) = self.take_history.get_mut(&id) {
+            known.extend(step, &self.data.model);
+        } else if let Some(known) = self.edit_history.get_mut(&id) {
+            known.extend(step, &self.data.model);
+        } else if take || step.touches_several_sections() {
+            self.take_history.insert(id, step);
+        } else {
+            self.edit_history.insert(id, step);
         }
     }
 
@@ -1265,15 +1234,14 @@ impl MergeView {
         } else {
             self.output_pane.buffer().undo_group_id()
         };
-        let id = id.filter(|id| {
-            self.take_history.get(id).is_some_and(|history| {
-                self.data.model.history_applies(if redo {
-                    &history.before
-                } else {
-                    &history.after
-                })
+        let step = id
+            .and_then(|id| {
+                self.take_history
+                    .get(&id)
+                    .or_else(|| self.edit_history.get(&id))
             })
-        });
+            .filter(|step| self.data.model.step_applies(step, redo))
+            .cloned();
         let replayed = if redo {
             self.output_pane.redo()
         } else {
@@ -1282,14 +1250,9 @@ impl MergeView {
         if !replayed {
             return;
         }
-        if let Some(history) = id.and_then(|id| self.take_history.get(&id)) {
-            let _ = self.output_pane.take_changes();
-            let (restored, left) = if redo {
-                (&history.after, &history.before)
-            } else {
-                (&history.before, &history.after)
-            };
-            self.data.model.restore_history_sections(restored, left);
+        if let Some(step) = step {
+            self.discard_pane_changes();
+            self.data.model.replay(&step, redo);
             self.touched();
         } else {
             self.absorb_edits(false);
@@ -1302,6 +1265,7 @@ impl MergeView {
     fn touched(&mut self) {
         self.strip_stale = true;
         self.visible = filter::visible(&self.data.model, self.filter);
+        self.marks_changed = self.waiting_sections() != self.written_marks;
     }
 
     /// Exchange the left and right inputs and merge again.
@@ -1568,6 +1532,7 @@ impl MergeView {
         self.saving_output = Some(self.output_pane.buffer().text());
         self.saving_revision = Some(self.output_pane.buffer().revision());
         self.saving_conflicts = Some(conflicts);
+        self.saving_marks = Some(self.waiting_sections());
         let template = self.data.sources.left.clone();
         let expected = self.output_baseline;
         let consent = self.consent;
@@ -2620,15 +2585,10 @@ impl SessionView for MergeView {
             Command::TakeLeftThenRight => self.take(Resolution::LeftThenRight),
             Command::TakeRightThenLeft => self.take(Resolution::RightThenLeft),
             Command::TakeAllNonConflicting => {
-                let indices: Vec<_> = (0..self.data.model.sections().len()).collect();
-                let before_id = self.output_pane.buffer().undo_group_id();
-                let before = self.data.model.history_sections(&indices);
-                let (changed, given_back) = self.data.model.take_all_non_conflicting_counted();
-                self.touched();
-                self.replace_output_sections(&changed);
-                if !changed.is_empty() {
-                    self.remember_take(before_id, before);
-                }
+                self.data.model.begin_journal();
+                let (_, given_back) = self.data.model.take_all_non_conflicting_counted();
+                let step = self.data.model.end_journal();
+                self.finish_take(step);
                 self.report_given_back(given_back);
             }
             Command::FavorLeft => self.rules.favor_left = !self.rules.favor_left,
@@ -2880,6 +2840,9 @@ impl ca_ui::view::ViewFactory for MergeView {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
+    mod merge_edit_driver;
+    mod merge_edit_probes;
+
     use super::{MergeView, Question, GIVEN_BACK};
     use crate::model::Resolution;
     use ca_ui::command::Command;
@@ -3327,12 +3290,7 @@ mod tests {
     type ViewState = (String, Vec<crate::model::Section>);
 
     fn state(view: &MergeView) -> ViewState {
-        let all: Vec<_> = (0..view.model().sections().len()).collect();
-        let sections = view.model().history_sections(&all);
-        (
-            view.output_text(),
-            sections.into_iter().map(|entry| entry.section).collect(),
-        )
+        (view.output_text(), view.model().sections_with_text())
     }
 
     fn assert_undo_and_redo_restore(
@@ -3399,7 +3357,7 @@ mod tests {
     }
 
     #[test]
-    fn taking_a_joined_section_before_the_one_holding_its_line_keeps_every_line() {
+    fn taking_a_joined_section_before_the_one_holding_its_line_keeps_one_copy_of_each_line() {
         let (mut view, _dir) = open_conflict_before_a_change();
         view.output_pane
             .place(ca_ui::editor::Caret::new(2, 0), false);
@@ -3407,17 +3365,21 @@ mod tests {
         view.absorb_output_edits();
         view.current = 2;
         view.run(Command::TakeCenter);
-        assert_eq!(view.output_text(), "a\nbc\nc\nd\ng\nh\ni\nX\nf\n");
+        assert_eq!(view.output_text(), "a\nbc\nd\ng\nh\ni\nX\nf\n");
         assert_output_lines_match_pane(&view);
         view.current = 1;
         view.run(Command::TakeLeft);
         assert_eq!(view.output_text(), "a\nL\nc\nd\ng\nh\ni\nX\nf\n");
-        assert_eq!(view.message, None);
+        assert!(view
+            .message
+            .as_deref()
+            .is_some_and(|message| message.starts_with(GIVEN_BACK)));
+        assert_eq!(view.model().sections()[2].resolution, Resolution::Center);
         assert_output_lines_match_pane(&view);
     }
 
     #[test]
-    fn a_take_after_a_paste_over_three_sections_keeps_their_lines() {
+    fn a_take_after_a_paste_over_three_sections_keeps_only_the_text_the_paste_left() {
         let (mut view, dir) = open_conflict_before_a_change();
         let original = state(&view);
         view.output_pane
@@ -3431,7 +3393,7 @@ mod tests {
         let pasted = state(&view);
         view.current = 1;
         view.run(Command::TakeLeft);
-        assert_eq!(view.output_text(), "a\nL\nc\nd\ng\nh\ni\nX\nf\n");
+        assert_eq!(view.output_text(), "a\nL\nX\nf\n");
         assert_output_lines_match_pane(&view);
         assert_eq!(
             view.model().sections()[4].resolution,
@@ -3458,6 +3420,121 @@ mod tests {
         assert_output_lines_match_pane(&view);
         let taken = state(&view);
         assert_undo_and_redo_restore(&mut view, &dir, &[original, joined, taken]);
+    }
+
+    #[test]
+    fn a_section_lending_to_two_holders_gets_its_lines_back_in_order() {
+        for holder_first in [true, false] {
+            let (mut view, _dir) = open(
+                "a\nm\nm2\nm3\nc\nd\nz\n",
+                Some("a\nm\nm2\nm3\nq\nc\nd\nz\n"),
+                "a\nm\nm2\nm3\nc\nd\nz\n",
+            );
+            run_until_ready(&mut view);
+            assert_eq!(view.model().sections().len(), 3);
+            assert_eq!(view.output_text(), "a\nm\nm2\nm3\nc\nd\nz\n");
+            view.output_pane
+                .place(ca_ui::editor::Caret::new(4, 0), false);
+            view.output_pane.backspace();
+            view.absorb_output_edits();
+            view.current = 1;
+            view.run(Command::TakeCenter);
+            assert_eq!(view.output_text(), "a\nm\nm2\nm3c\nq\nd\nz\n");
+            view.output_pane.clear_selection();
+            view.output_pane
+                .place(ca_ui::editor::Caret::new(5, 0), false);
+            view.output_pane.backspace();
+            view.absorb_output_edits();
+            assert_eq!(view.output_text(), "a\nm\nm2\nm3c\nqd\nz\n");
+            assert_output_lines_match_pane(&view);
+            let order = if holder_first {
+                [(0, Command::TakeCenter), (1, Command::TakeLeft)]
+            } else {
+                [(1, Command::TakeLeft), (0, Command::TakeCenter)]
+            };
+            for (section, command) in order {
+                view.output_pane.clear_selection();
+                view.current = section;
+                view.run(command);
+                assert_output_lines_match_pane(&view);
+            }
+            assert_eq!(
+                view.output_text(),
+                "a\nm\nm2\nm3\nc\nd\nz\n",
+                "first holder taken first: {holder_first}"
+            );
+            assert_eq!(view.model().sections()[2].resolution, Resolution::Center);
+        }
+    }
+
+    #[test]
+    fn a_take_that_changes_nothing_adds_no_undo_step() {
+        let (mut view, _dir) = open_conflict_before_a_change();
+        let before = state(&view);
+        view.current = 2;
+        view.run(Command::TakeCenter);
+        assert_eq!(state(&view), before);
+        assert!(!view.output_pane.buffer().can_undo());
+        view.run(Command::Undo);
+        assert_eq!(state(&view), before);
+        assert_eq!(view.model().sections()[2].resolution, Resolution::Center);
+    }
+
+    #[test]
+    fn undoing_back_through_a_take_all_after_claimed_separators_keeps_the_model_on_the_pane() {
+        let (mut view, _dir) = open(
+            "[s3]\n[s4]\n[u5]\n[u6]\n[u7]\n[l10]\n~\n",
+            Some("[c1]\n[c2]\n[u5]\n[u6]\n[u7]\n[c8]\n[c9]\n~"),
+            "[s3]\n[s4]\n[u5]\n[u6]\n[u7]\n~",
+        );
+        run_until_ready(&mut view);
+        let edit = |view: &mut MergeView, action: &dyn Fn(&mut MergeView)| {
+            view.output_pane.clear_selection();
+            view.focus = super::Pane::Output;
+            action(view);
+            view.absorb_output_edits();
+            assert_output_lines_match_pane(view);
+        };
+        let at = |line: u32, index: u32| ca_ui::editor::Caret::new(line, index);
+        edit(&mut view, &|view| {
+            view.output_pane.place(at(7, 0), false);
+            view.output_pane.backspace();
+        });
+        view.run(Command::Redo);
+        view.run(Command::ToggleIgnoreSameChanges);
+        view.run(Command::TakeAllNonConflicting);
+        assert_output_lines_match_pane(&view);
+        edit(&mut view, &|view| {
+            let end = u32::try_from(view.output_pane.line_text(2).chars().count()).unwrap();
+            view.output_pane.place(at(2, end), false);
+            view.output_pane.delete();
+        });
+        view.output_pane.clear_selection();
+        view.current = 3.min(view.model().sections().len() - 1);
+        view.run(Command::TakeCenter);
+        assert_output_lines_match_pane(&view);
+        edit(&mut view, &|view| {
+            view.output_pane.place(at(5, 0), false);
+            view.output_pane.backspace();
+        });
+        edit(&mut view, &|view| {
+            view.output_pane.place(at(0, 0), false);
+            view.output_pane.place(at(2, 7), true);
+            view.output_pane.backspace();
+        });
+        view.run(Command::ToggleIgnoreSameChanges);
+        edit(&mut view, &|view| {
+            view.output_pane.place(at(3, 0), false);
+            view.output_pane.backspace();
+        });
+        for _ in 0..12 {
+            view.run(Command::Undo);
+            assert_output_lines_match_pane(&view);
+        }
+        for _ in 0..12 {
+            view.run(Command::Redo);
+            assert_output_lines_match_pane(&view);
+        }
     }
 
     #[test]
@@ -4084,6 +4161,58 @@ mod tests {
         view.run(Command::TakeLeft);
 
         assert_eq!(view.exit_code(), Some(14));
+    }
+
+    #[test]
+    fn marking_a_saved_merge_as_conflicted_requires_save_before_close() {
+        let (mut view, dir) = open("a\nL\nc\n", Some("a\nb\nc\n"), "a\nR\nc\n");
+        run_until_ready(&mut view);
+        view.run(Command::NextConflict);
+        view.run(Command::TakeLeft);
+        assert_eq!(save_and_read(&mut view, &dir), b"a\nL\nc\n");
+        assert!(!view.is_modified());
+        assert_eq!(view.exit_code(), Some(0));
+        view.run(Command::ToggleConflict);
+        assert_eq!(view.model().totals().conflicts_remaining, 1);
+        assert!(
+            view.is_modified(),
+            "a newly marked conflict changes what a save writes"
+        );
+        assert!(!view.may_close());
+        assert_eq!(view.question(), Some(&Question::CloseModified));
+        view.answer(false);
+        assert!(save_with_markers(&mut view, &dir).contains("<<<<<<<"));
+        assert_eq!(view.exit_code(), Some(14));
+        assert!(!view.is_modified());
+        assert!(view.may_close());
+    }
+
+    #[test]
+    fn ignoring_a_saved_conflict_requires_save_before_close() {
+        let (mut view, dir) = open("a\nL\nc\n", Some("a\nb\nc\n"), "a\nR\nc\n");
+        run_until_ready(&mut view);
+        assert!(save_with_markers(&mut view, &dir).contains("<<<<<<<"));
+        assert_eq!(view.exit_code(), Some(14));
+        assert!(!view.is_modified());
+        view.run(Command::NextConflict);
+        view.run(Command::ToggleSectionIgnored);
+        assert_eq!(view.model().totals().conflicts_remaining, 0);
+        assert!(
+            view.is_modified(),
+            "an ignored conflict is written without markers"
+        );
+        assert!(!view.may_close());
+        view.answer(false);
+        assert_eq!(save_and_read(&mut view, &dir), b"a\nb\nc\n");
+        assert_eq!(view.exit_code(), Some(0));
+        assert!(!view.is_modified());
+        view.run(Command::ToggleSectionIgnored);
+        assert!(view.is_modified());
+        view.run(Command::ToggleSectionIgnored);
+        assert!(
+            !view.is_modified(),
+            "the marks the last save wrote are back"
+        );
     }
 
     #[test]
