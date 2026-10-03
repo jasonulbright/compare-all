@@ -183,6 +183,12 @@ pub trait SessionView {
             .any(|state| state.command == command && state.enabled)
     }
 
+    /// Why the view refuses `command` at this moment, where the view knows a
+    /// more exact reason than the one the menu line carries.
+    fn refusal(&self, _command: Command) -> Option<&'static str> {
+        None
+    }
+
     /// Run a command the view reported it accepts.
     fn run(&mut self, _command: Command) {}
 
@@ -446,6 +452,10 @@ impl SessionView for OwnsTemporaries {
 
     fn accepts(&self, command: Command) -> bool {
         self.view.accepts(command)
+    }
+
+    fn refusal(&self, command: Command) -> Option<&'static str> {
+        self.view.refusal(command)
     }
 
     fn run(&mut self, command: Command) {

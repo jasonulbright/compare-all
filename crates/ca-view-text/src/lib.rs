@@ -2274,16 +2274,22 @@ impl TextView {
         }
     }
 
+    /// Why a command that turns rows into lines waits: for the load, or for
+    /// the comparison of an edit or a settings change.
+    const fn rows_reason(&self) -> &'static str {
+        if matches!(self.status, Status::Ready) {
+            EDIT_NOT_COMPARED
+        } else {
+            NOT_COMPARED
+        }
+    }
+
     /// The toolbar items this view declares, in the state it is in now.
     #[must_use]
     pub fn toolbar_items(&self) -> Vec<toolbar::Item> {
         let ready = self.status == Status::Ready;
         let rows = self.rows_current();
-        let rows_reason = if ready {
-            EDIT_NOT_COMPARED
-        } else {
-            NOT_COMPARED
-        };
+        let rows_reason = self.rows_reason();
         vec![
             toolbar::Item::widget("home", 70.0),
             toolbar::Item::widget("sessions", 90.0),
@@ -4860,6 +4866,23 @@ impl SessionView for TextView {
             }
             _ => false,
         }
+    }
+
+    fn refusal(&self, command: Command) -> Option<&'static str> {
+        let open = match command {
+            Command::NextDifference
+            | Command::PreviousDifference
+            | Command::NextSection
+            | Command::PreviousSection
+            | Command::SelectSection => true,
+            Command::CopyToRight | Command::CopyLineToRight => !self.right_pane.is_read_only(),
+            Command::CopyToLeft | Command::CopyLineToLeft => !self.left_pane.is_read_only(),
+            Command::CopyToOtherSide => {
+                !self.locked && !self.pane(self.active.other()).is_read_only()
+            }
+            _ => return None,
+        };
+        (open && !self.rows_current()).then(|| self.rows_reason())
     }
 
     fn run(&mut self, command: Command) {
