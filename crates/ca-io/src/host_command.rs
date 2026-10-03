@@ -173,24 +173,53 @@ impl Image {
     /// unknown every named root counts: a host program given the image's
     /// variables fails, while a variable of another image that is cleaned in
     /// error names paths that are not this process's anyway.
+    ///
+    /// `resolve` gives the canonical form of a folder, or `None`. Each folder
+    /// matches in the form the variable gives and in its canonical form, so a
+    /// folder named through a link or relative to the working folder matches
+    /// the resolved paths that the executable and the variables hold.
     #[must_use]
-    pub fn detect(environment: &Environment, executable: Option<&Path>) -> Option<Self> {
-        let runs_from = |root: &Vec<u8>| {
-            executable.is_none_or(|program| inside(root, program.as_os_str().as_encoded_bytes()))
+    pub fn detect(
+        environment: &Environment,
+        executable: Option<&Path>,
+        resolve: &dyn Fn(&Path) -> Option<PathBuf>,
+    ) -> Option<Self> {
+        let forms = |name: &str| -> Vec<Vec<u8>> {
+            let Some(given) = value(environment, name) else {
+                return Vec::new();
+            };
+            let resolved = resolve(Path::new(given));
+            let mut forms: Vec<Vec<u8>> = [Some(given), resolved.as_deref().map(Path::as_os_str)]
+                .into_iter()
+                .flatten()
+                .filter_map(root_of)
+                .collect();
+            forms.dedup();
+            let runs_from = executable.is_none_or(|program| {
+                let program = program.as_os_str().as_encoded_bytes();
+                forms.iter().any(|root| inside(root, program))
+            });
+            if runs_from {
+                forms
+            } else {
+                Vec::new()
+            }
         };
-        let sharun = value(environment, "SHARUN_DIR")
-            .and_then(root_of)
-            .filter(runs_from);
         let from_runtime =
             value(environment, "SHARUN_DIR").is_some() || value(environment, "APPIMAGE").is_some();
-        let appdir = value(environment, "APPDIR")
-            .and_then(root_of)
-            .filter(|root| from_runtime && runs_from(root));
-        let runtime = appdir.is_some() && value(environment, "APPIMAGE").is_some();
-        let mut roots = Vec::new();
-        roots.extend(sharun);
-        roots.extend(appdir);
-        roots.dedup();
+        let sharun = forms("SHARUN_DIR");
+        let appdir = if from_runtime {
+            forms("APPDIR")
+        } else {
+            Vec::new()
+        };
+        let runtime = !appdir.is_empty() && value(environment, "APPIMAGE").is_some();
+        let mut roots = sharun;
+        for root in appdir {
+            if !roots.contains(&root) {
+                roots.push(root);
+            }
+        }
         if roots.is_empty() {
             return None;
         }
@@ -412,11 +441,18 @@ pub fn host_command(program: impl AsRef<OsStr>) -> Command {
 /// started, never on the frame thread.
 #[must_use]
 pub fn host_environment() -> Option<Environment> {
+    static IMAGE: OnceLock<Option<Image>> = OnceLock::new();
     if cfg!(any(windows, target_os = "macos")) {
         return None;
     }
     let current: Environment = std::env::vars_os().collect();
-    let mut image = Image::detect(&current, executable())?;
+    let mut image = IMAGE
+        .get_or_init(|| {
+            Image::detect(&current, executable(), &|folder| {
+                std::fs::canonicalize(folder).ok()
+            })
+        })
+        .clone()?;
     if image.needs_account_home(&current) {
         image = image.with_account_home(account_home());
     }
