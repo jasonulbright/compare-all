@@ -106,7 +106,7 @@ fn sharun_child() -> Environment {
 }
 
 fn clean(environment: &Environment) -> Environment {
-    let image = Image::detect(environment).expect("an image environment");
+    let image = Image::detect(environment, None).expect("an image environment");
     clean_environment(environment, &image)
 }
 
@@ -380,13 +380,79 @@ fn outside_an_image_nothing_is_detected() {
         ("PATH", "/usr/bin:/bin"),
         ("GCONV_PATH", "/usr/lib/gconv"),
     ]);
-    assert_eq!(Image::detect(&plain), None);
+    assert_eq!(Image::detect(&plain, None), None);
 
     let own_appdir = environment(&[("APPDIR", "/home/tester/apps"), ("PATH", "/usr/bin")]);
-    assert_eq!(Image::detect(&own_appdir), None);
+    assert_eq!(Image::detect(&own_appdir, None), None);
 
     let file_system_root = environment(&[("SHARUN_DIR", "/"), ("APPDIR", "relative")]);
-    assert_eq!(Image::detect(&file_system_root), None);
+    assert_eq!(Image::detect(&file_system_root, None), None);
+}
+
+fn detect_from(environment: &Environment, executable: &str) -> Option<Image> {
+    Image::detect(environment, Some(std::path::Path::new(executable)))
+}
+
+#[test]
+fn a_plain_binary_under_another_image_keeps_the_environment() {
+    let terminal = environment(&[
+        ("APPDIR", "/tmp/.mount_TermAB"),
+        ("APPIMAGE", "/home/u/Term.AppImage"),
+        ("HOME", "/home/u/Term.AppImage.home"),
+        ("XDG_CONFIG_HOME", "/home/u/Term.AppImage.config"),
+        ("LD_LIBRARY_PATH", "/opt/vendor/lib"),
+        ("PATH", "/tmp/.mount_TermAB/bin:/usr/bin"),
+    ]);
+    assert_eq!(detect_from(&terminal, "/usr/bin/compare-all"), None);
+    assert!(detect_from(
+        &terminal,
+        "/tmp/.mount_TermAB/shared/lib/ld-linux-x86-64.so.2"
+    )
+    .is_some());
+
+    let extract_and_run = environment(&[
+        ("APPDIR", "/tmp/appimage_extracted_7112f36"),
+        ("SHARUN_DIR", "/tmp/appimage_extracted_7112f36"),
+        ("APPIMAGE", "/home/u/compare-all.AppImage"),
+    ]);
+    assert!(detect_from(
+        &extract_and_run,
+        "/tmp/appimage_extracted_7112f36/shared/lib/ld-linux-x86-64.so.2"
+    )
+    .is_some());
+
+    let extracted_tree = environment(&[("SHARUN_DIR", "/home/u/squashfs-root")]);
+    assert!(detect_from(
+        &extracted_tree,
+        "/home/u/squashfs-root/shared/lib/ld-linux-x86-64.so.2"
+    )
+    .is_some());
+
+    let inside_the_terminal = environment(&[
+        ("SHARUN_DIR", "/tmp/.mount_comparAB"),
+        ("APPDIR", "/tmp/.mount_TermAB"),
+        ("APPIMAGE", "/home/u/Term.AppImage"),
+        ("HOME", "/home/u/Term.AppImage.home"),
+        (
+            "PATH",
+            "/tmp/.mount_comparAB/bin:/tmp/.mount_TermAB/bin:/usr/bin",
+        ),
+    ]);
+    let image = detect_from(
+        &inside_the_terminal,
+        "/tmp/.mount_comparAB/shared/lib/ld-linux-x86-64.so.2",
+    )
+    .unwrap();
+    assert!(!image.needs_account_home(&inside_the_terminal));
+    let cleaned = clean_environment(&inside_the_terminal, &image);
+    assert_eq!(
+        cleaned.get(OsStr::new("PATH")),
+        Some(&OsString::from("/tmp/.mount_TermAB/bin:/usr/bin"))
+    );
+    assert_eq!(
+        cleaned.get(OsStr::new("HOME")),
+        Some(&OsString::from("/home/u/Term.AppImage.home"))
+    );
 }
 
 #[test]
@@ -421,7 +487,7 @@ fn portable_child() -> Environment {
 #[test]
 fn portable_mode_gives_a_host_child_the_account_home() {
     let input = portable_child();
-    let image = Image::detect(&input).unwrap();
+    let image = Image::detect(&input, None).unwrap();
     assert!(image.needs_account_home(&input));
     let image = image.with_account_home(Some("/home/tester".into()));
     let cleaned = clean_environment(&input, &image);
@@ -439,7 +505,7 @@ fn portable_mode_gives_a_host_child_the_account_home() {
 #[test]
 fn portable_mode_with_no_known_account_home_keeps_home() {
     let input = portable_child();
-    let image = Image::detect(&input).unwrap();
+    let image = Image::detect(&input, None).unwrap();
     let cleaned = clean_environment(&input, &image);
     assert_eq!(
         cleaned.get(OsStr::new("HOME")),
@@ -462,7 +528,7 @@ fn saved_originals_are_restored_rather_than_removed() {
     ] {
         input.insert(name.into(), value.into());
     }
-    let image = Image::detect(&input).unwrap();
+    let image = Image::detect(&input, None).unwrap();
     assert!(!image.needs_account_home(&input));
     let cleaned = clean_environment(&input, &image);
     for (name, value) in [
@@ -485,7 +551,7 @@ fn saved_originals_are_restored_rather_than_removed() {
 fn a_home_that_is_not_the_portable_folder_is_kept() {
     let mut input = apprun_child();
     input.insert("HOME".into(), "/srv/elsewhere".into());
-    let image = Image::detect(&input).unwrap();
+    let image = Image::detect(&input, None).unwrap();
     assert!(!image.needs_account_home(&input));
     let image = image.with_account_home(Some("/home/tester".into()));
     assert_eq!(

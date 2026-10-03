@@ -1,8 +1,9 @@
 //! The time zone read started from an image.
 //!
-//! The case runs this test binary again with an image environment and a `date`
-//! on `PATH` that records its environment before it runs the real `date`, so
-//! the test process itself never changes a variable.
+//! The case runs a copy of this test binary placed inside an image folder, with
+//! an image environment and a `date` on `PATH` that records its environment
+//! before it runs the real `date`, so the test process itself never changes a
+//! variable.
 #![cfg(target_os = "linux")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -41,11 +42,17 @@ fn the_date_child_gets_no_image_variable_and_still_reads_the_zone() -> Result<()
             record.display()
         ),
     )?;
+    let current = std::env::current_exe()?;
+    let program = image
+        .join("shared/bin")
+        .join(current.file_name().ok_or("no file name")?);
+    std::fs::create_dir_all(program.parent().ok_or("no parent")?)?;
+    std::fs::copy(&current, &program)?;
     #[allow(
         clippy::disallowed_methods,
-        reason = "the test binary is started with an exact environment"
+        reason = "a copy of the test binary inside the image is started with an exact environment"
     )]
-    let mut command = std::process::Command::new(std::env::current_exe()?);
+    let mut command = std::process::Command::new(program);
     let output = command
         .args(["--exact", "zone_probe", "--nocapture"])
         .env_clear()
