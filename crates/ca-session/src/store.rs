@@ -2390,11 +2390,17 @@ fn run_directory(environment: &PlatformEnvironment, reason: &str) -> StateDirect
         },
         Err(detail) => StateDirectory {
             path: unusable_directory(),
-            notice: Some(format!(
-                "No home folder is known: {reason}. No private folder could be made for this run in {detail}. Settings are not saved."
-            )),
+            notice: Some(unsaved_notice(reason, detail)),
         },
     }
+}
+
+/// The one line shown when a run has nowhere private to write. `detail` names
+/// the temporary folder and why no folder could be made in it.
+fn unsaved_notice(reason: &str, detail: &str) -> String {
+    format!(
+        "Settings are not saved, because no home folder is known ({reason}) and no private folder could be made in {detail}."
+    )
 }
 
 /// The folder the private folder of a run is made in.
@@ -2496,6 +2502,13 @@ impl SettingsPaths {
             Ok(path) => StateDirectory { path, notice: None },
             Err(reason) => run_directory(&environment, reason),
         }
+    }
+
+    /// True when `path` is the folder a run uses when it has nowhere private
+    /// to write, which no file system call accepts.
+    #[must_use]
+    pub fn is_unusable(path: &Path) -> bool {
+        path == unusable_directory()
     }
 
     /// Delete the private folder [`SettingsPaths::state_directory`] made for
@@ -4070,6 +4083,20 @@ mod tests {
             0o777,
             "a folder of another user changed"
         );
+    }
+
+    #[test]
+    fn a_run_with_nowhere_to_write_says_so_in_one_sentence() {
+        let notice = unsaved_notice(
+            "HOME is not set to an absolute folder",
+            "/missing: No such file or directory (os error 2)",
+        );
+        assert_eq!(notice.matches("not saved").count(), 1, "{notice}");
+        assert!(notice.ends_with('.') && !notice.contains(". "), "{notice}");
+        assert!(notice.contains("/missing"), "{notice}");
+        assert!(!notice.contains('\0'), "{notice:?}");
+        assert!(SettingsPaths::is_unusable(&unusable_directory()));
+        assert!(!SettingsPaths::is_unusable(Path::new("/tmp")));
     }
 
     #[test]
