@@ -602,6 +602,17 @@ mod tests {
         assert!(failure.contains("remote") || failure.contains("machine"));
     }
 
+    #[cfg(not(windows))]
+    #[test]
+    fn a_local_live_key_is_refused_with_the_platform_reason() {
+        let failure = read_side(
+            Flavor::Registry,
+            Path::new(r"reg:\\HKEY_CURRENT_USER\Software"),
+        )
+        .unwrap_err();
+        assert!(failure.contains("no Windows registry"), "{failure}");
+    }
+
     #[test]
     fn two_export_files_load_and_compare_on_a_worker() {
         let dir = tempfile::tempdir().unwrap();
