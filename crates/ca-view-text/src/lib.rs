@@ -271,8 +271,8 @@ pub struct TextView {
     context_lines: u32,
     visible: Visible,
     caret: usize,
-    /// The row a move made current, held while both text carets stay where
-    /// that move put them.
+    /// The row a move made current, held while the text is unchanged and both
+    /// text carets stay where that move put them.
     ///
     /// A row the active pane has no line on is not the row of any text caret,
     /// so the row caret cannot be derived from the caret there.
@@ -399,12 +399,30 @@ pub struct TextView {
 }
 
 /// The row a move made current and the carets it left.
+///
+/// The row is held as one of its lines. A comparison of unchanged text numbers
+/// the rows afresh, so a row index names another place in the new rows, while
+/// every line keeps its number and leads back to the row that shows it now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RowAnchor {
-    row: usize,
+    /// A side with a line on the row; the active side where it has one.
+    side: Side,
+    line: u32,
+    /// The edit count of the text the move ran over.
+    revision: u64,
     active: Side,
     left: editor::Caret,
     right: editor::Caret,
+}
+
+impl RowAnchor {
+    /// The row that shows the held line in `model`.
+    fn row(&self, model: &model::RowModel) -> Option<usize> {
+        match self.side {
+            Side::Left => model.row_of_left_line(self.line),
+            Side::Right => model.row_of_right_line(self.line),
+        }
+    }
 }
 
 /// What a copy left behind, so the move after it runs only while nothing else
@@ -1482,9 +1500,11 @@ impl TextView {
     fn install(&mut self, data: TextData, keep_carets: bool) {
         let mut data = data;
         data.model.set_ignore_unimportant(self.ignore_unimportant);
-        // Rows are numbered afresh, so a row the old map made current names
-        // another place in the new one.
-        self.anchor = None;
+        // A load replaces the text without counting an edit, so a held line
+        // would name a line of other text.
+        if data.sources.is_some() || !keep_carets {
+            self.anchor = None;
+        }
         if let Some(sources) = data.sources.take() {
             if let Some(generation) = self.rediff.generation() {
                 self.loaded_generation = generation;
@@ -1633,19 +1653,19 @@ impl TextView {
 
     /// Put the row caret back on the line the text caret is on.
     ///
-    /// A row a move made current stays current while both text carets are
-    /// where the move left them and the same pane is active; any other caret
-    /// position makes the caret's own row current.
+    /// A row a move made current stays current while the text is unchanged,
+    /// both text carets are where the move left them and the same pane is
+    /// active, through any comparison of that text; any other caret position
+    /// makes the caret's own row current.
     fn follow_caret(&mut self) {
         if let Some(anchor) = self.anchor {
-            let held = anchor.active == self.active
+            let held = anchor.revision == self.revision
+                && anchor.active == self.active
                 && anchor.left == self.left_pane.caret()
-                && anchor.right == self.right_pane.caret()
-                && anchor.row < self.data.model.row_count();
-            if held {
-                self.caret = anchor.row;
-            } else {
-                self.anchor = None;
+                && anchor.right == self.right_pane.caret();
+            match anchor.row(&self.data.model).filter(|_| held) {
+                Some(row) => self.caret = row,
+                None => self.anchor = None,
             }
         }
         if self.anchor.is_none() {
@@ -1682,8 +1702,18 @@ impl TextView {
             }
         }
         self.horizontal = 0.0;
-        self.anchor = Some(RowAnchor {
-            row,
+        let entry = self.data.model.row(row);
+        let held = [self.active, self.active.other()]
+            .into_iter()
+            .find_map(|side| {
+                entry
+                    .and_then(|entry| side.line_of(entry))
+                    .map(|line| (side, line))
+            });
+        self.anchor = held.map(|(side, line)| RowAnchor {
+            side,
+            line,
+            revision: self.revision,
             active: self.active,
             left: self.left_pane.caret(),
             right: self.right_pane.caret(),
