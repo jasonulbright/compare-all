@@ -12,8 +12,15 @@
 //!
 //! The image is recognised by the variables its launchers set: `SHARUN_DIR`
 //! (sharun, every entry point) and `APPDIR` together with `APPIMAGE` or
-//! `SHARUN_DIR` (the AppImage runtime). Without them, and always on Windows and
-//! macOS, the environment passes through unchanged.
+//! `SHARUN_DIR` (the AppImage runtime), each counted only when this process's
+//! executable lies inside the folder it names. Without them, and always on
+//! Windows and macOS, the environment passes through unchanged.
+//!
+//! The programs the workspace starts itself go through [`host_command`]: the
+//! time zone read (`date`), the Subversion client (`svn`), `bsdtar` for RAR
+//! archives, and the Open With, system open and file manager commands. The
+//! helper of the native file dialog (`zenity`, without a desktop portal) is
+//! started by the dialog library and does not pass through this module.
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -423,8 +430,9 @@ fn from_bytes(bytes: &[u8]) -> Option<OsString> {
 /// A [`Command`] for `program`, a program of the host, with the environment
 /// [`host_environment`] gives.
 ///
-/// Every program this workspace starts that is not part of the image goes
-/// through this function. Off the image the command is the plain
+/// Every program that workspace code starts and that is not part of the image
+/// goes through this function; programs that a library starts on its own, such
+/// as the file dialog's helper, do not. Off the image the command is the plain
 /// [`Command::new`].
 pub fn host_command(program: impl AsRef<OsStr>) -> Command {
     command_with(program, host_environment())
