@@ -86,6 +86,9 @@ const EDIT_NOT_COMPARED: &str = "Available once the edit is compared";
 /// What the message panel says when such a command arrives anyway.
 const WAIT_FOR_COMPARISON: &str =
     "The comparison of the last edit is not finished. Try again when it is.";
+/// What the message panel says when the display filter shows no difference
+/// to move to.
+const FILTER_HIDES: &str = "The display filter hides every difference.";
 
 const fn command_is_save_or_overwrite(command: Command) -> bool {
     matches!(
@@ -1383,27 +1386,27 @@ impl TextView {
 
     /// Move to the next or the previous difference.
     ///
-    /// Where nothing lies in that direction the Next Difference page decides
-    /// what happens: the move continues from the other end, or it stops and the
-    /// message panel says why.
+    /// Only a row the display filter shows is a destination. Where nothing
+    /// lies in that direction the Next Difference page decides what happens:
+    /// the move continues from the other end, or it stops and the message
+    /// panel says why.
     fn navigate(&mut self, command: Command) {
         if !self.rows_current() {
             self.message = Some(WAIT_FOR_COMPARISON.to_owned());
             return;
         }
         let model = &self.data.model;
-        let target = match command {
-            Command::NextDifference => model.next_difference(self.caret),
-            Command::PreviousDifference => model.previous_difference(self.caret),
-            Command::NextSection => model.next_section(self.caret),
-            Command::PreviousSection => model.previous_section(self.caret),
+        let step = |row: usize| match command {
+            Command::NextDifference => model.next_difference(row),
+            Command::PreviousDifference => model.previous_difference(row),
+            Command::NextSection => model.next_section(row),
+            Command::PreviousSection => model.previous_section(row),
             _ => None,
         };
-        if let Some(row) = target {
-            self.move_to_row(row);
-            return;
-        }
-        if self.navigation.wrap_around {
+        let target = self.first_shown(step(self.caret), step).or_else(|| {
+            if !self.navigation.wrap_around {
+                return None;
+            }
             let wrapped = match command {
                 Command::NextDifference => model.first_difference(),
                 Command::PreviousDifference => model.last_difference(),
@@ -1411,14 +1414,46 @@ impl TextView {
                 Command::PreviousSection => model.last_section(),
                 _ => None,
             };
-            if let Some(row) = wrapped {
-                self.move_to_row(row);
-                return;
-            }
+            self.first_shown(wrapped, step)
+        });
+        if let Some(row) = target {
+            self.move_to_row(row);
+            return;
         }
         if self.navigation.show_message_panel {
-            self.message = Some(LAST_DIFFERENCE.to_owned());
+            let hidden = model.counts().differences > 0
+                && self
+                    .first_shown(model.first_difference(), |row| model.next_difference(row))
+                    .is_none();
+            self.message = Some(
+                if hidden {
+                    FILTER_HIDES
+                } else {
+                    LAST_DIFFERENCE
+                }
+                .to_owned(),
+            );
         }
+    }
+
+    /// The first row of `start`, `step(start)`, `step(step(start))` and so on
+    /// that the display filter shows.
+    ///
+    /// Every navigation step moves strictly away from the row it starts at,
+    /// so the walk ends.
+    fn first_shown(
+        &self,
+        start: Option<usize>,
+        step: impl Fn(usize) -> Option<usize>,
+    ) -> Option<usize> {
+        let mut at = start;
+        while let Some(row) = at {
+            if self.visible.shows(row) {
+                return Some(row);
+            }
+            at = step(row);
+        }
+        None
     }
 
     fn jump_to_first_difference_once(&mut self) {
@@ -1427,7 +1462,11 @@ impl TextView {
         }
         if self.navigation.go_to_first_difference_on_load {
             if let Some(first) = self.first_difference() {
-                self.move_to_row(first);
+                if self.visible.shows(first) {
+                    self.move_to_row(first);
+                } else {
+                    self.go_to_row(first);
+                }
             }
         }
     }
@@ -1617,11 +1656,13 @@ impl TextView {
 
     /// Reveal `row`, make it current and put both text carets on it.
     ///
-    /// A pane with no line on the row takes the nearest line above it, or with
-    /// none above, the nearest line below. The row stays current while the
-    /// carets stay where this leaves them, so the copy commands act on the
-    /// row's section even when the active pane's caret is on a line of another
-    /// row.
+    /// A pane with no line on the row takes the nearest line above it that the
+    /// display filter shows, or with none above, the nearest shown line below;
+    /// with no shown line at all its caret stays where it is. The row stays
+    /// current while the carets stay where this leaves them, so the copy
+    /// commands act on the row's section even when the active pane's caret is
+    /// on a line of another row. The view scrolls back to the first column,
+    /// where the carets go.
     fn move_to_row(&mut self, row: usize) {
         self.go_to_row(row);
         let row = self.caret;
@@ -1637,6 +1678,7 @@ impl TextView {
                     .place(editor::Caret::new(line, 0), false);
             }
         }
+        self.horizontal = 0.0;
         self.anchor = Some(RowAnchor {
             row,
             active: self.active,
@@ -3628,22 +3670,30 @@ impl TextView {
         let _ = response;
     }
 
-    /// The closest row at or above `from` that one side has a line on, falling
-    /// back to the closest row below it.
+    /// The closest shown row at or above `from` that one side has a line on,
+    /// falling back to the closest shown row below it.
+    ///
+    /// A line on a row the display filter hides is not painted, so a caret put
+    /// there would take keystrokes into text the user cannot see. The walk
+    /// steps through display positions, so hidden rows cost nothing.
     fn nearest_line(&self, from: usize, side: Side) -> Option<(usize, u32)> {
         let model = &self.data.model;
-        let line_of = |index: usize| model.row(index).and_then(|row| side.line_of(row));
-        for index in (0..=from).rev() {
-            if let Some(line) = line_of(index) {
-                return Some((index, line));
-            }
-        }
-        for index in from..model.row_count() {
-            if let Some(line) = line_of(index) {
-                return Some((index, line));
-            }
-        }
-        None
+        let visible = &self.visible;
+        let line_at = |position: usize| {
+            let index = visible.row_at(position)?;
+            let line = model.row(index).and_then(|row| side.line_of(row))?;
+            Some((index, line))
+        };
+        let below = visible.position_of(from).unwrap_or(visible.len());
+        let above = if visible.row_at(below) == Some(from) {
+            below + 1
+        } else {
+            below
+        };
+        (0..above)
+            .rev()
+            .find_map(line_at)
+            .or_else(|| (below..visible.len()).find_map(line_at))
     }
 
     /// Place or extend the caret from the pointer.
