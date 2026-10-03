@@ -569,10 +569,9 @@ impl PictureView {
             return;
         };
         let messages = job.drain();
-        let mut finished = job.is_finished();
+        let finished = job.is_finished();
         let current = self.scheduler.is_current(self.job_id);
         for message in messages {
-            finished |= ca_ui::worker::Terminal::is_terminal(&message);
             if !current {
                 continue;
             }
