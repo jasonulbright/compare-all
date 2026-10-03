@@ -147,6 +147,9 @@ fn a_cleared_message_panel_says_nothing_when_navigation_stops() {
 }
 
 /// A copy moves on to the next difference only when the page asks for it.
+///
+/// The move reads the rows of the copied text, so it lands once the copy is
+/// compared.
 #[test]
 fn a_copy_moves_to_the_next_difference_only_when_the_page_says_so() {
     let mut staying = Harness::configured("A\nb\nC\n", "X\nb\nY\n", |options| {
@@ -156,6 +159,8 @@ fn a_copy_moves_to_the_next_difference_only_when_the_page_says_so() {
     assert_eq!(staying.view.current_row(), 0);
     staying.view.run(Command::CopyToRight);
     assert_eq!(staying.view.current_row(), 0);
+    assert!(staying.frames_until(|harness| harness.view.is_settled()));
+    assert_eq!(staying.view.current_row(), 0);
 
     let mut moving = Harness::configured("A\nb\nC\n", "X\nb\nY\n", |options| {
         options.next_difference.go_to_first_difference_on_load = true;
@@ -163,6 +168,7 @@ fn a_copy_moves_to_the_next_difference_only_when_the_page_says_so() {
     });
     assert_eq!(moving.view.current_row(), 0);
     moving.view.run(Command::CopyToRight);
+    assert!(moving.frames_until(|harness| harness.view.is_settled()));
     assert_eq!(moving.view.current_row(), 2);
 }
 

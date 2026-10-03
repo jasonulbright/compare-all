@@ -10,6 +10,9 @@ pub mod lines;
 pub mod model;
 pub mod patch_view;
 pub mod prettify;
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic)]
+mod row_commands;
 pub mod settings;
 pub mod sidecopy;
 pub mod structure;
@@ -77,6 +80,12 @@ const PENDING: &str = "Not available in this build";
 const NOT_COMPARED: &str = "Available once the comparison finishes";
 /// Reason shown on a control a read-only comparison does not offer.
 const LOCKED: &str = "This view is read-only";
+/// Reason shown on a control that maps rows to lines while the comparison of
+/// an edit is still due.
+const EDIT_NOT_COMPARED: &str = "Available once the edit is compared";
+/// What the message panel says when such a command arrives anyway.
+const WAIT_FOR_COMPARISON: &str =
+    "The comparison of the last edit is not finished. Try again when it is.";
 
 const fn command_is_save_or_overwrite(command: Command) -> bool {
     matches!(
@@ -256,6 +265,8 @@ pub struct TextView {
     context_lines: u32,
     visible: Visible,
     caret: usize,
+    /// A copy that moves to the next difference once its comparison lands.
+    advance_after_copy: Option<PendingAdvance>,
     font: ca_ui::font::FontSize,
     /// Padding the options add between rows, read once per frame.
     line_spacing: u32,
@@ -373,6 +384,15 @@ pub struct TextView {
     /// The files are copies the tab owns, so neither pane takes an edit and
     /// nothing is saved.
     read_only: bool,
+}
+
+/// What a copy left behind, so the move after it runs only while nothing else
+/// changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingAdvance {
+    revision: u64,
+    side: Side,
+    caret: editor::Caret,
 }
 
 /// Where one difference section's copy arrow was drawn.
@@ -518,6 +538,7 @@ impl TextView {
             context_lines: 2,
             visible: Visible::All(0),
             caret: 0,
+            advance_after_copy: None,
             font: ca_ui::font::FontSize::new(DEFAULT_FONT_SIZE),
             line_spacing: 0,
             navigation: ca_session::options::NextDifferenceOptions::default(),
@@ -700,6 +721,7 @@ impl TextView {
         self.data = TextData::default();
         self.visible = Visible::All(0);
         self.caret = 0;
+        self.advance_after_copy = None;
         self.scroll = RowScroll::top();
         self.horizontal = 0.0;
         self.strip_stale = true;
@@ -1048,6 +1070,7 @@ impl TextView {
         self.right_edits = EditMarks::default();
         self.bookmarks.clear();
         self.caret = 0;
+        self.advance_after_copy = None;
         self.scroll = RowScroll::top();
         self.horizontal = 0.0;
         self.strip_stale = true;
@@ -1102,6 +1125,16 @@ impl TextView {
             && self.job.is_none()
             && !self.rediff.is_running()
             && !self.rediff.is_stale()
+    }
+
+    /// True when the row map describes the text both panes hold now.
+    ///
+    /// After an edit the map of the text before it stays on screen until the
+    /// comparison that follows the edit is installed. A row of that map can
+    /// name a line that now holds other text, so a command that turns rows
+    /// into lines acts on it only when this holds.
+    fn rows_current(&self) -> bool {
+        self.status == Status::Ready && self.is_settled()
     }
 
     /// The colored runs of one line, for a test that checks what a frame paints.
@@ -1336,6 +1369,10 @@ impl TextView {
     /// what happens: the move continues from the other end, or it stops and the
     /// message panel says why.
     fn navigate(&mut self, command: Command) {
+        if !self.rows_current() {
+            self.message = Some(WAIT_FOR_COMPARISON.to_owned());
+            return;
+        }
         let model = &self.data.model;
         let target = match command {
             Command::NextDifference => model.next_difference(self.caret),
@@ -1678,6 +1715,7 @@ impl TextView {
     fn note_edit(&mut self) {
         self.revision = self.revision.saturating_add(1);
         self.rediff.mark_stale(Instant::now());
+        self.advance_after_copy = None;
         for span in self.left_pane.take_changes() {
             self.bookmarks.shift(
                 span.start_line as usize,
@@ -1750,6 +1788,28 @@ impl TextView {
         }
         if finished {
             self.rediff.finish();
+        }
+    }
+
+    /// Run the move a copy asked for, once the copy is compared.
+    ///
+    /// The move is dropped when the text changed again, the active pane
+    /// changed or its caret moved since the copy, or the comparison failed.
+    fn advance_when_compared(&mut self) {
+        let Some(pending) = self.advance_after_copy else {
+            return;
+        };
+        let unchanged = pending.revision == self.revision
+            && pending.side == self.active
+            && pending.caret == self.pane(pending.side).caret()
+            && self.status == Status::Ready;
+        if !unchanged {
+            self.advance_after_copy = None;
+            return;
+        }
+        if self.rows_current() {
+            self.advance_after_copy = None;
+            self.navigate(Command::NextDifference);
         }
     }
 
@@ -1909,8 +1969,17 @@ impl TextView {
     }
 
     /// Copy the selection, or the current difference section, to `to`.
+    ///
+    /// The copy is compared at once rather than after the quiet period an edit
+    /// waits out, since a copy is one whole edit. The move to the next
+    /// difference that may follow it waits for that comparison, because it
+    /// reads the rows of the copied text.
     fn copy_to(&mut self, to: Side, line_only: bool) {
         if self.pane(to).is_read_only() {
+            return;
+        }
+        if !self.rows_current() {
+            self.message = Some(WAIT_FOR_COMPARISON.to_owned());
             return;
         }
         let from = to.other();
@@ -1936,8 +2005,15 @@ impl TextView {
         // after a copy reverses that copy.
         self.active = to;
         self.note_edit();
+        if self.job.is_none() {
+            self.start_rediff();
+        }
         if self.navigation.go_to_next_after_copy {
-            self.navigate(Command::NextDifference);
+            self.advance_after_copy = Some(PendingAdvance {
+                revision: self.revision,
+                side: to,
+                caret: self.pane(to).caret(),
+            });
         }
     }
 
@@ -1970,6 +2046,10 @@ impl TextView {
 
     /// Select every line of the difference section the caret is in.
     fn select_section(&mut self) {
+        if !self.rows_current() {
+            self.message = Some(WAIT_FOR_COMPARISON.to_owned());
+            return;
+        }
         let Some(rows) = self.current_section_rows() else {
             return;
         };
@@ -2080,6 +2160,12 @@ impl TextView {
     #[must_use]
     pub fn toolbar_items(&self) -> Vec<toolbar::Item> {
         let ready = self.status == Status::Ready;
+        let rows = self.rows_current();
+        let rows_reason = if ready {
+            EDIT_NOT_COMPARED
+        } else {
+            NOT_COMPARED
+        };
         vec![
             toolbar::Item::widget("home", 70.0),
             toolbar::Item::widget("sessions", 90.0),
@@ -2096,22 +2182,22 @@ impl TextView {
                 "copy",
                 Command::CopyToOtherSide,
                 "Copy",
-                ready && !self.locked,
-                if self.locked { LOCKED } else { NOT_COMPARED },
+                rows && !self.locked,
+                if self.locked { LOCKED } else { rows_reason },
             ),
             toolbar::Item::command(
                 "next-section",
                 Command::NextSection,
                 "Next Section",
-                ready,
-                NOT_COMPARED,
+                rows,
+                rows_reason,
             ),
             toolbar::Item::command(
                 "previous-section",
                 Command::PreviousSection,
                 "Prev Section",
-                ready,
-                NOT_COMPARED,
+                rows,
+                rows_reason,
             ),
             toolbar::Item::command("swap", Command::SwapSides, "Swap", !self.locked, LOCKED),
             toolbar::Item::command("reload", Command::Reload, "Reload", !self.locked, LOCKED),
@@ -2480,12 +2566,17 @@ impl TextView {
             return None;
         }
         let mut copy = None;
+        let enabled = ui.is_enabled() && self.rows_current();
         for arrow in &self.arrows {
             let response = ui.interact(
                 arrow.rect,
                 self.id
                     .with(("arrow", arrow.section, arrow.side == Side::Right)),
-                egui::Sense::click(),
+                if enabled {
+                    egui::Sense::click()
+                } else {
+                    egui::Sense::hover()
+                },
             );
             let icon = if arrow.side == Side::Left {
                 ca_ui::icons::Icon::CopyToRight
@@ -2498,19 +2589,27 @@ impl TextView {
                 "Copy to Left"
             };
             response.widget_info(|| {
-                egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
+                egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label)
             });
             icon.paint_in_row(
                 painter,
                 arrow.rect.center(),
                 arrow.rect.height(),
-                if response.hovered() {
+                if enabled && response.hovered() {
                     palette.important_text
                 } else {
                     palette.gutter_arrow
                 },
             );
-            if response.clicked() {
+            let clicked = enabled && response.clicked();
+            if ui.is_enabled() && !enabled {
+                let _ = response.on_hover_text(if self.status == Status::Ready {
+                    EDIT_NOT_COMPARED
+                } else {
+                    NOT_COMPARED
+                });
+            }
+            if clicked {
                 let start = self
                     .data
                     .model
@@ -4467,6 +4566,7 @@ impl SessionView for TextView {
     fn tick(&mut self) {
         self.poll();
         self.poll_rediff();
+        self.advance_when_compared();
         self.poll_save();
         self.poll_find();
         self.left_syntax.poll(&self.notify);
@@ -4572,7 +4672,8 @@ impl SessionView for TextView {
             | Command::PreviousDifference
             | Command::NextSection
             | Command::PreviousSection
-            | Command::ShowAll
+            | Command::SelectSection => self.rows_current(),
+            Command::ShowAll
             | Command::ShowDifferences
             | Command::ShowSame
             | Command::ShowContext
@@ -4582,7 +4683,6 @@ impl SessionView for TextView {
             | Command::FindPrevious
             | Command::GoTo
             | Command::SelectAll
-            | Command::SelectSection
             | Command::Copy
             | Command::ToggleOverwrite
             | Command::ClearBookmarks
@@ -4596,7 +4696,7 @@ impl SessionView for TextView {
             | Command::Reload => true,
             Command::OpenFile => self.picker.is_none(),
             Command::CopyToOtherSide => {
-                self.status == Status::Ready && !self.pane(self.active.other()).is_read_only()
+                self.rows_current() && !self.pane(self.active.other()).is_read_only()
             }
             Command::Undo => {
                 !self.active_pane().is_read_only() && self.active_pane().buffer().can_undo()
@@ -4612,10 +4712,10 @@ impl SessionView for TextView {
                 self.status == Status::Ready && !self.active_pane().is_read_only()
             }
             Command::CopyToRight | Command::CopyLineToRight => {
-                self.status == Status::Ready && !self.right_pane.is_read_only()
+                self.rows_current() && !self.right_pane.is_read_only()
             }
             Command::CopyToLeft | Command::CopyLineToLeft => {
-                self.status == Status::Ready && !self.left_pane.is_read_only()
+                self.rows_current() && !self.left_pane.is_read_only()
             }
             Command::SaveFile => self.active_pane().is_modified() && self.save_job.is_none(),
             Command::SaveFileAs => {
