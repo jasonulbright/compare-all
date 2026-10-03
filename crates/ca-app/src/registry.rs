@@ -98,6 +98,17 @@ pub fn is_available(kind: &SessionKind) -> bool {
     VIEWS.iter().any(|(known, _)| known == kind)
 }
 
+/// What a Registry Compare reads on a platform without a Windows registry.
+pub const REGISTRY_FILES_ONLY: &str =
+    "Compares registry export (.reg) files. This platform has no Windows registry to read.";
+
+/// What the launcher tells about `kind` when the kind does less on this
+/// platform than its name says.
+#[must_use]
+pub fn platform_note(kind: &SessionKind) -> Option<&'static str> {
+    (*kind == SessionKind::RegistryCompare && !cfg!(windows)).then_some(REGISTRY_FILES_ONLY)
+}
+
 /// Every kind this build has a view for, in the order the launcher lists them.
 #[must_use]
 pub fn available() -> Vec<SessionKind> {
@@ -110,7 +121,7 @@ pub fn available() -> Vec<SessionKind> {
 
 #[cfg(test)]
 mod tests {
-    use super::{available, construct, is_available};
+    use super::{available, construct, is_available, platform_note, REGISTRY_FILES_ONLY};
     use ca_session::SessionKind;
     use ca_ui::testing::context;
     use std::path::PathBuf;
@@ -155,6 +166,15 @@ mod tests {
             SessionKind::MediaCompare,
         ] {
             assert!(is_available(&kind), "{kind} has no view");
+        }
+    }
+
+    #[test]
+    fn only_registry_compare_off_windows_carries_a_platform_note() {
+        for kind in SessionKind::ALL {
+            let expected = (*kind == SessionKind::RegistryCompare && !cfg!(windows))
+                .then_some(REGISTRY_FILES_ONLY);
+            assert_eq!(platform_note(kind), expected, "{kind}");
         }
     }
 }

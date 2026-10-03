@@ -356,10 +356,13 @@ impl SessionView for HomeView {
                     .on_hover_text("Not available in this build");
                     continue;
                 }
-                let response = ui.add(widgets::IconButton::new(
+                let mut response = ui.add(widgets::IconButton::new(
                     kind.title(),
                     Some(ca_ui::icons::session_icon(&kind)),
                 ));
+                if let Some(note) = registry::platform_note(&kind) {
+                    response = response.on_hover_text(note);
+                }
                 if response.clicked() {
                     if self.paths_are_set() {
                         let (left, right) = self.sides();
@@ -801,6 +804,41 @@ mod tests {
         assert_eq!(
             view.take_actions(),
             vec![super::HomeAction::NewSession(SessionKind::TextCompare)]
+        );
+    }
+
+    #[test]
+    fn the_registry_compare_button_names_export_files_where_no_registry_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let context = ca_ui::testing::context();
+        let mut view =
+            super::HomeView::in_settings_directory(&context, 1, dir.path().to_path_buf());
+        let mut probe = ca_ui::testing::probe::Probe::new(1280.0, 800.0);
+        let mut run = |ctx: &egui::Context| {
+            ctx.style_mut(|style| style.interaction.tooltip_delay = 0.0);
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = ca_ui::view::SessionView::ui(&mut view, ui, &context);
+            });
+        };
+        probe.idle(&mut run);
+        probe.idle(&mut run);
+        let title = SessionKind::RegistryCompare.title();
+        let control = probe.find(title).unwrap();
+        assert!(control.enabled);
+        probe.frame(
+            vec![egui::Event::PointerMoved(control.rect.center())],
+            &mut run,
+        );
+        let output = probe.frame(Vec::new(), &mut run);
+        let shown = output.shapes.iter().any(|shape| {
+            matches!(&shape.shape, egui::Shape::Text(text)
+                if text.galley.text() == registry::REGISTRY_FILES_ONLY)
+        });
+        assert_eq!(shown, !cfg!(windows));
+        probe.click(title, &mut run).unwrap();
+        assert_eq!(
+            view.take_actions(),
+            vec![super::HomeAction::NewSession(SessionKind::RegistryCompare)]
         );
     }
 

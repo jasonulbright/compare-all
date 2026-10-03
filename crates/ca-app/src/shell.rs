@@ -416,7 +416,11 @@ const TABLE_FILE: &[Entry] = &[
 ];
 
 /// Why an Up One Level line is disabled.
-const UP_ONE_LEVEL: &str = "The side is not a live registry key below a hive root";
+const UP_ONE_LEVEL: &str = if cfg!(windows) {
+    "The side is not a live registry key below a hive root"
+} else {
+    NO_LIVE_REGISTRY
+};
 
 /// The Session menu of the registry bar: the text bar's Session menu with the
 /// three Up One Level lines after Swap Sides.
@@ -752,7 +756,15 @@ const SELECTABLE: &str = "The active view has nothing to select";
 /// Why an action command is disabled.
 const ACTIONABLE: &str = "Select the items to act on first";
 /// Why a base key command is disabled.
-const BASE_KEYS: &str = "Put the cursor on a key of a live registry side first";
+const BASE_KEYS: &str = if cfg!(windows) {
+    "Put the cursor on a key of a live registry side first"
+} else {
+    NO_LIVE_REGISTRY
+};
+/// Why a command that needs a live registry side is disabled on a platform
+/// without a Windows registry.
+const NO_LIVE_REGISTRY: &str =
+    "This platform has no Windows registry; Registry Compare reads export files only";
 /// Why Check for Updates is disabled.
 const NO_UPDATE_CHECK: &str = "A check is running, or a policy turns update checks off";
 /// Why remote profiles are disabled.
@@ -5190,6 +5202,34 @@ mod tests {
             assert!(table_edit.iter().any(|line| line == label));
             assert!(!text_edit.iter().any(|line| line == label));
         }
+    }
+
+    #[test]
+    fn live_key_commands_give_the_platform_reason_where_no_registry_exists() {
+        let live_only = [
+            Command::UpOneLevelLeft,
+            Command::UpOneLevelRight,
+            Command::UpOneLevelBoth,
+            Command::SetAsBaseKeys,
+            Command::SetBothAsBaseKeys,
+            Command::SetAsBaseKeyOnOtherSide,
+        ];
+        let mut seen = Vec::new();
+        for (_, entries) in super::REGISTRY_MENUS {
+            for entry in *entries {
+                if let Entry::Run(command, reason) = entry {
+                    if live_only.contains(command) {
+                        seen.push(*command);
+                        assert_eq!(
+                            *reason == super::NO_LIVE_REGISTRY,
+                            !cfg!(windows),
+                            "{command:?}: {reason}"
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(seen, live_only);
     }
 
     #[test]
