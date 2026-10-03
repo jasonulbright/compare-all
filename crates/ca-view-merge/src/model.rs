@@ -1830,6 +1830,7 @@ impl MergeModel {
             section.resolution == previous.automatic_for(section.kind)
                 && section.conflict == matches!(section.kind, MergeKind::Conflict)
                 && !section.ignored
+                && section.lent.is_empty()
         };
         if previous.sections.iter().all(untouched) {
             return;
