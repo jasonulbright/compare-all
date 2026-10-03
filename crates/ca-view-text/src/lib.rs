@@ -89,6 +89,22 @@ const EDIT_NOT_COMPARED: &str = "Available once the edit is compared";
 /// What the message panel says when such a command arrives anyway.
 const WAIT_FOR_COMPARISON: &str =
     "The comparison of the last edit is not finished. Try again when it is.";
+/// Reason shown on a control that maps rows to lines while a comparison of
+/// unchanged text is due, after a change of rules, options or file name.
+const NOT_COMPARED_AGAIN: &str = "Available once the text is compared again";
+/// What the message panel says when such a command arrives anyway.
+const WAIT_FOR_COMPARISON_AGAIN: &str =
+    "The text is being compared again. Try again when that is finished.";
+/// What the message panel says when such a command arrives during a load.
+const WAIT_FOR_LOAD: &str = "The comparison is not finished. Try again when it is.";
+/// Reason shown on a control that needs a comparison after one failed.
+const FAILED: &str = "The comparison failed. Use Reload to compare again";
+/// Reason shown on a control that needs a comparison after one was stopped.
+const STOPPED: &str = "The comparison was stopped. Use Reload to compare again";
+/// Reason shown when a comparison failed in a view that cannot reload.
+const FAILED_LOCKED: &str = "The comparison failed";
+/// Reason shown when a comparison was stopped in a view that cannot reload.
+const STOPPED_LOCKED: &str = "The comparison was stopped";
 /// What the message panel says when the display filter shows no difference
 /// to move to.
 const FILTER_HIDES: &str = "The display filter hides every difference.";
@@ -346,6 +362,8 @@ pub struct TextView {
     line_cache: std::collections::HashMap<(u8, u32), CachedLine>,
     /// Counts the edits this view has seen, which is what empties the cache.
     revision: u64,
+    /// The edit counts of the texts the comparisons of the panes read.
+    compared: ComparedRevisions,
     /// The edit and coloring revisions the cache was filled at.
     cached_revision: (u64, u64, u64),
     /// The rectangle the rows were painted in on the last frame.
@@ -396,6 +414,15 @@ pub struct TextView {
     /// The files are copies the tab owns, so neither pane takes an edit and
     /// nothing is saved.
     read_only: bool,
+}
+
+/// The edit counts of the texts two comparisons of the panes read.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ComparedRevisions {
+    /// The text the rows on screen were compared from.
+    shown: u64,
+    /// The text the running comparison of the panes reads.
+    running: u64,
 }
 
 /// The row a move made current and the carets it left.
@@ -626,6 +653,7 @@ impl TextView {
             pending_settings: None,
             line_cache: std::collections::HashMap::new(),
             revision: 0,
+            compared: ComparedRevisions::default(),
             cached_revision: (u64::MAX, u64::MAX, u64::MAX),
             left_syntax: syntax::Highlighter::default(),
             right_syntax: syntax::Highlighter::default(),
@@ -1117,6 +1145,9 @@ impl TextView {
         self.horizontal = 0.0;
         self.strip_stale = true;
         self.revision = self.revision.saturating_add(1);
+        // The projection replaces the text without an edit by the user.
+        self.compared.shown = self.revision;
+        self.compared.running = self.revision;
         self.cached_revision = (u64::MAX, u64::MAX, u64::MAX);
         let left_payload = Self::side_facts(&self.data.left);
         let right_payload = Self::side_facts(&self.data.right);
@@ -1223,6 +1254,7 @@ impl TextView {
                 TextMessage::Failed(reason) => self.status = Status::Failed(reason),
                 TextMessage::Cancelled => self.status = Status::Cancelled,
                 TextMessage::Ready(data) => {
+                    self.compared.shown = self.revision;
                     self.install(*data, true);
                 }
             }
@@ -1413,7 +1445,7 @@ impl TextView {
     /// panel says why.
     fn navigate(&mut self, command: Command) {
         if !self.rows_current() {
-            self.message = Some(WAIT_FOR_COMPARISON.to_owned());
+            self.message = Some(self.rows_message());
             return;
         }
         let model = &self.data.model;
@@ -1879,6 +1911,7 @@ impl TextView {
             self.compare_settings(),
             self.notify.clone(),
         );
+        self.compared.running = self.revision;
         self.rediff.start(job);
     }
 
@@ -1899,7 +1932,10 @@ impl TextView {
         let finished = job.is_finished();
         for message in messages {
             match message {
-                TextMessage::Ready(data) => self.install(*data, true),
+                TextMessage::Ready(data) => {
+                    self.compared.shown = self.compared.running;
+                    self.install(*data, true);
+                }
                 TextMessage::Failed(reason) => self.status = Status::Failed(reason),
                 TextMessage::Progress(_) | TextMessage::Cancelled => {}
             }
@@ -2097,7 +2133,7 @@ impl TextView {
             return;
         }
         if !self.rows_current() {
-            self.message = Some(WAIT_FOR_COMPARISON.to_owned());
+            self.message = Some(self.rows_message());
             return;
         }
         let from = to.other();
@@ -2165,7 +2201,7 @@ impl TextView {
     /// Select every line of the difference section the caret is in.
     fn select_section(&mut self) {
         if !self.rows_current() {
-            self.message = Some(WAIT_FOR_COMPARISON.to_owned());
+            self.message = Some(self.rows_message());
             return;
         }
         let Some(rows) = self.current_section_rows() else {
@@ -2274,13 +2310,43 @@ impl TextView {
         }
     }
 
-    /// Why a command that turns rows into lines waits: for the load, or for
-    /// the comparison of an edit or a settings change.
-    const fn rows_reason(&self) -> &'static str {
-        if matches!(self.status, Status::Ready) {
+    /// Why a command that needs a comparison on screen is refused: it waits
+    /// for the load, or no comparison comes before a Reload.
+    const fn not_compared_reason(&self) -> &'static str {
+        match (&self.status, self.locked) {
+            (Status::Failed(_), false) => FAILED,
+            (Status::Failed(_), true) => FAILED_LOCKED,
+            (Status::Cancelled, false) => STOPPED,
+            (Status::Cancelled, true) => STOPPED_LOCKED,
+            (Status::Running(_) | Status::Ready, _) => NOT_COMPARED,
+        }
+    }
+
+    /// True while an edit waits for its comparison.
+    const fn edit_not_compared(&self) -> bool {
+        self.revision != self.compared.shown
+    }
+
+    /// Why a command that turns rows into lines waits: for the load, for the
+    /// comparison of an edit, or for a comparison of unchanged text.
+    fn rows_reason(&self) -> &'static str {
+        if self.status != Status::Ready {
+            self.not_compared_reason()
+        } else if self.edit_not_compared() {
             EDIT_NOT_COMPARED
         } else {
-            NOT_COMPARED
+            NOT_COMPARED_AGAIN
+        }
+    }
+
+    /// What the message panel says when a command that turns rows into lines
+    /// arrives while the rows are not current.
+    fn rows_message(&self) -> String {
+        match self.status {
+            Status::Ready if self.edit_not_compared() => WAIT_FOR_COMPARISON.to_owned(),
+            Status::Ready => WAIT_FOR_COMPARISON_AGAIN.to_owned(),
+            Status::Running(_) => WAIT_FOR_LOAD.to_owned(),
+            Status::Failed(_) | Status::Cancelled => format!("{}.", self.not_compared_reason()),
         }
     }
 
@@ -2331,7 +2397,7 @@ impl TextView {
                 Command::CompareReport,
                 "Report",
                 ready,
-                NOT_COMPARED,
+                self.not_compared_reason(),
             ),
         ]
     }
@@ -2727,11 +2793,7 @@ impl TextView {
             );
             let clicked = enabled && response.clicked();
             if ui.is_enabled() && !enabled {
-                let reason = if self.status == Status::Ready {
-                    EDIT_NOT_COMPARED
-                } else {
-                    NOT_COMPARED
-                };
+                let reason = self.rows_reason();
                 widgets::describe_refusal(&response, reason);
                 let _ = response.on_hover_text(reason);
             }
