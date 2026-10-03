@@ -115,6 +115,10 @@ pub struct AppliedEdit {
     pub removed: String,
     /// The text the edit inserted.
     pub inserted: String,
+    /// The undo group the edit belongs to: the group it joined or started,
+    /// or the group an undo or redo replayed. Undo and redo replay whole
+    /// groups, so a reader that keeps one record per group stays in step.
+    pub group: u64,
 }
 
 /// One recorded edit.
@@ -527,9 +531,17 @@ impl TextBuffer {
                 offset: at.saturating_sub(line_start),
                 removed,
                 inserted: insert.to_owned(),
+                group: 0,
             });
         }
         Ok(change)
+    }
+
+    /// Name the group of the edit `apply_tracked` kept last.
+    fn tag_applied(&mut self, group: u64) {
+        if let Some(edit) = self.applied.as_mut().and_then(|edits| edits.last_mut()) {
+            edit.group = group;
+        }
     }
 
     /// Applies an edit to the rope, leaving it untouched when the range does not fit.
@@ -559,19 +571,27 @@ impl TextBuffer {
         if self.open_depth > 0 {
             if let Some(group) = self.open_group.as_mut() {
                 group.edits.push(edit);
+                let id = group.id;
+                self.tag_applied(id);
                 return;
             }
         }
         if kind == EditKind::Typing && !self.sealed && self.can_coalesce(&edit) {
-            if let Some(last) = self.undo.last_mut().and_then(|g| g.edits.last_mut()) {
-                last.inserted.push_str(&edit.inserted);
-                return;
+            if let Some(group) = self.undo.last_mut() {
+                if let Some(last) = group.edits.last_mut() {
+                    last.inserted.push_str(&edit.inserted);
+                    let id = group.id;
+                    self.tag_applied(id);
+                    return;
+                }
             }
         }
         // A line break ends a typing run, so the next character starts its own group.
         self.sealed = kind != EditKind::Typing || edit.inserted.contains(['\r', '\n']);
+        let id = next_revision();
+        self.tag_applied(id);
         self.push_group(EditGroup {
-            id: next_revision(),
+            id,
             kind,
             edits: vec![edit],
         });
@@ -701,6 +721,7 @@ impl TextBuffer {
         for edit in group.edits.iter().rev() {
             let inserted = edit.inserted.chars().count();
             let change = self.apply_tracked(edit.at, inserted, &edit.removed)?;
+            self.tag_applied(group.id);
             caret = Some(edit.at + edit.removed.chars().count());
             self.changes.push(change);
         }
@@ -733,6 +754,7 @@ impl TextBuffer {
         for edit in &group.edits {
             let removed = edit.removed.chars().count();
             let change = self.apply_tracked(edit.at, removed, &edit.inserted)?;
+            self.tag_applied(group.id);
             caret = Some(edit.at + edit.inserted.chars().count());
             self.changes.push(change);
         }
@@ -1053,6 +1075,48 @@ mod tests {
         let edits = buffer.take_applied_edits();
         assert_eq!(edits.len(), 1);
         assert_eq!(edits[0].inserted, "Z");
+        assert_eq!(Some(edits[0].group), buffer.undo_group_id());
+    }
+
+    #[test]
+    fn applied_edits_name_the_undo_group_they_joined() {
+        let mut buffer = TextBuffer::from_text("ab\n");
+        buffer.track_applied_edits();
+        buffer.insert_typed(1, "Z");
+        let first = buffer.undo_group_id();
+        buffer.insert_typed(2, "W");
+        buffer.insert_typed(3, "\n");
+        let second = buffer.undo_group_id();
+        buffer.insert_typed(4, "Y");
+        let third = buffer.undo_group_id();
+        {
+            let mut group = buffer.group();
+            group.insert(0, "1");
+            group.insert(0, "2");
+        }
+        let fourth = buffer.undo_group_id();
+        let groups: Vec<Option<u64>> = buffer
+            .take_applied_edits()
+            .iter()
+            .map(|edit| Some(edit.group))
+            .collect();
+        assert_eq!(groups, [first, first, second, third, fourth, fourth]);
+        assert_eq!(
+            [first, second, third, fourth]
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            4
+        );
+        assert!(buffer.undo().unwrap());
+        assert!(buffer.undo().unwrap());
+        assert!(buffer.redo().unwrap());
+        let groups: Vec<Option<u64>> = buffer
+            .take_applied_edits()
+            .iter()
+            .map(|edit| Some(edit.group))
+            .collect();
+        assert_eq!(groups, [fourth, fourth, third, third]);
     }
 
     #[test]
