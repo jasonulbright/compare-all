@@ -48,8 +48,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@9376cdc5a5e25b16da71af47712785cf06b0d6d4 # 1.94.1
         with:
           components: clippy, rustfmt
-      - if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libgtk-3-dev
       - run: cargo fmt --all --check
       - if: runner.os == 'Linux'
         run: |
@@ -81,7 +79,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@9376cdc5a5e25b16da71af47712785cf06b0d6d4 # 1.94.1
       - run: >-
-          sudo apt-get update && sudo apt-get install -y desktop-file-utils libgtk-3-dev zsync
+          sudo apt-get update && sudo apt-get install -y desktop-file-utils zsync
       - name: Build release binaries
         run: cargo xtask build -p ca-app -p ca-cli --release
       - name: Build the AppImage
