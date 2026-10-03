@@ -72,9 +72,13 @@ pub fn construct(
     left: PathBuf,
     right: PathBuf,
     context: &ViewContext,
-    salt: u64,
+    instance: u64,
 ) -> Option<Box<dyn SessionView>> {
-    open(&OpenRequest::new(kind.clone(), left, right), context, salt)
+    open(
+        &OpenRequest::new(kind.clone(), left, right),
+        context,
+        instance,
+    )
 }
 
 /// Build the view a request names.
@@ -82,10 +86,10 @@ pub fn construct(
 pub fn open(
     request: &OpenRequest,
     context: &ViewContext,
-    salt: u64,
+    instance: u64,
 ) -> Option<Box<dyn SessionView>> {
     let (_, build) = VIEWS.iter().find(|(known, _)| *known == request.kind)?;
-    Some(build(request, context, salt))
+    Some(build(request, context, instance))
 }
 
 /// True when this build has a view for `kind`.

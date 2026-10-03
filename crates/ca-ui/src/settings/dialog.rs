@@ -80,7 +80,7 @@ impl SettingsDialog {
         kind: SessionKind,
         overrides: &SessionSettingsOverride,
         layers: &SettingsLayers,
-        salt: u64,
+        instance: u64,
     ) -> Self {
         let defaults = layers.resolve_defaults(&kind);
         let current = layers
@@ -94,7 +94,7 @@ impl SettingsDialog {
             active: 0,
             scope: Scope::ThisViewOnly,
             open: true,
-            id: egui::Id::new(("session-settings", salt)),
+            id: egui::Id::new(("session-settings", instance)),
         }
     }
 

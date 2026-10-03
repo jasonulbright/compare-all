@@ -838,7 +838,7 @@ const ACTIONS_AFTER: &str = "Edit";
 pub struct App {
     tabs: Vec<Box<dyn SessionView>>,
     active: usize,
-    next_salt: u64,
+    next_instance: u64,
     closing: bool,
     /// What the active view declared this frame, read once and used by every
     /// menu line, so a menu never rebuilds a view's whole declaration per item.
@@ -1029,7 +1029,7 @@ impl App {
             explorer: ExplorerState::default(),
             tabs: Vec::new(),
             active: 0,
-            next_salt: 0,
+            next_instance: 0,
             closing: false,
             declared: Vec::new(),
             recovery: None,
@@ -1205,9 +1205,9 @@ impl App {
             // was refused has nowhere to be printed and is carried into the
             // launcher instead.
             Startup::Rejected(reason) => {
-                let salt = app.salt();
+                let instance = app.instance();
                 let store = std::rc::Rc::clone(&app.store);
-                let mut view = HomeView::with_notice(context, salt, store, reason);
+                let mut view = HomeView::with_notice(context, instance, store, reason);
                 view.share_actions(std::rc::Rc::clone(&app.home_outbox));
                 app.push(Box::new(view));
             }
@@ -1271,15 +1271,15 @@ impl App {
         self.closing
     }
 
-    fn salt(&mut self) -> u64 {
-        self.next_salt += 1;
-        self.next_salt
+    fn instance(&mut self) -> u64 {
+        self.next_instance += 1;
+        self.next_instance
     }
 
     /// Open the launcher in a new tab.
     pub fn open_home(&mut self, context: &ViewContext) {
-        let salt = self.salt();
-        let mut view = HomeView::new(context, salt, std::rc::Rc::clone(&self.store));
+        let instance = self.instance();
+        let mut view = HomeView::new(context, instance, std::rc::Rc::clone(&self.store));
         view.watch(Arc::clone(&self.startup_notice));
         view.share_actions(std::rc::Rc::clone(&self.home_outbox));
         self.push(Box::new(view));
@@ -2186,7 +2186,7 @@ impl App {
     ///
     /// The Specs page of a tab that shows a saved session names the sides the
     /// stored session names; every other page shows what the view runs under.
-    fn open_settings(&mut self, salt: u64) {
+    fn open_settings(&mut self, instance: u64) {
         let Some(mut settings) = self.tabs.get(self.active).and_then(|tab| tab.settings()) else {
             return;
         };
@@ -2213,7 +2213,7 @@ impl App {
             settings.kind(),
             &overrides,
             &layers,
-            salt,
+            instance,
         ));
         self.settings_tab = self.active;
     }
@@ -2355,8 +2355,8 @@ impl App {
         )
         .with_center(center)
         .with_output(output);
-        let salt = self.salt();
-        let Some(mut view) = registry::open(&request, context, salt) else {
+        let instance = self.instance();
+        let Some(mut view) = registry::open(&request, context, instance) else {
             return Err(NO_VIEW_FOR_SIDES);
         };
         view.apply_settings(settings);
@@ -2472,7 +2472,7 @@ impl App {
                 if let Some(options) = options {
                     self.apply_options(*options);
                 }
-                self.import_report = Some(ImportReportDialog::new(&report, self.next_salt));
+                self.import_report = Some(ImportReportDialog::new(&report, self.next_instance));
                 self.save_store();
             }
             Some(ShareMessage::Failed { store, reason }) => {
@@ -2585,8 +2585,8 @@ impl App {
     /// offers kinds the registry answers for, so this path is reached from a
     /// command line alone.
     pub fn open(&mut self, request: &OpenRequest, context: &ViewContext) {
-        let salt = self.salt();
-        if let Some(view) = registry::open(request, context, salt) {
+        let instance = self.instance();
+        if let Some(view) = registry::open(request, context, instance) {
             self.push(view);
         }
     }
@@ -2835,8 +2835,8 @@ impl App {
                 self.request_session_save();
             }
             Command::SessionSettings => {
-                let salt = self.salt();
-                self.open_settings(salt);
+                let instance = self.instance();
+                self.open_settings(instance);
             }
             Command::ToggleLocked => {
                 if let Some(id) = self.active_session() {
@@ -2854,24 +2854,24 @@ impl App {
             }
             Command::ClearSession => self.clear_session(context),
             Command::SaveWorkspaceAs => {
-                let salt = self.salt();
-                self.workspaces = Some(WorkspaceManager::with_name(salt, "Workspace"));
+                let instance = self.instance();
+                self.workspaces = Some(WorkspaceManager::with_name(instance, "Workspace"));
             }
             Command::LoadWorkspace => {
-                let salt = self.salt();
-                self.workspaces = Some(WorkspaceManager::new(salt));
+                let instance = self.instance();
+                self.workspaces = Some(WorkspaceManager::new(instance));
             }
             Command::Options => {
-                let salt = self.salt();
+                let instance = self.instance();
                 let mut shown = self.options.options_or_default();
                 if let Some(state) = self.explorer.installed {
                     shown.startup.shell_integration = state.any();
                 }
-                self.options_dialog = Some(OptionsDialog::new(&shown, self.policies, salt));
+                self.options_dialog = Some(OptionsDialog::new(&shown, self.policies, instance));
             }
             Command::RestoreFactoryDefaults => {
-                let salt = self.salt();
-                self.restore = Some(RestoreDialog::new(salt));
+                let instance = self.instance();
+                self.restore = Some(RestoreDialog::new(instance));
             }
             Command::Profiles => {
                 if !self.policies.remote_profiles_disabled() {

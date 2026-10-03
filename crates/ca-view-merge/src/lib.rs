@@ -398,35 +398,35 @@ fn empty_text() -> ca_text::LoadedText {
 impl MergeView {
     /// A tab over the paths a request names.
     #[must_use]
-    pub fn from_request(request: &OpenRequest, context: &ViewContext, salt: u64) -> Self {
+    pub fn from_request(request: &OpenRequest, context: &ViewContext, instance: u64) -> Self {
         let paths = MergePaths {
             left: request.left.clone(),
             center: request.center.clone(),
             right: request.right.clone(),
             output: request.output.clone(),
         };
-        Self::over(paths, request.titles.clone(), context, salt)
+        Self::over(paths, request.titles.clone(), context, instance)
     }
 
     /// A tab over two versions with no ancestor.
     #[must_use]
-    pub fn new(left: PathBuf, right: PathBuf, context: &ViewContext, salt: u64) -> Self {
+    pub fn new(left: PathBuf, right: PathBuf, context: &ViewContext, instance: u64) -> Self {
         let paths = MergePaths {
             left,
             center: None,
             right,
             output: None,
         };
-        Self::over(paths, Titles::default(), context, salt)
+        Self::over(paths, Titles::default(), context, instance)
     }
 
     /// A tab over a whole set of merge paths.
     #[must_use]
-    pub fn over(paths: MergePaths, titles: Titles, context: &ViewContext, salt: u64) -> Self {
+    pub fn over(paths: MergePaths, titles: Titles, context: &ViewContext, instance: u64) -> Self {
         let mut view = Self {
             take_history: std::collections::HashMap::new(),
             absorbed_group: None,
-            id: egui::Id::new(("merge", salt)),
+            id: egui::Id::new(("merge", instance)),
             paths,
             titles,
             session_settings: ca_session::settings::TextMergeSettings::default(),
@@ -492,7 +492,7 @@ impl MergeView {
             output_glyphs: Vec::new(),
             report: ViewReport::new(
                 ReportKind::Merge,
-                egui::Id::new(("text-merge", salt)),
+                egui::Id::new(("text-merge", instance)),
                 context.notify.clone(),
             ),
             toolbar_rect: egui::Rect::NOTHING,
@@ -2861,12 +2861,12 @@ impl MergeView {
 }
 
 impl ca_ui::view::ViewFactory for MergeView {
-    fn create(left: PathBuf, right: PathBuf, context: &ViewContext, salt: u64) -> Self {
-        Self::new(left, right, context, salt)
+    fn create(left: PathBuf, right: PathBuf, context: &ViewContext, instance: u64) -> Self {
+        Self::new(left, right, context, instance)
     }
 
-    fn create_from(request: &OpenRequest, context: &ViewContext, salt: u64) -> Self {
-        Self::from_request(request, context, salt)
+    fn create_from(request: &OpenRequest, context: &ViewContext, instance: u64) -> Self {
+        Self::from_request(request, context, instance)
     }
 }
 

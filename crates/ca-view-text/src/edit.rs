@@ -174,9 +174,9 @@ pub struct TextEditView {
 impl TextEditView {
     /// An editor over `path`, or over a new empty text when `path` is empty.
     #[must_use]
-    pub fn new(path: PathBuf, context: &ViewContext, salt: u64) -> Self {
+    pub fn new(path: PathBuf, context: &ViewContext, instance: u64) -> Self {
         let mut view = Self {
-            id: egui::Id::new(("text-edit", salt)),
+            id: egui::Id::new(("text-edit", instance)),
             session_settings: ca_session::settings::TextEditSettings::default(),
             field: path.display().to_string(),
             path,
@@ -1078,14 +1078,14 @@ impl TextEditView {
 }
 
 impl ca_ui::view::ViewFactory for TextEditView {
-    fn create(left: PathBuf, right: PathBuf, context: &ViewContext, salt: u64) -> Self {
+    fn create(left: PathBuf, right: PathBuf, context: &ViewContext, instance: u64) -> Self {
         // A single file view takes whichever side names a file.
         let path = if left.as_os_str().is_empty() {
             right
         } else {
             left
         };
-        Self::new(path, context, salt)
+        Self::new(path, context, instance)
     }
 }
 

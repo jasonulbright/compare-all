@@ -223,9 +223,9 @@ impl RecordsView {
         left: PathBuf,
         right: PathBuf,
         context: &ViewContext,
-        salt: u64,
+        instance: u64,
     ) -> Self {
-        let id = egui::Id::new((flavor.id(), salt));
+        let id = egui::Id::new((flavor.id(), instance));
         let settings = SessionSettings::defaults_for(&flavor.kind());
         let mut view = Self {
             flavor,
@@ -2559,7 +2559,7 @@ mod find_tests {
     #[allow(clippy::too_many_lines)]
     fn version_and_media_select_all_copy_the_rows_on_the_active_side() {
         let dir = tempfile::tempdir().unwrap();
-        for (salt, flavor, pair, special_field) in [
+        for (instance, flavor, pair, special_field) in [
             (
                 921,
                 Flavor::Version,
@@ -2573,7 +2573,7 @@ mod find_tests {
                 "North\tDivision\n\"Tools\"",
             ),
         ] {
-            let mut view = RecordsView::new(flavor, pair.0, pair.1, &context(), salt);
+            let mut view = RecordsView::new(flavor, pair.0, pair.1, &context(), instance);
             assert!(!view.accepts(Command::SelectAll));
             assert!(wait_until(Duration::from_secs(10), || {
                 view.poll();

@@ -43,21 +43,21 @@ pub struct WorkspaceManager {
 impl WorkspaceManager {
     /// A manager with nothing selected and an empty name field.
     #[must_use]
-    pub fn new(salt: u64) -> Self {
+    pub fn new(instance: u64) -> Self {
         Self {
             name: String::new(),
             selected: None,
             renaming: None,
             confirming: None,
             open: true,
-            id: egui::Id::new(("workspaces", salt)),
+            id: egui::Id::new(("workspaces", instance)),
         }
     }
 
     /// A manager opened with the name field filled, for Save Workspace As.
     #[must_use]
-    pub fn with_name(salt: u64, name: impl Into<String>) -> Self {
-        let mut manager = Self::new(salt);
+    pub fn with_name(instance: u64, name: impl Into<String>) -> Self {
+        let mut manager = Self::new(instance);
         manager.name = name.into();
         manager
     }

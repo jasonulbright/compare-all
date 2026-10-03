@@ -65,14 +65,14 @@ pub struct OptionsDialog {
 impl OptionsDialog {
     /// A dialog over a copy of `options`.
     #[must_use]
-    pub fn new(options: &ProgramOptions, policies: AdminPolicies, salt: u64) -> Self {
+    pub fn new(options: &ProgramOptions, policies: AdminPolicies, instance: u64) -> Self {
         Self {
             edited: options.clone(),
             committed: options.clone(),
             policies,
             active: 0,
             open: true,
-            id: egui::Id::new(("program-options", salt)),
+            id: egui::Id::new(("program-options", instance)),
             color_group: ColorGroup::Text,
             color_variant: Variant::Dark,
             command_view: MenuView::Text,

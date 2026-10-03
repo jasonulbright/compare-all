@@ -190,9 +190,9 @@ pub fn layout(view: &mut PictureView, ctx: &egui::Context, width: f32, height: f
 }
 
 /// A view over two paths, with its own egui context.
-pub fn open(left: PathBuf, right: PathBuf, salt: u64) -> (PictureView, egui::Context) {
+pub fn open(left: PathBuf, right: PathBuf, instance: u64) -> (PictureView, egui::Context) {
     (
-        PictureView::new(left, right, &context(), salt),
+        PictureView::new(left, right, &context(), instance),
         egui::Context::default(),
     )
 }
