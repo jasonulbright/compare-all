@@ -98,6 +98,10 @@ macro_rules! record_view {
                 self.0.accepts(command)
             }
 
+            fn refusal(&self, command: Command) -> Option<&'static str> {
+                self.0.refusal(command)
+            }
+
             fn run(&mut self, command: Command) {
                 self.0.run(command);
             }

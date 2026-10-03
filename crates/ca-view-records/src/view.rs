@@ -1934,6 +1934,10 @@ impl SessionView for RecordsView {
         ca_ui::view::declare(&handled, |command| self.accepts(command))
     }
 
+    fn refusal(&self, command: Command) -> Option<&'static str> {
+        self.copy_refusal(command)
+    }
+
     fn accepts(&self, command: Command) -> bool {
         if editing::EDIT_COMMANDS.contains(&command) {
             return self.accepts_edit(command);
