@@ -233,6 +233,37 @@ fn a_user_loader_path_survives_for_a_host_child() {
 }
 
 #[test]
+fn a_value_that_is_not_a_path_list_is_kept_byte_for_byte() {
+    let opaque = [
+        ("MY_URL", format!("file:{MOUNT}/share/doc")),
+        ("GIT_SSH_COMMAND", format!("ssh -i {MOUNT}/key")),
+        ("http_proxy", "http://proxy.invalid:3128".to_owned()),
+        ("DISPLAY", ":0".to_owned()),
+        (
+            "DBUS_SESSION_BUS_ADDRESS",
+            "unix:path=/run/user/1000/bus".to_owned(),
+        ),
+        (
+            "LS_COLORS",
+            "rs=0:di=01;34:ln=01;36:*.tar=01;31:".to_owned(),
+        ),
+        ("MIXED", format!("relative:{MOUNT}/share")),
+    ];
+    let mut input = apprun_child();
+    for (name, value) in &opaque {
+        input.insert((*name).into(), value.into());
+    }
+    let cleaned = clean(&input);
+    for (name, value) in &opaque {
+        assert_eq!(
+            cleaned.get(OsStr::new(name)),
+            Some(&OsString::from(value)),
+            "{name}"
+        );
+    }
+}
+
+#[test]
 fn a_new_variable_that_points_into_the_image_is_removed() {
     let mut input = apprun_child();
     input.insert(
