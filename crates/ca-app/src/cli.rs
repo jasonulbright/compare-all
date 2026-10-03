@@ -64,6 +64,19 @@ impl Startup {
     }
 }
 
+/// The switches that ask for the version on the console.
+const VERSION_SWITCHES: [&str; 2] = ["--version", "-V"];
+
+/// True when the arguments after the program name are one version switch
+/// alone.
+///
+/// A version switch next to other arguments is not one: `-V` can be the name
+/// of a file to compare, and such a command line keeps its earlier meaning.
+#[must_use]
+pub fn asks_for_version(arguments: &[OsString]) -> bool {
+    matches!(arguments, [only] if VERSION_SWITCHES.iter().any(|switch| only == switch))
+}
+
 /// Decide what to open from the arguments after the program name.
 ///
 /// `probe` reports what each path is, so the decision is testable without a
@@ -525,6 +538,30 @@ mod tests {
                 PathKind::File
             }
         }
+    }
+
+    #[test]
+    fn a_version_switch_alone_asks_for_the_version() {
+        assert!(super::asks_for_version(&args(&["--version"])));
+        assert!(super::asks_for_version(&args(&["-V"])));
+        for other in [
+            &[][..],
+            &["-v"][..],
+            &["--Version"][..],
+            &["--version", "b.txt"][..],
+            &["-V", "b.txt"][..],
+            &["a.txt", "--version"][..],
+        ] {
+            assert!(!super::asks_for_version(&args(other)), "{other:?}");
+        }
+        assert_eq!(
+            parse(args(&["-V", "b.txt"]), &probe(&[])),
+            Startup::open(
+                SessionKind::TextCompare,
+                Path::new("-V"),
+                Path::new("b.txt")
+            )
+        );
     }
 
     #[test]
