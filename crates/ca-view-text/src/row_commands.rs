@@ -336,3 +336,69 @@ fn a_section_at_the_top_with_no_line_on_the_active_side_is_made_current() {
         "a wrap to the first section made another section current"
     );
 }
+
+/// 300 lines that differ on lines 20 and 150.
+fn long_pair() -> (String, String) {
+    let side = |differing: &str| -> String {
+        (0..300)
+            .map(|line| {
+                if line == 20 || line == 150 {
+                    format!("{differing} {line}\n")
+                } else {
+                    format!("line {line}\n")
+                }
+            })
+            .collect()
+    };
+    (side("LEFT"), side("RIGHT"))
+}
+
+#[test]
+fn navigation_under_show_same_leaves_the_caret_on_a_shown_line() {
+    let (left, right) = long_pair();
+    let mut fixture = Fixture::new(&left, &right);
+    fixture.view.left_pane.place(Caret::new(50, 0), false);
+    fixture.frame(Vec::new());
+    fixture.view.run(Command::ShowSame);
+    for command in [
+        Command::NextSection,
+        Command::PreviousSection,
+        Command::NextDifference,
+        Command::PreviousDifference,
+    ] {
+        fixture.view.run(command);
+        assert_eq!(fixture.view.pane(Side::Left).caret(), Caret::new(50, 0));
+        assert_eq!(fixture.view.message(), Some(super::FILTER_HIDES));
+    }
+    fixture.frame(vec![egui::Event::Text("Z".to_owned())]);
+    assert_eq!(fixture.view.pane(Side::Left).line_text(50), "Zline 50");
+    assert_eq!(fixture.view.pane(Side::Left).line_text(150), "LEFT 150");
+}
+
+#[test]
+fn navigation_under_show_differences_leaves_the_caret_on_a_shown_line() {
+    let mut fixture = Fixture::new(GAP_LEFT, GAP_RIGHT);
+    fixture.view.run(Command::ShowDifferences);
+    fixture.view.run(Command::NextSection);
+    fixture.frame(Vec::new());
+    assert_eq!(fixture.view.current_section_rows(), Some(3..5));
+    for side in [Side::Left, Side::Right] {
+        let line = fixture.view.pane(side).caret().line;
+        let row = match side {
+            Side::Left => fixture.view.data.model.row_of_left_line(line),
+            Side::Right => fixture.view.data.model.row_of_right_line(line),
+        };
+        assert!(
+            row.is_some_and(|row| fixture.view.visible.shows(row)),
+            "the {side:?} caret is on line {line}, which the filter hides"
+        );
+    }
+}
+
+#[test]
+fn navigation_shows_the_start_of_the_line_it_moves_to() {
+    let mut fixture = Fixture::new(GAP_LEFT, GAP_RIGHT);
+    fixture.view.horizontal = 40.0;
+    fixture.view.run(Command::NextSection);
+    assert!(fixture.view.horizontal.abs() < f32::EPSILON);
+}
