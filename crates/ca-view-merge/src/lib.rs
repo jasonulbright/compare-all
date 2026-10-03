@@ -1272,6 +1272,8 @@ impl MergeView {
             self.data.model.replay(&step, redo);
             self.touched();
         } else {
+            #[cfg(test)]
+            model::ownership::REABSORBS.with(|count| count.set(count.get() + 1));
             self.absorb_edits(false);
         }
         self.follow_caret();
@@ -2857,8 +2859,11 @@ impl ca_ui::view::ViewFactory for MergeView {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
+    mod lent_text_probes;
     mod merge_edit_driver;
+    mod merge_edit_frame_probes;
     mod merge_edit_probes;
+    mod randomized_merge_driver;
 
     use super::{MergeView, Question, GIVEN_BACK};
     use crate::model::Resolution;

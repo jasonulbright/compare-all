@@ -150,6 +150,13 @@ pub(super) fn remove_prefix(lines: &mut Vec<String>, prefix: &str) -> bool {
     true
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static RESYNCS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static REABSORBS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static PANE_EDITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl MergeModel {
     /// The lent records `holder`'s lines hold, as `(lender, seq)`.
     fn held_by(&self, holder: usize) -> Vec<(usize, u64)> {
@@ -748,6 +755,8 @@ impl MergeModel {
     /// the edit, or nothing when the edit does not fit the model's lines.
     #[allow(clippy::too_many_lines)]
     pub(crate) fn apply_pane_edit(&mut self, edit: &AppliedEdit) -> Option<usize> {
+        #[cfg(test)]
+        PANE_EDITS.with(|count| count.set(count.get() + 1));
         let total = self.output.len();
         let first = (edit.change.start_line as usize).min(total);
         let end = (edit.change.start_line as usize)
@@ -1096,6 +1105,8 @@ impl MergeModel {
         end: u32,
         lines: &[String],
     ) -> Option<usize> {
+        #[cfg(test)]
+        RESYNCS.with(|count| count.set(count.get() + 1));
         let total = u32::try_from(self.output.len()).ok()?;
         let end = end.min(total);
         let first = first.min(end);
