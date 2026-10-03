@@ -383,9 +383,10 @@ fn spawn_load(paths: SettingsPaths, notify: Arc<dyn Fn() + Send + Sync>) -> Job<
                 Ok(LockOutcome::Acquired(lock)) => Some(lock),
                 Ok(LockOutcome::Held { .. }) | Err(_) => None,
             };
+            let announced = crate::paths::settings_notice_for(paths.directory().path());
             let message = match SessionStore::load(&paths.sessions_file()) {
                 Ok(outcome) => {
-                    let notice = load_notice(&outcome, lock.is_none());
+                    let notice = load_notice(announced, &outcome, lock.is_none());
                     StoreMessage::Loaded {
                         store: Box::new(outcome.store),
                         lock,
@@ -394,7 +395,12 @@ fn spawn_load(paths: SettingsPaths, notify: Arc<dyn Fn() + Send + Sync>) -> Job<
                 }
                 Err(error) => StoreMessage::Failed {
                     store: Some(Box::new(SessionStore::default())),
-                    reason: format!("The sessions document could not be read: {error}"),
+                    reason: announced.map_or_else(
+                        || format!("The sessions document could not be read: {error}"),
+                        |announced| {
+                            format!("{announced} The sessions document could not be read: {error}")
+                        },
+                    ),
                 },
             };
             emitter.send(message);
@@ -403,9 +409,14 @@ fn spawn_load(paths: SettingsPaths, notify: Arc<dyn Fn() + Send + Sync>) -> Job<
     )
 }
 
-/// What a load has to report, where it has anything.
-fn load_notice(outcome: &ca_session::LoadOutcome, read_mostly: bool) -> Option<String> {
-    let mut parts: Vec<String> = Vec::new();
+/// What a load has to report, where it has anything. `announced` is what the
+/// settings directory itself has to say, shown first.
+fn load_notice(
+    announced: Option<&str>,
+    outcome: &ca_session::LoadOutcome,
+    read_mostly: bool,
+) -> Option<String> {
+    let mut parts: Vec<String> = announced.into_iter().map(str::to_owned).collect();
     if let Some(backup) = &outcome.recovered_backup {
         parts.push(format!(
             "The sessions document could not be read and was moved to {}. An empty one is in use.",

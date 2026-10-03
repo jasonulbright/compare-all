@@ -27,14 +27,14 @@ fn main() -> eframe::Result {
     // never opens the window.
     let startup = match cli::run_automatic(startup) {
         Ok(startup) => startup,
-        Err(code) => std::process::exit(code),
+        Err(code) => exit(code),
     };
     // The file manager menu starts the program once for each selected item, so
     // a comparison from it takes two starts: one remembers the left side.
     let probe = |path: &std::path::Path| cli::probe_with(path, Some(&stored.archives));
     let startup = match cli::run_left_side(startup, &ca_ui::paths::settings_directory(), &probe) {
         Ok(startup) => startup,
-        Err(code) => std::process::exit(code),
+        Err(code) => exit(code),
     };
     // Copies of archive entries that an earlier run left behind, such as after
     // a crash, are deleted on a worker so the window never waits on the disk.
@@ -73,9 +73,17 @@ fn main() -> eframe::Result {
     // A delete worker still running at process exit dies with the process and
     // leaves its copies behind until the sweep of the next start.
     ca_ui::view::wait_for_temporary_deletes(EXIT_DELETE_WAIT);
+    ca_session::SettingsPaths::remove_run_directory();
     let code = status.load(std::sync::atomic::Ordering::SeqCst);
     if outcome.is_ok() && code != 0 {
-        std::process::exit(code);
+        exit(code);
     }
     outcome
+}
+
+/// End the process with `code`, deleting the private settings folder of this
+/// run first, because the exit skips every destructor.
+fn exit(code: i32) -> ! {
+    ca_session::SettingsPaths::remove_run_directory();
+    std::process::exit(code)
 }

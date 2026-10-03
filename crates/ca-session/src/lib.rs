@@ -35,6 +35,6 @@ pub use share::{
 pub use store::{
     DocumentStamp, LoadOutcome, LoadRepairs, LockHolder, LockOutcome, PlatformEnvironment,
     PlatformFamily, SaveOutcome, SavedSession, SessionId, SessionStore, SettingsDirectory,
-    SettingsLock, SettingsPaths, TreeNode, UnknownNode, WindowBounds, Workspace, WorkspaceTab,
-    WorkspaceWindow, SETTINGS_DIRECTORY_VARIABLE,
+    SettingsLock, SettingsPaths, StateDirectory, TreeNode, UnknownNode, WindowBounds, Workspace,
+    WorkspaceTab, WorkspaceWindow, SETTINGS_DIRECTORY_VARIABLE,
 };

@@ -2347,6 +2347,82 @@ fn per_user_folder(
     }
 }
 
+/// The folder a run keeps its state in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateDirectory {
+    /// The folder.
+    pub path: PathBuf,
+    /// What a person has to be told about it: set when state kept there does
+    /// not last.
+    pub notice: Option<String>,
+}
+
+/// The private folder made for this run, once one was needed. One per process,
+/// so every caller in the process keeps its state in the same place.
+static RUN_FOLDER: std::sync::OnceLock<std::result::Result<PathBuf, String>> =
+    std::sync::OnceLock::new();
+
+/// A folder for this run, used when the environment names no per-user
+/// folder. `reason` says why it names none.
+fn run_directory(environment: &PlatformEnvironment, reason: &str) -> StateDirectory {
+    if let Some(path) = SettingsPaths::runtime_directory_in(environment) {
+        let notice = format!(
+            "No home folder is known: {reason}. Settings are kept in {} only until you log out.",
+            path.display()
+        );
+        return StateDirectory {
+            path,
+            notice: Some(notice),
+        };
+    }
+    let created = RUN_FOLDER.get_or_init(|| {
+        let parent = temporary_parent(environment.family)?;
+        ca_io::private::create_private_folder_in(&parent, "compare-all-")
+            .map_err(|error| format!("{}: {error}", parent.display()))
+    });
+    match created {
+        Ok(path) => StateDirectory {
+            path: path.clone(),
+            notice: Some(format!(
+                "No home folder is known: {reason}. Settings are not kept after the program closes. This run keeps them in {}.",
+                path.display()
+            )),
+        },
+        Err(detail) => StateDirectory {
+            path: unusable_directory(),
+            notice: Some(format!(
+                "No home folder is known: {reason}. No private folder could be made for this run in {detail}. Settings are not saved."
+            )),
+        },
+    }
+}
+
+/// The folder the private folder of a run is made in.
+///
+/// A relative temporary folder would resolve against the working directory,
+/// so it is replaced by `/tmp` on Unix and refused elsewhere.
+fn temporary_parent(family: PlatformFamily) -> std::result::Result<PathBuf, String> {
+    let temporary = std::env::temp_dir();
+    if family.is_absolute(temporary.as_os_str()) {
+        return Ok(temporary);
+    }
+    match family {
+        PlatformFamily::Windows => Err(format!(
+            "{}: the temporary folder is not absolute",
+            temporary.display()
+        )),
+        PlatformFamily::MacOs | PlatformFamily::OtherUnix => Ok(PathBuf::from("/tmp")),
+    }
+}
+
+/// A folder no file system call accepts, so a run that has nowhere private
+/// to write writes nothing: the standard library refuses every path that
+/// holds a NUL byte before it reaches the operating system.
+fn unusable_directory() -> PathBuf {
+    let root = if cfg!(windows) { r"C:\" } else { "/" };
+    PathBuf::from(root).join("compare-all\0")
+}
+
 /// Resolved locations of the stored documents.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SettingsPaths {
@@ -2371,12 +2447,76 @@ impl SettingsPaths {
     /// folder while the variable is set.
     #[must_use]
     pub fn resolve(executable_directory: &Path, per_user: PathBuf) -> Self {
+        Self::resolve_with(Some(executable_directory), || per_user)
+    }
+
+    /// Chooses as [`SettingsPaths::resolve`] does, asking for the per-user
+    /// folder only when neither the environment nor the executable's folder
+    /// decides.
+    #[must_use]
+    pub fn resolve_with<F>(executable_directory: Option<&Path>, per_user: F) -> Self
+    where
+        F: FnOnce() -> PathBuf,
+    {
         if let Some(named) = named_settings_directory() {
             return Self {
                 directory: SettingsDirectory::PerUser(named),
             };
         }
-        Self::choose(executable_directory, per_user)
+        if let Some(directory) = executable_directory {
+            if directory.join(PROGRAM_STATE_FILE).exists() {
+                return Self {
+                    directory: SettingsDirectory::Portable(directory.to_path_buf()),
+                };
+            }
+        }
+        Self {
+            directory: SettingsDirectory::PerUser(per_user()),
+        }
+    }
+
+    /// The folder a run keeps its state in: the per-user folder, or a folder
+    /// for this run when the environment names none.
+    ///
+    /// The fallback is `$XDG_RUNTIME_DIR/compare-all` when that variable names
+    /// an absolute folder of the running user, and otherwise a folder with an
+    /// unpredictable name in the temporary folder, made once per process and
+    /// open only to the running user. Either way the result carries the
+    /// notice a person has to see.
+    #[must_use]
+    pub fn state_directory() -> StateDirectory {
+        if let Some(named) = named_settings_directory() {
+            return StateDirectory {
+                path: named,
+                notice: None,
+            };
+        }
+        let environment = PlatformEnvironment::from_process();
+        match per_user_folder(&environment) {
+            Ok(path) => StateDirectory { path, notice: None },
+            Err(reason) => run_directory(&environment, reason),
+        }
+    }
+
+    /// Delete the private folder [`SettingsPaths::state_directory`] made for
+    /// this run, if it made one. For the end of the process: a later call to
+    /// [`SettingsPaths::state_directory`] still names the deleted folder.
+    pub fn remove_run_directory() {
+        if let Some(Ok(path)) = RUN_FOLDER.get() {
+            let _ = fs::remove_dir_all(path);
+        }
+    }
+
+    /// `$XDG_RUNTIME_DIR/compare-all` when the variable names an absolute
+    /// folder the running user owns.
+    #[must_use]
+    pub fn runtime_directory_in(environment: &PlatformEnvironment) -> Option<PathBuf> {
+        if environment.family == PlatformFamily::Windows {
+            return None;
+        }
+        let runtime = environment.absolute(environment.runtime_directory.as_ref())?;
+        ca_io::private::check_owned_folder(&runtime).ok()?;
+        Some(runtime.join(APPLICATION_FOLDER))
     }
 
     /// Chooses between the two directories without reading the environment.
@@ -3784,6 +3924,69 @@ mod tests {
             SettingsPaths::per_user_directory_in(&linux).unwrap(),
             Path::new("/srv/config").join("compare-all")
         );
+    }
+
+    #[test]
+    fn the_runtime_folder_counts_only_when_it_is_an_absolute_folder_of_this_user() {
+        let runtime = TempDir::new().unwrap();
+        for value in ["", "runtime", "/no/such/runtime/folder"] {
+            let linux = PlatformEnvironment {
+                runtime_directory: os(value),
+                ..environment(PlatformFamily::OtherUnix)
+            };
+            assert_eq!(
+                SettingsPaths::runtime_directory_in(&linux),
+                None,
+                "{value:?}"
+            );
+        }
+        let windows = PlatformEnvironment {
+            runtime_directory: Some(runtime.path().as_os_str().to_owned()),
+            ..environment(PlatformFamily::Windows)
+        };
+        assert_eq!(SettingsPaths::runtime_directory_in(&windows), None);
+        let file = runtime.path().join("file");
+        fs::write(&file, b"x").unwrap();
+        let running = PlatformEnvironment {
+            runtime_directory: Some(file.into_os_string()),
+            ..environment(PlatformFamily::running())
+        };
+        assert_eq!(SettingsPaths::runtime_directory_in(&running), None);
+        #[cfg(unix)]
+        {
+            let linux = PlatformEnvironment {
+                runtime_directory: Some(runtime.path().as_os_str().to_owned()),
+                ..environment(PlatformFamily::OtherUnix)
+            };
+            assert_eq!(
+                SettingsPaths::runtime_directory_in(&linux),
+                Some(runtime.path().join("compare-all"))
+            );
+        }
+    }
+
+    #[test]
+    fn the_folder_of_a_run_with_nowhere_to_write_cannot_be_created() {
+        let path = unusable_directory();
+        assert!(path.is_absolute());
+        assert!(fs::create_dir_all(&path).is_err());
+        assert!(SettingsLock::acquire(&path).is_err());
+        assert!(SessionStore::default()
+            .save(&path.join(SESSIONS_FILE))
+            .is_err());
+    }
+
+    #[test]
+    fn a_relative_temporary_folder_is_never_the_parent_of_a_run_folder() {
+        for family in [
+            PlatformFamily::Windows,
+            PlatformFamily::MacOs,
+            PlatformFamily::OtherUnix,
+        ] {
+            if let Ok(parent) = temporary_parent(family) {
+                assert!(family.is_absolute(parent.as_os_str()), "{family:?}");
+            }
+        }
     }
 
     #[test]

@@ -973,6 +973,7 @@ dependencies = [
 name = "ca-io"
 version = "0.0.0"
 dependencies = [
+ "rustix 1.1.5",
  "tempfile",
  "winsafe",
 ]
