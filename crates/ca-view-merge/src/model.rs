@@ -316,6 +316,12 @@ pub(crate) struct Lent {
     pub(crate) seq: u64,
     /// Characters into the lender's own text where the text goes back.
     pub(crate) insert_at: usize,
+    /// The lender's characters this record stands for, as the lender held
+    /// them before it lent them, with the characters an edit later removed
+    /// from the holder's line. The sources of a lender's records, oldest
+    /// first, join to a prefix of its text before the lending. `None`: an
+    /// older record of the same lender carries this record's characters.
+    pub(crate) source: Option<String>,
 }
 
 impl Section {
@@ -1903,10 +1909,20 @@ impl MergeModel {
                     }
                     (None, Some(_)) => back.push(entry),
                     (Some(holder), None) => {
-                        let target = (holder + 1..self.sections.len())
-                            .find(|index| !carried.contains(index));
-                        if let Some(target) = target {
-                            self.leave_out_lent_text(target, holder, entry);
+                        let Some(target) = self.uncarried_successor(holder, &carried) else {
+                            continue;
+                        };
+                        // A section whose new text does not start with the
+                        // lent characters keeps its text; the record still
+                        // lets a take of the holder give them back to it.
+                        if entry.source.is_none()
+                            || !self.leave_out_lent_text(target, holder, entry.clone())
+                        {
+                            self.sections[target].lent.push(Lent {
+                                holder,
+                                insert_at: 0,
+                                ..entry
+                            });
                         }
                     }
                     _ => {}
@@ -1919,6 +1935,9 @@ impl MergeModel {
                     let section = &mut self.sections[lender];
                     ownership::insert_text(&mut section.edited, entry.insert_at, &entry.text);
                     section.resolution = Resolution::Edited;
+                    if entry.source.as_deref() != Some(entry.text.as_str()) {
+                        section.restore = None;
+                    }
                 }
             }
         }
@@ -1937,17 +1956,47 @@ impl MergeModel {
         self.refresh_all_joined_through();
     }
 
+    /// The section after `holder` whose text follows the holder's text in
+    /// the new merge, when the reload did not carry it: the first section
+    /// after `holder` that was not carried, past carried sections without
+    /// output lines only.
+    fn uncarried_successor(
+        &self,
+        holder: usize,
+        carried: &std::collections::HashSet<usize>,
+    ) -> Option<usize> {
+        for index in holder + 1..self.sections.len() {
+            if !carried.contains(&index) {
+                return Some(index);
+            }
+            let section = &self.sections[index];
+            let empty = if matches!(section.resolution, Resolution::Edited) {
+                section.edited.is_empty()
+            } else {
+                automatic_len(&self.inputs, section) == 0
+            };
+            if !empty {
+                return None;
+            }
+        }
+        None
+    }
+
     /// Before a rebuild: let a section that was not carried leave out the
-    /// text its carried holder still shows, when its text starts with it.
-    fn leave_out_lent_text(&mut self, index: usize, holder: usize, entry: Lent) {
+    /// text its carried holder still shows, when its text starts with the
+    /// characters that text stands for. Returns false when it does not.
+    fn leave_out_lent_text(&mut self, index: usize, holder: usize, entry: Lent) -> bool {
+        let Some(source) = entry.source.as_deref() else {
+            return false;
+        };
         let section = self.sections[index].clone();
         let mut text = if matches!(section.resolution, Resolution::Edited) {
             section.edited.clone()
         } else {
             self.contribution(index, &section)
         };
-        if !ownership::remove_prefix(&mut text, &entry.text) {
-            return;
+        if !ownership::remove_prefix(&mut text, source) {
+            return false;
         }
         let target = &mut self.sections[index];
         if target.restore.is_none() && !matches!(target.resolution, Resolution::Edited) {
@@ -1967,6 +2016,7 @@ impl MergeModel {
             insert_at: 0,
             ..entry
         });
+        true
     }
 
     fn fingerprint(&self, section: &Section) -> Fingerprint {
