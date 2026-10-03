@@ -471,9 +471,19 @@ fn executable() -> Option<&'static Path> {
 /// The home folder the local account database gives the real user.
 #[cfg(unix)]
 fn account_home() -> Option<OsString> {
-    let database = std::fs::read_to_string("/etc/passwd").ok()?;
+    use std::io::Read;
+    let mut database = Vec::new();
+    std::fs::File::open("/etc/passwd")
+        .ok()?
+        .take(MAX_PASSWORD_BYTES)
+        .read_to_end(&mut database)
+        .ok()?;
     home_of(&database, rustix::process::getuid().as_raw())
 }
+
+/// Most bytes read from the password database.
+#[cfg(unix)]
+const MAX_PASSWORD_BYTES: u64 = 16 * 1024 * 1024;
 
 #[cfg(not(unix))]
 fn account_home() -> Option<OsString> {
@@ -528,13 +538,20 @@ fn portable_folder(environment: &Environment, name: &str, suffix: &str) -> bool 
 
 /// The home folder of `uid` in a password database (`name:password:uid:gid:
 /// comment:home:shell` per line).
+/// The fields are bytes: a comment or a name in a legacy encoding is not text.
 #[cfg_attr(not(unix), allow(dead_code))]
-fn home_of(database: &str, uid: u32) -> Option<OsString> {
-    database.lines().find_map(|line| {
-        let mut fields = line.split(':');
-        let id = fields.nth(2)?.parse::<u32>().ok()?;
+fn home_of(database: &[u8], uid: u32) -> Option<OsString> {
+    database.split(|byte| *byte == b'\n').find_map(|line| {
+        let mut fields = line.split(|byte| *byte == b':');
+        let id = std::str::from_utf8(fields.nth(2)?)
+            .ok()?
+            .parse::<u32>()
+            .ok()?;
         let home = fields.nth(2)?;
-        (id == uid && home.starts_with('/')).then(|| OsString::from(home))
+        if id != uid || home.first() != Some(&b'/') {
+            return None;
+        }
+        from_bytes(home.strip_suffix(b"\r").unwrap_or(home))
     })
 }
 
