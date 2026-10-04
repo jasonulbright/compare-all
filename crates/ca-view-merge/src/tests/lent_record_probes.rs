@@ -182,6 +182,32 @@ fn a_conflict_lending_to_a_conflict_gives_one_text_in_every_order() {
     assert_eq!(single(&finals), "a\nbcc2c3x\nz\n");
 }
 
+#[test]
+fn a_pending_take_restores_selected_lines_after_reload() {
+    let (mut view, _dir) = open(F4[0], Some(F4[1]), F4[2]);
+    run_until_ready(&mut view);
+    f4_joined(&mut view);
+    take_at(&mut view, 2, Command::TakeCenter);
+    take_at(&mut view, 3, Command::TakeRight);
+    view.run(Command::Reload);
+    run_until_ready(&mut view);
+    take_at(&mut view, 1, Command::TakeLeft);
+    assert_eq!(view.output_text(), "a\nL1\nc\nc2\nc3\nR2\nz\n");
+}
+
+#[test]
+fn a_pending_take_restores_selected_lines_after_side_swap() {
+    let (mut view, _dir) = open(F4[0], Some(F4[1]), F4[2]);
+    run_until_ready(&mut view);
+    f4_joined(&mut view);
+    take_at(&mut view, 2, Command::TakeCenter);
+    take_at(&mut view, 3, Command::TakeRight);
+    view.run(Command::SwapSides);
+    run_until_ready(&mut view);
+    take_at(&mut view, 1, Command::TakeLeft);
+    assert_eq!(view.output_text(), "a\nR1\nc\nc2\nc3\nR2\nz\n");
+}
+
 const F1: [&str; 3] = [
     "a\nL\nc\nd\ng\nh\ni\nX\nf\n",
     "a\nb\nc\nd\ng\nh\ni\ne\nf\n",

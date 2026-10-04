@@ -259,6 +259,7 @@ impl MergeModel {
         let entry = section.lent.remove(position);
         if lost {
             section.restore = None;
+            section.restore_from_take = false;
         }
         let holder = entry.holder;
         self.refresh_joined_through(holder);
@@ -444,6 +445,7 @@ impl MergeModel {
         let conflict = self.sections[owner].conflict;
         self.touch(owner);
         self.sections[owner].restore = None;
+        self.sections[owner].restore_from_take = false;
         if self.edit_output_range(owner, local..local + 1, vec![text]) {
             self.sections[owner].conflict = conflict;
             self.refresh_section_totals(owner);
@@ -535,6 +537,8 @@ impl MergeModel {
     }
 
     /// Restore the state `index` kept for when its lent text is back.
+    /// Rebuild its output because edits to the holder may have changed line
+    /// boundaries while the text was away.
     fn apply_restore(&mut self, index: usize) {
         let Some(live) = self.sections.get(index) else {
             return;
@@ -542,19 +546,27 @@ impl MergeModel {
         let Some(restore) = live.restore.as_deref() else {
             return;
         };
+        let restore_from_take = live.restore_from_take;
         let mut state = live.clone();
         state.resolution = restore.resolution;
         state.conflict = restore.conflict || live.conflict;
-        if !live.lent.is_empty() || automatic_len(&self.inputs, &state) != live.output_len {
+        if !live.lent.is_empty()
+            || (!restore_from_take && automatic_len(&self.inputs, &state) != live.output_len)
+        {
             return;
         }
         state.restore = None;
+        state.restore_from_take = false;
         state.edited.clear();
         state.edited_from_output = false;
         state.refresh(self.rules);
         self.touch(index);
         self.sections[index] = state;
-        self.refresh_section_totals(index);
+        if restore_from_take {
+            self.rebuild_changed_sections(&[index], true);
+        } else {
+            self.refresh_section_totals(index);
+        }
     }
 
     /// The records `holder` keeps on output line `line`, in column order, as
@@ -797,11 +809,17 @@ impl MergeModel {
         entry: super::Lent,
     ) -> Option<(usize, Range<u32>)> {
         self.uncover_after(lender, &entry);
-        if entry.source.as_deref() != Some(entry.text.as_str()) {
-            // The text that comes back differs from what the lender lent, so
-            // the lender cannot return to its state before the lending.
+        if !entry
+            .source
+            .as_deref()
+            .is_some_and(|source| Self::same_characters_ignoring_line_endings(source, &entry.text))
+        {
+            // The characters that come back differ from the lent source, so
+            // the lender cannot return to its selected input without losing
+            // an edit that remains in the holder.
             self.touch(lender);
             self.sections[lender].restore = None;
+            self.sections[lender].restore_from_take = false;
         }
         let range = self.output_range(lender)?;
         let mut target = None;
@@ -844,6 +862,14 @@ impl MergeModel {
         self.repair_local(lender, &lines);
         self.apply_restore(lender);
         Some((lender, lines))
+    }
+
+    fn same_characters_ignoring_line_endings(left: &str, right: &str) -> bool {
+        left.chars()
+            .filter(|character| !matches!(*character, '\r' | '\n'))
+            .eq(right
+                .chars()
+                .filter(|character| !matches!(*character, '\r' | '\n')))
     }
 
     /// Give back the text lent to line `local` of `holder`, before that
@@ -922,6 +948,7 @@ impl MergeModel {
             section.edited.clear();
             section.edited_from_output = false;
             section.restore = None;
+            section.restore_from_take = false;
             let fresh = section.clone();
             let mut lines = self.contribution(index, &fresh);
             let mut own: Vec<super::Lent> = fresh.lent.clone();
@@ -941,6 +968,7 @@ impl MergeModel {
                     restore.joined_through = None;
                     let section = &mut self.sections[index];
                     section.restore = Some(Box::new(restore));
+                    section.restore_from_take = true;
                     section.resolution = Resolution::Edited;
                     section.conflict = false;
                 } else {
@@ -1287,6 +1315,7 @@ impl MergeModel {
                 if self.sections[index].restore.is_some() {
                     self.touch(index);
                     self.sections[index].restore = None;
+                    self.sections[index].restore_from_take = false;
                 }
                 continue;
             }
@@ -1300,6 +1329,7 @@ impl MergeModel {
                 restore.joined_through = None;
                 self.touch(index);
                 self.sections[index].restore = Some(Box::new(restore));
+                self.sections[index].restore_from_take = false;
             }
             self.apply_restore(index);
         }
@@ -1346,6 +1376,7 @@ impl MergeModel {
             };
             self.touch(index);
             self.sections[index].restore = None;
+            self.sections[index].restore_from_take = false;
             if !self.edit_output_range(index, local_start..local_end, replacement) {
                 return None;
             }

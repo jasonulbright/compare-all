@@ -306,6 +306,9 @@ pub struct Section {
     /// The state this section takes again once every lent text is back,
     /// kept while nothing but lending changed its text.
     restore: Option<Box<Section>>,
+    /// The saved state came from a Take command and must restore its selected
+    /// input's line boundaries when the held text comes back.
+    restore_from_take: bool,
 }
 
 /// Text one section lent to a line of an earlier section, the holder.
@@ -347,6 +350,7 @@ impl Section {
             lent: Vec::new(),
             joined_through: None,
             restore: None,
+            restore_from_take: false,
         }
     }
 
@@ -962,6 +966,7 @@ struct Decision {
     ignored: bool,
     lent: Vec<Lent>,
     restore: Option<Box<Section>>,
+    restore_from_take: bool,
 }
 
 /// Lent text a reload gives back, with places in the earlier output as
@@ -1369,6 +1374,7 @@ impl MergeModel {
         entry.edited_from_output = false;
         entry.conflict = false;
         entry.restore = None;
+        entry.restore_from_take = false;
         self.rebuild_changed_sections(&[section], false);
     }
 
@@ -1557,6 +1563,7 @@ impl MergeModel {
             global_start..global_start.checked_add(u32::try_from(replacement.len()).ok()?)?;
         self.touch(section_index);
         self.sections[section_index].restore = None;
+        self.sections[section_index].restore_from_take = false;
         if !self.edit_output_range(section_index, local, replacement) {
             return None;
         }
@@ -1881,6 +1888,7 @@ impl MergeModel {
                     ignored: section.ignored,
                     lent: section.lent.clone(),
                     restore,
+                    restore_from_take: section.restore_from_take,
                 },
             );
         }
@@ -1901,6 +1909,7 @@ impl MergeModel {
             section.conflict = decision.conflict;
             section.ignored = decision.ignored;
             section.restore.clone_from(&decision.restore);
+            section.restore_from_take = decision.restore_from_take;
             section.lent.clear();
             section.refresh(rules);
         }
@@ -1977,6 +1986,7 @@ impl MergeModel {
                 section.resolution = restore.resolution;
                 section.conflict |= restore.conflict;
                 section.edited.clear();
+                section.restore_from_take = false;
             }
         }
         self.refresh_all_joined_through();
@@ -2063,8 +2073,10 @@ impl MergeModel {
         if target.restore.is_none() && !matches!(target.resolution, Resolution::Edited) {
             let mut restore = section;
             restore.restore = None;
+            restore.restore_from_take = false;
             restore.lent.clear();
             target.restore = Some(Box::new(restore));
+            target.restore_from_take = false;
         }
         target.resolution = Resolution::Edited;
         target.edited = text;
