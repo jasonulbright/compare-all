@@ -17,10 +17,22 @@ use ca_ui::view::{OpenRequest, SessionView, ViewAction};
 use ca_view_folder::merge_view::MergeFilter;
 use ca_view_folder::FolderMergeView;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 /// How long a test waits for background work before giving up.
 const PATIENCE: Duration = Duration::from_secs(30);
+
+/// The modified time of every file the fixture writes.
+const FIXTURE_TIME: Duration = Duration::from_secs(1_700_000_000);
+
+fn stamp(path: &Path, since_epoch: Duration) {
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(SystemTime::UNIX_EPOCH + since_epoch)
+        .unwrap();
+}
 
 fn poll_until(view: &mut FolderMergeView, ready: impl Fn(&FolderMergeView) -> bool) -> bool {
     let deadline = Instant::now() + PATIENCE;
@@ -65,10 +77,14 @@ impl Fixture {
         self.dir.path().join(side)
     }
 
+    /// Two copies written one after the other straddle a whole second now and
+    /// then, and the quick test then counts the later copy as a change. One
+    /// stamp on every fixture file leaves the sizes to tell versions apart.
     fn write(&self, side: &str, rel: &str, body: &[u8]) {
         let path = self.path(side).join(rel);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, body).unwrap();
+        std::fs::write(&path, body).unwrap();
+        stamp(&path, FIXTURE_TIME);
     }
 
     fn request(&self) -> OpenRequest {
@@ -206,6 +222,90 @@ fn a_cancelled_confirmation_writes_nothing_and_a_confirmed_one_writes_the_output
     assert_eq!(
         fixture.read("left", "clash.txt").as_deref(),
         Some(&b"one\nLEFT\nthree\n"[..])
+    );
+}
+
+#[test]
+fn every_fixture_file_carries_the_fixture_time() {
+    let fixture = Fixture::new();
+    for (side, rel) in [
+        ("left", "same.txt"),
+        ("center", "same.txt"),
+        ("right", "same.txt"),
+        ("left", "added.txt"),
+        ("center", "edited.txt"),
+        ("left", "edited.txt"),
+        ("right", "edited.txt"),
+        ("center", "clash.txt"),
+        ("left", "clash.txt"),
+        ("right", "clash.txt"),
+    ] {
+        let modified = std::fs::metadata(fixture.path(side).join(rel))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(
+            modified,
+            SystemTime::UNIX_EPOCH + FIXTURE_TIME,
+            "{side}/{rel} has its own time"
+        );
+    }
+}
+
+/// A copy whose time alone differs from the ancestor counts as a change, so a
+/// row both sides changed is mergeable and waits for a person. The plan on
+/// screen leaves it out, and the clean report covers only the planned steps.
+#[test]
+fn a_copy_whose_time_alone_differs_from_the_ancestor_stays_out_of_the_plan_and_the_output() {
+    let fixture = Fixture::new();
+    stamp(
+        &fixture.path("left").join("edited.txt"),
+        FIXTURE_TIME + Duration::from_secs(4),
+    );
+    let center_time = std::fs::metadata(fixture.path("center").join("edited.txt"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    let left_time = std::fs::metadata(fixture.path("left").join("edited.txt"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    assert_ne!(center_time, left_time, "the file system kept the time gap");
+
+    let mut text_view = fixture.view();
+    assert_eq!(status_of(&text_view, "edited.txt"), MergeStatus::Mergeable);
+    assert!(text_view.select(Path::new("edited.txt")));
+    assert!(text_view.accepts(Command::OpenTextMerge));
+    let request = text_view
+        .text_merge_request()
+        .expect("the mergeable file can be resolved in Text Merge");
+    assert_eq!(request.kind, SessionKind::TextMerge);
+    assert_eq!(
+        request.output,
+        Some(fixture.path("output").join("edited.txt"))
+    );
+
+    let mut view = fixture.view();
+    view.set_confirm_merge(true);
+
+    merge(&mut view);
+    let shown = view.pending_plan().expect("a plan is on screen").clone();
+    assert!(
+        shown
+            .steps
+            .iter()
+            .all(|step| step.rel != Path::new("edited.txt")),
+        "a row waiting for a person is in the plan"
+    );
+    view.confirm_pending();
+    assert!(poll_until(&mut view, FolderMergeView::has_summary));
+    let report = view.last_report().expect("a report is on screen");
+    assert!(report.is_clean());
+    assert_eq!(report.completed(), shown.steps.len());
+    assert!(fixture.read("output", "edited.txt").is_none());
+    assert_eq!(
+        fixture.read("output", "added.txt").as_deref(),
+        Some(&b"from the left"[..])
     );
 }
 
