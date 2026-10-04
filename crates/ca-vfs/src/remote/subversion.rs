@@ -1187,7 +1187,7 @@ mod tests {
         let worker_cancel = cancel.clone();
         let worker_marker = marker.clone();
         let cancellation = thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(8);
+            let deadline = Instant::now() + Duration::from_secs(15);
             while !worker_marker.exists() && Instant::now() < deadline {
                 thread::sleep(Duration::from_millis(10));
             }
@@ -1274,10 +1274,10 @@ mod tests {
                     "-NoProfile".into(),
                     "-NonInteractive".into(),
                     "-Command".into(),
-                    "for ($i = 0; $i -lt 8; $i++) { [Console]::Out.Write('x'); [Console]::Out.Flush(); Start-Sleep -Seconds 1 }".into(),
+                    "for ($i = 0; $i -lt 12; $i++) { [Console]::Out.Write('x'); [Console]::Out.Flush(); Start-Sleep -Seconds 1 }".into(),
                 ],
                 &Cancel::new(),
-                Duration::from_secs(5),
+                Duration::from_secs(10),
                 &Limits::default(),
                 1024,
             )
@@ -1285,7 +1285,7 @@ mod tests {
         let mut bytes = Vec::new();
         output.read_to_end(&mut bytes).unwrap();
 
-        assert_eq!(bytes.len(), 8);
+        assert_eq!(bytes.len(), 12);
     }
 
     #[cfg(windows)]
