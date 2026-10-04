@@ -303,23 +303,18 @@ trait CommandRunner: Send + Sync {
     ) -> VfsResult<OpenFile>;
 }
 
+#[derive(Default)]
 struct ProcessRunner {
-    program: OsString,
-}
-
-impl Default for ProcessRunner {
-    fn default() -> Self {
-        Self {
-            program: OsString::from("svn"),
-        }
-    }
+    // Tests inject helper executables; production always launches the fixed SVN client.
+    #[cfg(test)]
+    program: Option<OsString>,
 }
 
 impl ProcessRunner {
     #[cfg(test)]
     fn for_program(program: impl Into<OsString>) -> Self {
         Self {
-            program: program.into(),
+            program: Some(program.into()),
         }
     }
 }
@@ -338,7 +333,14 @@ impl CommandRunner for ProcessRunner {
         max_bytes: u64,
     ) -> VfsResult<OpenFile> {
         cancel.check()?;
-        let mut command = ca_io::host_command::host_command(&self.program);
+        #[cfg(test)]
+        let mut command = ca_io::host_command::host_command(
+            self.program
+                .as_deref()
+                .unwrap_or(std::ffi::OsStr::new("svn")),
+        );
+        #[cfg(not(test))]
+        let mut command = ca_io::host_command::host_command("svn");
         command
             .args(args)
             .stdin(Stdio::null())
