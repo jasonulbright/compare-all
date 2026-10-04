@@ -50,6 +50,14 @@ const REDIFF_DEBOUNCE: Duration = Duration::from_millis(300);
 const COMBO_WIDTH: f32 = 116.0;
 /// Why a toolbar button refuses while the comparison is still running.
 const NOT_READY: &str = "Available once the comparison finishes";
+/// Reason shown on a copy after the comparison failed.
+const FAILED: &str = "The comparison failed. Use Reload to compare again";
+/// Reason shown on a copy after the comparison was stopped.
+const STOPPED: &str = "The comparison was stopped. Use Reload to compare again";
+/// Reason shown on a copy into the left pane while that pane takes no edit.
+const LEFT_READ_ONLY: &str = "The left pane is read-only";
+/// Reason shown on a copy into the right pane while that pane takes no edit.
+const RIGHT_READ_ONLY: &str = "The right pane is read-only";
 /// Character columns the address area takes, including its trailing space.
 const ADDRESS_COLUMNS_HEX: f32 = 9.0;
 /// Character columns a decimal address area takes.
@@ -2884,6 +2892,23 @@ impl SessionView for HexView {
         ca_ui::view::declare(HANDLED, |command| self.accepts(command))
     }
 
+    fn refusal(&self, command: Command) -> Option<&'static str> {
+        let (target, read_only) = match command {
+            Command::CopyToRight => (&self.right_bytes, RIGHT_READ_ONLY),
+            Command::CopyToLeft => (&self.left_bytes, LEFT_READ_ONLY),
+            _ => return None,
+        };
+        if target.is_read_only() {
+            return Some(read_only);
+        }
+        match self.status {
+            Status::Ready => None,
+            Status::Running(_) => Some(NOT_READY),
+            Status::Failed(_) => Some(FAILED),
+            Status::Cancelled => Some(STOPPED),
+        }
+    }
+
     fn accepts(&self, command: Command) -> bool {
         let ready = self.status == Status::Ready;
         match command {
@@ -3335,6 +3360,53 @@ mod tests {
             assert_eq!(std::fs::read(&right).unwrap(), [2]);
             assert_eq!(view.wants_close(), closing);
             assert!(view.may_close());
+        }
+    }
+
+    #[test]
+    fn a_refused_byte_copy_names_the_read_only_pane_or_what_the_comparison_waits_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let left = dir.path().join("left.bin");
+        let right = dir.path().join("right.bin");
+        std::fs::write(&left, [1u8, 2, 3]).unwrap();
+        std::fs::write(&right, [1u8, 2, 4]).unwrap();
+        let mut view = HexView::new(left, right, &context(), 10);
+        assert_eq!(view.refusal(Command::CopyToRight), Some(super::NOT_READY));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline && view.status != super::Status::Ready {
+            view.tick();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        for command in [Command::CopyToRight, Command::CopyToLeft] {
+            assert!(view.accepts(command), "{command:?}");
+            assert_eq!(view.refusal(command), None, "{command:?}");
+        }
+
+        view.right_bytes.set_read_only(true);
+        assert!(!view.accepts(Command::CopyToRight));
+        assert_eq!(
+            view.refusal(Command::CopyToRight),
+            Some(super::RIGHT_READ_ONLY)
+        );
+        assert!(view.accepts(Command::CopyToLeft));
+        assert_eq!(view.refusal(Command::CopyToLeft), None);
+        view.left_bytes.set_read_only(true);
+        assert_eq!(
+            view.refusal(Command::CopyToLeft),
+            Some(super::LEFT_READ_ONLY)
+        );
+        view.left_bytes.set_read_only(false);
+
+        for (status, expected) in [
+            (
+                super::Status::Failed("unreadable".to_owned()),
+                super::FAILED,
+            ),
+            (super::Status::Cancelled, super::STOPPED),
+        ] {
+            view.status = status;
+            assert!(view.accepts(Command::Reload));
+            assert_eq!(view.refusal(Command::CopyToLeft), Some(expected));
         }
     }
 

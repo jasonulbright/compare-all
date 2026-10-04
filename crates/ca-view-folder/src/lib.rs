@@ -89,6 +89,11 @@ const SYNC_COMBO_WIDTH: f32 = 170.0;
 const PREVIEW_HEIGHT: f32 = 220.0;
 /// What a control this build does not carry says when hovered.
 const NOT_BUILT: &str = "Not available in this build";
+/// Why a copy has nothing to act on.
+const NOTHING_TO_COPY: &str = "Select the items to copy first";
+/// Why a copy waits while a file operation is planned, asks, runs or shows
+/// its result.
+const OPERATION_OPEN: &str = "Available once the open file operation is closed";
 /// How often streamed content results are folded into the rows on screen.
 const REBUILD_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -1820,7 +1825,11 @@ impl FolderView {
                 Command::CopyToOtherSide,
                 "Copy",
                 idle && has_selection,
-                "Select the items to copy first",
+                if idle {
+                    NOTHING_TO_COPY
+                } else {
+                    OPERATION_OPEN
+                },
             ),
             toolbar::Item::widget("expand", 80.0),
             toolbar::Item::widget("collapse", 90.0),
@@ -3344,6 +3353,10 @@ impl SessionView for FolderSyncView {
         }
     }
 
+    fn refusal(&self, command: Command) -> Option<&'static str> {
+        self.view.refusal(command)
+    }
+
     fn run(&mut self, command: Command) {
         match command {
             Command::Synchronize => self.view.start_synchronisation(),
@@ -3511,6 +3524,19 @@ impl SessionView for FolderView {
 
     fn commands(&self) -> Vec<ca_ui::view::CommandState> {
         view::declare(HANDLED, |command| self.accepts(command))
+    }
+
+    fn refusal(&self, command: Command) -> Option<&'static str> {
+        match command {
+            Command::CopyToRight | Command::CopyToLeft if !self.accepts(command) => {
+                Some(if matches!(self.stage, Stage::Idle) {
+                    NOTHING_TO_COPY
+                } else {
+                    OPERATION_OPEN
+                })
+            }
+            _ => None,
+        }
     }
 
     fn accepts(&self, command: Command) -> bool {
@@ -3959,6 +3985,53 @@ mod stale_results {
 
     fn shows_stale(view: &FolderView) -> bool {
         view.arena().index_of(Path::new("stale.txt")).is_some()
+    }
+
+    #[test]
+    fn a_refused_folder_copy_asks_for_a_selection_or_for_the_open_operation_to_close() {
+        use crate::{
+            toolbar, Command, FolderSyncView, OperationPlan, Stage, NOTHING_TO_COPY, OPERATION_OPEN,
+        };
+        use ca_ui::view::SessionView;
+
+        let copy_reason = |view: &FolderView| {
+            view.toolbar_items()
+                .into_iter()
+                .find_map(|item| match item {
+                    toolbar::Item::Command {
+                        name: "copy",
+                        reason,
+                        ..
+                    } => Some(reason),
+                    _ => None,
+                })
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut view = ready_view(dir.path());
+        for command in [Command::CopyToRight, Command::CopyToLeft] {
+            assert!(!view.accepts(command));
+            assert_eq!(view.refusal(command), Some(NOTHING_TO_COPY), "{command:?}");
+        }
+        assert_eq!(copy_reason(&view), Some(NOTHING_TO_COPY));
+
+        view.run(Command::SelectAll);
+        for command in [Command::CopyToRight, Command::CopyToLeft] {
+            assert!(view.accepts(command), "{command:?}");
+            assert_eq!(view.refusal(command), None, "{command:?}");
+        }
+
+        view.stage = Stage::Running(Box::new(OperationPlan::new(
+            ca_fs::OperationKind::Copy,
+            Vec::new(),
+            ca_fs::OperationOptions::default(),
+        )));
+        for command in [Command::CopyToRight, Command::CopyToLeft] {
+            assert!(!view.accepts(command));
+            assert_eq!(view.refusal(command), Some(OPERATION_OPEN), "{command:?}");
+        }
+        assert_eq!(copy_reason(&view), Some(OPERATION_OPEN));
+        let sync = FolderSyncView::from(view);
+        assert_eq!(sync.refusal(Command::CopyToRight), Some(OPERATION_OPEN));
     }
 
     #[test]

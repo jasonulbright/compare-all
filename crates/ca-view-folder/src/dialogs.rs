@@ -107,7 +107,7 @@ pub fn confirm(
             let allowed = !plan.steps.is_empty();
             let confirm = ui.add_enabled(allowed, egui::Button::new(confirm_label(operation)));
             if !allowed {
-                confirm.on_hover_text("There is nothing to carry out");
+                let _ = ca_ui::widgets::disabled_reason(confirm, "There is nothing to carry out");
             } else if confirm.clicked() {
                 choice = ConfirmChoice::Confirm;
             }

@@ -58,6 +58,10 @@ const HATCH_STEP: f32 = 7.0;
 const SEPARATOR: f32 = 2.0;
 /// Reason shown on a control that needs a finished merge.
 const NOT_MERGED: &str = "Available once the merge finishes";
+/// Reason shown on a line that needs a merge after the merge failed.
+const MERGE_FAILED: &str = "The merge failed. Use Reload to merge again";
+/// Reason shown on a line that needs a merge after the merge was stopped.
+const MERGE_STOPPED: &str = "The merge was stopped. Use Reload to merge again";
 /// Reason shown on a control that needs an output file.
 const NO_OUTPUT: &str = "This session names no output file";
 /// What the view says when an edit of the output is asked for while the
@@ -2512,6 +2516,28 @@ impl SessionView for MergeView {
         ca_ui::view::declare(HANDLED, |command| SessionView::accepts(self, command))
     }
 
+    fn refusal(&self, command: Command) -> Option<&'static str> {
+        let output_line = matches!(
+            command,
+            Command::Cut
+                | Command::Copy
+                | Command::Paste
+                | Command::SelectAll
+                | Command::SelectSection
+        );
+        if !output_line || SessionView::accepts(self, command) {
+            return None;
+        }
+        if self.editing_off() && CHANGES_OUTPUT.contains(&command) {
+            return Some(EDITING_OFF);
+        }
+        Some(match self.status {
+            Status::Failed(_) => MERGE_FAILED,
+            Status::Cancelled => MERGE_STOPPED,
+            Status::Running(_) | Status::Ready => NOT_MERGED,
+        })
+    }
+
     fn accepts(&self, command: Command) -> bool {
         if self.editing_off() && CHANGES_OUTPUT.contains(&command) {
             return false;
@@ -2914,6 +2940,57 @@ mod tests {
         };
         let view = MergeView::over(paths, ca_ui::view::Titles::default(), &context(), 7);
         (view, dir)
+    }
+
+    #[test]
+    fn a_refused_output_line_says_what_the_merge_waits_for() {
+        const LINES: [Command; 5] = [
+            Command::Cut,
+            Command::Copy,
+            Command::Paste,
+            Command::SelectAll,
+            Command::SelectSection,
+        ];
+        let (mut view, _dir) = open("a\nb\n", Some("a\n"), "a\nc\n");
+        for command in LINES {
+            assert!(!view.accepts(command), "{command:?}");
+            assert_eq!(
+                view.refusal(command),
+                Some(super::NOT_MERGED),
+                "{command:?}"
+            );
+        }
+        run_until_ready(&mut view);
+        for command in LINES {
+            assert!(view.accepts(command), "{command:?}");
+            assert_eq!(view.refusal(command), None, "{command:?}");
+        }
+
+        view.session_settings.specs.disable_editing = true;
+        for command in [Command::Cut, Command::Paste] {
+            assert!(!view.accepts(command), "{command:?}");
+            assert_eq!(
+                view.refusal(command),
+                Some(super::EDITING_OFF),
+                "{command:?}"
+            );
+        }
+        assert_eq!(view.refusal(Command::Copy), None);
+        view.session_settings.specs.disable_editing = false;
+
+        for (status, expected) in [
+            (
+                super::Status::Failed("unreadable".to_owned()),
+                super::MERGE_FAILED,
+            ),
+            (super::Status::Cancelled, super::MERGE_STOPPED),
+        ] {
+            view.status = status;
+            assert!(view.accepts(Command::Reload));
+            for command in LINES {
+                assert_eq!(view.refusal(command), Some(expected), "{command:?}");
+            }
+        }
     }
 
     fn run_until_ready(view: &mut MergeView) {

@@ -173,20 +173,24 @@ impl RestoreDialog {
             );
         }
         if self.selection.holds(RestoreCategory::FileFormats) {
-            ui.add_enabled_ui(false, |ui| {
-                let mut value = self.selection.delete_all_file_formats;
-                ui.checkbox(&mut value, "Delete every customized file format");
-            })
-            .response
-            .on_hover_text(NOT_STORED);
+            let mut value = self.selection.delete_all_file_formats;
+            let _ = crate::widgets::disabled_reason(
+                ui.add_enabled(
+                    false,
+                    egui::Checkbox::new(&mut value, "Delete every customized file format"),
+                ),
+                NOT_STORED,
+            );
         }
         if self.selection.holds(RestoreCategory::Profiles) {
-            ui.add_enabled_ui(false, |ui| {
-                let mut value = self.selection.delete_all_profiles;
-                ui.checkbox(&mut value, "Delete every named profile");
-            })
-            .response
-            .on_hover_text(NOT_STORED);
+            let mut value = self.selection.delete_all_profiles;
+            let _ = crate::widgets::disabled_reason(
+                ui.add_enabled(
+                    false,
+                    egui::Checkbox::new(&mut value, "Delete every named profile"),
+                ),
+                NOT_STORED,
+            );
         }
     }
 }

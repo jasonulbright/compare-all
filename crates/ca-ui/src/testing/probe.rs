@@ -16,6 +16,16 @@ use std::cell::{Cell, RefCell};
 /// Time between two frames the probe runs.
 const FRAME_SECONDS: f64 = 1.0 / 60.0;
 
+/// Time a resting pointer is held past the tooltip delay, so a tooltip that
+/// opens on the frame after the delay is in the frame a hover returns.
+const HOVER_MARGIN_SECONDS: f64 = 0.25;
+
+/// Frames a hovering pointer takes to slide onto its point.
+const HOVER_APPROACH_STEPS: u8 = 4;
+
+/// Points the hovering pointer moves in one of those frames.
+const HOVER_APPROACH_STEP: f32 = 2.0;
+
 /// Height of the window a toolbar is drawn in.
 const BAR_WINDOW_HEIGHT: f32 = 600.0;
 
@@ -45,6 +55,8 @@ pub struct Control {
     pub enabled: bool,
     /// The state of a toggle or a check box.
     pub toggled: Option<bool>,
+    /// What the widget says beyond its label, such as why it refuses input.
+    pub description: Option<String>,
 }
 
 impl Control {
@@ -85,6 +97,7 @@ pub fn controls(output: &egui::FullOutput) -> Vec<Control> {
                 Some(Toggled::False) => Some(false),
                 Some(Toggled::Mixed) | None => None,
             },
+            description: node.description().map(str::to_owned),
         });
     }
     found.sort_by(|a, b| {
@@ -92,6 +105,27 @@ pub fn controls(output: &egui::FullOutput) -> Vec<Control> {
             .partial_cmp(&(b.rect.top(), b.rect.left()))
             .unwrap_or(std::cmp::Ordering::Equal)
     });
+    found
+}
+
+/// Every text one frame painted, tooltips included.
+#[must_use]
+pub fn painted_texts(output: &egui::FullOutput) -> Vec<String> {
+    fn collect(shape: &egui::Shape, found: &mut Vec<String>) {
+        match shape {
+            egui::Shape::Text(text) => found.push(text.galley.text().to_owned()),
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect(shape, found);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut found = Vec::new();
+    for clipped in &output.shapes {
+        collect(&clipped.shape, &mut found);
+    }
     found
 }
 
@@ -240,6 +274,36 @@ impl Probe {
         let control = self.find(label)?;
         self.press_at(control.rect.center(), run);
         Ok(control)
+    }
+
+    /// Rest the pointer on `point` for longer than a tooltip takes to open, and
+    /// return the last frame.
+    ///
+    /// egui opens no tooltip for a pointer that last moved less than a tenth
+    /// of a second after a click, and it counts a pointer as moved only from
+    /// a velocity over several frames, never from one jump. The pointer
+    /// therefore waits past that time after a press the probe delivered, then
+    /// slides onto `point` over several frames.
+    pub fn hover(
+        &mut self,
+        point: egui::Pos2,
+        run: &mut impl FnMut(&egui::Context),
+    ) -> egui::FullOutput {
+        let moves = self.time + HOVER_MARGIN_SECONDS;
+        while self.time < moves {
+            let _ = self.frame(Vec::new(), run);
+        }
+        for step in (1..=HOVER_APPROACH_STEPS).rev() {
+            let along = egui::vec2(HOVER_APPROACH_STEP * f32::from(step), 0.0);
+            let _ = self.frame(vec![egui::Event::PointerMoved(point - along)], run);
+        }
+        let mut output = self.frame(vec![egui::Event::PointerMoved(point)], run);
+        let delay = f64::from(self.ctx.style().interaction.tooltip_delay);
+        let rested = self.time + delay + HOVER_MARGIN_SECONDS;
+        while self.time < rested {
+            output = self.frame(Vec::new(), run);
+        }
+        output
     }
 
     /// Press and release the primary button at `point`, then move the pointer

@@ -298,7 +298,7 @@ pub fn command_item_in(
         IconButton::new(&label, crate::icons::command_icon(command)).menu(),
     );
     if !enabled {
-        response.on_hover_text(reason);
+        let _ = disabled_reason(response, reason);
         return false;
     }
     if response.clicked() {
@@ -308,10 +308,39 @@ pub fn command_item_in(
     false
 }
 
+/// Attach why a disabled control refuses input.
+///
+/// egui draws a hover text only over an enabled widget, so the reason goes
+/// through the tooltip egui draws over a disabled one. The reason is also the
+/// description of the control's accessibility node, where a screen reader
+/// reads it. An enabled control is returned unchanged, so a tooltip it
+/// carries for its normal use still shows and the reason does not.
+#[must_use]
+pub fn disabled_reason(response: egui::Response, reason: &str) -> egui::Response {
+    if response.enabled() || reason.is_empty() {
+        return response;
+    }
+    describe_refusal(&response, reason);
+    response.on_disabled_hover_text(reason)
+}
+
+/// Name why a control refuses input in its accessibility node.
+///
+/// A control that refuses input while the widget under it stays enabled,
+/// such as an area that senses only hover, shows its reason through an
+/// ordinary tooltip and states it here.
+pub fn describe_refusal(response: &egui::Response, reason: &str) {
+    response.ctx.accesskit_node_builder(response.id, |node| {
+        node.set_description(reason.to_owned());
+    });
+}
+
 /// A menu entry for something this build does not do yet.
 pub fn pending_item(ui: &mut egui::Ui, label: &str) {
-    ui.add_enabled(false, egui::Button::new(label))
-        .on_hover_text("Not available in this build");
+    let _ = disabled_reason(
+        ui.add_enabled(false, egui::Button::new(label)),
+        "Not available in this build",
+    );
 }
 
 /// A toolbar button that is disabled with a stated reason rather than absent.
@@ -370,7 +399,7 @@ pub fn toolbar_button_with_icon(
     if enabled {
         response.clicked()
     } else {
-        response.on_hover_text(reason);
+        let _ = disabled_reason(response, reason);
         false
     }
 }
