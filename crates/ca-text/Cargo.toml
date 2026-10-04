@@ -7,6 +7,9 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+test-counters = []
+
 [dependencies]
 # Line breaks must be exactly LF, CR and CRLF. The crate's default feature set
 # also breaks lines on VT, FF, NEL, LS and PS, which would split a source file

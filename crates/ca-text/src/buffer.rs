@@ -18,6 +18,11 @@ use crate::eol::{self, LineEnding};
 
 static NEXT_REVISION: AtomicU64 = AtomicU64::new(1);
 
+#[cfg(feature = "test-counters")]
+std::thread_local! {
+    static TEXT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn next_revision() -> u64 {
     NEXT_REVISION.fetch_add(1, Ordering::Relaxed)
 }
@@ -287,7 +292,16 @@ impl TextBuffer {
     /// The whole buffer as a string.
     #[must_use]
     pub fn text(&self) -> String {
+        #[cfg(feature = "test-counters")]
+        TEXT_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
         self.rope.to_string()
+    }
+
+    /// Number of whole-buffer conversions on this thread.
+    #[cfg(feature = "test-counters")]
+    #[must_use]
+    pub fn text_call_count() -> usize {
+        TEXT_CALLS.with(std::cell::Cell::get)
     }
 
     /// Number of characters in the buffer.

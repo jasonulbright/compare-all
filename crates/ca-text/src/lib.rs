@@ -17,6 +17,8 @@
 
 #![allow(clippy::module_name_repetitions)]
 
+use std::sync::Arc;
+
 pub mod binary;
 pub mod buffer;
 pub mod encoding;
@@ -79,11 +81,11 @@ pub struct LoadedText {
     /// True when decoding needed replacement characters, so saving is lossy.
     pub had_errors: bool,
     /// Bytes past an honored end of file marker, preserved verbatim.
-    trailer: Vec<u8>,
+    trailer: Arc<[u8]>,
     /// The bytes as loaded, kept only when decoding was lossy. Re-encoding the
     /// decoded text would write replacement characters over content the buffer
     /// never held, so an unedited save replays these instead.
-    original: Option<Vec<u8>>,
+    original: Option<Arc<[u8]>>,
 }
 
 impl LoadedText {
@@ -98,8 +100,8 @@ impl LoadedText {
             source: decoded.source,
             eol,
             had_errors: decoded.had_errors,
-            trailer: decoded.trailer,
-            original: decoded.had_errors.then(|| bytes.to_vec()),
+            trailer: Arc::from(decoded.trailer),
+            original: decoded.had_errors.then(|| Arc::from(bytes)),
         }
     }
 
@@ -121,7 +123,7 @@ impl LoadedText {
                 return Err(SaveError::LossyLoad);
             }
             if let Some(original) = &self.original {
-                return Ok(original.clone());
+                return Ok(original.to_vec());
             }
         }
         let outcome = encode_file(&self.buffer.text(), self.spec, &self.trailer);
