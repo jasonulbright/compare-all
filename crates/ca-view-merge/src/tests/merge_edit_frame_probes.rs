@@ -131,18 +131,19 @@ fn two_lenders_on_one_line() -> (MergeView, tempfile::TempDir) {
 }
 
 #[test]
-fn two_lenders_on_one_line_get_their_text_back_in_every_take_order() {
-    let expected = "a\nL\ncdghi\nX\nf\n";
+fn two_lenders_and_the_holder_keep_one_copy_and_honor_selected_inputs() {
+    let holder_only = "a\nL\ncdghi\nX\nf\n";
+    let lenders_then_holder = "a\nL\nc\nd\ng\nh\ni\nX\nf\n";
     let (mut view, _dir) = two_lenders_on_one_line();
     take_at(&mut view, 1, Command::TakeLeft);
-    assert_eq!(view.output_text(), expected, "holder");
+    assert_eq!(view.output_text(), holder_only, "holder");
     let (mut view, _dir) = two_lenders_on_one_line();
     take_at(&mut view, 3, Command::TakeLeft);
     assert_eq!(view.output_text(), "a\nbcdghiX\nf\n", "second lender first");
     take_at(&mut view, 2, Command::TakeCenter);
     assert_eq!(view.output_text(), "a\nbcdghiX\nf\n", "first lender second");
     take_at(&mut view, 1, Command::TakeLeft);
-    assert_eq!(view.output_text(), expected, "holder last");
+    assert_eq!(view.output_text(), lenders_then_holder, "holder last");
     for _ in 0..3 {
         view.run(Command::Undo);
         assert_output_lines_match_pane(&view);
@@ -452,7 +453,7 @@ fn taking_all_non_conflicting_after_joining_several_lines_of_the_next_section_ke
 }
 
 #[test]
-fn taking_the_lender_after_joining_several_of_its_lines_keeps_one_copy() {
+fn retaking_a_lender_after_joining_lines_restores_its_selected_input() {
     let (mut view, _dir) = f1();
     for _ in 0..2 {
         view.output_pane.place(Caret::new(1, 0), false);
@@ -465,7 +466,7 @@ fn taking_the_lender_after_joining_several_of_its_lines_keeps_one_copy() {
     take_at(&mut view, 2, Command::TakeCenter);
     assert_eq!(view.output_text(), "a\nbcd\ng\nh\ni\nX\nf\n");
     take_at(&mut view, 1, Command::TakeLeft);
-    assert_eq!(view.output_text(), "a\nL\ncd\ng\nh\ni\nX\nf\n");
+    assert_eq!(view.output_text(), "a\nL\nc\nd\ng\nh\ni\nX\nf\n");
 }
 
 #[test]
