@@ -332,11 +332,10 @@ impl SettingsDialog {
                 // The control still shows the stored value, so the page reads
                 // the same either way, but it takes no edit: a field no engine
                 // reads must never look as though it changed something.
-                ui.add_enabled_ui(false, |ui| {
+                let shown = ui.add_enabled_ui(false, |ui| {
                     control(ui, field, &value);
-                })
-                .response
-                .on_hover_text(reason);
+                });
+                let _ = crate::widgets::disabled_reason(shown.response, reason);
                 return;
             }
             if let Some(edited) = control(ui, field, &value) {

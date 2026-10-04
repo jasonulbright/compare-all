@@ -253,6 +253,268 @@ fn row_controls_say_why_they_wait_for_the_comparison_of_an_edit() {
     assert_eq!(fixture.text(Side::Right), "one\nTWO\nthree\nfour\nfive\n");
 }
 
+/// The reasons of the ten row commands, from the view and from the toolbar.
+fn row_reasons(view: &TextView) -> Vec<(String, Option<&'static str>)> {
+    use ca_ui::toolbar::Item;
+
+    let mut found: Vec<(String, Option<&'static str>)> = [
+        Command::CopyToRight,
+        Command::CopyLineToRight,
+        Command::CopyToLeft,
+        Command::CopyLineToLeft,
+        Command::CopyToOtherSide,
+        Command::SelectSection,
+        Command::NextSection,
+        Command::PreviousSection,
+        Command::NextDifference,
+        Command::PreviousDifference,
+    ]
+    .into_iter()
+    .map(|command| (format!("{command:?}"), view.refusal(command)))
+    .collect();
+    for item in view.toolbar_items() {
+        if let Item::Command {
+            name,
+            enabled,
+            reason,
+            ..
+        } = item
+        {
+            if ["copy", "next-section", "previous-section"].contains(&name) {
+                assert!(!enabled, "{name} is enabled");
+                found.push((name.to_owned(), Some(reason)));
+            }
+        }
+    }
+    found
+}
+
+fn assert_every_row_reason(view: &TextView, expected: &str) {
+    for (name, reason) in row_reasons(view) {
+        assert_eq!(reason, Some(expected), "{name}");
+    }
+}
+
+#[test]
+fn row_commands_say_the_text_is_compared_again_after_a_rule_change_with_no_edit() {
+    let mut fixture = Fixture::new(COPY_LEFT, COPY_RIGHT);
+    let mut rules = fixture.view.rules();
+    rules.case_unimportant = !rules.case_unimportant;
+    fixture.view.set_rules(rules);
+    assert_every_row_reason(&fixture.view, super::NOT_COMPARED_AGAIN);
+    fixture.view.run(Command::NextSection);
+    assert_eq!(
+        fixture.view.message(),
+        Some(super::WAIT_FOR_COMPARISON_AGAIN)
+    );
+
+    fixture.view.left_pane.place(Caret::new(0, 0), false);
+    fixture.view.left_pane.type_character('z');
+    fixture.view.note_edit();
+    assert_every_row_reason(&fixture.view, super::EDIT_NOT_COMPARED);
+    fixture.view.run(Command::NextSection);
+    assert_eq!(fixture.view.message(), Some(super::WAIT_FOR_COMPARISON));
+
+    fixture.settle();
+    let mut settings = fixture.view.session_settings().clone();
+    settings.alignment.never_align_differences = !settings.alignment.never_align_differences;
+    fixture.view.apply_session_settings(settings);
+    assert!(!fixture.view.rows_current());
+    assert_every_row_reason(&fixture.view, super::NOT_COMPARED_AGAIN);
+}
+
+#[test]
+fn an_edit_after_a_rule_change_is_named_as_the_wait() {
+    let mut fixture = Fixture::new(COPY_LEFT, COPY_RIGHT);
+    fixture.view.left_pane.place(Caret::new(0, 0), false);
+    fixture.view.left_pane.type_character('z');
+    fixture.view.note_edit();
+    let mut rules = fixture.view.rules();
+    rules.case_unimportant = !rules.case_unimportant;
+    fixture.view.set_rules(rules);
+    assert_every_row_reason(&fixture.view, super::EDIT_NOT_COMPARED);
+}
+
+#[test]
+fn a_failed_or_stopped_comparison_names_reload_as_the_way_out() {
+    use super::Status;
+
+    for (status, locked, expected) in [
+        (
+            Status::Failed("unreadable".to_owned()),
+            false,
+            super::FAILED,
+        ),
+        (Status::Cancelled, false, super::STOPPED),
+        (
+            Status::Failed("unreadable".to_owned()),
+            true,
+            super::FAILED_LOCKED,
+        ),
+        (Status::Cancelled, true, super::STOPPED_LOCKED),
+    ] {
+        let mut fixture = Fixture::new(COPY_LEFT, COPY_RIGHT);
+        fixture.view.status = status.clone();
+        fixture.view.locked = locked;
+        let mut reasons = row_reasons(&fixture.view);
+        reasons.retain(|(name, _)| !locked || !(name.contains("Copy") || name == "copy"));
+        for (name, reason) in reasons {
+            assert_eq!(reason, Some(expected), "{status:?} {name}");
+        }
+        let report = fixture
+            .view
+            .toolbar_items()
+            .into_iter()
+            .find_map(|item| match item {
+                ca_ui::toolbar::Item::Command {
+                    name: "report",
+                    reason,
+                    ..
+                } => Some(reason),
+                _ => None,
+            });
+        assert_eq!(report, Some(expected), "{status:?} report");
+        fixture.view.run(Command::NextSection);
+        assert_eq!(
+            fixture.view.message(),
+            Some(format!("{expected}.").as_str()),
+            "{status:?}"
+        );
+    }
+}
+
+/// No command the view accepts carries a reason for refusing it.
+fn assert_no_reason_for_an_accepted_command(view: &TextView, state: &str) {
+    for command in Command::ALL {
+        let reason = view.refusal(*command);
+        assert!(
+            reason.is_none() || !view.accepts(*command),
+            "{state}: {command:?} is accepted and refused with {reason:?}"
+        );
+    }
+}
+
+#[test]
+fn a_copy_into_a_read_only_pane_names_that_pane() {
+    let mut fixture = Fixture::new(COPY_LEFT, COPY_RIGHT);
+    fixture.view.right_pane.set_read_only(true);
+    assert_no_reason_for_an_accepted_command(&fixture.view, "settled");
+    for command in [Command::CopyToRight, Command::CopyLineToRight] {
+        assert!(!fixture.view.accepts(command));
+        assert_eq!(
+            fixture.view.refusal(command),
+            Some(super::RIGHT_READ_ONLY),
+            "{command:?}"
+        );
+    }
+    assert_eq!(fixture.view.active, Side::Left);
+    assert_eq!(
+        fixture.view.refusal(Command::CopyToOtherSide),
+        Some(super::RIGHT_READ_ONLY)
+    );
+    assert!(fixture.view.accepts(Command::CopyToLeft));
+    assert_eq!(fixture.view.refusal(Command::CopyToLeft), None);
+
+    fixture.view.left_pane.place(Caret::new(0, 0), false);
+    fixture.view.left_pane.type_character('z');
+    fixture.view.note_edit();
+    assert_no_reason_for_an_accepted_command(&fixture.view, "after a left edit");
+    assert_eq!(
+        fixture.view.refusal(Command::CopyToRight),
+        Some(super::RIGHT_READ_ONLY)
+    );
+    assert_eq!(
+        fixture.view.refusal(Command::CopyToLeft),
+        Some(super::EDIT_NOT_COMPARED)
+    );
+
+    fixture.view.active = Side::Right;
+    fixture.view.right_pane.set_read_only(false);
+    fixture.view.left_pane.set_read_only(true);
+    assert_eq!(
+        fixture.view.refusal(Command::CopyToOtherSide),
+        Some(super::LEFT_READ_ONLY)
+    );
+    assert_eq!(
+        fixture.view.refusal(Command::CopyLineToLeft),
+        Some(super::LEFT_READ_ONLY)
+    );
+}
+
+#[test]
+fn a_copy_with_editing_off_names_the_read_only_pane_and_a_fixed_view_says_it_is_read_only() {
+    let mut fixture = Fixture::new(COPY_LEFT, COPY_RIGHT);
+    let mut settings = fixture.view.session_settings().clone();
+    settings.specs.disable_editing = true;
+    fixture.view.apply_session_settings(settings);
+    fixture.settle();
+    assert_no_reason_for_an_accepted_command(&fixture.view, "editing off");
+    assert_eq!(
+        fixture.view.refusal(Command::CopyToRight),
+        Some(super::RIGHT_READ_ONLY)
+    );
+    assert_eq!(
+        fixture.view.refusal(Command::CopyToLeft),
+        Some(super::LEFT_READ_ONLY)
+    );
+
+    fixture.view.locked = true;
+    assert_no_reason_for_an_accepted_command(&fixture.view, "locked");
+    for command in [
+        Command::CopyToRight,
+        Command::CopyLineToLeft,
+        Command::CopyToOtherSide,
+    ] {
+        assert_eq!(
+            fixture.view.refusal(command),
+            Some(super::LOCKED),
+            "{command:?}"
+        );
+    }
+}
+
+/// The reason a disabled row control gives is the one drawn while the pointer
+/// rests on it and the one its accessibility node describes.
+#[test]
+fn a_row_control_shows_the_wait_for_a_comparison_of_unchanged_text_on_hover() {
+    use ca_ui::testing::probe::{painted_texts, Probe};
+
+    let mut fixture = Fixture::new(COPY_LEFT, COPY_RIGHT);
+    let mut rules = fixture.view.rules();
+    rules.case_unimportant = !rules.case_unimportant;
+    fixture.view.set_rules(rules);
+    let context = ca_ui::testing::context();
+    let mut probe = Probe::new(2_400.0, 900.0);
+    let view = &mut fixture.view;
+    let mut draw = |ctx: &egui::Context| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            view.ui(ui, &context);
+        });
+    };
+    probe.idle(&mut draw);
+    probe.idle(&mut draw);
+    for label in ["Next Section", "Copy to Right"] {
+        let control = probe.find_all(label).remove(0);
+        assert!(!control.enabled, "{label}");
+        let output = probe.hover(control.rect.center(), &mut draw);
+        let painted = painted_texts(&output);
+        assert!(
+            painted.iter().any(|text| text == super::NOT_COMPARED_AGAIN),
+            "{label}: painted {painted:?}"
+        );
+        let described = probe
+            .find_all(label)
+            .into_iter()
+            .find(|found| found.rect == control.rect)
+            .and_then(|found| found.description);
+        assert_eq!(
+            described.as_deref(),
+            Some(super::NOT_COMPARED_AGAIN),
+            "{label}"
+        );
+    }
+}
+
 /// Sections at rows 1, 3..5 and 7; rows 3 and 4 hold no left line.
 const GAP_LEFT: &str = "a\nb\nc\nd\ne\nf\n";
 const GAP_RIGHT: &str = "a\nB\nc\nX\nY\nd\ne\nF\n";

@@ -346,14 +346,16 @@ impl SessionView for HomeView {
             // the launcher without this file naming it.
             for (kind, available) in launcher_entries() {
                 if !available {
-                    ui.add_enabled(
-                        false,
-                        widgets::IconButton::new(
-                            kind.title(),
-                            Some(ca_ui::icons::session_icon(&kind)),
+                    let _ = widgets::disabled_reason(
+                        ui.add_enabled(
+                            false,
+                            widgets::IconButton::new(
+                                kind.title(),
+                                Some(ca_ui::icons::session_icon(&kind)),
+                            ),
                         ),
-                    )
-                    .on_hover_text("Not available in this build");
+                        "Not available in this build",
+                    );
                     continue;
                 }
                 let mut response = ui.add(widgets::IconButton::new(
