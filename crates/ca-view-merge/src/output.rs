@@ -14,7 +14,7 @@
 
 use crate::jobs::Sources;
 use crate::model::MergeModel;
-use ca_text::{LoadedText, TextBuffer};
+use ca_text::{EditSnapshot, LineRange, LoadedText, TextBuffer};
 use ca_ui::save::text::SaveConsent;
 use ca_ui::save::{Baseline, FileSystem, SaveOutcome};
 use std::path::Path;
@@ -37,6 +37,76 @@ pub struct MarkerLabels {
     pub center: String,
     /// Name written on the closing marker.
     pub right: String,
+}
+
+/// Rope snapshots of the inputs that supply marker blocks.
+#[derive(Debug)]
+pub(crate) struct MarkerSaveInputs {
+    pub(crate) left: EditSnapshot,
+    pub(crate) center: Option<EditSnapshot>,
+    pub(crate) right: EditSnapshot,
+}
+
+impl MarkerSaveInputs {
+    /// Share the input text without copying it on the UI thread.
+    pub(crate) fn from_sources(sources: &Sources) -> Self {
+        Self {
+            left: sources.left.buffer.edit_snapshot(),
+            center: sources
+                .center
+                .as_ref()
+                .map(|source| source.buffer.edit_snapshot()),
+            right: sources.right.buffer.edit_snapshot(),
+        }
+    }
+}
+
+/// The small piece of merge state a marker save needs from the UI thread.
+/// The input and output text remain in their rope-backed buffers and are read
+/// by the save worker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MarkerSavePlan {
+    two_way: bool,
+    sections: Vec<MarkerSaveSection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MarkerSaveSection {
+    index: usize,
+    output: std::ops::Range<u32>,
+    left: std::ops::Range<u32>,
+    center: std::ops::Range<u32>,
+    right: std::ops::Range<u32>,
+}
+
+impl MarkerSavePlan {
+    /// Copy conflict ranges without cloning the merge model or its text.
+    pub(crate) fn from_model(model: &MergeModel) -> Self {
+        let mut sections = Vec::new();
+        for (index, section) in model.sections().iter().enumerate() {
+            if !section.is_unresolved_conflict() {
+                continue;
+            }
+            if let Some(output) = model.output_range(index) {
+                sections.push(MarkerSaveSection {
+                    index,
+                    output,
+                    left: section.left.clone(),
+                    center: section.center.clone(),
+                    right: section.right.clone(),
+                });
+            }
+        }
+        Self {
+            two_way: model.inputs().two_way,
+            sections,
+        }
+    }
+
+    /// Sections whose markers the save will write.
+    pub(crate) fn waiting_sections(&self) -> Vec<usize> {
+        self.sections.iter().map(|section| section.index).collect()
+    }
 }
 
 impl Default for MarkerLabels {
@@ -134,6 +204,92 @@ pub fn marked_text(model: &MergeModel, labels: &MarkerLabels) -> String {
     text
 }
 
+/// Compose markers around unresolved regions using immutable pane snapshots.
+///
+/// This is used by the save worker so a large output, or a large merge model,
+/// is not copied on the UI frame thread.
+pub(crate) fn marked_text_from_snapshot(
+    output: &TextBuffer,
+    left: &TextBuffer,
+    center: Option<&TextBuffer>,
+    right: &TextBuffer,
+    plan: &MarkerSavePlan,
+    labels: &MarkerLabels,
+) -> String {
+    let end = terminator_from_buffers(output, left);
+    let output_len = output.len_lines();
+    let mut text = String::new();
+    let mut cursor = 0;
+    for section in &plan.sections {
+        let start = section.output.start.max(cursor).min(output_len);
+        let finish = section.output.end.max(start).min(output_len);
+        push_piece(
+            &mut text,
+            &output.line_range_text(LineRange::new(cursor, start)),
+            end,
+        );
+        write_marker(&mut text, "<<<<<<< ", &labels.left, end);
+        push_piece(
+            &mut text,
+            &left.line_range_text(LineRange::new(section.left.start, section.left.end)),
+            end,
+        );
+        if !plan.two_way {
+            write_marker(&mut text, "||||||| ", &labels.center, end);
+            if let Some(center) = center {
+                push_piece(
+                    &mut text,
+                    &center
+                        .line_range_text(LineRange::new(section.center.start, section.center.end)),
+                    end,
+                );
+            }
+        }
+        write_marker(&mut text, "=======", "", end);
+        push_piece(
+            &mut text,
+            &right.line_range_text(LineRange::new(section.right.start, section.right.end)),
+            end,
+        );
+        write_marker(&mut text, ">>>>>>> ", &labels.right, end);
+        cursor = finish;
+    }
+    push_piece(
+        &mut text,
+        &output.line_range_text(LineRange::new(cursor, output_len)),
+        end,
+    );
+    text
+}
+
+/// The marker line ending chosen by the model, found without flattening the
+/// output or input buffers.
+fn terminator_from_buffers(output: &TextBuffer, left: &TextBuffer) -> &'static str {
+    let mut has_carriage_return = false;
+    for buffer in [output, left] {
+        for index in 0..buffer.len_lines() {
+            let Some(line) = buffer.line(index) else {
+                continue;
+            };
+            let length = line.len_chars();
+            if length == 0 {
+                continue;
+            }
+            match line.char(length - 1) {
+                '\n' if length > 1 && line.char(length - 2) == '\r' => return "\r\n",
+                '\n' => return "\n",
+                '\r' => has_carriage_return = true,
+                _ => {}
+            }
+        }
+    }
+    if has_carriage_return {
+        "\r"
+    } else {
+        "\n"
+    }
+}
+
 /// Write one marker line: the marker, the name it carries and a terminator.
 fn write_marker(text: &mut String, marker: &str, label: &str, end: &str) {
     push_piece(text, &format!("{marker}{label}{end}"), end);
@@ -189,13 +345,17 @@ pub fn to_bytes(
 /// source that did not decode cleanly and therefore needs explicit consent.
 #[must_use]
 pub fn contains_lossy_input(model: &MergeModel, sources: &Sources) -> bool {
-    model.output_text().contains('\u{fffd}')
-        && (sources.left.had_errors
-            || sources
-                .center
-                .as_ref()
-                .is_some_and(|source| source.had_errors)
-            || sources.right.had_errors)
+    let has_lossy_source = sources.left.had_errors
+        || sources
+            .center
+            .as_ref()
+            .is_some_and(|source| source.had_errors)
+        || sources.right.had_errors;
+    has_lossy_source
+        && model
+            .output_lines()
+            .iter()
+            .any(|line| line.contains('\u{fffd}'))
 }
 
 fn encoded(
@@ -251,12 +411,13 @@ pub fn save_with_endings(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::{
-        exit_code, marked_text, save, to_bytes, MarkerLabels, Outcome, EXIT_CONFLICTS,
-        EXIT_CONFLICTS_NOT_WRITTEN, EXIT_ERROR, EXIT_SUCCESS,
+        exit_code, marked_text, marked_text_from_snapshot, save, to_bytes, MarkerLabels,
+        MarkerSavePlan, Outcome, EXIT_CONFLICTS, EXIT_CONFLICTS_NOT_WRITTEN, EXIT_ERROR,
+        EXIT_SUCCESS,
     };
     use crate::model::{split, Inputs, MergeModel, Resolution};
     use ca_diff::merge3::MergeOptions;
-    use ca_text::{DecodeOptions, LoadedText};
+    use ca_text::{DecodeOptions, LoadedText, TextBuffer};
     use ca_ui::save::text::SaveConsent;
     use ca_ui::save::{Baseline, FileSystem, RealFileSystem, SaveOutcome, Stamp};
     use std::collections::HashMap;
@@ -319,6 +480,78 @@ mod tests {
 
     fn template() -> LoadedText {
         LoadedText::load(b"a\n", &DecodeOptions::default())
+    }
+
+    fn joined(lines: &[String]) -> String {
+        let mut text = String::new();
+        for line in lines {
+            text.push_str(line);
+        }
+        text
+    }
+
+    fn marked_snapshot(model: &MergeModel, labels: &MarkerLabels) -> String {
+        let inputs = model.inputs();
+        let output = TextBuffer::from_text(&model.output_text());
+        let left = TextBuffer::from_text(&joined(&inputs.left));
+        let center = (!inputs.two_way).then(|| TextBuffer::from_text(&joined(&inputs.center)));
+        let right = TextBuffer::from_text(&joined(&inputs.right));
+        marked_text_from_snapshot(
+            &output,
+            &left,
+            center.as_ref(),
+            &right,
+            &MarkerSavePlan::from_model(model),
+            labels,
+        )
+    }
+
+    #[test]
+    fn marker_save_snapshot_matches_the_model_for_line_endings_and_resolutions() {
+        let labels = MarkerLabels {
+            left: "left.txt".to_owned(),
+            center: "base.txt".to_owned(),
+            right: "right.txt".to_owned(),
+        };
+        let cases = [
+            model("a\nL\nc\n", "a\nb\nc\n", "a\nR\nc\n"),
+            model("a\rL\rc\r", "a\rb\rc\r", "a\rR\rc\r"),
+            model("k\rx\rm\r", "k\rc\rm\r", "k\n\nm\n"),
+        ];
+        for merged in cases {
+            assert_eq!(
+                marked_snapshot(&merged, &labels),
+                marked_text(&merged, &labels),
+            );
+        }
+
+        let two_way = MergeModel::build(
+            Inputs {
+                left: split("L\n"),
+                center: Vec::new(),
+                right: split("R\n"),
+                two_way: true,
+            },
+            &MergeOptions::default(),
+            &ca_ui::worker::Cancel::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            marked_snapshot(&two_way, &labels),
+            marked_text(&two_way, &labels),
+        );
+
+        let mut resolved = model("a\nL\nc\n", "a\nb\nc\n", "a\nR\nc\n");
+        let section = resolved
+            .sections()
+            .iter()
+            .position(crate::model::Section::is_unresolved_conflict)
+            .unwrap();
+        resolved.set_resolution(section, Resolution::Left);
+        assert_eq!(
+            marked_snapshot(&resolved, &labels),
+            marked_text(&resolved, &labels),
+        );
     }
 
     #[test]

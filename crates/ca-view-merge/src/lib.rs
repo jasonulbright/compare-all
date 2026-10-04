@@ -23,7 +23,7 @@ use ca_ui::filter::Visible;
 use ca_ui::find::{self, FindOperation, FindPanel, FindSettings, FindTask, PanelRequest};
 use ca_ui::report::{ReportKind, ViewReport};
 use ca_ui::save::text::SaveConsent;
-use ca_ui::save::{Baseline, SaveMessage, SaveOutcome};
+use ca_ui::save::{Baseline, SaveOutcome};
 use ca_ui::scroll::RowScroll;
 use ca_ui::theme::merge::{palette as merge_palette, MergeClass, Palette};
 use ca_ui::theme::Variant;
@@ -233,6 +233,34 @@ impl Question {
     }
 }
 
+#[derive(Debug)]
+enum MergeSaveMessage {
+    Done {
+        outcome: Box<SaveOutcome>,
+        output: String,
+        marks: Vec<usize>,
+    },
+    Cancelled,
+}
+
+impl ca_ui::worker::Terminal for MergeSaveMessage {
+    fn is_terminal(&self) -> bool {
+        true
+    }
+
+    fn cancelled() -> Self {
+        Self::Cancelled
+    }
+
+    fn panicked(detail: String) -> Self {
+        Self::Done {
+            outcome: Box::new(SaveOutcome::Failed(detail)),
+            output: String::new(),
+            marks: Vec::new(),
+        }
+    }
+}
+
 /// A rectangle one frame drew, named, for a layout check.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct WidgetRect {
@@ -257,12 +285,10 @@ pub struct MergeView {
     data: MergeData,
     status: Status,
     job: Option<Job<MergeMessage>>,
-    save_job: Option<Job<SaveMessage>>,
+    save_job: Option<Job<MergeSaveMessage>>,
     save_rules: ca_ui::save::SaveRules,
-    saving_output: Option<String>,
     saving_revision: Option<u64>,
     saving_conflicts: Option<u32>,
-    saving_marks: Option<Vec<usize>>,
     /// The sections that waited for review in the output last written, or
     /// in the merge as it loaded before any write. A save writes markers for
     /// exactly these, so a different set is an unsaved change.
@@ -488,10 +514,8 @@ impl MergeView {
             job: None,
             save_job: None,
             save_rules: ca_ui::save::SaveRules::default(),
-            saving_output: None,
             saving_revision: None,
             saving_conflicts: None,
-            saving_marks: None,
             written_marks: Vec::new(),
             marks_changed: false,
             output_pane: ca_ui::editor::Pane::default(),
@@ -887,9 +911,13 @@ impl MergeView {
         let mut finished = job.is_finished();
         for message in messages {
             match message {
-                SaveMessage::Cancelled => finished = true,
-                SaveMessage::Done(outcome) => {
-                    self.finish_save(*outcome);
+                MergeSaveMessage::Cancelled => finished = true,
+                MergeSaveMessage::Done {
+                    outcome,
+                    output,
+                    marks,
+                } => {
+                    self.finish_save(*outcome, output, marks);
                     finished = true;
                 }
             }
@@ -899,11 +927,14 @@ impl MergeView {
         }
     }
 
-    fn finish_save(&mut self, outcome: SaveOutcome) {
-        let saved_output = self.saving_output.take();
+    fn finish_save(
+        &mut self,
+        outcome: SaveOutcome,
+        saved_output: String,
+        saving_marks: Vec<usize>,
+    ) {
         let saving_revision = self.saving_revision.take();
         let saving_conflicts = self.saving_conflicts.take();
-        let saving_marks = self.saving_marks.take();
         self.consent = SaveConsent::default();
         let conflict_backup = match &outcome {
             SaveOutcome::SavedWithConflict { backup, .. } => Some(backup.display().to_string()),
@@ -912,12 +943,10 @@ impl MergeView {
         match outcome {
             SaveOutcome::Saved(stamp) | SaveOutcome::SavedWithConflict { stamp, .. } => {
                 self.output_baseline = Baseline::Present(stamp);
-                self.saved_output = saved_output;
+                self.saved_output = Some(saved_output);
                 self.saved_conflicts = saving_conflicts;
-                if let Some(marks) = saving_marks {
-                    self.written_marks = marks;
-                    self.marks_changed = self.waiting_sections() != self.written_marks;
-                }
+                self.written_marks = saving_marks;
+                self.marks_changed = self.waiting_sections() != self.written_marks;
                 self.output_changed_on_load = false;
                 if let Some(revision) = saving_revision {
                     self.output_pane.buffer_mut().mark_saved_revision(revision);
@@ -1546,50 +1575,73 @@ impl MergeView {
         if self.save_job.is_some() {
             return;
         }
+        if self.accept_markers {
+            self.absorb_output_edits();
+        }
         let conflicts = self.data.model.totals().conflicts_remaining;
         if conflicts > 0 && !self.accept_markers {
             self.question = Some(Question::SaveWithConflicts);
             return;
         }
         let markers = (conflicts > 0).then(|| self.marker_labels());
-        let model = markers.as_ref().map(|_| self.data.model.clone());
+        let marker_plan = markers
+            .as_ref()
+            .map(|_| output::MarkerSavePlan::from_model(&self.data.model));
         let snapshot = self.output_pane.buffer().edit_snapshot();
-        self.saving_output = Some(self.output_pane.buffer().text());
         self.saving_revision = Some(self.output_pane.buffer().revision());
         self.saving_conflicts = Some(conflicts);
-        self.saving_marks = Some(self.waiting_sections());
+        let marker_inputs = marker_plan
+            .as_ref()
+            .map(|_| output::MarkerSaveInputs::from_sources(&self.data.sources));
         let template = self.data.sources.left.clone();
         let expected = self.output_baseline;
         let consent = self.consent;
         let rules = self.save_rules.clone();
-        self.save_job = Some(ca_ui::save::spawn_with(
-            Arc::clone(&self.notify),
-            move || {
-                if let Some(model) = model {
-                    output::save_with_endings(
-                        &rules.files(),
-                        &path,
-                        &model,
-                        &template,
-                        markers.as_ref(),
-                        expected,
-                        consent,
-                        rules.line_endings,
-                    )
+        self.save_job = Some(Job::spawn_notifying(
+            move |emitter, _| {
+                let saved_output = snapshot.buffer().text();
+                let marked = match (
+                    markers.as_ref(),
+                    marker_plan.as_ref(),
+                    marker_inputs.as_ref(),
+                ) {
+                    (Some(labels), Some(plan), Some(inputs)) => {
+                        Some(output::marked_text_from_snapshot(
+                            snapshot.buffer(),
+                            inputs.left.buffer(),
+                            inputs.center.as_ref().map(ca_text::EditSnapshot::buffer),
+                            inputs.right.buffer(),
+                            plan,
+                            labels,
+                        ))
+                    }
+                    _ => None,
+                };
+                let marks = marker_plan
+                    .as_ref()
+                    .map_or_else(Vec::new, output::MarkerSavePlan::waiting_sections);
+                let mut loaded = template;
+                if let Some(marked) = marked {
+                    loaded.buffer = TextBuffer::from_text(&marked);
                 } else {
-                    let mut loaded = template;
                     loaded.buffer = TextBuffer::from_rope(snapshot.buffer().rope().clone());
-                    loaded.had_errors = false;
-                    ca_ui::save::text::save_with_endings(
-                        &rules.files(),
-                        &path,
-                        &loaded,
-                        expected,
-                        consent,
-                        rules.line_endings,
-                    )
                 }
+                loaded.had_errors = false;
+                let outcome = ca_ui::save::text::save_with_endings(
+                    &rules.files(),
+                    &path,
+                    &loaded,
+                    expected,
+                    consent,
+                    rules.line_endings,
+                );
+                emitter.send(MergeSaveMessage::Done {
+                    outcome: Box::new(outcome),
+                    output: saved_output,
+                    marks,
+                });
             },
+            Arc::clone(&self.notify),
         ));
     }
 
@@ -2895,7 +2947,7 @@ mod tests {
     mod merge_edit_probes;
     mod randomized_merge_driver;
 
-    use super::{MergeView, Question, GIVEN_BACK};
+    use super::{Job, MergeSaveMessage, MergeView, Question, GIVEN_BACK};
     use crate::model::Resolution;
     use ca_ui::command::Command;
     use ca_ui::testing::{context, raw_input};
@@ -3835,6 +3887,38 @@ mod tests {
     }
 
     #[test]
+    fn saving_does_not_flatten_output_on_the_frame_thread() {
+        let (mut resolved, _) = open("a\nL\nc\n", Some("a\nb\nc\n"), "a\nb\nc\n");
+        run_until_ready(&mut resolved);
+        let before = super::MergeModel::output_text_call_count();
+        let pane_before = ca_text::TextBuffer::text_call_count();
+        resolved.save_output();
+        assert_eq!(super::MergeModel::output_text_call_count(), before);
+        assert_eq!(ca_text::TextBuffer::text_call_count(), pane_before);
+        assert!(ca_ui::testing::wait_until(Duration::from_secs(20), || {
+            resolved.drain_save();
+            !resolved.is_saving()
+        }));
+        assert_eq!(super::MergeModel::output_text_call_count(), before);
+        assert_eq!(ca_text::TextBuffer::text_call_count(), pane_before);
+
+        let (mut marked, _) = open("a\nL\nc\n", Some("a\nb\nc\n"), "a\nR\nc\n");
+        run_until_ready(&mut marked);
+        marked.accept_markers = true;
+        let before = super::MergeModel::output_text_call_count();
+        let pane_before = ca_text::TextBuffer::text_call_count();
+        marked.save_output();
+        assert_eq!(super::MergeModel::output_text_call_count(), before);
+        assert_eq!(ca_text::TextBuffer::text_call_count(), pane_before);
+        assert!(ca_ui::testing::wait_until(Duration::from_secs(20), || {
+            marked.drain_save();
+            !marked.is_saving()
+        }));
+        assert_eq!(super::MergeModel::output_text_call_count(), before);
+        assert_eq!(ca_text::TextBuffer::text_call_count(), pane_before);
+    }
+
+    #[test]
     fn randomized_merges_save_the_pane_in_every_line_ending_style() {
         use std::fmt::Write as _;
         struct Random(u64);
@@ -4238,10 +4322,18 @@ mod tests {
         let (mut view, _dir) = open("a\nL\nc\n", Some("a\nb\nc\n"), "a\nR\nc\n");
         run_until_ready(&mut view);
         view.consent.accept_disk_change = true;
-        view.finish_save(ca_ui::save::SaveOutcome::NotWritable);
+        view.finish_save(
+            ca_ui::save::SaveOutcome::NotWritable,
+            String::new(),
+            Vec::new(),
+        );
         assert!(!view.consent.accept_disk_change);
 
-        view.finish_save(ca_ui::save::SaveOutcome::ChangedOnDisk);
+        view.finish_save(
+            ca_ui::save::SaveOutcome::ChangedOnDisk,
+            String::new(),
+            Vec::new(),
+        );
 
         assert_eq!(view.question(), Some(&Question::OverwriteChanged));
     }
@@ -4326,10 +4418,17 @@ mod tests {
         view.run(Command::TakeLeft);
 
         let (release, wait) = std::sync::mpsc::channel();
-        view.save_job = Some(ca_ui::save::spawn_with(Arc::new(|| {}), move || {
-            wait.recv().unwrap();
-            ca_ui::save::SaveOutcome::NotWritable
-        }));
+        view.save_job = Some(Job::spawn_notifying(
+            move |emitter, _| {
+                wait.recv().unwrap();
+                emitter.send(MergeSaveMessage::Done {
+                    outcome: Box::new(ca_ui::save::SaveOutcome::NotWritable),
+                    output: String::new(),
+                    marks: Vec::new(),
+                });
+            },
+            Arc::new(|| {}),
+        ));
 
         assert!(SessionView::is_busy(&view));
         assert!(!view.may_close());
@@ -5103,6 +5202,23 @@ mod tests {
         let expected = format!(
             "a\r\nxb\rc\n{}",
             marker_block(&view, "\r\n", ["L\n", "B\n", "R\n"])
+        );
+        assert_eq!(saved, expected);
+        assert_output_lines_match_pane(&view);
+    }
+
+    #[test]
+    fn a_marker_save_keeps_conflict_ranges_aligned_with_a_pending_line_insert() {
+        let (mut view, dir) = open("a\nL\nc\n", Some("a\nb\nc\n"), "a\nR\nc\n");
+        run_until_ready(&mut view);
+        view.output_pane
+            .place(ca_ui::editor::Caret::new(0, 0), false);
+        view.output_pane.paste("prefix\n");
+
+        let saved = save_with_markers(&mut view, &dir);
+        let expected = format!(
+            "prefix\na\n{}c\n",
+            marker_block(&view, "\n", ["L\n", "b\n", "R\n"])
         );
         assert_eq!(saved, expected);
         assert_output_lines_match_pane(&view);
