@@ -257,6 +257,59 @@ fn a_cancelled_read_of_a_solid_container_returns_promptly() {
     assert!(started.elapsed() < Duration::from_secs(10));
 }
 
+// --- 7z coder memory -----------------------------------------------------
+
+/// A 7z whose one LZMA2 coder names a 4 GiB dictionary for a 23-byte entry.
+const SEVENZ_ENTRY_FOUR_GIB_DICTIONARY: &[u8] = include_bytes!("fixtures/dict-4gib.7z");
+/// A 7z whose encoded header is coded LZMA with a 4 GiB dictionary.
+const SEVENZ_HEADER_LZMA_FOUR_GIB_DICTIONARY: &[u8] =
+    include_bytes!("fixtures/encoded-header-dict-4gib.7z");
+/// A 7z whose encoded header is coded LZMA2 with a 4 GiB dictionary.
+const SEVENZ_HEADER_LZMA2_FOUR_GIB_DICTIONARY: &[u8] =
+    include_bytes!("fixtures/encoded-header-lzma2-dict-4gib.7z");
+
+fn is_decoder_memory_refusal(error: &VfsError) -> bool {
+    matches!(
+        error,
+        VfsError::LimitExceeded {
+            kind: LimitKind::DecoderMemory,
+            ..
+        }
+    )
+}
+
+#[test]
+fn a_7z_entry_whose_coder_names_a_dictionary_past_the_limit_is_refused_with_a_message() {
+    let fs = open_memory(SEVENZ_ENTRY_FOUR_GIB_DICTIONARY.to_vec(), "x.7z").unwrap();
+    let listed: Vec<String> = fs
+        .list(&VfsPath::root(), &Cancel::new())
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.name)
+        .collect();
+    assert_eq!(listed, ["a.txt"]);
+    let error = fs
+        .open(&VfsPath::parse("a.txt").unwrap(), &Cancel::new())
+        .map(|_| ())
+        .unwrap_err();
+    assert!(is_decoder_memory_refusal(&error), "{error:?}");
+    assert!(error.to_string().contains("268435456"), "{error}");
+}
+
+#[test]
+fn a_7z_header_whose_coder_names_a_dictionary_past_the_limit_is_refused_with_a_message() {
+    for bytes in [
+        SEVENZ_HEADER_LZMA_FOUR_GIB_DICTIONARY,
+        SEVENZ_HEADER_LZMA2_FOUR_GIB_DICTIONARY,
+    ] {
+        let error = open_memory(bytes.to_vec(), "x.7z")
+            .and_then(|fs| fs.list(&VfsPath::root(), &Cancel::new()).map(|_| ()))
+            .unwrap_err();
+        assert!(is_decoder_memory_refusal(&error), "{error:?}");
+        assert!(error.to_string().contains("268435456"), "{error}");
+    }
+}
+
 // --- a file and a directory of the same name -----------------------------
 
 #[test]
