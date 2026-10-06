@@ -191,22 +191,26 @@ pub fn system_open_command(path: &std::path::Path) -> LaunchCommand {
 
 /// The command that shows `path` in the platform's file manager.
 ///
-/// Files are selected where the platform offers that operation. Folders are
-/// opened directly. The path is always one process argument; it is never
+/// Files are selected where the platform offers that operation. On macOS a
+/// folder is selected in its parent too; elsewhere a folder is opened
+/// directly. The path is always one process argument; it is never
 /// interpolated into a shell command.
 #[must_use]
 pub fn system_explorer_command(path: &std::path::Path, selection: Selection) -> LaunchCommand {
-    if std::env::consts::OS == "windows" {
+    explorer_command_on(std::env::consts::OS, path, selection)
+}
+
+/// [`system_explorer_command`] for the platform named `os`.
+fn explorer_command_on(os: &str, path: &std::path::Path, selection: Selection) -> LaunchCommand {
+    if os == "windows" {
         return windows_explorer_command(path, selection);
     }
-    let (program, arguments) = match (std::env::consts::OS, selection) {
-        ("macos", Selection::Files) => (
+    let (program, arguments) = match (os, selection) {
+        // An application bundle is a folder, and `open` on it starts the
+        // application, so a folder is revealed like a file.
+        ("macos", _) => (
             std::path::PathBuf::from("/usr/bin/open"),
             vec!["-R".to_owned(), path.display().to_string()],
-        ),
-        ("macos", Selection::Folders) => (
-            std::path::PathBuf::from("/usr/bin/open"),
-            vec![path.display().to_string()],
         ),
         (_, Selection::Files) => (
             std::path::PathBuf::from("xdg-open"),
@@ -336,8 +340,8 @@ pub fn spawn(
 #[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::{
-        commands_of, label_of, offered, spawn, system_explorer_command, windows_explorer_command,
-        LaunchMessage, Selection, Spawner,
+        commands_of, explorer_command_on, label_of, offered, spawn, system_explorer_command,
+        windows_explorer_command, LaunchMessage, Selection, Spawner,
     };
     use ca_session::options::{
         LaunchCommand, LaunchContext, LaunchSide, OpenWithEntry, OpenWithOptions,
@@ -395,6 +399,16 @@ mod tests {
             command.arguments.last().map(String::as_str),
             Some("/tmp/a folder")
         );
+    }
+
+    #[test]
+    fn showing_a_folder_in_the_mac_file_manager_reveals_it_and_never_opens_it() {
+        for folder in ["/tmp/left/Probe.app", "/tmp/left/plain folder"] {
+            let command =
+                explorer_command_on("macos", std::path::Path::new(folder), Selection::Folders);
+            assert_eq!(command.program, PathBuf::from("/usr/bin/open"));
+            assert_eq!(command.arguments, ["-R", folder]);
+        }
     }
 
     fn context() -> LaunchContext {
