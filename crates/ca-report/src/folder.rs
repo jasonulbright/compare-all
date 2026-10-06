@@ -56,7 +56,9 @@ impl FolderCounts {
         self.files += 1;
         match row.status {
             EntryStatus::Same => self.same += 1,
-            EntryStatus::Different | EntryStatus::MergeByHand => self.different += 1,
+            EntryStatus::Different | EntryStatus::MergeByHand | EntryStatus::MergedByHand => {
+                self.different += 1;
+            }
             EntryStatus::LeftNewer => self.left_newer += 1,
             EntryStatus::RightNewer => self.right_newer += 1,
             EntryStatus::LeftOrphan => self.left_orphans += 1,
@@ -91,8 +93,8 @@ impl FolderCounts {
 /// Whether the filter keeps one entry.
 fn keeps(filter: &FolderDisplayFilter, status: EntryStatus) -> Result<bool> {
     use EntryStatus::{
-        Different, Error, KindMismatch, LeftNewer, LeftOrphan, MergeByHand, NotCompared,
-        RightNewer, RightOrphan, Same,
+        Different, Error, KindMismatch, LeftNewer, LeftOrphan, MergeByHand, MergedByHand,
+        NotCompared, RightNewer, RightOrphan, Same,
     };
     let keep = match filter {
         FolderDisplayFilter::All => true,
@@ -103,22 +105,48 @@ fn keeps(filter: &FolderDisplayFilter, status: EntryStatus) -> Result<bool> {
         FolderDisplayFilter::LeftNewer => {
             matches!(
                 status,
-                LeftNewer | Different | MergeByHand | KindMismatch | NotCompared | Error
+                LeftNewer
+                    | Different
+                    | MergeByHand
+                    | MergedByHand
+                    | KindMismatch
+                    | NotCompared
+                    | Error
             )
         }
         FolderDisplayFilter::RightNewer => {
             matches!(
                 status,
-                RightNewer | Different | MergeByHand | KindMismatch | NotCompared | Error
+                RightNewer
+                    | Different
+                    | MergeByHand
+                    | MergedByHand
+                    | KindMismatch
+                    | NotCompared
+                    | Error
             )
         }
         FolderDisplayFilter::LeftNewerOrphans => matches!(
             status,
-            LeftNewer | LeftOrphan | Different | MergeByHand | KindMismatch | NotCompared | Error
+            LeftNewer
+                | LeftOrphan
+                | Different
+                | MergeByHand
+                | MergedByHand
+                | KindMismatch
+                | NotCompared
+                | Error
         ),
         FolderDisplayFilter::RightNewerOrphans => matches!(
             status,
-            RightNewer | RightOrphan | Different | MergeByHand | KindMismatch | NotCompared | Error
+            RightNewer
+                | RightOrphan
+                | Different
+                | MergeByHand
+                | MergedByHand
+                | KindMismatch
+                | NotCompared
+                | Error
         ),
         FolderDisplayFilter::LeftOrphans => status == LeftOrphan,
         FolderDisplayFilter::RightOrphans => status == RightOrphan,
@@ -653,6 +681,7 @@ mod tests {
             EntryStatus::Same,
             EntryStatus::Different,
             EntryStatus::MergeByHand,
+            EntryStatus::MergedByHand,
             EntryStatus::LeftNewer,
             EntryStatus::RightNewer,
             EntryStatus::LeftOrphan,
@@ -665,9 +694,9 @@ mod tests {
                 let view_status = match status {
                     EntryStatus::NotCompared => ca_fs::compare::NodeStatus::NotCompared,
                     EntryStatus::Same => ca_fs::compare::NodeStatus::Same,
-                    EntryStatus::Different | EntryStatus::MergeByHand => {
-                        ca_fs::compare::NodeStatus::Different
-                    }
+                    EntryStatus::Different
+                    | EntryStatus::MergeByHand
+                    | EntryStatus::MergedByHand => ca_fs::compare::NodeStatus::Different,
                     EntryStatus::LeftNewer => ca_fs::compare::NodeStatus::LeftNewer,
                     EntryStatus::RightNewer => ca_fs::compare::NodeStatus::RightNewer,
                     EntryStatus::LeftOrphan => ca_fs::compare::NodeStatus::LeftOrphan,
@@ -711,6 +740,57 @@ mod tests {
         };
         let xml = render_rows(&xml_options, &OutputOptions::plain_text(), input);
         assert!(xml.contains("status=\"merge-by-hand\""), "{xml}");
+    }
+
+    /// A row left for a merge by hand, or merged by hand, counts as different
+    /// even where one side lacks the item. The left only and right only counts
+    /// and filters hold only the rows labelled Left only and Right only.
+    #[test]
+    fn a_row_merged_or_left_for_a_merge_by_hand_counts_as_different_when_one_side_lacks_it() {
+        assert!(EntryStatus::MergedByHand.is_difference());
+        assert!(!EntryStatus::MergedByHand.is_orphan());
+        let mut gone = named_row("gone.txt", EntryStatus::MergeByHand);
+        gone.left = SideFacts::absent();
+        let input = vec![gone, named_row("merged.txt", EntryStatus::MergedByHand)];
+        let options = FolderReportOptions::default();
+        let html = render_rows(&options, &OutputOptions::html_color(), input.clone());
+        assert!(html.contains("<td>Merged by hand</td>"), "{html}");
+        for wanted in [
+            "<dt>different</dt><dd>2</dd>",
+            "<dt>left only</dt><dd>0</dd>",
+            "<dt>right only</dt><dd>0</dd>",
+            "<dt>differences</dt><dd>2</dd>",
+        ] {
+            assert!(html.contains(wanted), "{wanted}: {html}");
+        }
+        let xml_options = FolderReportOptions {
+            layout: FolderLayout::Xml,
+            ..FolderReportOptions::default()
+        };
+        let xml = render_rows(&xml_options, &OutputOptions::plain_text(), input);
+        assert!(xml.contains("status=\"merged-by-hand\""), "{xml}");
+        for status in [EntryStatus::MergeByHand, EntryStatus::MergedByHand] {
+            for filter in [
+                FolderDisplayFilter::Orphans,
+                FolderDisplayFilter::LeftOrphans,
+                FolderDisplayFilter::RightOrphans,
+            ] {
+                assert!(
+                    !super::keeps(&filter, status).unwrap(),
+                    "{filter:?} {status:?}"
+                );
+            }
+            for filter in [
+                FolderDisplayFilter::Mismatches,
+                FolderDisplayFilter::LeftNewerOrphans,
+                FolderDisplayFilter::RightNewerOrphans,
+            ] {
+                assert!(
+                    super::keeps(&filter, status).unwrap(),
+                    "{filter:?} {status:?}"
+                );
+            }
+        }
     }
 
     #[test]
