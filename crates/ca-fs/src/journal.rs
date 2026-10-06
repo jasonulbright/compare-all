@@ -99,7 +99,11 @@ impl Journal {
     /// Returns [`std::io::ErrorKind::AlreadyExists`] when the path is taken,
     /// and otherwise propagates the underlying I/O error.
     pub fn create(path: &Path) -> std::io::Result<Self> {
-        let file = File::options().write(true).create_new(true).open(path)?;
+        let mut options = File::options();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let file = options.open(path)?;
         Ok(Self {
             path: path.to_path_buf(),
             file: Mutex::new(file),
@@ -109,12 +113,14 @@ impl Journal {
     /// Create a journal under `directory` with a name no other batch shares.
     ///
     /// The directory is created when it is missing, so a caller only has to
-    /// name a place to keep journals.
+    /// name a place to keep journals. On Unix it is open only to the running
+    /// user, as is each journal.
     ///
     /// # Errors
-    /// Propagates the underlying I/O error.
+    /// Propagates the underlying I/O error, and refuses a directory that is a
+    /// link or belongs to another user.
     pub fn create_in(directory: &Path) -> std::io::Result<Self> {
-        std::fs::create_dir_all(directory)?;
+        ca_io::private::create_owned_folder(directory)?;
         let stamp = now_unix_seconds();
         let process = std::process::id();
         for attempt in 0..1_000u32 {
@@ -465,6 +471,20 @@ mod tests {
                 aborted: false,
             })
             .unwrap();
+    }
+
+    /// A journal lists the path of every item in a batch.
+    #[cfg(unix)]
+    #[test]
+    fn a_journal_and_its_folder_are_open_only_to_their_user() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("settings").join("journals");
+        let journal = Journal::create_in(&folder).unwrap();
+        let mode =
+            |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&folder), 0o700);
+        assert_eq!(mode(journal.path()), 0o600);
     }
 
     #[test]
