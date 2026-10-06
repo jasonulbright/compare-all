@@ -257,6 +257,12 @@ impl OpenWithEntry {
             };
             let side = if suffix == Some('2') { 2 } else { 1 };
             if let Some(value) = self.value_of(name, side, context) {
+                // A value that opens the argument with a hyphen would reach
+                // the program as an option; the current folder prefix keeps
+                // it a path.
+                if out.is_empty() && value.starts_with('-') {
+                    out.push_str(&self.delimit(&format!(".{}", std::path::MAIN_SEPARATOR)));
+                }
                 out.push_str(&value);
             } else {
                 out.push('%');
@@ -375,6 +381,39 @@ mod tests {
                 "report file".to_owned(),
                 PathBuf::from("dir/report file.txt").display().to_string(),
                 PathBuf::from("dir").display().to_string(),
+            ]
+        );
+    }
+
+    /// A program reads an argument that starts with a hyphen as an option.
+    #[test]
+    fn a_name_that_starts_with_a_hyphen_reaches_the_program_as_a_path() {
+        let side = |base: &str| LaunchSide {
+            path: PathBuf::from(base).join("-dir").join("--output=evil.txt"),
+            base: Some(PathBuf::from(base)),
+            line: Some(3),
+        };
+        let context = LaunchContext {
+            first: side("/work/left"),
+            second: Some(side("/work/right")),
+        };
+        let entry = entry(&["%F1", "%F2", "%n", "%b", "%P", "--line=%l", "x%n"]);
+        let command = entry.command(&context);
+        let here = |rest: &str| format!(".{}{rest}", std::path::MAIN_SEPARATOR);
+        let relative = PathBuf::from("-dir")
+            .join("--output=evil.txt")
+            .display()
+            .to_string();
+        assert_eq!(
+            command.arguments,
+            vec![
+                here(&relative),
+                here(&relative),
+                here("--output=evil.txt"),
+                here("--output=evil"),
+                here("-dir"),
+                "--line=3".to_owned(),
+                "x--output=evil.txt".to_owned(),
             ]
         );
     }

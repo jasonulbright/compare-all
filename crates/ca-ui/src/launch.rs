@@ -165,6 +165,18 @@ pub fn commands_of(entry: &OpenWithEntry, context: &LaunchContext) -> Vec<Launch
     built
 }
 
+/// `path` as one argument that a program reads as a path, never as an
+/// option: a relative path that starts with a hyphen gets the current folder
+/// in front of it.
+fn path_argument(path: &std::path::Path) -> String {
+    let text = path.display().to_string();
+    if text.starts_with('-') {
+        format!(".{}{text}", std::path::MAIN_SEPARATOR)
+    } else {
+        text
+    }
+}
+
 /// The command that hands `path` to whatever the platform opens it with.
 ///
 /// Every platform reaches its handler through a program and arguments, never
@@ -172,7 +184,7 @@ pub fn commands_of(entry: &OpenWithEntry, context: &LaunchContext) -> Vec<Launch
 /// start a second command.
 #[must_use]
 pub fn system_open_command(path: &std::path::Path) -> LaunchCommand {
-    let text = path.display().to_string();
+    let text = path_argument(path);
     #[cfg(target_os = "windows")]
     let (program, arguments) = (
         std::path::PathBuf::from("rundll32.exe"),
@@ -210,19 +222,17 @@ fn explorer_command_on(os: &str, path: &std::path::Path, selection: Selection) -
         // application, so a folder is revealed like a file.
         ("macos", _) => (
             std::path::PathBuf::from("/usr/bin/open"),
-            vec!["-R".to_owned(), path.display().to_string()],
+            vec!["-R".to_owned(), path_argument(path)],
         ),
         (_, Selection::Files) => (
             std::path::PathBuf::from("xdg-open"),
-            vec![path
-                .parent()
-                .unwrap_or_else(|| std::path::Path::new("."))
-                .display()
-                .to_string()],
+            vec![path_argument(
+                path.parent().unwrap_or_else(|| std::path::Path::new(".")),
+            )],
         ),
         (_, Selection::Folders) => (
             std::path::PathBuf::from("xdg-open"),
-            vec![path.display().to_string()],
+            vec![path_argument(path)],
         ),
     };
     LaunchCommand {
@@ -234,8 +244,8 @@ fn explorer_command_on(os: &str, path: &std::path::Path, selection: Selection) -
 
 fn windows_explorer_command(path: &std::path::Path, selection: Selection) -> LaunchCommand {
     let arguments = match selection {
-        Selection::Files => vec!["/select,".to_owned(), path.display().to_string()],
-        Selection::Folders => vec![path.display().to_string()],
+        Selection::Files => vec!["/select,".to_owned(), path_argument(path)],
+        Selection::Folders => vec![path_argument(path)],
     };
     LaunchCommand {
         program: std::path::PathBuf::from("explorer.exe"),
@@ -399,6 +409,30 @@ mod tests {
             command.arguments.last().map(String::as_str),
             Some("/tmp/a folder")
         );
+    }
+
+    #[test]
+    fn a_path_that_starts_with_a_hyphen_reaches_the_platform_tool_as_a_path() {
+        let here = |rest: &str| format!(".{}{rest}", std::path::MAIN_SEPARATOR);
+        let file = std::path::Path::new("--output=evil.txt");
+        let opened = super::system_open_command(file);
+        assert_eq!(
+            opened.arguments.last().map(String::as_str),
+            Some(here("--output=evil.txt").as_str())
+        );
+        for os in ["windows", "macos", "linux"] {
+            for selection in [Selection::Files, Selection::Folders] {
+                let command = explorer_command_on(os, file, selection);
+                assert!(
+                    command
+                        .arguments
+                        .iter()
+                        .all(|argument| argument != "--output=evil.txt"),
+                    "{os}: {:?}",
+                    command.arguments
+                );
+            }
+        }
     }
 
     #[test]
