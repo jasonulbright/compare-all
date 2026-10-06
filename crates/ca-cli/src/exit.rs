@@ -24,7 +24,8 @@ pub const RULES_DIFFERENT: u8 = 13;
 /// A merge finished with conflicts, or folder merge items that need a merge
 /// by hand, left in it.
 pub const CONFLICTS: u8 = 14;
-/// Something failed that no other code names.
+/// Something failed that no other code names, or a folder merge step did not
+/// complete.
 pub const UNKNOWN_ERROR: u8 = 100;
 /// A merge left conflicts, or folder merge items that need a merge by hand,
 /// and wrote nothing to the output.
@@ -74,7 +75,7 @@ pub const TABLE: &[ExitMeaning] = &[
     },
     ExitMeaning {
         code: UNKNOWN_ERROR,
-        meaning: "an error no other code names",
+        meaning: "an error no other code names, or a folder merge step that did not complete",
     },
     ExitMeaning {
         code: CONFLICTS_NO_OUTPUT,
