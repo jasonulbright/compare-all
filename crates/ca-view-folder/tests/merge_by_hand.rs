@@ -445,6 +445,284 @@ fn reload(view: &mut FolderMergeView) {
     assert!(poll_until(view, |view| view.tree().is_some()));
 }
 
+fn saved_file(path: PathBuf, conflicts: u32) -> ca_ui::view::SavedFile {
+    ca_ui::view::SavedFile { path, conflicts }
+}
+
+/// Only `both.txt`: the ancestor at T, the left side the same text touched
+/// at T + 4, the right side edited at T + 8.
+fn one_mergeable_row() -> Fixture {
+    let fixture = Fixture::empty();
+    fixture.write("center", "both.txt", b"one\ntwo\nthree\n", T);
+    fixture.write("left", "both.txt", b"one\ntwo\nthree\n", T + 4);
+    fixture.write("right", "both.txt", b"one\ntwo\nTHREE\n", T + 8);
+    fixture
+}
+
+/// The report word and the exit code with `body` in the output at `secs`.
+fn state_with_output(body: &[u8], secs: u64) -> (&'static str, Option<i32>) {
+    let fixture = one_mergeable_row();
+    fixture.write("output", "both.txt", body, secs);
+    let view = fixture.view();
+    assert_eq!(status_of(&view, "both.txt"), MergeStatus::Mergeable);
+    (report_word(&view, "both.txt"), view.exit_code())
+}
+
+/// A save from Text Merge into an output file older than the inputs, so
+/// only the save marks the row; then `side` changes and the view reloads.
+fn a_save_is_dropped_when_an_input_changes(side: &str) {
+    let fixture = one_mergeable_row();
+    let mut view = fixture.view();
+    fixture.write("output", "both.txt", b"one\ntwo\nThree\n", T + 2);
+    view.file_saved(&saved_file(fixture.path("output").join("both.txt"), 0));
+    assert_eq!(report_word(&view, "both.txt"), "Merged by hand");
+    reload(&mut view);
+    assert_eq!(
+        report_word(&view, "both.txt"),
+        "Merged by hand",
+        "no input changed"
+    );
+
+    fixture.write(side, "both.txt", b"one\ntwo\nthree, edited\n", T + 60);
+    reload(&mut view);
+
+    assert!(status_of(&view, "both.txt").needs_person());
+    assert_eq!(
+        report_word(&view, "both.txt"),
+        "Merge by hand",
+        "the save outlived a change of the {side} input"
+    );
+    assert_eq!(view.exit_code(), Some(101));
+}
+
+#[test]
+fn a_save_is_dropped_when_the_left_input_changes() {
+    a_save_is_dropped_when_an_input_changes("left");
+}
+
+#[test]
+fn a_save_is_dropped_when_the_ancestor_changes() {
+    a_save_is_dropped_when_an_input_changes("center");
+}
+
+#[test]
+fn a_save_is_dropped_when_the_right_input_changes() {
+    a_save_is_dropped_when_an_input_changes("right");
+}
+
+/// The output is the left input: Text Merge saves into the left folder, and
+/// `side` changes after the save.
+fn a_save_into_the_left_input_is_dropped_when_another_input_changes(side: &str) {
+    let fixture = one_mergeable_row();
+    let mut view = fixture.view();
+    let Some(ca_session::settings::SessionSettings::FolderMerge(mut merge)) = view.settings()
+    else {
+        panic!("no folder merge settings")
+    };
+    merge.merge.target = ca_session::settings::folder::MergeTarget::Left;
+    view.apply_settings(&ca_session::settings::SessionSettings::FolderMerge(merge));
+    assert!(poll_until(&mut view, |view| view.tree().is_some()));
+    fixture.write("left", "both.txt", b"one\ntwo\nTHREE, merged\n", T + 30);
+    view.file_saved(&saved_file(fixture.path("left").join("both.txt"), 0));
+    reload(&mut view);
+    assert_eq!(report_word(&view, "both.txt"), "Merged by hand");
+
+    fixture.write(side, "both.txt", b"one\ntwo\nthree, edited\n", T + 60);
+    reload(&mut view);
+
+    assert_eq!(
+        report_word(&view, "both.txt"),
+        "Merge by hand",
+        "the save outlived a change of the {side} input"
+    );
+}
+
+#[test]
+fn a_save_into_the_left_input_is_dropped_when_the_ancestor_changes() {
+    a_save_into_the_left_input_is_dropped_when_another_input_changes("center");
+}
+
+#[test]
+fn a_save_into_the_left_input_is_dropped_when_the_right_input_changes() {
+    a_save_into_the_left_input_is_dropped_when_another_input_changes("right");
+}
+
+#[test]
+fn a_copy_of_one_input_with_a_new_time_is_not_a_merge_by_hand() {
+    assert_eq!(
+        state_with_output(b"one\ntwo\nTHREE\n", T + 30),
+        ("Merge by hand", Some(101)),
+        "a copy of the right input"
+    );
+    assert_eq!(
+        state_with_output(b"one\ntwo\nthree\n", T + 30),
+        ("Merge by hand", Some(101)),
+        "a copy of the left input"
+    );
+}
+
+#[test]
+fn a_merge_result_with_the_size_of_an_input_and_other_bytes_is_a_merge_by_hand() {
+    assert_eq!(
+        state_with_output(b"one\ntwo\nThree\n", T + 30),
+        ("Merged by hand", Some(0))
+    );
+}
+
+#[test]
+fn an_output_file_with_conflict_markers_is_not_a_merge_by_hand() {
+    assert_eq!(
+        state_with_output(
+            b"one\ntwo\n<<<<<<< left\nthree\n=======\nTHREE\n>>>>>>> right\n",
+            T + 30
+        ),
+        ("Merge by hand", Some(101))
+    );
+}
+
+#[test]
+fn a_save_with_conflicts_left_is_not_a_merge_by_hand() {
+    let fixture = Fixture::empty();
+    fixture.write("center", "clash.txt", b"one\ntwo\nthree\n", T);
+    fixture.write("left", "clash.txt", b"one\nLEFT\nthree\n", T + 4);
+    fixture.write("right", "clash.txt", b"one\nRIGHT SIDE\nthree\n", T + 8);
+    let mut view = fixture.view();
+    let marked = b"one\n<<<<<<< left\nLEFT\n=======\nRIGHT SIDE\n>>>>>>> right\nthree\n";
+    fixture.write("output", "clash.txt", marked, T + 30);
+
+    view.file_saved(&saved_file(fixture.path("output").join("clash.txt"), 1));
+
+    assert_eq!(report_word(&view, "clash.txt"), "Merge by hand");
+    assert_eq!(view.exit_code(), Some(101));
+    let mut probe = Probe::new(WINDOW[0], WINDOW[1]);
+    let _ = frame_text(&mut probe, &mut view);
+    let shown = frame_text(&mut probe, &mut view);
+    assert!(
+        shown.lines().any(|line| line == "Saved with conflicts"),
+        "the Action column does not say the save kept conflicts:\n{shown}"
+    );
+    reload(&mut view);
+    assert_eq!(report_word(&view, "clash.txt"), "Merge by hand");
+    merge_at_once(&mut view);
+    assert!(
+        message(&view).ends_with("Item: clash.txt (conflict, saved with conflicts)."),
+        "{}",
+        message(&view)
+    );
+
+    fixture.write(
+        "output",
+        "clash.txt",
+        b"one\nLEFT and RIGHT\nthree\n",
+        T + 40,
+    );
+    view.file_saved(&saved_file(fixture.path("output").join("clash.txt"), 0));
+    assert_eq!(report_word(&view, "clash.txt"), "Merged by hand");
+    assert_eq!(view.exit_code(), Some(0));
+}
+
+#[cfg(windows)]
+#[test]
+fn a_save_spelled_in_other_letter_case_marks_its_row() {
+    let fixture = one_mergeable_row();
+    let mut view = fixture.view();
+    fixture.write("output", "both.txt", b"one\ntwo\nThree\n", T + 2);
+    let upper = PathBuf::from(
+        fixture
+            .path("output")
+            .join("BOTH.TXT")
+            .to_string_lossy()
+            .to_uppercase(),
+    );
+    view.file_saved(&saved_file(upper, 0));
+    assert_eq!(report_word(&view, "both.txt"), "Merged by hand");
+    assert_eq!(view.exit_code(), Some(0));
+}
+
+#[test]
+fn a_save_into_an_output_named_with_a_trailing_separator_marks_its_row() {
+    let fixture = one_mergeable_row();
+    let output = PathBuf::from(format!(
+        "{}{}",
+        fixture.path("output").display(),
+        std::path::MAIN_SEPARATOR
+    ));
+    let request = OpenRequest::new(
+        SessionKind::FolderMerge,
+        fixture.path("left"),
+        fixture.path("right"),
+    )
+    .with_center(Some(fixture.path("center")))
+    .with_output(Some(output));
+    let mut view = fixture.open(&request);
+    fixture.write("output", "both.txt", b"one\ntwo\nThree\n", T + 2);
+    view.file_saved(&saved_file(fixture.path("output").join("both.txt"), 0));
+    assert_eq!(report_word(&view, "both.txt"), "Merged by hand");
+}
+
+/// A link to the output folder: a junction on Windows, a symbolic link
+/// elsewhere.
+fn link_to(target: &Path, link: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .is_ok_and(|out| out.status.success())
+    }
+    #[cfg(not(windows))]
+    {
+        std::os::unix::fs::symlink(target, link).is_ok()
+    }
+}
+
+#[test]
+fn a_save_through_a_link_to_the_output_marks_its_row() {
+    let fixture = one_mergeable_row();
+    let link = fixture.dir.path().join("output-link");
+    assert!(link_to(&fixture.path("output"), &link), "no link was made");
+    let mut view = fixture.view();
+    fixture.write("output", "both.txt", b"one\ntwo\nThree\n", T + 2);
+
+    view.file_saved(&saved_file(link.join("both.txt"), 0));
+
+    assert!(
+        poll_until(&mut view, |view| report_word(view, "both.txt")
+            == "Merged by hand"),
+        "a save through the link is not matched"
+    );
+}
+
+#[test]
+fn the_exit_code_follows_the_resolutions_and_not_the_output() {
+    let fixture = Fixture::empty();
+    fixture.write("left", "added.txt", b"from the left\n", T + 4);
+    let mut view = fixture.view();
+    let Some(ca_session::settings::SessionSettings::FolderMerge(mut merge)) = view.settings()
+    else {
+        panic!("no folder merge settings")
+    };
+    merge.merge.automatic_merge = false;
+    view.apply_settings(&ca_session::settings::SessionSettings::FolderMerge(merge));
+    assert!(poll_until(&mut view, |view| view.tree().is_some()));
+    merge_at_once(&mut view);
+    assert!(fixture.output_is_empty());
+    assert_eq!(view.exit_code(), Some(0), "no row needs a merge by hand");
+
+    let fixture = Fixture::mixed();
+    let mut view = fixture.view();
+    view.run(Command::SelectAll);
+    view.run(Command::TakeLeft);
+    assert!(fixture.output_is_empty());
+    assert_eq!(
+        view.exit_code(),
+        Some(0),
+        "a Take resolves every row before any merge runs"
+    );
+}
+
 #[test]
 fn a_merge_of_a_selected_row_names_the_rows_left_for_a_merge_by_hand_in_its_result() {
     let fixture = Fixture::mixed();
@@ -881,7 +1159,7 @@ fn a_save_from_text_merge_marks_its_row_merged_by_hand_without_a_reload() {
     assert_eq!(view.exit_code(), Some(101));
 
     merge_mixed_by_hand(&fixture);
-    view.file_saved(&fixture.path("output").join("both.txt"));
+    view.file_saved(&saved_file(fixture.path("output").join("both.txt"), 0));
 
     let text = message(&view);
     assert!(
@@ -897,7 +1175,7 @@ fn a_save_from_text_merge_marks_its_row_merged_by_hand_without_a_reload() {
     assert_eq!(report_word(&view, "both.txt"), "Merged by hand");
     assert_eq!(view.exit_code(), Some(101), "clash.txt still waits");
 
-    view.file_saved(&fixture.path("output").join("clash.txt"));
+    view.file_saved(&saved_file(fixture.path("output").join("clash.txt"), 0));
     assert_eq!(view.message(), None);
     assert_eq!(view.exit_code(), Some(0));
 }
@@ -916,7 +1194,7 @@ fn a_save_into_an_output_that_is_the_left_input_keeps_its_row_merged_by_hand_aft
     assert_eq!(report_word(&view, "both.txt"), "Merge by hand");
 
     fixture.write("left", "both.txt", b"one\ntwo\nTHREE, merged\n", T + 30);
-    view.file_saved(&fixture.path("left").join("both.txt"));
+    view.file_saved(&saved_file(fixture.path("left").join("both.txt"), 0));
     reload(&mut view);
 
     assert_eq!(

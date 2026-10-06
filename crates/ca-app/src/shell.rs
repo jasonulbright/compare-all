@@ -1104,6 +1104,20 @@ impl App {
         }
     }
 
+    /// Hand every file a tab wrote to every tab, on screen or not.
+    fn hand_out_saves(&mut self) {
+        let saved: Vec<ca_ui::view::SavedFile> = self
+            .tabs
+            .iter_mut()
+            .flat_map(|tab| tab.take_saved())
+            .collect();
+        for file in &saved {
+            for tab in &mut self.tabs {
+                tab.file_saved(file);
+            }
+        }
+    }
+
     /// A window showing whatever the command line asked for.
     ///
     /// Withheld from the tests of this crate for the reason [`App::new`] gives.
@@ -2695,6 +2709,7 @@ impl App {
         {
             self.session_save = None;
         }
+        self.hand_out_saves();
         let mut view = self.tabs.remove(index);
         self.publish_exit(view.as_ref());
         if index < self.tab_sessions.len() {
@@ -2974,11 +2989,6 @@ impl App {
                 ViewAction::Close => {
                     self.drop_pending_workspace();
                     self.close_tab(self.active);
-                }
-                ViewAction::Saved(path) => {
-                    for tab in &mut self.tabs {
-                        tab.file_saved(&path);
-                    }
                 }
             }
         }
@@ -3530,6 +3540,7 @@ impl App {
             tab.set_active(index == active);
             tab.tick();
         }
+        self.hand_out_saves();
         self.declared = self
             .tabs
             .get(self.active)
@@ -5132,6 +5143,29 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_save_that_finishes_while_text_merge_is_in_the_background_reaches_the_folder_merge() {
+        let context = context();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        folders_with_one_mergeable_file(root);
+        let (_settings, mut app) = started_app(Startup::Open(folder_merge_request(root)), &context);
+        wait_until_ready(&mut app, 0);
+        app.open(&text_merge_request(root, "both.txt"), &context);
+        wait_until_ready(&mut app, 1);
+        app.run(Command::SaveFile, &context);
+        app.active = 0;
+        let written = root.join("output").join("both.txt");
+        frames_until(&mut app, |_| written.exists());
+        assert!(written.exists());
+        assert_eq!(app.active, 0, "the Text Merge tab came to the front");
+        assert_eq!(
+            app.tabs[0].exit_code(),
+            Some(0),
+            "the folder merge tab never heard of the save"
+        );
+    }
+
     /// A tab that asks for a fixed exit code.
     struct CodeView(i32);
 
@@ -5215,6 +5249,70 @@ mod tests {
     #[test]
     fn a_folder_merge_with_a_waiting_row_ends_with_its_code_when_it_closes_last() {
         assert_eq!(three_tabs_closed_in([1, 2, 0]), 101);
+    }
+
+    #[test]
+    fn a_text_merge_save_that_keeps_conflicts_leaves_the_folder_merge_row_waiting() {
+        let context = context();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for side in ["left", "center", "right", "output"] {
+            std::fs::create_dir_all(root.join(side)).unwrap();
+        }
+        add_a_conflicting_file(root);
+        let mut folder = ca_view_folder::FolderMergeView::with_journal_directory(
+            &folder_merge_request(root),
+            &context,
+            1,
+            root.join("journals"),
+        );
+        let mut text = ca_view_merge::MergeView::from_request(
+            &text_merge_request(root, "clash.txt"),
+            &context,
+            2,
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !(folder.is_ready() && text.is_ready()) && std::time::Instant::now() < deadline {
+            folder.tick();
+            text.tick();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(folder.exit_code(), Some(101));
+
+        text.run(Command::SaveFile);
+        assert_eq!(
+            text.question(),
+            Some(&ca_view_merge::Question::SaveWithConflicts)
+        );
+        text.answer(true);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while text.is_saving() && std::time::Instant::now() < deadline {
+            text.tick();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let saves = text.take_saved();
+        assert_eq!(saves.len(), 1);
+        assert_eq!(saves[0].conflicts, 1);
+        let written = std::fs::read_to_string(root.join("output").join("clash.txt")).unwrap();
+        assert!(written.contains("<<<<<<<"), "{written}");
+        for save in &saves {
+            folder.file_saved(save);
+        }
+
+        assert_eq!(text.exit_code(), Some(14));
+        assert_eq!(
+            folder.exit_code(),
+            Some(101),
+            "a save with conflicts left counts as merged by hand"
+        );
+        folder.run(Command::Reload);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        folder.tick();
+        while !folder.is_ready() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            folder.tick();
+        }
+        assert_eq!(folder.exit_code(), Some(101));
     }
 
     /// One expected bar, as menu name, then the lines in order.

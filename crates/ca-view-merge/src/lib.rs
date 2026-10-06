@@ -29,7 +29,7 @@ use ca_ui::theme::merge::{palette as merge_palette, MergeClass, Palette};
 use ca_ui::theme::Variant;
 use ca_ui::thumbnail::Strip;
 use ca_ui::toolbar;
-use ca_ui::view::{OpenRequest, SessionView, Titles, ViewAction, ViewContext};
+use ca_ui::view::{OpenRequest, SavedFile, SessionView, Titles, ViewAction, ViewContext};
 use ca_ui::widgets;
 use ca_ui::worker::Job;
 use filter::MergeFilter;
@@ -348,6 +348,8 @@ pub struct MergeView {
     toolbar_rows: usize,
     closing: bool,
     pending: Vec<ViewAction>,
+    /// Output files written since the window last asked.
+    saved_files: Vec<SavedFile>,
     /// Text a menu command put on the clipboard. A command runs without a
     /// frame, and only a frame reaches the clipboard.
     pending_clipboard: Option<String>,
@@ -568,6 +570,7 @@ impl MergeView {
             toolbar_rows: 1,
             closing: false,
             pending: Vec::new(),
+            saved_files: Vec::new(),
             pending_clipboard: None,
             paste_requested: false,
             swapped: false,
@@ -944,7 +947,10 @@ impl MergeView {
             SaveOutcome::Saved(stamp) | SaveOutcome::SavedWithConflict { stamp, .. } => {
                 self.output_baseline = Baseline::Present(stamp);
                 if let Some(path) = self.paths.output.clone() {
-                    self.pending.push(ViewAction::Saved(path));
+                    self.saved_files.push(SavedFile {
+                        path,
+                        conflicts: saving_conflicts.unwrap_or(0),
+                    });
                 }
                 self.saved_output = Some(saved_output);
                 self.saved_conflicts = saving_conflicts;
@@ -2833,6 +2839,10 @@ impl SessionView for MergeView {
 
     fn exit_code(&self) -> Option<i32> {
         Some(output::exit_code(self.outcome()))
+    }
+
+    fn take_saved(&mut self) -> Vec<SavedFile> {
+        std::mem::take(&mut self.saved_files)
     }
 }
 
