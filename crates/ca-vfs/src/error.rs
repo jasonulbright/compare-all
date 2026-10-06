@@ -18,6 +18,9 @@ pub enum LimitKind {
     ExpansionRatio,
     /// Archives are nested deeper than the allowed number of levels.
     NestingDepth,
+    /// A decoder would claim more memory for its dictionary or model than
+    /// the reader allows.
+    DecoderMemory,
 }
 
 impl LimitKind {
@@ -30,13 +33,14 @@ impl LimitKind {
             Self::ArchiveEntries => "archive entry count",
             Self::ExpansionRatio => "expansion ratio",
             Self::NestingDepth => "nesting depth",
+            Self::DecoderMemory => "decoder memory",
         }
     }
 
     fn unit(self) -> &'static str {
         match self {
             Self::ArchiveEntries => " entries",
-            Self::EntrySize | Self::ArchiveSize => " bytes",
+            Self::EntrySize | Self::ArchiveSize | Self::DecoderMemory => " bytes",
             Self::ExpansionRatio | Self::NestingDepth => "",
         }
     }

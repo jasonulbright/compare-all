@@ -269,7 +269,7 @@ fn skip_block(cursor: &mut HeaderCursor<'_>) -> VfsResult<u64> {
         if flags & 0x80 != 0 {
             return Err(VfsError::unsupported("7z alternative coder methods"));
         }
-        cursor.skip(u64::from(flags & 0x0F))?;
+        let method = cursor.take(u64::from(flags & 0x0F))?;
         let (coder_in, coder_out) = if flags & 0x10 == 0 {
             (1, 1)
         } else {
@@ -277,10 +277,13 @@ fn skip_block(cursor: &mut HeaderCursor<'_>) -> VfsResult<u64> {
         };
         inputs = inputs.saturating_add(coder_in);
         outputs = outputs.saturating_add(coder_out);
-        if flags & 0x20 != 0 {
-            let properties = cursor.count()?;
-            cursor.skip(properties)?;
-        }
+        let properties = if flags & 0x20 != 0 {
+            let length = cursor.count()?;
+            cursor.take(length)?
+        } else {
+            &[]
+        };
+        check_coder(method, properties)?;
     }
     let pairs = outputs.checked_sub(1).ok_or_else(malformed)?;
     for _ in 0..pairs {
@@ -300,13 +303,67 @@ fn malformed() -> VfsError {
     VfsError::corrupt("7z header is truncated or malformed")
 }
 
+/// Most memory one coder may name for its dictionary or model, the same
+/// ceiling the xz and LZMA readers apply.
+const CODER_MEMORY_LIMIT: u64 = super::span::DICTIONARY_LIMIT_KIB as u64 * 1024;
+
+const METHOD_LZMA: &[u8] = &[0x03, 0x01, 0x01];
+const METHOD_LZMA2: &[u8] = &[0x21];
+const METHOD_PPMD: &[u8] = &[0x03, 0x04, 0x01];
+
+/// The memory the decoder of a coder claims before it reads any data, as its
+/// properties name it, or `None` for a coder that claims a fixed amount.
+fn coder_memory(method: &[u8], properties: &[u8]) -> Option<u64> {
+    match method {
+        METHOD_LZMA2 => {
+            let bits = u32::from(*properties.first()?);
+            match bits {
+                0..=39 => Some(u64::from(2 | (bits & 1)) << (bits / 2 + 11)),
+                40 => Some(u64::from(u32::MAX)),
+                _ => None,
+            }
+        }
+        METHOD_LZMA | METHOD_PPMD => {
+            let field = properties.get(1..5)?;
+            Some(u64::from(u32::from_le_bytes([
+                field[0], field[1], field[2], field[3],
+            ])))
+        }
+        _ => None,
+    }
+}
+
+/// Refuse a coder whose decoder would claim more than [`CODER_MEMORY_LIMIT`].
+///
+/// The decoder library allocates whatever dictionary a coder names, so the
+/// check runs on the raw properties before the library sees them.
+fn check_coder(method: &[u8], properties: &[u8]) -> VfsResult<()> {
+    match coder_memory(method, properties) {
+        Some(memory) if memory > CODER_MEMORY_LIMIT => Err(VfsError::LimitExceeded {
+            kind: LimitKind::DecoderMemory,
+            limit: CODER_MEMORY_LIMIT,
+        }),
+        _ => Ok(()),
+    }
+}
+
+/// [`check_coder`] for every coder of every block of a parsed container.
+fn check_blocks(archive: &sevenz_rust2::Archive) -> VfsResult<()> {
+    for block in &archive.blocks {
+        for coder in &block.coders {
+            check_coder(coder.encoder_method_id(), coder.properties())?;
+        }
+    }
+    Ok(())
+}
+
 /// Reads raw header fields. A count is capped by the bytes left, since each
 /// counted item takes at least one byte.
 struct HeaderCursor<'a> {
     bytes: &'a [u8],
 }
 
-impl HeaderCursor<'_> {
+impl<'a> HeaderCursor<'a> {
     fn byte(&mut self) -> VfsResult<u8> {
         let (&first, rest) = self.bytes.split_first().ok_or_else(malformed)?;
         self.bytes = rest;
@@ -314,9 +371,17 @@ impl HeaderCursor<'_> {
     }
 
     fn skip(&mut self, count: u64) -> VfsResult<()> {
+        self.take(count).map(|_| ())
+    }
+
+    fn take(&mut self, count: u64) -> VfsResult<&'a [u8]> {
         let count = usize::try_from(count).map_err(|_| malformed())?;
-        self.bytes = self.bytes.get(count..).ok_or_else(malformed)?;
-        Ok(())
+        if count > self.bytes.len() {
+            return Err(malformed());
+        }
+        let (taken, rest) = self.bytes.split_at(count);
+        self.bytes = rest;
+        Ok(taken)
     }
 
     /// The leading one bits of the first byte say how many little-endian
@@ -477,6 +542,7 @@ pub(crate) fn open_entry(
     let reader = backing.reader()?;
     let mut archive = ArchiveReader::new(reader, password_of(password))
         .map_err(|error| map_sevenz(error, path))?;
+    check_blocks(archive.archive())?;
     // The pass hands over references into the archive's own file list, and
     // that list does not move while the pass runs, so an entry's address
     // names its position even when two entries share a name.
@@ -594,5 +660,29 @@ fn map_sevenz(error: SevenZError, path: &VfsPath) -> VfsError {
         SevenZError::FileNotFound => VfsError::NotFound { path: path.clone() },
         SevenZError::Io(error, _) => crate::limits::uncarry(error),
         other => VfsError::corrupt(other.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{check_coder, METHOD_LZMA, METHOD_LZMA2, METHOD_PPMD};
+
+    #[test]
+    fn a_coder_is_refused_only_above_the_memory_ceiling() {
+        // LZMA2 property 32 names 256 MiB, 33 names 384 MiB, 40 names 4 GiB.
+        assert!(check_coder(METHOD_LZMA2, &[24]).is_ok());
+        assert!(check_coder(METHOD_LZMA2, &[32]).is_ok());
+        assert!(check_coder(METHOD_LZMA2, &[33]).is_err());
+        assert!(check_coder(METHOD_LZMA2, &[40]).is_err());
+        let field = |bytes: u32| {
+            let mut properties = vec![0x5d];
+            properties.extend_from_slice(&bytes.to_le_bytes());
+            properties
+        };
+        assert!(check_coder(METHOD_LZMA, &field(64 << 20)).is_ok());
+        assert!(check_coder(METHOD_LZMA, &field(u32::MAX)).is_err());
+        assert!(check_coder(METHOD_PPMD, &field(192 << 20)).is_ok());
+        assert!(check_coder(METHOD_PPMD, &field(1 << 30)).is_err());
+        assert!(check_coder(&[0x00], &[]).is_ok());
     }
 }
