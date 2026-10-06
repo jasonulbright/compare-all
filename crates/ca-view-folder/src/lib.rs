@@ -3894,6 +3894,53 @@ mod tests {
         assert!(opened.right.starts_with(&opened.temporaries[0]));
         assert!(opened.temporaries[0].starts_with(&copies));
     }
+
+    /// Windows reads a path whose last name is `NUL` as the null device.
+    #[test]
+    fn an_archive_entry_with_a_device_name_is_copied_out_with_its_bytes() {
+        const EMPTY_ZIP: &[u8] = &[
+            0x50, 0x4b, 0x05, 0x06, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let zip_with = |name: &str, bytes: &[u8]| {
+            let zip = dir.path().join(name);
+            std::fs::write(&zip, EMPTY_ZIP).unwrap();
+            let source = ca_fs::Source::archive(&zip, ca_vfs::ArchiveOptions::default()).unwrap();
+            let mut reader = bytes;
+            source
+                .file_system()
+                .write_file(
+                    &ca_vfs::VfsPath::parse("NUL").unwrap(),
+                    &mut reader,
+                    &ca_vfs::Cancel::new(),
+                )
+                .unwrap();
+            zip
+        };
+        let left = zip_with("left.zip", b"left content\n");
+        let right = zip_with("right.zip", b"RIGHT DIFFERENT\n");
+        let sides = crate::jobs::Sides {
+            left: ca_fs::Source::archive(&left, ca_vfs::ArchiveOptions::default()).unwrap(),
+            right: ca_fs::Source::archive(&right, ca_vfs::ArchiveOptions::default()).unwrap(),
+        };
+        let rel = Path::new("NUL");
+        let request = pair_request(
+            &left,
+            &right,
+            rel,
+            &archives(&ca_session::settings::folder::ArchiveHandling::AsFolders),
+        );
+        let copies = dir.path().join("copies");
+        let opened =
+            crate::jobs::extract_pair(&sides, rel, &copies, request, &ca_ui::worker::Cancel::new())
+                .unwrap();
+        assert_eq!(std::fs::read(&opened.left).unwrap(), b"left content\n");
+        assert_eq!(std::fs::read(&opened.right).unwrap(), b"RIGHT DIFFERENT\n");
+        if cfg!(windows) {
+            let shown = opened.titles.left.clone().unwrap_or_default();
+            assert!(shown.ends_with("NUL"), "{shown}");
+        }
+    }
 }
 
 #[cfg(test)]
