@@ -2958,6 +2958,7 @@ mod tests {
     mod merge_edit_driver;
     mod merge_edit_frame_probes;
     mod merge_edit_probes;
+    mod pending_take_reload_probes;
     mod randomized_merge_driver;
     mod take_order_probes;
 

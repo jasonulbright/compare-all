@@ -538,8 +538,10 @@ impl MergeModel {
 
     /// Restore the state `index` kept for when its lent text is back.
     /// Rebuild its output because edits to the holder may have changed line
-    /// boundaries while the text was away.
-    fn apply_restore(&mut self, index: usize) {
+    /// boundaries while the text was away. Only `lent` shows what is still
+    /// away, so a caller that holds more of the section's text calls this
+    /// once that text is placed.
+    pub(super) fn apply_restore(&mut self, index: usize) {
         let Some(live) = self.sections.get(index) else {
             return;
         };
@@ -802,17 +804,26 @@ impl MergeModel {
     }
 
     /// Put the text of `entry`, a record of `lender` no line holds now, in
-    /// front of the lender's own text.
+    /// front of the lender's own text, then apply the lender's restore.
     ///
-    /// A restore the lender still keeps applies once its last record is
-    /// back, whatever characters the records hold: an edit that changes a
-    /// character of the lender after the restore was recorded drops the
-    /// restore at that edit, and a take's restore stands for the selected
-    /// input over edits made before the take. Comparing the returned
-    /// characters here would make the result depend on the take order, and
-    /// a record split by a line break returns in pieces whose first piece
-    /// carries no source.
+    /// The restore applies once the lender's last record is back. The
+    /// returned characters are not compared with the lent source: an edit
+    /// after the restore was recorded that changes a character of the
+    /// lender has already dropped it.
     pub(super) fn return_to_lender(
+        &mut self,
+        lender: usize,
+        entry: super::Lent,
+    ) -> Option<(usize, Range<u32>)> {
+        let placed = self.place_returned(lender, entry)?;
+        self.apply_restore(lender);
+        Some(placed)
+    }
+
+    /// Put the text of `entry`, a record of `lender` no line holds now, in
+    /// front of the lender's own text. The caller applies the restore once
+    /// no piece of the lender's text is still away.
+    pub(super) fn place_returned(
         &mut self,
         lender: usize,
         entry: super::Lent,
@@ -857,7 +868,6 @@ impl MergeModel {
             len..len + count
         };
         self.repair_local(lender, &lines);
-        self.apply_restore(lender);
         Some((lender, lines))
     }
 
