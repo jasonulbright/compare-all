@@ -165,8 +165,13 @@ fn claim(folder: &std::path::Path) -> std::io::Result<std::fs::File> {
     Ok(file)
 }
 
-/// Delete every entry under `root` except `own` and the folders another live
-/// process holds locked. Returns how many entries were deleted.
+/// Delete the folders that earlier runs of this application left under
+/// `root`, except `own` and the folders another live process holds locked.
+/// Returns how many folders were deleted.
+///
+/// Only a folder named the way [`process_folder_name`] names one is deleted:
+/// the process prefix and a number. A link with that name, and every other
+/// item under `root`, stays.
 #[must_use]
 pub fn sweep_temporary_in(root: &std::path::Path, own: &str) -> usize {
     let Ok(entries) = std::fs::read_dir(root) else {
@@ -175,24 +180,28 @@ pub fn sweep_temporary_in(root: &std::path::Path, own: &str) -> usize {
     let mut deleted = 0;
     for entry in entries.flatten() {
         let name = entry.file_name();
-        if name.to_string_lossy() == own {
+        let name = name.to_string_lossy();
+        if name == own || !is_process_folder_name(&name) {
+            continue;
+        }
+        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
             continue;
         }
         let path = entry.path();
-        let is_process_folder = name.to_string_lossy().starts_with(PROCESS_PREFIX);
-        if is_process_folder && is_held(&path) {
+        if is_held(&path) {
             continue;
         }
-        let removed = if path.is_dir() {
-            std::fs::remove_dir_all(&path)
-        } else {
-            std::fs::remove_file(&path)
-        };
-        if removed.is_ok() {
+        if std::fs::remove_dir_all(&path).is_ok() {
             deleted += 1;
         }
     }
     deleted
+}
+
+/// True for the name [`process_folder_name`] gives a process folder.
+fn is_process_folder_name(name: &str) -> bool {
+    name.strip_prefix(PROCESS_PREFIX)
+        .is_some_and(|id| !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 /// True when a live process holds the lock inside `folder`.
@@ -257,14 +266,53 @@ mod tests {
         std::fs::write(root.path().join("loose.txt"), b"x").unwrap();
         let live = root.path().join("process-3");
         let held = super::claim(&live).unwrap();
-        assert_eq!(super::sweep_temporary_in(root.path(), own), 3);
+        assert_eq!(super::sweep_temporary_in(root.path(), own), 1);
         assert!(root.path().join(own).join("copy").is_dir());
         assert!(live.join(super::LOCK_FILE).is_file());
         assert!(!root.path().join("process-2").exists());
-        assert!(!root.path().join("loose.txt").exists());
+        assert!(root.path().join("from-an-older-build").is_dir());
+        assert!(root.path().join("loose.txt").is_file());
         drop(held);
         assert_eq!(super::sweep_temporary_in(root.path(), own), 1);
         assert!(!live.exists());
+    }
+
+    #[test]
+    fn the_sweep_leaves_every_item_the_application_did_not_make() {
+        let root = tempfile::tempdir().unwrap();
+        let own = "process-1";
+        std::fs::create_dir_all(root.path().join(own)).unwrap();
+        std::fs::write(root.path().join("report-2026.docx"), b"user file").unwrap();
+        std::fs::create_dir_all(root.path().join("my-notes").join("drafts")).unwrap();
+        std::fs::write(
+            root.path()
+                .join("my-notes")
+                .join("drafts")
+                .join("draft.txt"),
+            b"user draft",
+        )
+        .unwrap();
+        std::fs::write(root.path().join("process-7"), b"a file, not a folder").unwrap();
+        std::fs::create_dir_all(root.path().join("process-notes")).unwrap();
+        std::fs::write(
+            root.path().join("process-notes").join(super::LOCK_FILE),
+            b"",
+        )
+        .unwrap();
+
+        assert_eq!(super::sweep_temporary_in(root.path(), own), 0);
+        assert_eq!(
+            std::fs::read(root.path().join("report-2026.docx")).unwrap(),
+            b"user file"
+        );
+        assert!(root
+            .path()
+            .join("my-notes")
+            .join("drafts")
+            .join("draft.txt")
+            .is_file());
+        assert!(root.path().join("process-7").is_file());
+        assert!(root.path().join("process-notes").is_dir());
     }
 
     /// The copies hold file content, so the folders above them are open only
