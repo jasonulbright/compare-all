@@ -110,6 +110,9 @@ pub enum ViewAction {
     OpenHome,
     /// Close the tab this view occupies.
     Close,
+    /// The view wrote the file at this path. Every tab is told, so a view
+    /// that shows the file can take note.
+    Saved(PathBuf),
 }
 
 /// One command a view handles, with whether it can run now.
@@ -261,6 +264,12 @@ pub trait SessionView {
     fn holds_unwritten_edits(&self) -> bool {
         false
     }
+
+    /// Take note that another tab wrote the file at `path`.
+    ///
+    /// Called from the frame thread, so a view records the fact and reads
+    /// nothing from the disk here.
+    fn file_saved(&mut self, _path: &std::path::Path) {}
 
     /// The process exit code this view asks for, where it has one.
     ///
@@ -501,6 +510,10 @@ impl SessionView for OwnsTemporaries {
 
     fn holds_unwritten_edits(&self) -> bool {
         self.view.holds_unwritten_edits()
+    }
+
+    fn file_saved(&mut self, path: &std::path::Path) {
+        self.view.file_saved(path);
     }
 
     fn exit_code(&self) -> Option<i32> {
