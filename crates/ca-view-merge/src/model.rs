@@ -978,6 +978,10 @@ struct Returning {
     /// The earlier place of each record a carried holder still shows, by
     /// lender and order number.
     earlier: HashMap<(usize, u64), (usize, u32, u32)>,
+    /// Records, by lender and order number, whose text leaves the carried
+    /// holder once the new output is built: the lender's input changed and
+    /// its new text shows a line of that text, though not at its start.
+    dropped: Vec<(usize, u64)>,
 }
 
 /// How many sections before this one hold `print`, counting this one in.
@@ -1947,8 +1951,11 @@ impl MergeModel {
         self.lend_seq = self.lend_seq.max(previous.lend_seq);
         let mut decisions: Vec<&Decision> = kept.values().collect();
         decisions.sort_by_key(|decision| decision.index);
-        let returning = self.carry_lent_text(&decisions, &moved);
+        let mut returning = self.carry_lent_text(&decisions, &moved);
         self.rebuild();
+        for (lender, seq) in std::mem::take(&mut returning.dropped) {
+            self.strip_lent(lender, seq);
+        }
         self.return_carried_text(returning);
         for index in 0..self.sections.len() {
             self.settle_sources(index);
@@ -1958,9 +1965,10 @@ impl MergeModel {
 
     /// Point lent text at the carried sections. A lender that was not
     /// carried but whose holder was leaves out the text the holder still
-    /// shows, so no line appears twice. Returns the text whose holder was
-    /// not carried: the reload gave that holder its input, so the text goes
-    /// back to its lender once the new output is built.
+    /// shows, or, when its new text shows a line of that text elsewhere, the
+    /// text leaves the holder, so no line appears twice. Returns the text whose
+    /// holder was not carried: the reload gave that holder its input, so the
+    /// text goes back to its lender once the new output is built.
     fn carry_lent_text(
         &mut self,
         decisions: &[&Decision],
@@ -1972,6 +1980,9 @@ impl MergeModel {
             let mut lent: Vec<Lent> = decision.lent.clone();
             lent.sort_by_key(|entry| entry.seq);
             let lender = moved.get(&decision.index).copied();
+            // Whether the last record with a source left the holder; the
+            // records it covers follow it.
+            let mut dropping = false;
             for entry in lent {
                 let holder = moved.get(&entry.holder).copied();
                 let at = (entry.holder, entry.offset, entry.column);
@@ -1985,13 +1996,23 @@ impl MergeModel {
                         let Some(target) = self.uncarried_successor(holder, &carried) else {
                             continue;
                         };
-                        // A section whose new text does not start with the
-                        // lent characters keeps its text; the record still
-                        // lets a take of the holder give them back to it.
-                        if entry.source.is_none()
-                            || !self.leave_out_lent_text(target, holder, entry.clone())
-                        {
-                            self.sections[target].lent.push(Lent { holder, ..entry });
+                        // A lender whose input changed shows its new text.
+                        // When that text starts with the lent characters, it
+                        // leaves them out while the holder shows them. When
+                        // it shows a line of them elsewhere, the lent copy
+                        // leaves the holder, so no line shows twice.
+                        // Otherwise the holder keeps the lent copy.
+                        if let Some(source) = entry.source.clone() {
+                            if self.leave_out_lent_text(target, holder, entry.clone()) {
+                                dropping = false;
+                                continue;
+                            }
+                            dropping = self.shows_a_line_of(target, &source);
+                        }
+                        let seq = entry.seq;
+                        self.sections[target].lent.push(Lent { holder, ..entry });
+                        if dropping {
+                            returning.dropped.push((target, seq));
                         }
                     }
                     _ => {}
@@ -2118,6 +2139,26 @@ impl MergeModel {
         target.conflict = false;
         target.lent.push(Lent { holder, ..entry });
         true
+    }
+
+    /// Whether section `index`, before a rebuild, shows a line of `text`,
+    /// line endings left out. Empty lines do not count.
+    fn shows_a_line_of(&self, index: usize, text: &str) -> bool {
+        let Some(section) = self.sections.get(index) else {
+            return false;
+        };
+        let shown = if matches!(section.resolution, Resolution::Edited) {
+            section.edited.clone()
+        } else {
+            self.contribution(index, section)
+        };
+        let bare = |line: &str| line.trim_end_matches(['\r', '\n']).to_owned();
+        let shown: std::collections::HashSet<String> =
+            shown.iter().map(|line| bare(line)).collect();
+        ca_diff::split_lines(text)
+            .into_iter()
+            .map(bare)
+            .any(|line| !line.is_empty() && shown.contains(&line))
     }
 
     fn fingerprint(&self, section: &Section) -> Fingerprint {

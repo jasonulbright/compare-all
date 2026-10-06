@@ -342,7 +342,7 @@ impl MergeModel {
     /// Remove a record and its text from the holder's line, for a lender
     /// whose new text does not hold that text. Other records on the line
     /// keep their characters. The holder keeps its wait for review.
-    fn strip_lent(&mut self, lender: usize, seq: u64) {
+    pub(super) fn strip_lent(&mut self, lender: usize, seq: u64) {
         let Some(record) = self.lent_record(lender, seq).cloned() else {
             return;
         };
