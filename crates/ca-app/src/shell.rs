@@ -2951,6 +2951,11 @@ impl App {
                     self.drop_pending_workspace();
                     self.close_tab(self.active);
                 }
+                ViewAction::Saved(path) => {
+                    for tab in &mut self.tabs {
+                        tab.file_saved(&path);
+                    }
+                }
             }
         }
     }

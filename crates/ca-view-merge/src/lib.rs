@@ -943,6 +943,9 @@ impl MergeView {
         match outcome {
             SaveOutcome::Saved(stamp) | SaveOutcome::SavedWithConflict { stamp, .. } => {
                 self.output_baseline = Baseline::Present(stamp);
+                if let Some(path) = self.paths.output.clone() {
+                    self.pending.push(ViewAction::Saved(path));
+                }
                 self.saved_output = Some(saved_output);
                 self.saved_conflicts = saving_conflicts;
                 self.written_marks = saving_marks;
