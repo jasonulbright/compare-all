@@ -3,3 +3,4 @@
 *.ico binary
 # Preserve upstream license text, including its trailing whitespace.
 THIRD-PARTY-NOTICES.md whitespace=-blank-at-eol,-blank-at-eof
+*.7z binary
