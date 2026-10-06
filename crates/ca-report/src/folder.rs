@@ -56,7 +56,7 @@ impl FolderCounts {
         self.files += 1;
         match row.status {
             EntryStatus::Same => self.same += 1,
-            EntryStatus::Different => self.different += 1,
+            EntryStatus::Different | EntryStatus::MergeByHand => self.different += 1,
             EntryStatus::LeftNewer => self.left_newer += 1,
             EntryStatus::RightNewer => self.right_newer += 1,
             EntryStatus::LeftOrphan => self.left_orphans += 1,
@@ -91,8 +91,8 @@ impl FolderCounts {
 /// Whether the filter keeps one entry.
 fn keeps(filter: &FolderDisplayFilter, status: EntryStatus) -> Result<bool> {
     use EntryStatus::{
-        Different, Error, KindMismatch, LeftNewer, LeftOrphan, NotCompared, RightNewer,
-        RightOrphan, Same,
+        Different, Error, KindMismatch, LeftNewer, LeftOrphan, MergeByHand, NotCompared,
+        RightNewer, RightOrphan, Same,
     };
     let keep = match filter {
         FolderDisplayFilter::All => true,
@@ -103,22 +103,22 @@ fn keeps(filter: &FolderDisplayFilter, status: EntryStatus) -> Result<bool> {
         FolderDisplayFilter::LeftNewer => {
             matches!(
                 status,
-                LeftNewer | Different | KindMismatch | NotCompared | Error
+                LeftNewer | Different | MergeByHand | KindMismatch | NotCompared | Error
             )
         }
         FolderDisplayFilter::RightNewer => {
             matches!(
                 status,
-                RightNewer | Different | KindMismatch | NotCompared | Error
+                RightNewer | Different | MergeByHand | KindMismatch | NotCompared | Error
             )
         }
         FolderDisplayFilter::LeftNewerOrphans => matches!(
             status,
-            LeftNewer | LeftOrphan | Different | KindMismatch | NotCompared | Error
+            LeftNewer | LeftOrphan | Different | MergeByHand | KindMismatch | NotCompared | Error
         ),
         FolderDisplayFilter::RightNewerOrphans => matches!(
             status,
-            RightNewer | RightOrphan | Different | KindMismatch | NotCompared | Error
+            RightNewer | RightOrphan | Different | MergeByHand | KindMismatch | NotCompared | Error
         ),
         FolderDisplayFilter::LeftOrphans => status == LeftOrphan,
         FolderDisplayFilter::RightOrphans => status == RightOrphan,
@@ -652,6 +652,7 @@ mod tests {
             EntryStatus::NotCompared,
             EntryStatus::Same,
             EntryStatus::Different,
+            EntryStatus::MergeByHand,
             EntryStatus::LeftNewer,
             EntryStatus::RightNewer,
             EntryStatus::LeftOrphan,
@@ -664,7 +665,9 @@ mod tests {
                 let view_status = match status {
                     EntryStatus::NotCompared => ca_fs::compare::NodeStatus::NotCompared,
                     EntryStatus::Same => ca_fs::compare::NodeStatus::Same,
-                    EntryStatus::Different => ca_fs::compare::NodeStatus::Different,
+                    EntryStatus::Different | EntryStatus::MergeByHand => {
+                        ca_fs::compare::NodeStatus::Different
+                    }
                     EntryStatus::LeftNewer => ca_fs::compare::NodeStatus::LeftNewer,
                     EntryStatus::RightNewer => ca_fs::compare::NodeStatus::RightNewer,
                     EntryStatus::LeftOrphan => ca_fs::compare::NodeStatus::LeftOrphan,
@@ -679,6 +682,35 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_row_left_for_a_merge_by_hand_is_written_and_counted_as_a_difference() {
+        assert!(EntryStatus::MergeByHand.is_difference());
+        assert!(!EntryStatus::MergeByHand.is_orphan());
+
+        let mut input = rows();
+        input.push(named_row("both.txt", EntryStatus::MergeByHand));
+        let options = FolderReportOptions::default();
+        let html = render_rows(&options, &OutputOptions::html_color(), input.clone());
+        assert!(
+            html.contains("<tr class=\"diff\"><td>both.txt</td>"),
+            "{html}"
+        );
+        assert!(html.contains("<td>Merge by hand</td>"), "{html}");
+        assert!(html.contains("<dt>different</dt><dd>1</dd>"), "{html}");
+        let text = render_rows(&options, &OutputOptions::plain_text(), input.clone());
+        let line = text
+            .lines()
+            .find(|line| line.starts_with("both.txt"))
+            .expect("a line for the row");
+        assert!(line.contains("Merge by hand"), "{line}");
+        let xml_options = FolderReportOptions {
+            layout: FolderLayout::Xml,
+            ..FolderReportOptions::default()
+        };
+        let xml = render_rows(&xml_options, &OutputOptions::plain_text(), input);
+        assert!(xml.contains("status=\"merge-by-hand\""), "{xml}");
     }
 
     #[test]
