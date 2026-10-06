@@ -100,16 +100,23 @@ impl Fixture {
             .is_none()
     }
 
-    fn view(&self) -> FolderMergeView {
-        let request = OpenRequest::new(
+    fn request(&self) -> OpenRequest {
+        OpenRequest::new(
             SessionKind::FolderMerge,
             self.path("left"),
             self.path("right"),
         )
         .with_center(Some(self.path("center")))
-        .with_output(Some(self.path("output")));
+        .with_output(Some(self.path("output")))
+    }
+
+    fn view(&self) -> FolderMergeView {
+        self.open(&self.request())
+    }
+
+    fn open(&self, request: &OpenRequest) -> FolderMergeView {
         let mut view =
-            FolderMergeView::with_journal_directory(&request, &context(), 1, self.path("journals"));
+            FolderMergeView::with_journal_directory(request, &context(), 1, self.path("journals"));
         // A test never reaches the real recycle bin: on some platforms that
         // call asks the desktop shell for permission and blocks on a dialog.
         view.operation_options_mut().use_recycle_bin = false;
@@ -401,6 +408,556 @@ fn a_merge_with_no_row_left_for_a_person_exits_with_success() {
     assert!(poll_until(&mut view, FolderMergeView::has_summary));
     assert_eq!(view.exit_code(), Some(0));
     assert!(view.message().is_none(), "{:?}", view.message());
+}
+
+fn close_and_rescan(view: &mut FolderMergeView) {
+    view.close_summary();
+    assert!(poll_until(view, |view| view.tree().is_some()));
+}
+
+/// The state word the report gives the row at `rel`.
+fn report_word(view: &FolderMergeView, rel: &str) -> &'static str {
+    let (_, payload) = view.report_payload();
+    let ca_ui::report::Payload::Folder(rows) = payload else {
+        panic!("a folder merge writes a folder report");
+    };
+    rows.iter()
+        .find(|row| row.relative_path == rel)
+        .unwrap_or_else(|| panic!("no report row for {rel}"))
+        .status
+        .label()
+}
+
+/// Write the merged texts of the mixed fixture into the output, after every
+/// input was written, as a save from Text Merge does.
+fn merge_mixed_by_hand(fixture: &Fixture) {
+    fixture.write("output", "both.txt", b"one\ntwo\nTHREE, merged\n", T + 30);
+    fixture.write(
+        "output",
+        "clash.txt",
+        b"one\nLEFT and RIGHT SIDE\nthree\n",
+        T + 30,
+    );
+}
+
+fn reload(view: &mut FolderMergeView) {
+    view.run(Command::Reload);
+    assert!(poll_until(view, |view| view.tree().is_some()));
+}
+
+#[test]
+fn a_merge_of_a_selected_row_names_the_rows_left_for_a_merge_by_hand_in_its_result() {
+    let fixture = Fixture::mixed();
+    let mut view = fixture.view();
+    assert!(view.select(Path::new("added.txt")));
+    let mut probe = Probe::new(WINDOW[0], WINDOW[1]);
+    let _ = frame_text(&mut probe, &mut view);
+
+    merge_at_once(&mut view);
+    assert!(poll_until(&mut view, FolderMergeView::has_summary));
+    let _ = frame_text(&mut probe, &mut view);
+    let result = frame_text(&mut probe, &mut view);
+
+    assert!(result.contains("Every step completed."), "{result}");
+    assert!(
+        result.contains("2 items need a merge by hand (1 mergeable, 1 conflict)."),
+        "the result of a selection merge is silent on the rows that wait:\n{result}"
+    );
+    assert!(
+        message(&view).starts_with("2 items need a merge by hand"),
+        "{}",
+        message(&view)
+    );
+}
+
+#[test]
+fn a_second_merge_of_the_same_selection_does_not_call_the_output_finished_while_rows_wait() {
+    let fixture = Fixture::mixed();
+    let mut view = fixture.view();
+    assert!(view.select(Path::new("added.txt")));
+    merge_at_once(&mut view);
+    assert!(poll_until(&mut view, FolderMergeView::has_summary));
+    close_and_rescan(&mut view);
+    assert!(view.select(Path::new("added.txt")));
+
+    merge_at_once(&mut view);
+
+    assert!(fixture.read("output", "both.txt").is_none());
+    let text = message(&view);
+    assert_ne!(
+        text, FINISHED,
+        "the output is called finished while both.txt and clash.txt are absent"
+    );
+    assert!(
+        text.starts_with("Nothing is copied. 2 items need a merge by hand"),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_merge_of_a_selection_does_not_call_the_output_finished_while_other_items_are_not_written() {
+    let fixture = Fixture::empty();
+    fixture.write("left", "chosen.txt", b"chosen\n", T);
+    fixture.write("left", "other.txt", b"other\n", T);
+    let mut view = fixture.view();
+    assert!(view.select(Path::new("chosen.txt")));
+    merge_at_once(&mut view);
+    assert!(poll_until(&mut view, FolderMergeView::has_summary));
+    close_and_rescan(&mut view);
+    assert!(view.select(Path::new("chosen.txt")));
+
+    merge_at_once(&mut view);
+
+    assert!(fixture.read("output", "other.txt").is_none());
+    assert_eq!(
+        message(&view),
+        "Nothing is copied. Only the selected items take part in the merge. \
+         To write the other items to the output, select them and merge again."
+    );
+}
+
+#[test]
+fn with_automatic_merge_off_the_output_is_not_called_finished_while_it_lacks_an_item() {
+    let fixture = Fixture::empty();
+    fixture.write("left", "added.txt", b"from the left\n", T + 4);
+    let mut view = fixture.view();
+    let Some(ca_session::settings::SessionSettings::FolderMerge(mut merge)) = view.settings()
+    else {
+        panic!("no folder merge settings")
+    };
+    merge.merge.automatic_merge = false;
+    view.apply_settings(&ca_session::settings::SessionSettings::FolderMerge(merge));
+    assert!(poll_until(&mut view, |view| view.tree().is_some()));
+
+    merge_at_once(&mut view);
+
+    assert!(fixture.read("output", "added.txt").is_none());
+    assert_eq!(
+        message(&view),
+        "Nothing is copied. Merge automatically is off in the session settings, so 1 item \
+         has no action and the merge leaves it out. To write it, choose Take Left, \
+         Take Center or Take Right and merge again."
+    );
+}
+
+/// The rule for a row merged by hand reads the output item's time: a file
+/// written after every input item, and not a copy of one, holds the merge
+/// result. The batch writes `added.txt` first in one order and nothing in
+/// the other, which decides between exit codes 14 and 101 before the fix.
+fn rows_merged_by_hand_and_reloaded_count_as_merged(batch_first: bool) {
+    let fixture = Fixture::mixed();
+    if !batch_first {
+        std::fs::remove_file(fixture.path("left").join("added.txt")).unwrap();
+    }
+    let mut view = fixture.view();
+    merge_at_once(&mut view);
+    if view.has_summary() {
+        close_and_rescan(&mut view);
+    }
+    merge_mixed_by_hand(&fixture);
+
+    reload(&mut view);
+
+    assert_eq!(
+        view.exit_code(),
+        Some(0),
+        "both rows hold their merge result"
+    );
+    assert_eq!(report_word(&view, "both.txt"), "Merged by hand");
+    assert_eq!(report_word(&view, "clash.txt"), "Merged by hand");
+    let mut probe = Probe::new(WINDOW[0], WINDOW[1]);
+    let _ = frame_text(&mut probe, &mut view);
+    let shown = frame_text(&mut probe, &mut view);
+    assert_eq!(
+        shown
+            .lines()
+            .filter(|line| *line == "Merged by hand")
+            .count(),
+        2,
+        "the Action column does not mark both rows:\n{shown}"
+    );
+    merge_at_once(&mut view);
+    assert_eq!(message(&view), FINISHED);
+    assert_eq!(
+        fixture.read("output", "both.txt").as_deref(),
+        Some(&b"one\ntwo\nTHREE, merged\n"[..]),
+        "the merge wrote over a row merged by hand"
+    );
+}
+
+#[test]
+fn rows_merged_by_hand_after_a_merge_that_wrote_other_items_count_as_merged() {
+    rows_merged_by_hand_and_reloaded_count_as_merged(true);
+}
+
+#[test]
+fn rows_merged_by_hand_when_no_merge_wrote_anything_count_as_merged() {
+    rows_merged_by_hand_and_reloaded_count_as_merged(false);
+}
+
+#[test]
+fn an_older_output_item_or_a_copy_of_an_input_is_not_a_merge_by_hand() {
+    let fixture = Fixture::mixed();
+    fixture.write("output", "both.txt", b"one\ntwo\nthree\n", T);
+    fixture.write("output", "clash.txt", b"one\nRIGHT SIDE\nthree\n", T + 8);
+    let view = fixture.view();
+    assert_eq!(report_word(&view, "both.txt"), "Merge by hand");
+    assert_eq!(report_word(&view, "clash.txt"), "Merge by hand");
+    assert_eq!(view.exit_code(), Some(101));
+}
+
+#[test]
+fn a_take_on_a_row_merged_by_hand_replaces_the_output_item_and_the_confirmation_says_so() {
+    let fixture = Fixture::mixed();
+    merge_mixed_by_hand(&fixture);
+    let mut view = fixture.view();
+    assert_eq!(report_word(&view, "both.txt"), "Merged by hand");
+    assert!(view.select(Path::new("both.txt")));
+    view.run(Command::TakeRight);
+    let mut probe = Probe::new(WINDOW[0], WINDOW[1]);
+    let _ = frame_text(&mut probe, &mut view);
+    view.set_confirm_merge(true);
+    view.run(Command::MergeFolders);
+    assert!(poll_until(&mut view, FolderMergeView::is_confirming));
+    let _ = frame_text(&mut probe, &mut view);
+    let shown = frame_text(&mut probe, &mut view);
+    for wanted in [
+        "The merge replaces 1 item merged by hand in the output.",
+        "both.txt (merged by hand, replaced)",
+    ] {
+        assert!(
+            shown.contains(wanted),
+            "the confirmation lacks {wanted:?}:\n{shown}"
+        );
+    }
+
+    view.confirm_pending();
+    while !view.has_summary() {
+        assert!(poll_until(&mut view, |view| view.has_summary()
+            || view.pending_question().is_some()));
+        if let Some(question) = view.pending_question() {
+            view.answer(&question, ca_view_folder::opjobs::Answer::Proceed);
+        }
+    }
+    assert_eq!(
+        fixture.read("output", "both.txt").as_deref(),
+        Some(&b"one\ntwo\nTHREE\n"[..])
+    );
+    assert_eq!(
+        view.last_report().map(ca_fs::ExecutionReport::completed),
+        Some(1),
+        "the merge of the selected row copies both.txt"
+    );
+}
+
+#[test]
+fn a_binary_conflict_is_not_sent_to_text_merge() {
+    let fixture = Fixture::empty();
+    fixture.write("center", "pic.bin", b"\x00base", T);
+    fixture.write("left", "pic.bin", b"\x00left!", T + 4);
+    fixture.write("right", "pic.bin", b"\x00right!!", T + 8);
+    let mut view = fixture.view();
+    assert_eq!(status_of(&view, "pic.bin"), MergeStatus::Conflict);
+    assert!(view.select(Path::new("pic.bin")));
+    assert!(!view.accepts(Command::OpenTextMerge));
+
+    merge_at_once(&mut view);
+
+    assert_eq!(
+        message(&view),
+        "Nothing is copied. 1 item needs a merge by hand (0 mergeable, 1 conflict). \
+         The merge does not write it to the output. Text Merge cannot open it. \
+         To put one input's copy in the output, choose Take Left, Take Center or \
+         Take Right and merge again. Item: pic.bin (conflict, Take only, not in the output)."
+    );
+}
+
+#[test]
+fn a_deletion_against_an_edit_is_not_sent_to_text_merge() {
+    let fixture = Fixture::empty();
+    fixture.write("center", "gone.txt", b"one\ntwo\nthree\n", T);
+    fixture.write("right", "gone.txt", b"one\ntwo\nTHREE\n", T + 8);
+    let mut view = fixture.view();
+    assert!(view.select(Path::new("gone.txt")));
+    assert!(!view.accepts(Command::OpenTextMerge));
+
+    merge_at_once(&mut view);
+
+    let text = message(&view);
+    assert!(!text.contains("in Text Merge and save it"), "{text}");
+    assert!(text.contains("Text Merge cannot open it."), "{text}");
+    assert!(
+        text.ends_with("Item: gone.txt (conflict, Take only, not in the output)."),
+        "{text}"
+    );
+}
+
+fn write_zip(path: &Path, entries: &[(&str, &[u8])]) {
+    const EMPTY_ZIP: &[u8] = &[
+        0x50, 0x4b, 0x05, 0x06, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ];
+    std::fs::write(path, EMPTY_ZIP).unwrap();
+    let options = ca_vfs::ArchiveOptions {
+        zone_offset_seconds: ca_fs::local_offset_seconds(),
+        ..ca_vfs::ArchiveOptions::default()
+    };
+    let source = ca_fs::Source::archive(path, options).unwrap();
+    let cancel = ca_vfs::Cancel::new();
+    for (name, bytes) in entries {
+        let mut reader = *bytes;
+        source
+            .file_system()
+            .write_file(&ca_vfs::VfsPath::parse(name).unwrap(), &mut reader, &cancel)
+            .unwrap();
+    }
+}
+
+#[test]
+fn a_row_of_an_archive_input_is_not_sent_to_text_merge() {
+    let fixture = Fixture::empty();
+    let right = fixture.dir.path().join("right.zip");
+    write_zip(&right, &[("m.txt", b"one\ntwo\nTHREE\n")]);
+    fixture.write("center", "m.txt", b"one\ntwo\nthree\n", T);
+    fixture.write("left", "m.txt", b"ONE\ntwo\nthree\n", T + 4);
+    let request = OpenRequest::new(SessionKind::FolderMerge, fixture.path("left"), right)
+        .with_center(Some(fixture.path("center")))
+        .with_output(Some(fixture.path("output")));
+    let mut view = fixture.open(&request);
+    assert!(view.select(Path::new("m.txt")));
+    assert!(!view.accepts(Command::OpenTextMerge));
+
+    merge_at_once(&mut view);
+
+    let text = message(&view);
+    assert!(!text.contains("in Text Merge and save it"), "{text}");
+    assert!(text.contains("Text Merge cannot open it."), "{text}");
+}
+
+#[test]
+fn the_notice_tells_rows_text_merge_opens_from_rows_it_cannot_open() {
+    let fixture = Fixture::mixed();
+    std::fs::remove_file(fixture.path("left").join("added.txt")).unwrap();
+    fixture.write("center", "pic.bin", b"\x00base", T);
+    fixture.write("left", "pic.bin", b"\x00left!", T + 4);
+    fixture.write("right", "pic.bin", b"\x00right!!", T + 8);
+    let mut view = fixture.view();
+
+    merge_at_once(&mut view);
+
+    assert_eq!(
+        message(&view),
+        "Nothing is copied. 3 items need a merge by hand (1 mergeable, 2 conflicts). \
+         The merge does not write them to the output. \
+         2 of them open in Text Merge. To put their merge result in the output, merge \
+         each one there and save it. Text Merge cannot open the other one. \
+         To keep one input's copy instead, choose Take Left, Take Center or Take Right \
+         and merge again. Items: both.txt (mergeable, not in the output), \
+         clash.txt (conflict, not in the output), \
+         pic.bin (conflict, Take only, not in the output)."
+    );
+}
+
+/// Change `added.txt` after the confirmation, so the step drifts, then answer
+/// every question with `answer`.
+fn merge_with_a_drifted_step(
+    with_waiting_rows: bool,
+    after_confirmation: impl Fn(&Fixture),
+    answer: ca_view_folder::opjobs::Answer,
+) -> (Fixture, FolderMergeView) {
+    let fixture = if with_waiting_rows {
+        Fixture::mixed()
+    } else {
+        let fixture = Fixture::empty();
+        fixture.write("left", "added.txt", b"from the left\n", T + 4);
+        fixture
+    };
+    let mut view = fixture.view();
+    view.set_confirm_merge(true);
+    view.run(Command::MergeFolders);
+    assert!(poll_until(&mut view, FolderMergeView::is_confirming));
+    after_confirmation(&fixture);
+    view.confirm_pending();
+    while !view.has_summary() {
+        assert!(poll_until(&mut view, |view| view.has_summary()
+            || view.pending_question().is_some()));
+        if let Some(question) = view.pending_question() {
+            view.answer(&question, answer);
+        }
+    }
+    assert!(fixture.read("output", "added.txt").is_none());
+    (fixture, view)
+}
+
+fn change_added(fixture: &Fixture) {
+    fixture.write("left", "added.txt", b"from the left, longer now\n", T + 20);
+}
+
+fn remove_added(fixture: &Fixture) {
+    std::fs::remove_file(fixture.path("left").join("added.txt")).unwrap();
+}
+
+#[test]
+fn a_merge_with_a_skipped_step_and_no_waiting_row_does_not_exit_with_success() {
+    let (_fixture, mut view) =
+        merge_with_a_drifted_step(false, change_added, ca_view_folder::opjobs::Answer::Skip);
+    assert_eq!(
+        view.last_report().map(ca_fs::ExecutionReport::completed),
+        Some(0)
+    );
+    assert_eq!(view.exit_code(), Some(100));
+    close_and_rescan(&mut view);
+    assert_eq!(
+        view.exit_code(),
+        Some(100),
+        "the output still lacks added.txt"
+    );
+}
+
+#[test]
+fn a_merge_with_a_skipped_step_and_waiting_rows_reports_the_step_first() {
+    let (_fixture, view) =
+        merge_with_a_drifted_step(true, change_added, ca_view_folder::opjobs::Answer::Skip);
+    assert_eq!(view.exit_code(), Some(100));
+}
+
+#[test]
+fn a_merge_with_a_failed_step_does_not_exit_with_success() {
+    let (fixture, mut view) =
+        merge_with_a_drifted_step(false, remove_added, ca_view_folder::opjobs::Answer::Proceed);
+    let report = view.last_report().unwrap();
+    assert!(
+        !report.failures().is_empty() || !report.is_clean(),
+        "{report:?}"
+    );
+    assert_eq!(view.exit_code(), Some(100));
+
+    fixture.write("left", "added.txt", b"from the left\n", T + 4);
+    close_and_rescan(&mut view);
+    merge_at_once(&mut view);
+    assert!(poll_until(&mut view, FolderMergeView::has_summary));
+    assert_eq!(
+        view.exit_code(),
+        Some(0),
+        "a later merge wrote the item the failed step left out"
+    );
+}
+
+#[test]
+fn the_status_text_writes_item_paths_as_the_report_does() {
+    let fixture = Fixture::empty();
+    let rel = "dir with space/sous-dossier \u{fc}n\u{ef}c\u{f6}d\u{e9}/\u{65e5}\u{672c} file.txt";
+    let body = b"one\ntwo\nthree\nfour\nfive\nsix\nseven\n";
+    fixture.write("center", rel, body, T);
+    fixture.write(
+        "left",
+        rel,
+        b"ONE\ntwo\nthree\nfour\nfive\nsix\nseven\n",
+        T + 4,
+    );
+    fixture.write(
+        "right",
+        rel,
+        b"one\ntwo\nthree\nfour\nfive\nsix\nSEVEN\n",
+        T + 8,
+    );
+    let mut view = fixture.view();
+    assert_eq!(report_word(&view, rel), "Merge by hand");
+
+    merge_at_once(&mut view);
+
+    let text = message(&view);
+    assert!(
+        text.ends_with(&format!("Item: {rel} (mergeable, not in the output).")),
+        "the status text and the report write the same path differently: {text}"
+    );
+}
+
+#[test]
+fn a_save_from_text_merge_marks_its_row_merged_by_hand_without_a_reload() {
+    let fixture = Fixture::mixed();
+    std::fs::remove_file(fixture.path("left").join("added.txt")).unwrap();
+    let mut view = fixture.view();
+    merge_at_once(&mut view);
+    assert_eq!(view.exit_code(), Some(101));
+
+    merge_mixed_by_hand(&fixture);
+    view.file_saved(&fixture.path("output").join("both.txt"));
+
+    let text = message(&view);
+    assert!(
+        text.starts_with(
+            "Nothing is copied. 1 item needs a merge by hand (0 mergeable, 1 conflict)."
+        ),
+        "{text}"
+    );
+    assert!(
+        text.ends_with("Item: clash.txt (conflict, not in the output)."),
+        "{text}"
+    );
+    assert_eq!(report_word(&view, "both.txt"), "Merged by hand");
+    assert_eq!(view.exit_code(), Some(101), "clash.txt still waits");
+
+    view.file_saved(&fixture.path("output").join("clash.txt"));
+    assert_eq!(view.message(), None);
+    assert_eq!(view.exit_code(), Some(0));
+}
+
+#[test]
+fn a_save_into_an_output_that_is_the_left_input_keeps_its_row_merged_by_hand_after_a_reload() {
+    let fixture = Fixture::mixed();
+    let mut view = fixture.view();
+    let Some(ca_session::settings::SessionSettings::FolderMerge(mut merge)) = view.settings()
+    else {
+        panic!("no folder merge settings")
+    };
+    merge.merge.target = ca_session::settings::folder::MergeTarget::Left;
+    view.apply_settings(&ca_session::settings::SessionSettings::FolderMerge(merge));
+    assert!(poll_until(&mut view, |view| view.tree().is_some()));
+    assert_eq!(report_word(&view, "both.txt"), "Merge by hand");
+
+    fixture.write("left", "both.txt", b"one\ntwo\nTHREE, merged\n", T + 30);
+    view.file_saved(&fixture.path("left").join("both.txt"));
+    reload(&mut view);
+
+    assert_eq!(
+        report_word(&view, "both.txt"),
+        "Merged by hand",
+        "the output is an input, so only the save tells a merge by hand from an edit"
+    );
+    assert_eq!(report_word(&view, "clash.txt"), "Merge by hand");
+}
+
+#[test]
+fn a_take_without_a_new_merge_updates_the_notice_and_the_exit_code() {
+    let fixture = Fixture::mixed();
+    let mut view = fixture.view();
+    merge_at_once(&mut view);
+    assert!(poll_until(&mut view, FolderMergeView::has_summary));
+    close_and_rescan(&mut view);
+    assert!(message(&view).starts_with("2 items need a merge by hand"));
+    assert_eq!(view.exit_code(), Some(14));
+
+    assert!(view.select(Path::new("clash.txt")));
+    view.run(Command::TakeLeft);
+    let text = message(&view);
+    assert!(
+        text.starts_with("1 item needs a merge by hand (1 mergeable, 0 conflicts)."),
+        "{text}"
+    );
+    assert!(
+        text.ends_with("Item: both.txt (mergeable, not in the output)."),
+        "{text}"
+    );
+    assert_eq!(view.exit_code(), Some(14));
+
+    view.run(Command::SelectAll);
+    view.run(Command::TakeLeft);
+    assert_eq!(
+        view.message(),
+        None,
+        "the notice names rows a Take resolved"
+    );
+    assert_eq!(view.exit_code(), Some(0));
 }
 
 /// Presses on the drawn view, found by accessible label.

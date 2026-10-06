@@ -9,11 +9,12 @@
 use crate::dialogs::{self, modal};
 use crate::opjobs::{self, Answer, Ask, ExecMessage, ProgressState};
 use crate::settings::{merge_options_of, EngineOptions};
+use ca_fs::merge::automatic_resolution;
 use ca_fs::{
-    compare3_sources, leaves_for_person, left_for_person, plan_merge, scan_source, scan_with,
-    ExecutionReport, FilterContext, FolderMergeOptions, MergeBases, MergeFilters, MergeInputs,
-    MergeRequest, MergeRow, MergeSources, MergeStatus, MergeTree, OperationOptions, OperationPlan,
-    Pane, Resolution, RulesEngine, ScanResult, Source,
+    compare3_sources, leaves_for_person, output_written_after_inputs, plan_merge, scan_source,
+    scan_with, ExecutionReport, FilterContext, FolderMergeOptions, MergeBases, MergeFilters,
+    MergeInputs, MergeRequest, MergeRow, MergeSources, MergeStatus, MergeTree, OperationOptions,
+    OperationPlan, Pane, Resolution, RulesEngine, ScanResult, Source,
 };
 use ca_session::settings::folder::MergeTarget;
 use ca_session::settings::{FolderMergeSettings, SessionSettings};
@@ -44,9 +45,15 @@ const NO_OUTPUT: &str = "Name an output folder in the session settings first";
 const ARCHIVE_OUTPUT: &str =
     "The output is an archive. A merge writes into a local folder only. Name a folder as the output.";
 const NOT_READY: &str = "Available once the comparison finishes";
-/// What the view says when a merge has nothing to write and leaves no item
-/// for a merge by hand.
+/// What the view says when a merge has nothing to write and the output holds
+/// the merge result of every row.
 const FINISHED: &str = "The output already holds the merge result.";
+/// The Action column of a row whose output holds a merge by hand.
+const MERGED_BY_HAND: &str = "Merged by hand";
+/// The status text after a merge of a selection when other items still
+/// differ from the merge result.
+const REST_OF_THE_TREE: &str = "Only the selected items take part in the merge. \
+     To write the other items to the output, select them and merge again.";
 /// How many items a dialog names before it counts the rest.
 const DIALOG_NAMES: usize = 20;
 /// How many items the status text names before it counts the rest.
@@ -59,6 +66,10 @@ const EXIT_LEFT_FOR_HAND: i32 = 14;
 /// Exit code when items wait for a merge by hand and no merge wrote to the
 /// output; the text merge returns the same code when it writes no file.
 const EXIT_LEFT_FOR_HAND_NOTHING_WRITTEN: i32 = 101;
+/// Exit code when a step of a merge did not complete and no later merge
+/// settled its item; the text merge returns the same code when its write
+/// fails.
+const EXIT_STEP_UNDONE: i32 = 100;
 
 /// Every command from the shared vocabulary this view answers for.
 const HANDLED: &[Command] = &[
@@ -220,13 +231,40 @@ pub fn action_label(row: &MergeRow, resolution: Resolution, target: &MergeTarget
     }
 }
 
-/// The items one merge leaves for a merge by hand: the plan writes nothing
-/// for them, so the output holds their merge result only after a person
-/// merges each one.
+/// A relative path as the report writes it, with `/` between the names.
+fn slash_path(rel: &Path) -> String {
+    rel.to_string_lossy().replace('\\', "/")
+}
+
+/// The path in the output folder a row writes to: the output's own spelling
+/// where the output holds an item, else the row's.
+fn target_rel(row: &MergeRow) -> &Path {
+    row.output.as_ref().map_or(&row.rel, |entry| &entry.rel)
+}
+
+/// True when Text Merge opens `row`: both changed versions are text files,
+/// every input is a local folder, and writing the output item passes through
+/// no link or file of the output.
+///
+/// The Text Merge toolbar button and the notice that sends a row to Text
+/// Merge both read this rule, so the notice never names a step the toolbar
+/// refuses.
+fn opens_in_text_merge(tree: &MergeTree, row: &MergeRow) -> bool {
+    row.text
+        && row.left.is_some()
+        && row.right.is_some()
+        && tree.text_merge_inputs_are_local()
+        && tree.output_target_is_safe(target_rel(row))
+}
+
+/// The items of a comparison that wait for a merge by hand: no merge writes
+/// them, and the output does not hold a merge by hand of them.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ByHand {
     mergeable: usize,
     conflicts: usize,
+    /// How many of them Text Merge opens.
+    text_merge: usize,
     /// The first items in tree order, at most [`DIALOG_NAMES`] of them.
     first: Vec<ByHandItem>,
 }
@@ -236,27 +274,52 @@ struct ByHandItem {
     rel: PathBuf,
     conflict: bool,
     in_output: bool,
+    text_merge: bool,
 }
 
 impl ByHand {
-    fn of<'t>(rows: impl IntoIterator<Item = &'t MergeRow>) -> Self {
+    /// The rows that wait, each with whether Text Merge opens it.
+    fn of<'t>(rows: impl IntoIterator<Item = (&'t MergeRow, bool)>) -> Self {
         let mut by_hand = Self::default();
-        for row in rows {
+        for (row, text_merge) in rows {
             let conflict = row.status == MergeStatus::Conflict;
             if conflict {
                 by_hand.conflicts += 1;
             } else {
                 by_hand.mergeable += 1;
             }
+            if text_merge {
+                by_hand.text_merge += 1;
+            }
             if by_hand.first.len() < DIALOG_NAMES {
                 by_hand.first.push(ByHandItem {
                     rel: row.rel.clone(),
                     conflict,
                     in_output: row.output.is_some(),
+                    text_merge,
                 });
             }
         }
         by_hand
+    }
+
+    /// The rows of `tree` that wait under `request` with every row taking
+    /// part, leaving out the rows in `merged`.
+    fn waiting_in(
+        tree: &MergeTree,
+        request: &MergeRequest<'_>,
+        merged: &BTreeSet<PathBuf>,
+    ) -> Self {
+        let whole = MergeRequest {
+            selection: None,
+            ..*request
+        };
+        Self::of(
+            tree.rows
+                .iter()
+                .filter(|row| leaves_for_person(row, &whole) && !merged.contains(&row.rel))
+                .map(|row| (row, opens_in_text_merge(tree, row))),
+        )
     }
 
     /// How many items wait for a merge by hand.
@@ -272,7 +335,7 @@ impl ByHand {
     }
 
     /// The sentences that count the items and say what the user can do.
-    fn sentences(&self, has_center: bool) -> [String; 4] {
+    fn sentences(&self, has_center: bool) -> Vec<String> {
         let one = self.total() == 1;
         let (items, need) = if one {
             ("item", "needs")
@@ -289,7 +352,7 @@ impl ByHand {
         } else {
             "Take Left or Take Right"
         };
-        [
+        let mut sentences = vec![
             format!(
                 "{} {items} {need} a merge by hand ({} mergeable, {} {conflicts}).",
                 self.total(),
@@ -302,14 +365,43 @@ impl ByHand {
                 "The merge does not write them to the output."
             }
             .to_owned(),
-            if one {
+        ];
+        let others = self.total() - self.text_merge;
+        match (self.text_merge, others) {
+            (_, 0) if one => sentences.push(
                 "To put its merge result in the output, merge it in Text Merge and save it."
-            } else {
+                    .to_owned(),
+            ),
+            (_, 0) => sentences.push(
                 "To put their merge result in the output, merge each one in Text Merge and save it."
+                    .to_owned(),
+            ),
+            (0, _) if one => sentences.push("Text Merge cannot open it.".to_owned()),
+            (0, _) => sentences.push("Text Merge cannot open them.".to_owned()),
+            (opened, _) => {
+                sentences.push(if opened == 1 {
+                    "1 of them opens in Text Merge. To put its merge result in the output, \
+                     merge it there and save it."
+                        .to_owned()
+                } else {
+                    format!(
+                        "{opened} of them open in Text Merge. To put their merge result in the \
+                         output, merge each one there and save it."
+                    )
+                });
+                sentences.push(if others == 1 {
+                    "Text Merge cannot open the other one.".to_owned()
+                } else {
+                    format!("Text Merge cannot open the other {others}.")
+                });
             }
-            .to_owned(),
-            format!("To keep one input's copy instead, choose {takes} and merge again."),
-        ]
+        }
+        sentences.push(if self.text_merge == 0 {
+            format!("To put one input's copy in the output, choose {takes} and merge again.")
+        } else {
+            format!("To keep one input's copy instead, choose {takes} and merge again.")
+        });
+        sentences
     }
 
     /// One line per named item, at most `limit` of them.
@@ -318,16 +410,18 @@ impl ByHand {
             .iter()
             .take(limit)
             .map(|item| {
-                let kind = if item.conflict {
+                let mut facts = vec![if item.conflict {
                     "conflict"
                 } else {
                     "mergeable"
-                };
-                if item.in_output {
-                    format!("{} ({kind})", item.rel.display())
-                } else {
-                    format!("{} ({kind}, not in the output)", item.rel.display())
+                }];
+                if !item.text_merge {
+                    facts.push("Take only");
                 }
+                if !item.in_output {
+                    facts.push("not in the output");
+                }
+                format!("{} ({})", slash_path(&item.rel), facts.join(", "))
             })
             .collect()
     }
@@ -367,6 +461,216 @@ impl ByHand {
         }
         lines
     }
+}
+
+/// The output items merged by hand that a plan replaces or removes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Overwrites {
+    total: usize,
+    /// The first items in plan order, each with true where the step removes
+    /// the item, at most [`DIALOG_NAMES`] of them.
+    first: Vec<(PathBuf, bool)>,
+}
+
+impl Overwrites {
+    /// The steps of `plan` that write over a row in `merged`.
+    fn of(plan: &OperationPlan, merged: &BTreeSet<PathBuf>) -> Self {
+        let mut overwrites = Self::default();
+        for step in &plan.steps {
+            if !merged.contains(&step.rel) {
+                continue;
+            }
+            let removed = match step.action {
+                ca_fs::StepAction::CopyFile { .. } => false,
+                ca_fs::StepAction::DeleteFile { .. }
+                | ca_fs::StepAction::Trash { .. }
+                | ca_fs::StepAction::DeleteLink { .. } => true,
+                _ => continue,
+            };
+            overwrites.total += 1;
+            if overwrites.first.len() < DIALOG_NAMES {
+                overwrites.first.push((step.rel.clone(), removed));
+            }
+        }
+        overwrites
+    }
+
+    const fn is_empty(&self) -> bool {
+        self.total == 0
+    }
+
+    fn sentence(&self) -> String {
+        if self.total == 1 {
+            "The merge replaces 1 item merged by hand in the output.".to_owned()
+        } else {
+            format!(
+                "The merge replaces {} items merged by hand in the output.",
+                self.total
+            )
+        }
+    }
+
+    fn lines(&self) -> Vec<String> {
+        let mut lines: Vec<String> = self
+            .first
+            .iter()
+            .map(|(rel, removed)| {
+                let effect = if *removed { "removed" } else { "replaced" };
+                format!("{} (merged by hand, {effect})", slash_path(rel))
+            })
+            .collect();
+        if self.total > self.first.len() {
+            lines.push(format!("and {} more", self.total - self.first.len()));
+        }
+        lines
+    }
+}
+
+/// What a plan with no step leaves undone over the whole comparison, read on
+/// the planning worker.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Finish {
+    /// Rows with no resolution because automatic merge is off, that an
+    /// automatic merge would write.
+    unresolved: usize,
+    /// True when a merge of every row would write something a merge of the
+    /// selection does not.
+    rest: bool,
+    /// The items a merge of every row leaves alone, each with the reason.
+    skipped: Vec<String>,
+}
+
+impl Finish {
+    fn of(
+        tree: &MergeTree,
+        bases: MergeBases<'_>,
+        request: &MergeRequest<'_>,
+        options: &OperationOptions,
+        plan: &OperationPlan,
+    ) -> Self {
+        let whole = MergeRequest {
+            selection: None,
+            ..*request
+        };
+        let whole_plan = request
+            .selection
+            .is_some()
+            .then(|| plan_merge(tree, bases, &whole, options).ok())
+            .flatten();
+        let whole_plan = whole_plan.as_ref().unwrap_or(plan);
+        let unresolved = if request.automatic {
+            0
+        } else {
+            let automatic = MergeRequest {
+                automatic: true,
+                ..whole
+            };
+            plan_merge(tree, bases, &automatic, options).map_or(0, |written| {
+                let stepped: BTreeSet<&Path> = written
+                    .steps
+                    .iter()
+                    .map(|step| step.rel.as_path())
+                    .collect();
+                tree.rows
+                    .iter()
+                    .filter(|row| {
+                        !request.overrides.contains_key(&row.rel)
+                            && automatic_resolution(row) != Resolution::Leave
+                            && stepped.contains(row.rel.as_path())
+                    })
+                    .count()
+            })
+        };
+        Self {
+            unresolved,
+            rest: request.selection.is_some() && !whole_plan.steps.is_empty(),
+            skipped: whole_plan
+                .skipped
+                .iter()
+                .map(|skip| format!("{} ({})", slash_path(&skip.path), skip.reason))
+                .collect(),
+        }
+    }
+
+    const fn is_empty(&self) -> bool {
+        self.unresolved == 0 && !self.rest && self.skipped.is_empty()
+    }
+
+    fn sentences(&self, has_center: bool) -> Vec<String> {
+        let mut sentences = Vec::new();
+        if self.unresolved > 0 {
+            let takes = if has_center {
+                "Take Left, Take Center or Take Right"
+            } else {
+                "Take Left or Take Right"
+            };
+            sentences.push(if self.unresolved == 1 {
+                format!(
+                    "Merge automatically is off in the session settings, so 1 item has no \
+                     action and the merge leaves it out. To write it, choose {takes} and merge \
+                     again."
+                )
+            } else {
+                format!(
+                    "Merge automatically is off in the session settings, so {} items have no \
+                     action and the merge leaves them out. To write them, choose {takes} and \
+                     merge again.",
+                    self.unresolved
+                )
+            });
+        }
+        if self.rest {
+            sentences.push(REST_OF_THE_TREE.to_owned());
+        }
+        if !self.skipped.is_empty() {
+            sentences.push(format!(
+                "{} items are left alone: {}",
+                self.skipped.len(),
+                self.skipped.join("; ")
+            ));
+        }
+        sentences
+    }
+}
+
+/// The status text a merge leaves, kept in parts so the text follows the
+/// rows when a resolution, a save or the comparison changes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Notice {
+    /// True when the merge had no step to run.
+    nothing_copied: bool,
+    /// What the plan left undone over the whole comparison. Dropped once the
+    /// text is rebuilt, since it describes the plan, not the rows.
+    finish: Finish,
+}
+
+impl Notice {
+    fn text(&self, by_hand: &ByHand, has_center: bool) -> Option<String> {
+        let mut parts = Vec::new();
+        if !by_hand.is_empty() {
+            parts.push(by_hand.notice(has_center, MESSAGE_NAMES));
+        }
+        parts.extend(self.finish.sentences(has_center));
+        if parts.is_empty() {
+            return None;
+        }
+        if self.nothing_copied {
+            parts.insert(0, "Nothing is copied.".to_owned());
+        }
+        Some(parts.join(" "))
+    }
+}
+
+/// What the planning worker hands back with a plan.
+#[derive(Debug)]
+pub struct Planned {
+    plan: Box<OperationPlan>,
+    by_hand: ByHand,
+    overwrites: Overwrites,
+    finish: Finish,
+    /// Items a step left undone before that take part in this merge and that
+    /// it has no step for, so the output already holds what the merge wants.
+    settled: Vec<PathBuf>,
 }
 
 /// What the exit code of the view is read from.
@@ -419,8 +723,9 @@ enum DeferredComparison {
 pub enum CompareMessage {
     /// A step of the comparison started.
     Progress(&'static str),
-    /// The comparison finished.
-    Ready(Box<MergeTree>),
+    /// The comparison finished, with the rows whose output item was written
+    /// after every input item.
+    Ready(Box<MergeTree>, BTreeSet<PathBuf>),
     /// The comparison could not run.
     Failed(String),
 }
@@ -442,9 +747,8 @@ impl Terminal for CompareMessage {
 /// What the planning worker posts back.
 #[derive(Debug)]
 pub enum MergePlanMessage {
-    /// The plan with the items it leaves for a merge by hand, or why no plan
-    /// was built.
-    Done(Result<(Box<OperationPlan>, ByHand), String>),
+    /// The plan with what it leaves undone, or why no plan was built.
+    Done(Result<Box<Planned>, String>),
 }
 
 impl Terminal for MergePlanMessage {
@@ -489,12 +793,24 @@ pub struct FolderMergeView {
     cursor: Option<usize>,
     active: Pane,
     stage: Stage,
-    /// The items the last plan leaves for a merge by hand.
+    /// The items that wait for a merge by hand, as the last plan or the last
+    /// change of the rows left them.
     by_hand: ByHand,
+    /// The items merged by hand the plan on screen replaces.
+    overwrites: Overwrites,
+    /// Rows whose output item was written after every input item, as the
+    /// last comparison read them.
+    written_after: BTreeSet<PathBuf>,
+    /// Output paths Text Merge saved in this session.
+    saved: BTreeSet<PathBuf>,
+    /// Items a step left undone that no later merge settled.
+    undone: BTreeSet<PathBuf>,
     outcome: Outcome,
     report: ViewReport,
     actions: Vec<ViewAction>,
     message: Option<String>,
+    /// The parts of `message` a merge wrote, where it wrote it.
+    notice: Option<Notice>,
 }
 
 impl FolderMergeView {
@@ -554,6 +870,10 @@ impl FolderMergeView {
             active: Pane::Left,
             stage: Stage::Idle,
             by_hand: ByHand::default(),
+            overwrites: Overwrites::default(),
+            written_after: BTreeSet::new(),
+            saved: BTreeSet::new(),
+            undone: BTreeSet::new(),
             outcome: Outcome::default(),
             report: ViewReport::new(
                 ReportKind::Folder,
@@ -562,6 +882,7 @@ impl FolderMergeView {
             ),
             actions: Vec::new(),
             message: None,
+            notice: None,
         };
         view.restart();
         view
@@ -752,12 +1073,12 @@ impl FolderMergeView {
             .map(|row| ca_ui::report::FolderRow {
                 depth: u32::try_from(row.depth).unwrap_or(u32::MAX),
                 name: row.name.clone(),
-                relative_path: row.rel.to_string_lossy().replace('\\', "/"),
+                relative_path: slash_path(&row.rel),
                 is_dir: row.is_dir,
-                status: if leaves_for_person(row, &request) {
-                    ca_ui::report::EntryStatus::MergeByHand
-                } else {
-                    report_status(row)
+                status: match (leaves_for_person(row, &request), self.merged_by_hand(row)) {
+                    (true, true) => ca_ui::report::EntryStatus::MergedByHand,
+                    (true, false) => ca_ui::report::EntryStatus::MergeByHand,
+                    (false, _) => report_status(row),
                 },
                 left: side_facts(row.left.as_ref()),
                 right: side_facts(row.right.as_ref()),
@@ -794,10 +1115,10 @@ impl FolderMergeView {
         self.plan_job = None;
         if matches!(self.stage, Stage::Planning | Stage::Confirming(_)) {
             self.stage = Stage::Idle;
-            self.message = Some(
+            self.say(Some(
                 "The merge plan was dropped because the comparison changed. Build a new plan before running it."
                     .to_owned(),
-            );
+            ));
         }
         if self.exec_job.is_some() {
             if let Some(job) = self.compare_job.take() {
@@ -826,6 +1147,59 @@ impl FolderMergeView {
         ));
     }
 
+    /// Put `text` in the status text, as no merge notice.
+    fn say(&mut self, text: Option<String>) {
+        self.message = text;
+        self.notice = None;
+    }
+
+    /// Put the merge notice in the status text, from the items that wait now.
+    fn show_notice(&mut self, notice: Notice) {
+        self.message = notice.text(&self.by_hand, self.has_center());
+        self.notice = self.message.is_some().then_some(notice);
+    }
+
+    /// Count the items that wait again and rebuild the merge notice from
+    /// them, so the notice and the exit code read the same rows.
+    fn refresh_notice(&mut self) {
+        let Some(notice) = &self.notice else {
+            return;
+        };
+        let Some(tree) = self.tree.clone() else {
+            return;
+        };
+        let rebuilt = Notice {
+            nothing_copied: notice.nothing_copied,
+            finish: Finish::default(),
+        };
+        let merged = self.merged_rels(&tree);
+        self.by_hand = ByHand::waiting_in(&tree, &self.whole_request(), &merged);
+        self.show_notice(rebuilt);
+    }
+
+    /// Keep the items whose step did not complete, and forget the saves a
+    /// completed step wrote over.
+    fn record_steps(&mut self, plan: &OperationPlan, report: Option<&ExecutionReport>) {
+        let done: BTreeSet<usize> = report
+            .map(|report| {
+                report
+                    .results
+                    .iter()
+                    .filter(|result| result.outcome.is_done())
+                    .map(|result| result.index)
+                    .collect()
+            })
+            .unwrap_or_default();
+        for step in &plan.steps {
+            if done.contains(&step.index) {
+                self.undone.remove(&step.rel);
+                self.saved.remove(&step.rel);
+            } else {
+                self.undone.insert(step.rel.clone());
+            }
+        }
+    }
+
     fn poll(&mut self) {
         self.report.tick();
         if let Some(job) = &mut self.compare_job {
@@ -834,10 +1208,12 @@ impl FolderMergeView {
             for message in messages {
                 match message {
                     CompareMessage::Progress(step) => self.status = Status::Running(step),
-                    CompareMessage::Ready(tree) => {
+                    CompareMessage::Ready(tree, written_after) => {
                         self.tree = Some(Arc::from(tree));
+                        self.written_after = written_after;
                         self.status = Status::Ready;
                         self.rebuild();
+                        self.refresh_notice();
                     }
                     CompareMessage::Failed(reason) => self.status = Status::Failed(reason),
                 }
@@ -851,12 +1227,29 @@ impl FolderMergeView {
             if let Some(MergePlanMessage::Done(outcome)) = messages.into_iter().next() {
                 self.plan_job = None;
                 match outcome {
-                    Ok((plan, by_hand)) => {
+                    Ok(planned) => {
+                        let Planned {
+                            plan,
+                            by_hand,
+                            overwrites,
+                            finish,
+                            settled,
+                        } = *planned;
+                        for rel in &settled {
+                            self.undone.remove(rel);
+                        }
                         self.by_hand = by_hand;
+                        self.overwrites = overwrites;
                         if plan.steps.is_empty() {
                             self.stage = Stage::Idle;
-                            self.message =
-                                Some(nothing_to_do(&plan, &self.by_hand, self.has_center()));
+                            if self.by_hand.is_empty() && finish.is_empty() {
+                                self.say(Some(FINISHED.to_owned()));
+                            } else {
+                                self.show_notice(Notice {
+                                    nothing_copied: true,
+                                    finish,
+                                });
+                            }
                         } else if self.confirm {
                             self.stage = Stage::Confirming(plan);
                         } else {
@@ -866,7 +1259,8 @@ impl FolderMergeView {
                     Err(reason) => {
                         self.stage = Stage::Idle;
                         self.by_hand = ByHand::default();
-                        self.message = Some(reason);
+                        self.overwrites = Overwrites::default();
+                        self.say(Some(reason));
                     }
                 }
             }
@@ -889,13 +1283,14 @@ impl FolderMergeView {
                         if report.completed() > 0 {
                             self.outcome.wrote = true;
                         }
+                        self.record_steps(&plan, Some(&report));
+                        self.show_notice(Notice::default());
                         self.stage = Stage::Summary(plan, report);
-                        if !self.by_hand.is_empty() {
-                            self.message =
-                                Some(self.by_hand.notice(self.has_center(), MESSAGE_NAMES));
-                        }
                     }
-                    ExecMessage::Failed(reason) => self.message = Some(reason),
+                    ExecMessage::Failed(reason) => {
+                        self.record_steps(&plan, None);
+                        self.say(Some(reason));
+                    }
                 }
             }
         }
@@ -966,6 +1361,10 @@ impl FolderMergeView {
                     .insert(row.rel.clone(), Resolution::Take(pane));
             }
         }
+        if self.message.as_deref() == Some(FINISHED) {
+            self.say(None);
+        }
+        self.refresh_notice();
     }
 
     /// Move the cursor to the next or previous visible row that passes `test`.
@@ -1001,14 +1400,16 @@ impl FolderMergeView {
             return;
         };
         let Some(output) = self.output_folder().map(Path::to_path_buf) else {
-            self.message = Some(NO_OUTPUT.to_owned());
+            self.say(Some(NO_OUTPUT.to_owned()));
             return;
         };
         let folders = self.folders.clone();
         let options = self.operations.clone();
         let automatic = self.settings.merge.automatic_merge;
+        let merged = self.merged_rels(&tree);
+        let undone = self.undone.clone();
         self.stage = Stage::Planning;
-        self.message = None;
+        self.say(None);
         self.plan_job = Some(Job::spawn_notifying(
             move |emitter, _cancel| {
                 if output.is_file() {
@@ -1028,8 +1429,29 @@ impl FolderMergeView {
                 };
                 let outcome = plan_merge(&tree, bases, &request, &options)
                     .map(|plan| {
-                        let by_hand = ByHand::of(left_for_person(&tree, &request));
-                        (Box::new(plan), by_hand)
+                        let finish = if plan.steps.is_empty() {
+                            Finish::of(&tree, bases, &request, &options, &plan)
+                        } else {
+                            Finish::default()
+                        };
+                        let stepped: BTreeSet<&Path> =
+                            plan.steps.iter().map(|step| step.rel.as_path()).collect();
+                        let settled = undone
+                            .into_iter()
+                            .filter(|rel| {
+                                !stepped.contains(rel.as_path())
+                                    && request.selection.is_none_or(|selected| {
+                                        selected.iter().any(|chosen| rel.starts_with(chosen))
+                                    })
+                            })
+                            .collect();
+                        Box::new(Planned {
+                            by_hand: ByHand::waiting_in(&tree, &request, &merged),
+                            overwrites: Overwrites::of(&plan, &merged),
+                            finish,
+                            settled,
+                            plan: Box::new(plan),
+                        })
                     })
                     .map_err(|refused| refused.to_string());
                 emitter.send(MergePlanMessage::Done(outcome));
@@ -1091,7 +1513,7 @@ impl FolderMergeView {
     #[must_use]
     pub fn text_merge_request(&self) -> Option<OpenRequest> {
         let row = self.cursor_row()?;
-        if !row.text {
+        if !opens_in_text_merge(self.tree.as_deref()?, row) {
             return None;
         }
         let output = self.output_folder()?;
@@ -1101,16 +1523,10 @@ impl FolderMergeView {
             (Some(base), Some(entry)) if !entry.is_dir => Some(base.join(&entry.rel)),
             _ => None,
         };
-        let target_rel = row.output.as_ref().map_or(&row.rel, |entry| &entry.rel);
-        if !self.tree.as_deref().is_some_and(|tree| {
-            tree.text_merge_inputs_are_local() && tree.output_target_is_safe(target_rel)
-        }) {
-            return None;
-        }
         Some(
             OpenRequest::new(SessionKind::TextMerge, left, right)
                 .with_center(center)
-                .with_output(Some(output.join(target_rel))),
+                .with_output(Some(output.join(target_rel(row)))),
         )
     }
 
@@ -1154,7 +1570,31 @@ impl FolderMergeView {
     /// True when a merge of every row of `tree` leaves one for a person.
     fn leaves_any_for_person(&self, tree: &MergeTree) -> bool {
         let request = self.whole_request();
-        tree.rows.iter().any(|row| leaves_for_person(row, &request))
+        tree.rows
+            .iter()
+            .any(|row| leaves_for_person(row, &request) && !self.merged_by_hand(row))
+    }
+
+    /// True when a person has to merge `row` and the output holds their
+    /// merge: an output item written after every input item, or a save from
+    /// Text Merge in this session.
+    fn merged_by_hand(&self, row: &MergeRow) -> bool {
+        row.status.needs_person()
+            && (self.written_after.contains(&row.rel) || self.saved.contains(target_rel(row)))
+    }
+
+    /// Every row of `tree` merged by hand.
+    fn merged_rels(&self, tree: &MergeTree) -> BTreeSet<PathBuf> {
+        let mut merged = self.written_after.clone();
+        if !self.saved.is_empty() {
+            merged.extend(
+                tree.rows
+                    .iter()
+                    .filter(|row| self.merged_by_hand(row))
+                    .map(|row| row.rel.clone()),
+            );
+        }
+        merged
     }
 
     /// A merge of every row with the resolutions the view holds now.
@@ -1450,7 +1890,12 @@ impl FolderMergeView {
                             );
                         }
                     }
-                    let action = action_label(row, self.resolution(row), &target);
+                    let resolution = self.resolution(row);
+                    let action = if resolution == Resolution::Leave && self.merged_by_hand(row) {
+                        MERGED_BY_HAND
+                    } else {
+                        action_label(row, resolution, &target)
+                    };
                     let action_icon = match action {
                         "Take left" => Some(ca_ui::icons::Icon::TakeLeft),
                         "Take center" => Some(ca_ui::icons::Icon::TakeCenter),
@@ -1534,7 +1979,13 @@ impl FolderMergeView {
         let has_center = self.has_center();
         match std::mem::replace(&mut self.stage, Stage::Idle) {
             Stage::Confirming(plan) => {
-                match confirm(ui, id.with("confirm"), &plan, &self.by_hand, has_center) {
+                match confirm(
+                    ui,
+                    id.with("confirm"),
+                    &plan,
+                    (&self.by_hand, &self.overwrites),
+                    has_center,
+                ) {
                     Some(true) => self.execute(plan),
                     Some(false) => {}
                     None => self.stage = Stage::Confirming(plan),
@@ -1568,7 +2019,7 @@ impl FolderMergeView {
                     (Vec::new(), Vec::new())
                 } else {
                     (
-                        self.by_hand.sentences(has_center).to_vec(),
+                        self.by_hand.sentences(has_center),
                         self.by_hand.dialog_lines(),
                     )
                 };
@@ -1592,22 +2043,27 @@ impl FolderMergeView {
     }
 }
 
-/// The plan, the items it leaves for a merge by hand and its refusals, with
-/// the two buttons. `None` while neither button is pressed, `Some(true)` to
-/// carry it out.
+/// The plan, the items merged by hand it replaces, the items it leaves for a
+/// merge by hand and its refusals, with the two buttons. `None` while neither
+/// button is pressed, `Some(true)` to carry it out.
 fn confirm(
     ui: &egui::Ui,
     id: egui::Id,
     plan: &OperationPlan,
-    by_hand: &ByHand,
+    left: (&ByHand, &Overwrites),
     has_center: bool,
 ) -> Option<bool> {
+    let (by_hand, overwrites) = left;
     let shown = modal(ui, id, "Merge", |ui| {
         ui.label(format!(
             "{} steps, {} bytes",
             plan.steps.len(),
             ca_ui::format::format_bytes(plan.total_bytes())
         ));
+        if !overwrites.is_empty() {
+            ui.separator();
+            ca_ui::widgets::wrapped_text(ui, &overwrites.sentence());
+        }
         if !by_hand.is_empty() {
             ui.separator();
             by_hand.show_sentences(ui, has_center);
@@ -1618,6 +2074,12 @@ fn confirm(
             .show(ui, |ui| {
                 for step in &plan.steps {
                     ca_ui::widgets::wrapped_text(ui, &dialogs::describe(&step.action));
+                }
+                if !overwrites.is_empty() {
+                    ui.separator();
+                    for line in overwrites.lines() {
+                        ca_ui::widgets::wrapped_text(ui, &line);
+                    }
                 }
                 if !by_hand.is_empty() {
                     ui.separator();
@@ -1631,7 +2093,7 @@ fn confirm(
                     for skip in &plan.skipped {
                         ca_ui::widgets::wrapped_text(
                             ui,
-                            &format!("{}: {}", skip.path.display(), skip.reason),
+                            &format!("{}: {}", slash_path(&skip.path), skip.reason),
                         );
                     }
                 }
@@ -1652,29 +2114,6 @@ fn confirm(
         Some(answer) => answer,
         None => Some(false),
     }
-}
-
-/// What the view says about a plan with no step.
-fn nothing_to_do(plan: &OperationPlan, by_hand: &ByHand, has_center: bool) -> String {
-    if plan.skipped.is_empty() && by_hand.is_empty() {
-        return FINISHED.to_owned();
-    }
-    let mut parts = vec!["Nothing is copied.".to_owned()];
-    if !by_hand.is_empty() {
-        parts.push(by_hand.notice(has_center, MESSAGE_NAMES));
-    }
-    if !plan.skipped.is_empty() {
-        parts.push(format!(
-            "{} items are left alone: {}",
-            plan.skipped.len(),
-            plan.skipped
-                .iter()
-                .map(|skip| format!("{} ({})", skip.path.display(), skip.reason))
-                .collect::<Vec<_>>()
-                .join("; ")
-        ));
-    }
-    parts.join(" ")
 }
 
 fn report_status(row: &MergeRow) -> ca_ui::report::EntryStatus {
@@ -1719,7 +2158,16 @@ fn run_compare(
 ) {
     match compare_folders(folders, output, engine, emitter, cancel) {
         Ok(tree) => {
-            emitter.send(CompareMessage::Ready(Box::new(tree)));
+            let written_after = tree
+                .rows
+                .iter()
+                .filter(|row| {
+                    row.status.needs_person()
+                        && output_written_after_inputs(row, &engine.compare.quick)
+                })
+                .map(|row| row.rel.clone())
+                .collect();
+            emitter.send(CompareMessage::Ready(Box::new(tree), written_after));
         }
         Err(reason) => {
             emitter.send(CompareMessage::Failed(reason));
@@ -1988,6 +2436,8 @@ impl SessionView for FolderMergeView {
         self.operations.use_recycle_bin = recycle;
         self.overrides.clear();
         self.selection.clear();
+        self.saved.clear();
+        self.undone.clear();
         self.restart();
     }
 
@@ -2037,11 +2487,27 @@ impl SessionView for FolderMergeView {
         matches!(self.stage, Stage::Running(_))
     }
 
+    fn file_saved(&mut self, path: &Path) {
+        let Some(rel) = self
+            .output_folder()
+            .and_then(|output| path.strip_prefix(output).ok())
+            .map(Path::to_path_buf)
+        else {
+            return;
+        };
+        if self.saved.insert(rel) {
+            self.refresh_notice();
+        }
+    }
+
     fn exit_code(&self) -> Option<i32> {
         let waiting = match self.tree.as_deref() {
             Some(tree) => self.leaves_any_for_person(tree),
             None => self.outcome.waiting?,
         };
+        if !self.undone.is_empty() {
+            return Some(EXIT_STEP_UNDONE);
+        }
         Some(match (waiting, self.outcome.wrote) {
             (false, _) => EXIT_SUCCESS,
             (true, true) => EXIT_LEFT_FOR_HAND,

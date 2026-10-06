@@ -4961,6 +4961,103 @@ mod tests {
         assert_eq!(app.exit_code(), 101);
     }
 
+    /// Three folders whose one file both sides changed on separate lines,
+    /// and an empty output folder.
+    fn folders_with_one_mergeable_file(root: &Path) {
+        const T: u64 = 1_700_000_000;
+        for side in ["left", "center", "right", "output"] {
+            std::fs::create_dir_all(root.join(side)).unwrap();
+        }
+        for (side, body, secs) in [
+            ("center", "one\ntwo\nthree\nfour\nfive\n", T),
+            ("left", "ONE\ntwo\nthree\nfour\nfive\n", T + 4),
+            ("right", "one\ntwo\nthree\nfour\nFIVE\n", T + 8),
+        ] {
+            let path = root.join(side).join("both.txt");
+            std::fs::write(&path, body).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+                .unwrap();
+        }
+    }
+
+    fn wait_until_ready(app: &mut App, index: usize) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        app.tabs[index].tick();
+        while !app.tabs[index].is_ready() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            app.tabs[index].tick();
+        }
+        assert!(app.tabs[index].is_ready(), "tab {index} never became ready");
+    }
+
+    /// A folder merge started from the command line, its mergeable row opened
+    /// in Text Merge and saved there, then both tabs closed in `order`.
+    fn folder_merge_with_a_text_merge_save(folder_first: bool) -> i32 {
+        let context = context();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        folders_with_one_mergeable_file(root);
+        let args: Vec<std::ffi::OsString> = ["left", "right", "center", "output"]
+            .iter()
+            .map(|side| root.join(side).into_os_string())
+            .collect();
+        let startup = crate::cli::parse(args, &crate::cli::probe_file_system);
+        let (_settings, mut app) = started_app(startup, &context);
+        assert_eq!(app.tab_count(), 1);
+        wait_until_ready(&mut app, 0);
+        assert_eq!(app.tabs[0].exit_code(), Some(101));
+        let request = OpenRequest::new(
+            SessionKind::TextMerge,
+            root.join("left").join("both.txt"),
+            root.join("right").join("both.txt"),
+        )
+        .with_center(Some(root.join("center").join("both.txt")))
+        .with_output(Some(root.join("output").join("both.txt")));
+        app.open(&request, &context);
+        assert_eq!(app.tab_count(), 2);
+        wait_until_ready(&mut app, 1);
+        assert!(app.tabs[1].accepts(Command::SaveFile));
+        app.run(Command::SaveFile, &context);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while app.tabs[0].exit_code() != Some(0) && std::time::Instant::now() < deadline {
+            let _ = egui::Context::default().run(raw_input(), |ctx| app.frame(ctx));
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(
+            std::fs::read_to_string(root.join("output").join("both.txt")).unwrap(),
+            "ONE\ntwo\nthree\nfour\nFIVE\n"
+        );
+        assert_eq!(
+            app.tabs[0].exit_code(),
+            Some(0),
+            "the folder merge still counts the row saved in Text Merge"
+        );
+        if folder_first {
+            app.close_tab(0);
+            app.close_tab(0);
+        } else {
+            app.close_tab(1);
+            app.close_tab(0);
+        }
+        app.exit_code()
+    }
+
+    #[test]
+    fn a_row_saved_in_text_merge_ends_a_folder_merge_with_success_when_the_folder_tab_closes_first()
+    {
+        assert_eq!(folder_merge_with_a_text_merge_save(true), 0);
+    }
+
+    #[test]
+    fn a_row_saved_in_text_merge_ends_a_folder_merge_with_success_when_the_folder_tab_closes_last()
+    {
+        assert_eq!(folder_merge_with_a_text_merge_save(false), 0);
+    }
+
     /// One expected bar, as menu name, then the lines in order.
     ///
     /// The table is written from the observed menus rather than read from the
