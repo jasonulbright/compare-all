@@ -75,6 +75,60 @@ fn trash_error_kind(error: &trash::Error) -> io::ErrorKind {
     }
 }
 
+/// True when `path` lies on a volume the shell does not recycle on: a share,
+/// a mapped network drive, removable media or an optical disc.
+///
+/// The shell deletes an item on such a volume outright and still reports
+/// success, so the trash call never reaches the codes above.
+#[cfg(windows)]
+fn lacks_recycle_bin(path: &Path) -> bool {
+    use std::path::{Component, Prefix};
+
+    let on_share = |path: &Path| {
+        matches!(
+            path.components().next(),
+            Some(Component::Prefix(prefix))
+                if matches!(prefix.kind(), Prefix::UNC(..) | Prefix::VerbatimUNC(..))
+        )
+    };
+    if on_share(path) {
+        return true;
+    }
+    let Ok(absolute) = std::path::absolute(path) else {
+        return false;
+    };
+    // The item may be a link to another volume; its own entry lives in the
+    // volume of its parent folder.
+    let resolved = absolute
+        .parent()
+        .and_then(|parent| std::fs::canonicalize(parent).ok())
+        .unwrap_or(absolute);
+    if on_share(&resolved) {
+        return true;
+    }
+    let Some(text) = resolved.to_str() else {
+        return false;
+    };
+    let Ok(root) = winsafe::GetVolumePathName(text) else {
+        return false;
+    };
+    let root = match root.strip_prefix(r"\\?\") {
+        Some(rest) if rest.as_bytes().get(1) == Some(&b':') => rest.to_owned(),
+        Some(rest) if rest.starts_with(r"UNC\") => return true,
+        None if root.starts_with(r"\\") => return true,
+        _ => root,
+    };
+    matches!(
+        winsafe::GetDriveType(Some(&root)),
+        winsafe::co::DRIVE::REMOTE | winsafe::co::DRIVE::REMOVABLE | winsafe::co::DRIVE::CDROM
+    )
+}
+
+#[cfg(not(windows))]
+fn lacks_recycle_bin(_path: &Path) -> bool {
+    false
+}
+
 /// Attribute edits to apply to one item.
 ///
 /// `None` leaves the attribute as it is.
@@ -620,6 +674,12 @@ impl FileOps for RealFs {
     }
 
     fn move_to_trash(&self, path: &Path) -> io::Result<()> {
+        if lacks_recycle_bin(path) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("{}: this location has no recycle bin", path.display()),
+            ));
+        }
         trash::delete(path).map_err(|error| {
             io::Error::new(
                 trash_error_kind(&error),
@@ -889,6 +949,20 @@ fn set_attributes_impl(path: &Path, change: &AttributeChange) -> io::Result<()> 
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::{same_item, trash_error_kind, AttributeChange, FileOps, Reach, RealFs};
+
+    #[cfg(windows)]
+    #[test]
+    fn a_share_has_no_recycle_bin_and_a_fixed_drive_has_one() {
+        use std::path::Path;
+        for share in [
+            r"\\server.invalid\share\a.txt",
+            r"\\?\UNC\server.invalid\share\a.txt",
+        ] {
+            assert!(super::lacks_recycle_bin(Path::new(share)), "{share}");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!super::lacks_recycle_bin(&dir.path().join("a.txt")));
+    }
 
     #[test]
     fn a_volume_without_a_recycle_bin_reports_an_unsupported_trash_call() {
