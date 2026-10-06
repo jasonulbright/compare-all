@@ -1007,6 +1007,24 @@ fn a_verbose_log_records_each_item() {
 }
 
 #[test]
+fn a_password_in_a_location_reaches_neither_the_log_nor_the_error() {
+    let fixture = Fixture::new();
+    let target = fixture.root().join("run.log");
+    let mut session = fixture.session();
+    session.log.set_fixed_time(Some(0));
+    let source = format!(
+        "log verbose \"{}\"\nload \"ftp://alice:hunter2@127.0.0.1:1/pub\" \"{}\"\n",
+        target.display(),
+        fixture.right().display()
+    );
+    let error = run_script(&source, &Substitution::none(), &mut session).unwrap_err();
+    let text = std::fs::read_to_string(&target).expect("log");
+    assert!(text.contains("ftp://alice:***@127.0.0.1:1/pub"), "{text}");
+    assert!(!text.contains("hunter2"), "{text}");
+    assert!(!error.to_string().contains("hunter2"), "{error}");
+}
+
+#[test]
 fn append_adds_to_the_log_instead_of_replacing_it() {
     let fixture = Fixture::new();
     let target = fixture.root().join("run.log");
