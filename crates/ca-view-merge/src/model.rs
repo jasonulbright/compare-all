@@ -1143,6 +1143,28 @@ impl MergeModel {
         OUTPUT_TEXT_CALLS.with(std::cell::Cell::get)
     }
 
+    /// The resolution and lines a take recorded for section `index` to take
+    /// again once its lent text is back.
+    #[cfg(test)]
+    pub(crate) fn pending_take(&self, index: usize) -> Option<(Resolution, Vec<String>)> {
+        let section = self.sections.get(index)?;
+        if !section.restore_from_take {
+            return None;
+        }
+        let mut state = section.clone();
+        state.resolution = section.restore.as_deref()?.resolution;
+        Some((state.resolution, self.contribution(index, &state)))
+    }
+
+    /// The output lines of section `index`, without the separators a
+    /// composition added.
+    #[cfg(test)]
+    pub(crate) fn section_lines(&self, index: usize) -> Vec<String> {
+        self.output_range(index).map_or_else(Vec::new, |range| {
+            self.unrepaired_lines(range.start as usize..range.end as usize)
+        })
+    }
+
     /// The lines one pane shows.
     #[must_use]
     pub fn line(&self, pane: Pane, index: usize) -> Option<&str> {
