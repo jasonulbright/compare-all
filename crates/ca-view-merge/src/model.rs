@@ -2027,6 +2027,7 @@ impl MergeModel {
         returning
             .texts
             .sort_by_key(|(at, lender, entry)| (*at, *lender, entry.seq));
+        let mut placed = std::collections::BTreeSet::new();
         while let Some((at, lender, entry)) = returning.texts.pop() {
             let next = self.sections.get(lender).and_then(|section| {
                 section
@@ -2047,9 +2048,17 @@ impl MergeModel {
                     }
                 }
                 None => {
-                    let _ = self.return_to_lender(lender, entry);
+                    if self.place_returned(lender, entry).is_some() {
+                        placed.insert(lender);
+                    }
                 }
             }
+        }
+        // A lender takes its restore only after its last piece is back; a
+        // restore applied earlier rebuilds the lender from its input and the
+        // next piece then lands in front of that input a second time.
+        for lender in placed {
+            self.apply_restore(lender);
         }
     }
 
