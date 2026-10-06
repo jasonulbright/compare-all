@@ -364,6 +364,20 @@ impl FileOps for SourceOps {
         check_then_rename(self, from, to)
     }
 
+    fn replace(&self, from: &Path, to: &Path) -> io::Result<()> {
+        if self.state.route(from).is_none() && self.state.route(to).is_none() {
+            return self.state.local.replace(from, to);
+        }
+        self.rename(from, to)
+    }
+
+    fn match_access(&self, model: &Path, path: &Path) -> io::Result<()> {
+        if self.state.route(model).is_none() && self.state.route(path).is_none() {
+            return self.state.local.match_access(model, path);
+        }
+        Ok(())
+    }
+
     fn write_new(
         &self,
         target: &Path,
