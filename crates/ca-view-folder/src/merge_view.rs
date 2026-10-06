@@ -51,6 +51,14 @@ const FINISHED: &str = "The output already holds the merge result.";
 const DIALOG_NAMES: usize = 20;
 /// How many items the status text names before it counts the rest.
 const MESSAGE_NAMES: usize = 5;
+/// Exit code when no item waits for a merge by hand.
+const EXIT_SUCCESS: i32 = 0;
+/// Exit code when items wait for a merge by hand and a merge wrote to the
+/// output; the text merge returns the same code for conflicts it leaves.
+const EXIT_LEFT_FOR_HAND: i32 = 14;
+/// Exit code when items wait for a merge by hand and no merge wrote to the
+/// output; the text merge returns the same code when it writes no file.
+const EXIT_LEFT_FOR_HAND_NOTHING_WRITTEN: i32 = 101;
 
 /// Every command from the shared vocabulary this view answers for.
 const HANDLED: &[Command] = &[
@@ -361,6 +369,16 @@ impl ByHand {
     }
 }
 
+/// What the exit code of the view is read from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Outcome {
+    /// True once a batch of this view has completed a step.
+    wrote: bool,
+    /// Whether the last comparison left a row for a person, kept while the
+    /// next comparison runs.
+    waiting: Option<bool>,
+}
+
 /// The folders one merge reads and writes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Folders {
@@ -473,6 +491,7 @@ pub struct FolderMergeView {
     stage: Stage,
     /// The items the last plan leaves for a merge by hand.
     by_hand: ByHand,
+    outcome: Outcome,
     report: ViewReport,
     actions: Vec<ViewAction>,
     message: Option<String>,
@@ -535,6 +554,7 @@ impl FolderMergeView {
             active: Pane::Left,
             stage: Stage::Idle,
             by_hand: ByHand::default(),
+            outcome: Outcome::default(),
             report: ViewReport::new(
                 ReportKind::Folder,
                 egui::Id::new(("folder-merge-report", instance)),
@@ -765,6 +785,9 @@ impl FolderMergeView {
     }
 
     fn restart(&mut self) {
+        if let Some(tree) = self.tree.clone() {
+            self.outcome.waiting = Some(self.leaves_any_for_person(&tree));
+        }
         if let Some(job) = &self.plan_job {
             job.cancel();
         }
@@ -863,6 +886,9 @@ impl FolderMergeView {
                 };
                 match message {
                     ExecMessage::Done(report) => {
+                        if report.completed() > 0 {
+                            self.outcome.wrote = true;
+                        }
                         self.stage = Stage::Summary(plan, report);
                         if !self.by_hand.is_empty() {
                             self.message =
@@ -1123,6 +1149,12 @@ impl FolderMergeView {
 
     fn has_center(&self) -> bool {
         self.folders.center.is_some()
+    }
+
+    /// True when a merge of every row of `tree` leaves one for a person.
+    fn leaves_any_for_person(&self, tree: &MergeTree) -> bool {
+        let request = self.whole_request();
+        tree.rows.iter().any(|row| leaves_for_person(row, &request))
     }
 
     /// A merge of every row with the resolutions the view holds now.
@@ -2003,6 +2035,18 @@ impl SessionView for FolderMergeView {
 
     fn is_busy(&self) -> bool {
         matches!(self.stage, Stage::Running(_))
+    }
+
+    fn exit_code(&self) -> Option<i32> {
+        let waiting = match self.tree.as_deref() {
+            Some(tree) => self.leaves_any_for_person(tree),
+            None => self.outcome.waiting?,
+        };
+        Some(match (waiting, self.outcome.wrote) {
+            (false, _) => EXIT_SUCCESS,
+            (true, true) => EXIT_LEFT_FOR_HAND,
+            (true, false) => EXIT_LEFT_FOR_HAND_NOTHING_WRITTEN,
+        })
     }
 }
 

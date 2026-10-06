@@ -360,6 +360,49 @@ fn the_report_marks_each_row_left_for_a_merge_by_hand() {
     assert_eq!(clash.status.label(), "Different");
 }
 
+#[test]
+fn the_exit_code_reports_rows_left_for_a_merge_by_hand() {
+    let fixture = Fixture::mixed();
+    let mut view = fixture.view();
+    assert_eq!(view.exit_code(), Some(101), "nothing is merged yet");
+
+    merge_at_once(&mut view);
+    assert!(poll_until(&mut view, FolderMergeView::has_summary));
+    assert_eq!(
+        view.exit_code(),
+        Some(14),
+        "two rows wait for a merge by hand"
+    );
+    view.close_summary();
+    assert!(view.tree().is_none());
+    assert_eq!(view.exit_code(), Some(14), "the comparison runs again");
+    assert!(poll_until(&mut view, |view| view.tree().is_some()));
+    assert_eq!(view.exit_code(), Some(14));
+
+    view.run(Command::SelectAll);
+    view.run(Command::TakeLeft);
+    merge_at_once(&mut view);
+    assert!(poll_until(&mut view, FolderMergeView::has_summary));
+    assert_eq!(view.exit_code(), Some(0), "a Take resolved every row");
+    assert!(view.message().is_none(), "{:?}", view.message());
+    assert_eq!(
+        fixture.read("output", "clash.txt").as_deref(),
+        Some(&b"one\nLEFT\nthree\n"[..])
+    );
+}
+
+#[test]
+fn a_merge_with_no_row_left_for_a_person_exits_with_success() {
+    let fixture = Fixture::empty();
+    fixture.write("left", "added.txt", b"from the left\n", T);
+    let mut view = fixture.view();
+    assert_eq!(view.exit_code(), Some(0));
+    merge_at_once(&mut view);
+    assert!(poll_until(&mut view, FolderMergeView::has_summary));
+    assert_eq!(view.exit_code(), Some(0));
+    assert!(view.message().is_none(), "{:?}", view.message());
+}
+
 /// Presses on the drawn view, found by accessible label.
 mod probe {
     use super::{draw_view, FolderMergeView, Probe};
