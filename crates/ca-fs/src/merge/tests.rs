@@ -12,8 +12,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use super::{
-    compare3, left_for_person, plan_merge, Change, FolderMergeOptions, MergeBases, MergeFilters,
-    MergeInputs, MergeRefused, MergeRequest, MergeRow, MergeStatus, MergeTree, Pane, Resolution,
+    compare3, left_for_person, output_written_after_inputs, plan_merge, Change, FolderMergeOptions,
+    MergeBases, MergeFilters, MergeInputs, MergeRefused, MergeRequest, MergeRow, MergeStatus,
+    MergeTree, Pane, Resolution,
 };
 use crate::cancel::Cancel;
 use crate::criteria::{ContentMethod, ContentTests};
@@ -569,6 +570,55 @@ fn the_rows_left_for_a_person_are_the_unresolved_ones_the_plan_skips() {
         names(left_for_person(&tree, &selected)),
         vec![PathBuf::from("conflict.bin")]
     );
+}
+
+/// The output holds a merge by hand only where its file is not older than
+/// any input item and is not a copy of one under the size and time test.
+#[test]
+fn an_output_file_counts_as_written_after_the_inputs_only_when_no_input_is_newer_or_the_same() {
+    const T: u64 = 1_700_000_000;
+    let fixture = Fixture::new();
+    let stamp = |side: &str, rel: &str, body: &[u8], secs: u64| {
+        fixture.write(side, rel, body);
+        std::fs::File::options()
+            .write(true)
+            .open(fixture.path(side).join(rel))
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+            .unwrap();
+    };
+    for rel in [
+        "later.txt",
+        "older.txt",
+        "copy.txt",
+        "same_time.txt",
+        "none.txt",
+    ] {
+        stamp("center", rel, b"one\ntwo\nthree\n", T);
+        stamp("left", rel, b"ONE\ntwo\nthree\n", T + 4);
+        stamp("right", rel, b"one\ntwo\nTHREE!\n", T + 8);
+    }
+    stamp("output", "later.txt", b"ONE\ntwo\nTHREE!\n", T + 30);
+    stamp("output", "older.txt", b"ONE\ntwo\nTHREE!\n", T + 6);
+    stamp("output", "copy.txt", b"one\ntwo\nTHREE!\n", T + 8);
+    stamp("output", "same_time.txt", b"ONE\ntwo\nTHREE\n", T + 8);
+    let tree = compare(&fixture);
+    let written = |rel: &str| {
+        let row = tree
+            .rows
+            .iter()
+            .find(|row| row.rel == Path::new(rel))
+            .unwrap();
+        output_written_after_inputs(row, &crate::criteria::QuickTests::default())
+    };
+    assert!(written("later.txt"));
+    assert!(!written("older.txt"), "the right item is newer");
+    assert!(
+        !written("copy.txt"),
+        "the output holds the right item's copy"
+    );
+    assert!(written("same_time.txt"), "a time that matches is not older");
+    assert!(!written("none.txt"), "the output holds nothing");
 }
 
 // ------------------------------------------------------------------- safety

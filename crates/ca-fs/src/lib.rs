@@ -58,9 +58,9 @@ pub use ops::fsops::{AttributeChange, FileOps, ItemIdentity, RealFs, SyncWrite, 
 pub use ops::vfsops::{write_refusal, Mount, SourceOps};
 
 pub use merge::{
-    compare3, compare3_sources, leaves_for_person, left_for_person, plan_merge, Change,
-    FolderMergeOptions, MergeBases, MergeCounts, MergeFilters, MergeInputs, MergeRefused,
-    MergeRequest, MergeRow, MergeSources, MergeStatus, MergeTree, Pane, Resolution,
+    compare3, compare3_sources, leaves_for_person, left_for_person, output_written_after_inputs,
+    plan_merge, Change, FolderMergeOptions, MergeBases, MergeCounts, MergeFilters, MergeInputs,
+    MergeRefused, MergeRequest, MergeRow, MergeSources, MergeStatus, MergeTree, Pane, Resolution,
 };
 pub use ops::plan::{
     exclude_masks, plan_attributes, plan_copy, plan_delete, plan_exchange, plan_move,
