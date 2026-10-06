@@ -112,6 +112,15 @@ pub enum ViewAction {
     Close,
 }
 
+/// A file a view wrote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SavedFile {
+    /// Where the file was written.
+    pub path: PathBuf,
+    /// Conflicts the written text still marks.
+    pub conflicts: u32,
+}
+
 /// One command a view handles, with whether it can run now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CommandState {
@@ -261,6 +270,21 @@ pub trait SessionView {
     fn holds_unwritten_edits(&self) -> bool {
         false
     }
+
+    /// The files this view wrote since the last call.
+    ///
+    /// The window asks every tab after it ticks, whether or not the tab is on
+    /// screen, and hands each file to every tab through
+    /// [`SessionView::file_saved`].
+    fn take_saved(&mut self) -> Vec<SavedFile> {
+        Vec::new()
+    }
+
+    /// Take note that a tab wrote a file.
+    ///
+    /// Called from the frame thread, so a view records the fact and reads
+    /// nothing from the disk here.
+    fn file_saved(&mut self, _saved: &SavedFile) {}
 
     /// The process exit code this view asks for, where it has one.
     ///
@@ -501,6 +525,14 @@ impl SessionView for OwnsTemporaries {
 
     fn holds_unwritten_edits(&self) -> bool {
         self.view.holds_unwritten_edits()
+    }
+
+    fn take_saved(&mut self) -> Vec<SavedFile> {
+        self.view.take_saved()
+    }
+
+    fn file_saved(&mut self, saved: &SavedFile) {
+        self.view.file_saved(saved);
     }
 
     fn exit_code(&self) -> Option<i32> {

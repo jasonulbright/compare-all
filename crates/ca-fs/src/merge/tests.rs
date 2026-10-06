@@ -12,8 +12,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use super::{
-    compare3, plan_merge, Change, FolderMergeOptions, MergeBases, MergeFilters, MergeInputs,
-    MergeRefused, MergeRequest, MergeRow, MergeStatus, MergeTree, Pane, Resolution,
+    compare3, left_for_person, output_copies_an_input, output_holds_conflict_markers,
+    output_written_after_inputs, plan_merge, Change, FolderMergeOptions, MergeBases, MergeFilters,
+    MergeInputs, MergeRefused, MergeRequest, MergeRow, MergeStatus, MergeTree, Pane, Resolution,
 };
 use crate::cancel::Cancel;
 use crate::criteria::{ContentMethod, ContentTests};
@@ -502,6 +503,191 @@ fn a_take_resolves_a_conflict_the_automatic_merge_leaves_alone() {
         std::fs::read(fixture.path("output").join("conflict.bin")).unwrap(),
         b"\x00right"
     );
+}
+
+/// The rows the plan writes nothing for are the rows a person still has to
+/// merge: a mergeable and a conflicting row nobody resolved, inside the part
+/// of the tree the merge takes in.
+#[test]
+fn the_rows_left_for_a_person_are_the_unresolved_ones_the_plan_skips() {
+    let fixture = Fixture::new();
+    fixture.write("left", "added.txt", b"from the left");
+    let base = b"one\ntwo\nthree\nfour\nfive\nsix\nseven\n";
+    fixture.write("center", "apart.txt", base);
+    fixture.write(
+        "left",
+        "apart.txt",
+        b"ONE\ntwo\nthree\nfour\nfive\nsix\nseven\n",
+    );
+    fixture.write(
+        "right",
+        "apart.txt",
+        b"one\ntwo\nthree\nfour\nfive\nsix\nSEVEN\n",
+    );
+    fixture.write("center", "conflict.bin", b"\x00base");
+    fixture.write("left", "conflict.bin", b"\x00left");
+    fixture.write("right", "conflict.bin", b"\x00right");
+    let tree = compare(&fixture);
+    let names = |rows: Vec<&MergeRow>| -> Vec<PathBuf> {
+        rows.into_iter().map(|row| row.rel.clone()).collect()
+    };
+
+    let none = BTreeMap::new();
+    let request = automatic(&none);
+    let left = names(left_for_person(&tree, &request));
+    assert_eq!(
+        left,
+        vec![PathBuf::from("apart.txt"), PathBuf::from("conflict.bin")]
+    );
+    let planned = plan(&fixture, &tree, &request);
+    assert!(planned
+        .steps
+        .iter()
+        .any(|step| step.rel == Path::new("added.txt")));
+    assert!(planned.steps.iter().all(|step| !left.contains(&step.rel)));
+
+    let manual = MergeRequest {
+        overrides: &none,
+        selection: None,
+        automatic: false,
+    };
+    assert_eq!(names(left_for_person(&tree, &manual)), left);
+
+    let mut taken = BTreeMap::new();
+    taken.insert(PathBuf::from("conflict.bin"), Resolution::Take(Pane::Right));
+    assert_eq!(
+        names(left_for_person(&tree, &automatic(&taken))),
+        vec![PathBuf::from("apart.txt")]
+    );
+
+    let selection: BTreeSet<PathBuf> = [PathBuf::from("conflict.bin")].into_iter().collect();
+    let selected = MergeRequest {
+        overrides: &none,
+        selection: Some(&selection),
+        automatic: true,
+    };
+    assert_eq!(
+        names(left_for_person(&tree, &selected)),
+        vec![PathBuf::from("conflict.bin")]
+    );
+}
+
+/// The output holds a merge by hand only where its file is not older than
+/// any input item and is not a copy of one under the size and time test.
+#[test]
+fn an_output_file_counts_as_written_after_the_inputs_only_when_no_input_is_newer_or_the_same() {
+    const T: u64 = 1_700_000_000;
+    let fixture = Fixture::new();
+    let stamp = |side: &str, rel: &str, body: &[u8], secs: u64| {
+        fixture.write(side, rel, body);
+        std::fs::File::options()
+            .write(true)
+            .open(fixture.path(side).join(rel))
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+            .unwrap();
+    };
+    for rel in [
+        "later.txt",
+        "older.txt",
+        "copy.txt",
+        "same_time.txt",
+        "none.txt",
+    ] {
+        stamp("center", rel, b"one\ntwo\nthree\n", T);
+        stamp("left", rel, b"ONE\ntwo\nthree\n", T + 4);
+        stamp("right", rel, b"one\ntwo\nTHREE!\n", T + 8);
+    }
+    stamp("output", "later.txt", b"ONE\ntwo\nTHREE!\n", T + 30);
+    stamp("output", "older.txt", b"ONE\ntwo\nTHREE!\n", T + 6);
+    stamp("output", "copy.txt", b"one\ntwo\nTHREE!\n", T + 8);
+    stamp("output", "same_time.txt", b"ONE\ntwo\nTHREE\n", T + 8);
+    let tree = compare(&fixture);
+    let written = |rel: &str| {
+        let row = tree
+            .rows
+            .iter()
+            .find(|row| row.rel == Path::new(rel))
+            .unwrap();
+        output_written_after_inputs(row, &crate::criteria::QuickTests::default())
+    };
+    assert!(written("later.txt"));
+    assert!(!written("older.txt"), "the right item is newer");
+    assert!(
+        !written("copy.txt"),
+        "the output holds the right item's copy"
+    );
+    assert!(written("same_time.txt"), "a time that matches is not older");
+    assert!(!written("none.txt"), "the output holds nothing");
+}
+
+/// An output file with the bytes of one input is a copy whatever its time;
+/// one of the same size with other bytes is not.
+#[test]
+fn an_output_file_with_the_bytes_of_an_input_is_a_copy() {
+    let fixture = Fixture::new();
+    for rel in ["copy.txt", "merged.txt", "longer.txt"] {
+        fixture.write("center", rel, b"one\ntwo\nthree\n");
+        fixture.write("left", rel, b"ONE\ntwo\nthree\n");
+        fixture.write("right", rel, b"one\ntwo\nTHREE\n");
+    }
+    fixture.write("output", "copy.txt", b"one\ntwo\nTHREE\n");
+    fixture.write("output", "merged.txt", b"ONE\ntwo\nTHREE\n");
+    fixture.write("output", "longer.txt", b"ONE\ntwo\nTHREE, merged\n");
+    let tree = compare(&fixture);
+    let (left, center, right, output) = fixture.bases();
+    let bases = MergeBases {
+        left: &left,
+        center: Some(&center),
+        right: &right,
+        output: &output,
+    };
+    let copies = |rel: &str| {
+        let row = tree
+            .rows
+            .iter()
+            .find(|row| row.rel == Path::new(rel))
+            .unwrap();
+        output_copies_an_input(row, bases, None, &Cancel::new())
+    };
+    assert!(copies("copy.txt"));
+    assert!(
+        !copies("merged.txt"),
+        "same size as the inputs, other bytes"
+    );
+    assert!(!copies("longer.txt"), "no input has its size");
+}
+
+/// Conflict markers in the output file are found; a file without a closing
+/// marker holds none.
+#[test]
+fn an_output_file_with_conflict_markers_is_found() {
+    let fixture = Fixture::new();
+    for rel in ["marked.txt", "plain.txt", "opened.txt"] {
+        fixture.write("center", rel, b"one\n");
+        fixture.write("left", rel, b"LEFT\n");
+        fixture.write("right", rel, b"RIGHT\n");
+    }
+    fixture.write(
+        "output",
+        "marked.txt",
+        b"<<<<<<< left\nLEFT\n=======\nRIGHT\n>>>>>>> right\n",
+    );
+    fixture.write("output", "plain.txt", b"LEFT and RIGHT\n");
+    fixture.write("output", "opened.txt", b"<<<<<<< not a marker pair\n");
+    let tree = compare(&fixture);
+    let output = fixture.path("output");
+    let marked = |rel: &str| {
+        let row = tree
+            .rows
+            .iter()
+            .find(|row| row.rel == Path::new(rel))
+            .unwrap();
+        output_holds_conflict_markers(row, &output)
+    };
+    assert!(marked("marked.txt"));
+    assert!(!marked("plain.txt"));
+    assert!(!marked("opened.txt"));
 }
 
 // ------------------------------------------------------------------- safety

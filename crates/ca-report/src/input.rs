@@ -281,6 +281,12 @@ pub enum EntryStatus {
     Same,
     /// The two sides differ, with no side newer.
     Different,
+    /// Both sides changed the entry, and a folder merge leaves it for a
+    /// person to merge.
+    MergeByHand,
+    /// Both sides changed the entry, and the folder merge output holds a
+    /// result a person merged.
+    MergedByHand,
     /// The two sides differ and the left side is newer.
     LeftNewer,
     /// The two sides differ and the right side is newer.
@@ -308,6 +314,8 @@ impl EntryStatus {
         matches!(
             self,
             Self::Different
+                | Self::MergeByHand
+                | Self::MergedByHand
                 | Self::LeftNewer
                 | Self::RightNewer
                 | Self::LeftOrphan
@@ -323,6 +331,8 @@ impl EntryStatus {
             Self::NotCompared => "Not compared",
             Self::Same => "Same",
             Self::Different => "Different",
+            Self::MergeByHand => "Merge by hand",
+            Self::MergedByHand => "Merged by hand",
             Self::LeftNewer => "Left newer",
             Self::RightNewer => "Right newer",
             Self::LeftOrphan => "Left only",
@@ -339,6 +349,8 @@ impl EntryStatus {
             Self::NotCompared => "not-compared",
             Self::Same => "same",
             Self::Different => "different",
+            Self::MergeByHand => "merge-by-hand",
+            Self::MergedByHand => "merged-by-hand",
             Self::LeftNewer => "left-newer",
             Self::RightNewer => "right-newer",
             Self::LeftOrphan => "left-orphan",

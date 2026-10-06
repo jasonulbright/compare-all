@@ -21,11 +21,14 @@ pub const BINARY_DIFFERENT: u8 = 11;
 pub const SIMILAR: u8 = 12;
 /// A rules based comparison found differences that matter.
 pub const RULES_DIFFERENT: u8 = 13;
-/// A merge finished with conflicts left in it.
+/// A merge finished with conflicts, or folder merge items that need a merge
+/// by hand, left in it.
 pub const CONFLICTS: u8 = 14;
-/// Something failed that no other code names.
+/// Something failed that no other code names, or a folder merge step did not
+/// complete.
 pub const UNKNOWN_ERROR: u8 = 100;
-/// A merge found conflicts and wrote no output file.
+/// A merge left conflicts, or folder merge items that need a merge by hand,
+/// and wrote nothing to the output.
 pub const CONFLICTS_NO_OUTPUT: u8 = 101;
 /// A waiting launcher could not wait for the comparison.
 pub const LAUNCHER_CANNOT_WAIT: u8 = 102;
@@ -68,15 +71,16 @@ pub const TABLE: &[ExitMeaning] = &[
     },
     ExitMeaning {
         code: CONFLICTS,
-        meaning: "the merge left conflicts",
+        meaning: "the merge left conflicts, or folder merge items that need a merge by hand",
     },
     ExitMeaning {
         code: UNKNOWN_ERROR,
-        meaning: "an error no other code names",
+        meaning: "an error no other code names, or a folder merge step that did not complete",
     },
     ExitMeaning {
         code: CONFLICTS_NO_OUTPUT,
-        meaning: "the merge left conflicts and wrote no output file",
+        meaning: "the merge left conflicts, or folder merge items that need a merge by hand, \
+                  and wrote nothing to the output",
     },
     ExitMeaning {
         code: LAUNCHER_CANNOT_WAIT,

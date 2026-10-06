@@ -12,7 +12,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Component, Path, PathBuf};
 
-use crate::criteria::quick_compare;
+use crate::criteria::{quick_compare, QuickTests, Side};
 use crate::merge::{MergeBases, MergeRow, MergeStatus, MergeTree, Pane};
 use crate::ops::plan::{
     path_is_within, step, Conflict, OperationKind, OperationOptions, OperationPlan, PathState,
@@ -83,6 +83,70 @@ pub fn resolution_of(row: &MergeRow, request: &MergeRequest<'_>) -> Resolution {
     }
 }
 
+/// True when `row` is in the part of the tree `request` merges.
+fn takes_part(row: &MergeRow, request: &MergeRequest<'_>) -> bool {
+    request
+        .selection
+        .is_none_or(|selected| selected.iter().any(|chosen| row.rel.starts_with(chosen)))
+}
+
+/// True when a merge of `request` leaves `row` for a person: the row takes
+/// part, needs a person, and nobody chose a resolution that writes it.
+///
+/// The plan has no step for such a row, so the output holds its merge result
+/// only after a person writes it.
+#[must_use]
+pub fn leaves_for_person(row: &MergeRow, request: &MergeRequest<'_>) -> bool {
+    row.status.needs_person()
+        && takes_part(row, request)
+        && resolution_of(row, request) == Resolution::Leave
+}
+
+/// True when the output holds a file at `row` that was written after every
+/// input item of the row: it is not older than any of them, and it is not
+/// the same as any of them under a size and time test with the tolerances
+/// of `tests`.
+///
+/// A save of a merge by hand writes such a file. A copy step keeps the time
+/// of the item it copies, so a copied input is the same as that input and
+/// never passes. An item without a time never passes.
+#[must_use]
+pub fn output_written_after_inputs(row: &MergeRow, tests: &QuickTests) -> bool {
+    let Some(output) = row.output.as_ref() else {
+        return false;
+    };
+    if row.is_dir || output.is_dir || output.is_link() || output.modified.is_none() {
+        return false;
+    }
+    let size_and_time = QuickTests {
+        tolerance_seconds: tests.tolerance_seconds,
+        ignore_daylight_saving: tests.ignore_daylight_saving,
+        ignore_timezone: tests.ignore_timezone,
+        ..QuickTests::default()
+    };
+    let mut inputs = [row.left.as_ref(), row.center.as_ref(), row.right.as_ref()]
+        .into_iter()
+        .flatten()
+        .peekable();
+    inputs.peek().is_some()
+        && inputs.all(|input| {
+            if input.is_dir || input.modified.is_none() {
+                return false;
+            }
+            let quick = quick_compare(output, input, &size_and_time);
+            !quick.is_same() && quick.newer != Some(Side::Right)
+        })
+}
+
+/// Every row a merge of `request` leaves for a person, in tree order.
+#[must_use]
+pub fn left_for_person<'t>(tree: &'t MergeTree, request: &MergeRequest<'_>) -> Vec<&'t MergeRow> {
+    tree.rows
+        .iter()
+        .filter(|row| leaves_for_person(row, request))
+        .collect()
+}
+
 /// Turn a compared tree and the user's resolutions into the steps that write
 /// the output folder.
 ///
@@ -117,10 +181,7 @@ pub fn plan_merge(
     }
 
     for row in &tree.rows {
-        let taking_part = request
-            .selection
-            .is_none_or(|selected| selected.iter().any(|chosen| row.rel.starts_with(chosen)));
-        let resolution = if taking_part {
+        let resolution = if takes_part(row, request) {
             resolution_of(row, request)
         } else {
             Resolution::Leave
