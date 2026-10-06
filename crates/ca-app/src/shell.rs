@@ -808,6 +808,26 @@ const NO_EXPLORER_ITEM: &str = "The active view has no local file or folder to s
 /// already in flight.
 const EXIT_WRITE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// The more severe of two exit codes a merge tab reports: 100 (a step or a
+/// write failed), then 101 (items wait and nothing was written), then 14
+/// (items wait), then any other code, then 0.
+const fn more_severe(kept: i32, code: i32) -> i32 {
+    const fn rank(code: i32) -> u8 {
+        match code {
+            0 => 0,
+            100 => 4,
+            101 => 3,
+            14 => 2,
+            _ => 1,
+        }
+    }
+    if rank(code) > rank(kept) {
+        code
+    } else {
+        kept
+    }
+}
+
 /// Commands the window answers for rather than the active view.
 const SHELL_OWNED: &[Command] = &[
     Command::ShowNone,
@@ -1070,11 +1090,17 @@ impl App {
         self.exit_status.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// Record the exit code a view asks for.
+    /// Record the exit code of a view that closes.
+    ///
+    /// The window ends with the most severe code of every tab closed in the
+    /// session, so the order the tabs close in does not change it.
     fn publish_exit(&self, view: &dyn SessionView) {
         if let Some(code) = view.exit_code() {
-            self.exit_status
-                .store(code, std::sync::atomic::Ordering::SeqCst);
+            let _ = self.exit_status.fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |kept| Some(more_severe(kept, code)),
+            );
         }
     }
 
@@ -1871,6 +1897,7 @@ impl App {
         self.session_save = None;
         while !self.tabs.is_empty() {
             let mut view = self.tabs.remove(0);
+            self.publish_exit(view.as_ref());
             view.on_close();
             self.tab_sessions.remove(0);
             self.tab_recent.remove(0);
@@ -2654,10 +2681,6 @@ impl App {
         if index >= self.tabs.len() {
             return;
         }
-        // Keep the view's latest result code even when the close is deferred.
-        if let Some(tab) = self.tabs.get(index) {
-            self.publish_exit(tab.as_ref());
-        }
         if self.tabs.get_mut(index).is_some_and(|tab| !tab.may_close()) {
             self.active = index;
             return;
@@ -2673,6 +2696,7 @@ impl App {
             self.session_save = None;
         }
         let mut view = self.tabs.remove(index);
+        self.publish_exit(view.as_ref());
         if index < self.tab_sessions.len() {
             self.tab_sessions.remove(index);
             self.tab_recent.remove(index);
@@ -5056,6 +5080,141 @@ mod tests {
     fn a_row_saved_in_text_merge_ends_a_folder_merge_with_success_when_the_folder_tab_closes_last()
     {
         assert_eq!(folder_merge_with_a_text_merge_save(false), 0);
+    }
+
+    /// Adds `clash.txt`, which both sides changed on the same line.
+    fn add_a_conflicting_file(root: &Path) {
+        const T: u64 = 1_700_000_000;
+        for (side, body, secs) in [
+            ("center", "one\ntwo\nthree\n", T),
+            ("left", "one\nLEFT\nthree\n", T + 4),
+            ("right", "one\nRIGHT SIDE\nthree\n", T + 8),
+        ] {
+            let path = root.join(side).join("clash.txt");
+            std::fs::write(&path, body).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+                .unwrap();
+        }
+    }
+
+    fn folder_merge_request(root: &Path) -> OpenRequest {
+        OpenRequest::new(
+            SessionKind::FolderMerge,
+            root.join("left"),
+            root.join("right"),
+        )
+        .with_center(Some(root.join("center")))
+        .with_output(Some(root.join("output")))
+    }
+
+    fn text_merge_request(root: &Path, rel: &str) -> OpenRequest {
+        OpenRequest::new(
+            SessionKind::TextMerge,
+            root.join("left").join(rel),
+            root.join("right").join(rel),
+        )
+        .with_center(Some(root.join("center").join(rel)))
+        .with_output(Some(root.join("output").join(rel)))
+    }
+
+    fn frames_until(app: &mut App, done: impl Fn(&App) -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !done(app) && std::time::Instant::now() < deadline {
+            let _ = egui::Context::default().run(raw_input(), |ctx| app.frame(ctx));
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        for _ in 0..20 {
+            let _ = egui::Context::default().run(raw_input(), |ctx| app.frame(ctx));
+        }
+    }
+
+    /// A tab that asks for a fixed exit code.
+    struct CodeView(i32);
+
+    impl SessionView for CodeView {
+        fn title(&self) -> String {
+            format!("Code {}", self.0)
+        }
+
+        fn ui(&mut self, _ui: &mut egui::Ui, _context: &ViewContext) -> Vec<ViewAction> {
+            Vec::new()
+        }
+
+        fn exit_code(&self) -> Option<i32> {
+            Some(self.0)
+        }
+    }
+
+    #[test]
+    fn the_window_ends_with_the_most_severe_code_of_every_tab_closed() {
+        for (codes, expected) in [
+            ([14, 0, 101], 101),
+            ([101, 14, 0], 101),
+            ([0, 14, 0], 14),
+            ([14, 100, 101], 100),
+            ([0, 0, 0], 0),
+        ] {
+            for last_first in [false, true] {
+                let (_settings, mut app) = empty_app();
+                for code in codes {
+                    app.push(Box::new(CodeView(code)));
+                }
+                while app.tab_count() > 0 {
+                    let index = if last_first { app.tab_count() - 1 } else { 0 };
+                    app.close_tab(index);
+                }
+                assert_eq!(
+                    app.exit_code(),
+                    expected,
+                    "codes {codes:?}, closed from the {} end",
+                    if last_first { "last" } else { "first" }
+                );
+            }
+        }
+    }
+
+    /// A folder merge with `both.txt` saved in Text Merge and `clash.txt`
+    /// waiting, with a second Text Merge tab of `clash.txt` never saved; the
+    /// three tabs close in `order`.
+    fn three_tabs_closed_in(order: [usize; 3]) -> i32 {
+        let context = context();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        folders_with_one_mergeable_file(root);
+        add_a_conflicting_file(root);
+        let (_settings, mut app) = started_app(Startup::Open(folder_merge_request(root)), &context);
+        wait_until_ready(&mut app, 0);
+        app.open(&text_merge_request(root, "both.txt"), &context);
+        wait_until_ready(&mut app, 1);
+        app.run(Command::SaveFile, &context);
+        let written = root.join("output").join("both.txt");
+        frames_until(&mut app, |_| written.exists());
+        app.open(&text_merge_request(root, "clash.txt"), &context);
+        wait_until_ready(&mut app, 2);
+        let codes: Vec<_> = (0..3).map(|index| app.tabs[index].exit_code()).collect();
+        assert_eq!(codes, vec![Some(101), Some(0), Some(101)]);
+        let mut open: Vec<usize> = vec![0, 1, 2];
+        for tab in order {
+            let index = open.iter().position(|kept| *kept == tab).unwrap();
+            app.close_tab(index);
+            open.remove(index);
+        }
+        assert_eq!(app.tab_count(), 0);
+        app.exit_code()
+    }
+
+    #[test]
+    fn a_folder_merge_with_a_waiting_row_ends_with_its_code_when_a_saved_tab_closes_last() {
+        assert_eq!(three_tabs_closed_in([0, 2, 1]), 101);
+    }
+
+    #[test]
+    fn a_folder_merge_with_a_waiting_row_ends_with_its_code_when_it_closes_last() {
+        assert_eq!(three_tabs_closed_in([1, 2, 0]), 101);
     }
 
     /// One expected bar, as menu name, then the lines in order.
