@@ -187,15 +187,19 @@ fn a_plain_reload_or_swap_then_a_holder_take_restores_the_taken_lender_once() {
     }
 }
 
-/// Join line 1 twice, so s1 holds the `cd` of s2, then write `from` as `to`
-/// in all three inputs and reload.
+const C_TO_X: &[(&str, &str)] = &[("\nc", "\nx")];
+const C_D_TO_X_Y: &[(&str, &str)] = &[("\nc", "\nx"), ("\nd", "\ny")];
+
+/// Join line 1 twice, so s1 holds the `cd` of s2, then make each change of
+/// `changes` in all three inputs and reload.
 fn joined_then_reloaded(
     inputs: [&str; 3],
-    from: &str,
-    to: &str,
+    changes: &[(&str, &str)],
 ) -> (MergeView, tempfile::TempDir) {
     let (mut view, dir) = joined(inputs, 2);
-    rewrite(&dir, &["left.txt", "center.txt", "right.txt"], from, to);
+    for (from, to) in changes {
+        rewrite(&dir, &["left.txt", "center.txt", "right.txt"], from, to);
+    }
     reload(&mut view);
     (view, dir)
 }
@@ -205,7 +209,7 @@ fn joined_then_reloaded(
 #[test]
 fn a_reload_with_the_lender_changed_on_disk_shows_each_line_once() {
     for inputs in [F1, F1_CRLF, CRLF_CENTER] {
-        let (mut view, dir) = joined_then_reloaded(inputs, "\nc", "\nx");
+        let (mut view, dir) = joined_then_reloaded(inputs, C_TO_X);
         let mut reloaded = center_with_line_one_of(inputs, inputs[1]).replace("\nc", "\nx");
         if inputs == CRLF_CENTER {
             // The join removed the line break of `b`; the separator the
@@ -224,11 +228,10 @@ fn a_reload_with_the_lender_changed_on_disk_shows_each_line_once() {
 /// pane.
 fn after_takes(
     inputs: [&str; 3],
-    from: &str,
-    to: &str,
+    changes: &[(&str, &str)],
     takes: &[Option<(usize, Command)>],
 ) -> (String, Resolution) {
-    let (mut view, dir) = joined_then_reloaded(inputs, from, to);
+    let (mut view, dir) = joined_then_reloaded(inputs, changes);
     for take in takes {
         if let Some((section, command)) = take {
             take_at(&mut view, *section, *command);
@@ -258,12 +261,41 @@ fn takes_after_a_reload_with_the_lender_changed_give_one_result_in_every_order()
     for inputs in [F1, F1_CRLF, CRLF_CENTER] {
         let results: Vec<(String, Resolution)> = orders
             .iter()
-            .map(|takes| after_takes(inputs, "\nc", "\nx", takes))
+            .map(|takes| after_takes(inputs, C_TO_X, takes))
             .collect();
         let taken = center_with_line_one_of(inputs, inputs[0]).replace("\nc", "\nx");
         for (order, result) in orders.iter().zip(&results) {
             assert_eq!(result.0, taken, "{order:?} {inputs:?}");
             assert_eq!(result.1, Resolution::Center, "{order:?} {inputs:?}");
+        }
+    }
+}
+
+/// `c` and `d` of s2 change to `x` and `y` on disk. The new text of s2
+/// shows no line of the joined `cd`, so s1 keeps it and s2 still lends it on
+/// its automatic side. Take All Non-Conflicting takes s2 like an explicit
+/// take: one result in both orders with the holder take.
+#[test]
+fn take_all_takes_a_lender_left_on_its_side_by_a_reload_like_an_explicit_take() {
+    let lender = Some((2, Command::TakeCenter));
+    let holder = Some((1, Command::TakeLeft));
+    let orders: [&[Option<(usize, Command)>]; 4] = [
+        &[None, holder],
+        &[holder, None],
+        &[lender, holder],
+        &[holder, lender],
+    ];
+    for inputs in [F1, F1_CRLF, CRLF_CENTER] {
+        let (view, _dir) = joined_then_reloaded(inputs, C_D_TO_X_Y);
+        assert!(!view.model().sections()[2].lent_records().is_empty());
+        assert_eq!(view.model().sections()[2].resolution, Resolution::Center);
+        let taken = center_with_line_one_of(inputs, inputs[0])
+            .replace("\nc", "\nx")
+            .replace("\nd", "\ny");
+        for takes in orders {
+            let result = after_takes(inputs, C_D_TO_X_Y, takes);
+            assert_eq!(result.0, taken, "{takes:?} {inputs:?}");
+            assert_eq!(result.1, Resolution::Center, "{takes:?} {inputs:?}");
         }
     }
 }
