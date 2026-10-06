@@ -275,6 +275,38 @@ fn a_name_that_ends_in_a_dot_or_a_space_is_refused_and_the_shorter_name_kept() {
 }
 
 #[test]
+fn a_refusal_names_the_kind_of_item_and_the_operation() {
+    let dir = tempfile::tempdir().unwrap();
+    let folder = dir.path().join("folder");
+    fs::create_dir(&folder).unwrap();
+    let error = remove_file(&folder).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    assert!(error.to_string().contains("remove"), "{error}");
+    assert!(error.to_string().contains("folder"), "{error}");
+
+    let read_only = dir.path().join("read-only.txt");
+    fs::write(&read_only, b"x").unwrap();
+    let original = fs::metadata(&read_only).unwrap().permissions();
+    let mut permissions = original.clone();
+    permissions.set_readonly(true);
+    fs::set_permissions(&read_only, permissions).unwrap();
+    let error = write_atomic(&read_only, b"y").unwrap_err();
+    fs::set_permissions(&read_only, original).unwrap();
+    assert!(error.to_string().contains("replace"), "{error}");
+    assert!(error.to_string().contains("read-only"), "{error}");
+
+    let link = dir.path().join("link.txt");
+    #[cfg(unix)]
+    let linked = std::os::unix::fs::symlink(&read_only, &link).is_ok();
+    #[cfg(windows)]
+    let linked = std::os::windows::fs::symlink_file(&read_only, &link).is_ok();
+    if linked {
+        let error = open_log(&link, true).unwrap_err();
+        assert!(error.to_string().contains("link"), "{error}");
+    }
+}
+
+#[test]
 fn directories_are_not_replaced() {
     let dir = tempfile::tempdir().unwrap();
     let target = dir.path().join("folder");
