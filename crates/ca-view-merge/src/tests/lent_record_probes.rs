@@ -286,11 +286,7 @@ fn text_typed_between_the_holder_and_lent_text_after_a_strip() {
     assert_eq!(view.output_text(), "a\nb\nc\nd\ng\nh\niQX\nf\n");
     take_at(&mut view, 3, Command::TakeCenter);
     let after = view.output_text();
-    assert!(
-        after == "a\nb\nc\nd\ng\nh\niQ\ne\nf\n" || after == "a\nb\nc\nd\ng\nh\ni\ne\nf\n",
-        "{after:?}"
-    );
-    println!("typed between holder and lent text, after strip: {after:?}");
+    assert_eq!(after, "a\nb\nc\nd\ng\nh\niQ\ne\nf\n");
 }
 
 #[test]
@@ -403,15 +399,16 @@ fn a_side_that_starts_with_the_lent_characters_on_other_lines_keeps_one_copy() {
     let (mut view, _dir) = open(F6[0], Some(F6[1]), F6[2]);
     run_until_ready(&mut view);
     let sections = view.model().sections().len();
-    println!("F6 sections {sections}: {:?}", view.output_text());
+    assert_eq!(sections, 5);
+    assert_eq!(view.output_text(), "a\nb\nc\nc2\nc3\nXY\nf\n");
     view.output_pane.place(Caret::new(5, 0), false);
     view.output_pane.backspace();
     absorb(&mut view);
-    println!("F6 joined {:?}", view.output_text());
+    assert_eq!(view.output_text(), "a\nb\nc\nc2\nc3XY\nf\n");
     take_at(&mut view, 3, Command::TakeCenter);
-    println!("F6 after Take Center on s3 {:?}", view.output_text());
+    assert_eq!(view.output_text(), "a\nb\nc\nc2\nc3\nX\nYz\nf\n");
     take_at(&mut view, 2, Command::TakeLeft);
-    println!("F6 after Take Left on s2 {:?}", view.output_text());
+    assert_eq!(view.output_text(), "a\nb\nc\nc2\nc3\nX\nYz\nf\n");
 }
 
 #[test]
@@ -423,14 +420,14 @@ fn take_all_and_line_takes_after_joins_keep_one_copy() {
     assert_eq!(view.output_text(), "a\nbcc2c3fMg\ne\n");
     view.run(Command::TakeAllNonConflicting);
     assert_output_lines_match_pane(&view);
-    println!("take all after s3 center: {:?}", view.output_text());
+    assert_eq!(view.output_text(), "a\nbcc2c3fMg\nX\n");
     take_at(&mut view, 1, Command::TakeLeft);
-    println!("holder after take all: {:?}", view.output_text());
+    assert_eq!(view.output_text(), "a\nL\nc\nc2\nc3\nX\nf\nM\ng\n");
     saved_matches(&mut view, &dir).unwrap();
     view.row = 1;
     view.run(Command::TakeRightLine);
     assert_output_lines_match_pane(&view);
-    println!("right line on row 1: {:?}", view.output_text());
+    assert_eq!(view.output_text(), "a\nR\nc\nc2\nc3\nX\nf\nM\ng\n");
     saved_matches(&mut view, &dir).unwrap();
     while view.output_pane.buffer().can_undo() {
         view.run(Command::Undo);
@@ -467,10 +464,10 @@ fn toggles_reload_and_swap_after_joins_keep_the_text() {
     view.run(Command::SwapSides);
     run_until_ready(&mut view);
     assert_output_lines_match_pane(&view);
-    println!("swap after joins: {:?}", view.output_text());
+    assert_eq!(view.output_text(), "a\nbcc2c3Xfg\nm\n");
     saved_matches(&mut view, &dir).unwrap();
     take_at(&mut view, 1, Command::TakeRight);
-    println!("swap then take right on holder: {:?}", view.output_text());
+    assert_eq!(view.output_text(), "a\nL\ncc2c3\nX\nf\nm\ng\n");
 }
 
 #[test]
@@ -487,7 +484,7 @@ fn a_reload_with_the_lender_changed_on_disk_keeps_one_copy() {
     run_until_ready(&mut view);
     assert_output_lines_match_pane(&view);
     let text = view.output_text();
-    println!("reload with s5 left changed: {text:?}");
+    assert_eq!(text, "a\nbcc2c3XfMg\nMM\n");
     assert_eq!(text.matches("c2").count(), 1, "{text:?}");
     assert_eq!(text.matches('g').count(), 1, "{text:?}");
     take_at(&mut view, 1, Command::TakeLeft);
@@ -523,11 +520,11 @@ fn a_lender_left_out_then_given_back_onto_its_own_remaining_lines() {
     view.output_pane.place(Caret::new(6, 2), false);
     view.output_pane.type_character('Q');
     absorb(&mut view);
-    println!("joined X, typed Q: {:?}", view.output_text());
+    assert_eq!(view.output_text(), "a\nb\nc\nd\ng\nh\niXQ\nX2\nf\n");
     take_at(&mut view, 3, Command::TakeLeft);
-    println!("lender left: {:?}", view.output_text());
+    assert_eq!(view.output_text(), "a\nb\nc\nd\ng\nh\niXQ\nX2\nf\n");
     take_at(&mut view, 2, Command::TakeLeft);
-    println!("holder left: {:?}", view.output_text());
+    assert_eq!(view.output_text(), "a\nb\nc\nd\ng\nh\ni\nX\nX2\nf\n");
 }
 
 /// Every lent record's text sits on its holder line at its column.
@@ -631,7 +628,10 @@ fn a_reload_that_gives_text_back_to_a_carried_holder_keeps_its_records_on_their_
     view.run(Command::Reload);
     run_until_ready(&mut view);
     assert_output_lines_match_pane(&view);
-    println!("after reload: {:?}", view.output_text());
+    assert_eq!(
+        view.output_text(),
+        "[u1]\n[c2]\n[c3]\n[u6]\n\n[c7]\n[c8]\n[u13]\n[u14]\n[u15Z20]"
+    );
     records_on_their_text(&view).unwrap();
 }
 
@@ -654,7 +654,7 @@ fn a_second_reload_keeps_the_record_the_first_reload_moved() {
             assert_output_lines_match_pane(&view);
         }
         take_at(&mut view, 0, Command::TakeRight);
-        println!("reloads {reloads}: {:?}", view.output_text());
+        assert_eq!(view.output_text(), "~\n[r3]\n[u4]", "reloads {reloads}");
         finals.push(view.output_text());
     }
     assert_eq!(finals[0], finals[1]);
