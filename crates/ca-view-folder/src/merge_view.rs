@@ -1769,8 +1769,9 @@ impl FolderMergeView {
     }
 
     /// Drop every save whose row a new comparison lists with an input item
-    /// of another size or time, or does not list; take the input items of a
-    /// save that arrived with no comparison on screen.
+    /// of another size or time, or does not list. A save that arrived with no
+    /// comparison on screen takes its input items from this listing, and is
+    /// dropped when an input item is newer than the output file.
     fn check_saves(&mut self, tree: &MergeTree) {
         if self.saved.is_empty() {
             return;
@@ -1786,11 +1787,39 @@ impl FolderMergeView {
             match record.inputs {
                 Some(then) if then != now => continue,
                 Some(_) => {}
+                None if self.an_input_is_newer_than_the_output(row, output_pane) => continue,
                 None => record.inputs = Some(now),
             }
             kept.insert(key, record);
         }
         self.saved = kept;
+    }
+
+    /// True when the listing holds no output file with a time for `row`, or
+    /// an input item of the row, other than the output folder itself, newer
+    /// than it under the session's time test.
+    ///
+    /// A save that arrives with no comparison on screen takes its input items
+    /// from a listing made after the save, which may already hold an input
+    /// written after it.
+    fn an_input_is_newer_than_the_output(&self, row: &MergeRow, output_pane: Option<Pane>) -> bool {
+        let Some(output) = row.output.as_ref().filter(|entry| entry.modified.is_some()) else {
+            return true;
+        };
+        let tests = ca_fs::QuickTests {
+            tolerance_seconds: self.engine.compare.quick.tolerance_seconds,
+            ignore_daylight_saving: self.engine.compare.quick.ignore_daylight_saving,
+            ignore_timezone: self.engine.compare.quick.ignore_timezone,
+            ..ca_fs::QuickTests::default()
+        };
+        [Pane::Left, Pane::Center, Pane::Right]
+            .into_iter()
+            .filter(|pane| output_pane != Some(*pane))
+            .filter_map(|pane| row.entry(pane))
+            .any(|input| {
+                input.modified.is_none()
+                    || ca_fs::quick_compare(output, input, &tests).newer == Some(ca_fs::Side::Right)
+            })
     }
 
     /// A merge of every row with the resolutions the view holds now.
