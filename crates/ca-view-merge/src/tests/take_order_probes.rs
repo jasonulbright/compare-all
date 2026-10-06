@@ -323,6 +323,95 @@ fn enter_and_typing_inside_lent_text_then_taking_the_holder_first_restores_the_s
     assert_restored(&outcome, CRLF_CENTER_TAKEN);
 }
 
+const LENDER_EDIT_HOLDER: [Step; 3] = [Step::Lender, Step::Edit, Step::Holder];
+
+#[test]
+fn enter_inside_lent_text_between_the_lender_take_and_the_holder_take_restores_the_selected_bytes()
+{
+    let outcome = in_order(CRLF_CENTER, 2, &enter_inside_lent_text, LENDER_EDIT_HOLDER);
+    assert_restored(&outcome, CRLF_CENTER_TAKEN);
+}
+
+#[test]
+fn enter_inside_lf_lent_text_between_the_lender_take_and_the_holder_take_restores_the_lender() {
+    let enter = |view: &mut MergeView| {
+        view.output_pane.place(Caret::new(1, 2), false);
+        view.output_pane.enter("\n");
+        absorb(view);
+        assert_eq!(view.output_text(), "a\nbc\nd\ng\nh\ni\nX\nf\n");
+    };
+    assert_restored(&in_order(F1, 2, &enter, LENDER_EDIT_HOLDER), F1_TAKEN);
+}
+
+/// One join gives `a\nbc\nd\ng...` with the line break after `c` lent by
+/// s2; Delete at the end of line 1 removes that line break.
+fn remove_line_break_inside_lent_text(view: &mut MergeView) {
+    view.output_pane.place(Caret::new(1, 0), false);
+    view.output_pane.move_caret(Motion::LineEnd, false);
+    view.output_pane.delete();
+    absorb(view);
+    assert_eq!(
+        view.output_text().replace('\r', ""),
+        "a\nbcd\ng\n",
+        "{:?}",
+        view.output_text()
+    );
+}
+
+#[test]
+fn a_removed_line_break_inside_lent_text_then_taking_the_lender_first_restores_the_selected_bytes()
+{
+    let outcome = one_order(CRLF_CENTER, 1, &remove_line_break_inside_lent_text, true);
+    assert_restored(&outcome, CRLF_CENTER_TAKEN);
+}
+
+#[test]
+fn a_removed_line_break_inside_lent_text_then_taking_the_holder_first_restores_the_selected_bytes()
+{
+    let outcome = one_order(CRLF_CENTER, 1, &remove_line_break_inside_lent_text, false);
+    assert_restored(&outcome, CRLF_CENTER_TAKEN);
+}
+
+#[test]
+fn a_line_break_removed_inside_lent_text_between_the_takes_restores_the_selected_bytes() {
+    let outcome = in_order(
+        CRLF_CENTER,
+        1,
+        &remove_line_break_inside_lent_text,
+        LENDER_EDIT_HOLDER,
+    );
+    assert_restored(&outcome, CRLF_CENTER_TAKEN);
+}
+
+#[test]
+fn typing_inside_lent_text_between_the_lender_take_and_the_holder_take_keeps_the_typed_text() {
+    let outcome = in_order(F1, 2, &type_inside_lent_text, LENDER_EDIT_HOLDER);
+    assert_eq!(outcome.text, "a\nL\ncQd\ng\nh\ni\nX\nf\n");
+    assert_eq!(outcome.lender, Resolution::Edited);
+    assert_eq!(outcome.saved, outcome.text.as_bytes());
+}
+
+#[test]
+fn deleting_inside_lent_text_between_the_lender_take_and_the_holder_take_keeps_the_deletion() {
+    let outcome = in_order(F1, 2, &delete_inside_lent_text, LENDER_EDIT_HOLDER);
+    assert_eq!(outcome.text, "a\nL\nc\ng\nh\ni\nX\nf\n");
+    assert_eq!(outcome.lender, Resolution::Edited);
+    assert_eq!(outcome.saved, outcome.text.as_bytes());
+}
+
+#[test]
+fn enter_and_typing_inside_lent_text_between_the_takes_keeps_the_typed_text() {
+    let outcome = in_order(
+        CRLF_CENTER,
+        2,
+        &enter_and_type_inside_lent_text,
+        LENDER_EDIT_HOLDER,
+    );
+    assert_eq!(outcome.text.replace('\r', ""), "a\nL\nc\nQd\ng\n");
+    assert_eq!(outcome.lender, Resolution::Edited);
+    assert_eq!(outcome.saved, outcome.text.as_bytes());
+}
+
 /// Four joins give `a\nbcdgh\ni...`; removing `dg` leaves `bch`.
 fn remove_middle_of_lent_text(view: &mut MergeView) {
     assert_eq!(view.output_text(), "a\nbcdgh\ni\nX\nf\n");
