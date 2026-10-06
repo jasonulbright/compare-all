@@ -3217,6 +3217,93 @@ fn permanent_removal_consent_does_not_cover_content_that_changed_while_asking() 
     );
 }
 
+/// `path` reached through the administrative share of its drive, or `None`
+/// where that share is not reachable.
+#[cfg(windows)]
+fn through_local_share(path: &Path) -> Option<PathBuf> {
+    let text = path.to_str()?;
+    let (drive, rest) = text.split_once(":\\")?;
+    let shared = PathBuf::from(format!(r"\\localhost\{drive}$\{rest}"));
+    std::fs::metadata(&shared).ok()?;
+    Some(shared)
+}
+
+/// A policy that records the recycle bin question and declines the removal.
+#[cfg(windows)]
+struct DeclineOutrightRemoval(AtomicUsize);
+
+#[cfg(windows)]
+impl ErrorPolicy for DeclineOutrightRemoval {
+    fn on_error(&self, _step: &PlanStep, _attempt: u32, _message: &str) -> Decision {
+        Decision::Skip
+    }
+    fn on_recycle_bin_unavailable(&self, _step: &PlanStep) -> ConflictDecision {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        ConflictDecision::Skip
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn a_trash_call_on_a_share_is_refused_and_leaves_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("kept.txt");
+    std::fs::write(&file, b"must stay").unwrap();
+    let Some(shared) = through_local_share(&file) else {
+        println!("skipped: the administrative share of the drive is not reachable");
+        return;
+    };
+    let error = RealFs.move_to_trash(&shared).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::Unsupported, "{error}");
+    assert_eq!(std::fs::read(&file).unwrap(), b"must stay");
+}
+
+#[cfg(windows)]
+#[test]
+fn a_recycle_bin_delete_on_a_share_asks_the_policy_before_any_removal() {
+    let dir = tempfile::tempdir().unwrap();
+    let folder = dir.path().join("probe-folder");
+    std::fs::create_dir_all(folder.join("sub")).unwrap();
+    std::fs::write(folder.join("a.txt"), b"a").unwrap();
+    std::fs::write(folder.join("sub/b.txt"), b"b").unwrap();
+    let Some(shared) = through_local_share(&folder) else {
+        println!("skipped: the administrative share of the drive is not reachable");
+        return;
+    };
+    let mut opts = options();
+    opts.use_recycle_bin = true;
+    let mut plan = OperationPlan::new(
+        crate::ops::plan::OperationKind::Delete,
+        vec![shared.parent().unwrap().to_path_buf()],
+        opts,
+    );
+    plan.steps.push(PlanStep {
+        index: 0,
+        action: StepAction::Trash {
+            path: shared.clone(),
+        },
+        bytes: 0,
+        conflicts: Vec::new(),
+        backup: None,
+        side: None,
+        rel: PathBuf::from("probe-folder"),
+        expected: crate::ops::plan::StepExpectation::default(),
+    });
+    let policy = DeclineOutrightRemoval(AtomicUsize::new(0));
+    let cancel = Cancel::new();
+    let report = execute(
+        &plan,
+        &ExecutionContext::new(&RealFs, &cancel, Journaling::Disabled).with_policy(&policy),
+    );
+    assert_eq!(policy.0.load(Ordering::SeqCst), 1);
+    assert!(
+        matches!(report.results[0].outcome, StepOutcome::Skipped { .. }),
+        "{:?}",
+        report.results[0].outcome
+    );
+    assert_eq!(std::fs::read(folder.join("sub/b.txt")).unwrap(), b"b");
+}
+
 /// A policy whose user stops at the permanent-removal question after an
 /// earlier standing answer skipped every failure.
 struct StopAtUnavailableRecycling(AtomicUsize);
