@@ -296,6 +296,32 @@ fn replace_impl<T, E: From<io::Error>>(
     }
 }
 
+/// Put the finished, closed file `replacement` in place of the existing file
+/// `target` with `ReplaceFileW`, which keeps the access list, the creation
+/// time and the named streams of `target`. The two files must lie on one
+/// volume.
+///
+/// # Errors
+/// Returns the replacement error. On failure `target` keeps its content
+/// under its name, or the error names the path that holds it.
+#[cfg(windows)]
+pub fn replace_existing_file(target: &Path, replacement: &Path) -> io::Result<()> {
+    let extended_target = windows_extended_path(target)?;
+    let target = extended_target.as_deref().unwrap_or(target);
+    let extended_replacement = windows_extended_path(replacement)?;
+    let replacement = extended_replacement.as_deref().unwrap_or(replacement);
+    let parent = target
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let guard = COMMIT_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let outcome = replace_existing_windows(target, replacement, parent);
+    drop(guard);
+    outcome.map(drop)
+}
+
 fn retain_conflict_backup(
     backup: &mut tempfile::TempPath,
     has_conflict: &mut Option<&mut dyn FnMut(&Path) -> bool>,

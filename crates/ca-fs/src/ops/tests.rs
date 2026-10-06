@@ -522,6 +522,126 @@ fn excluding_steps_renumbers_what_is_left() {
 
 // ------------------------------------------------------------- copy, move
 
+/// Copy `name` from the left folder to the right one with `options`.
+fn copy_left_to_right(left: &Path, right: &Path, name: &str, options: &OperationOptions) {
+    let root = compared(left, right);
+    let bases = Bases { left, right };
+    let plan = plan_copy(&selection(&root, &[name]), Side::Left, bases, options);
+    let cancel = Cancel::new();
+    let report = execute(
+        &plan,
+        &ExecutionContext::new(&RealFs, &cancel, Journaling::Disabled),
+    );
+    assert!(report.is_clean(), "{:?}", report.results);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_copy_of_a_private_file_stays_private_over_a_target_to_a_new_name_and_in_a_backup() {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+    let private = |path: &Path, text: &[u8]| {
+        std::fs::write(path, text).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    };
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    private(&left.path().join("secret.txt"), b"new secret");
+    private(&right.path().join("secret.txt"), b"old secret");
+    private(&left.path().join("fresh.txt"), b"new secret");
+    let backed_up = OperationOptions {
+        overwrite: true,
+        backup: Some(BackupOptions::default()),
+        ..options()
+    };
+
+    copy_left_to_right(left.path(), right.path(), "secret.txt", &backed_up);
+    copy_left_to_right(left.path(), right.path(), "fresh.txt", &options());
+
+    assert_eq!(
+        std::fs::read(right.path().join("secret.txt")).unwrap(),
+        b"new secret"
+    );
+    assert_eq!(mode(&right.path().join("secret.txt")), 0o600);
+    assert_eq!(mode(&right.path().join("secret.txt.bak")), 0o600);
+    assert_eq!(mode(&right.path().join("fresh.txt")), 0o600);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_copy_over_a_shared_target_keeps_the_target_access() {
+    use std::os::unix::fs::PermissionsExt;
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    let source = left.path().join("a.txt");
+    let target = right.path().join("a.txt");
+    std::fs::write(&source, b"new").unwrap();
+    std::fs::write(&target, b"old").unwrap();
+    std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+    let replacing = OperationOptions {
+        overwrite: true,
+        ..options()
+    };
+    copy_left_to_right(left.path(), right.path(), "a.txt", &replacing);
+    let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777;
+    assert_eq!(mode, 0o640);
+}
+
+/// The access list of `path` as `icacls` prints it.
+#[cfg(windows)]
+fn access_list(path: &Path) -> String {
+    let out = std::process::Command::new("icacls")
+        .arg(path)
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+#[cfg(windows)]
+#[test]
+fn a_copy_over_an_owner_only_target_keeps_its_access_list() {
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    let source = left.path().join("secret.txt");
+    let target = right.path().join("secret.txt");
+    std::fs::write(&source, b"new").unwrap();
+    std::fs::write(&target, b"old").unwrap();
+    let user = std::env::var("USERNAME").unwrap();
+    let status = std::process::Command::new("icacls")
+        .arg(&target)
+        .args(["/inheritance:r", "/grant:r"])
+        .arg(format!("{user}:F"))
+        .stdout(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let before = access_list(&target);
+    assert!(!before.contains("(I)"), "{before}");
+
+    let replacing = OperationOptions {
+        overwrite: true,
+        ..options()
+    };
+    copy_left_to_right(left.path(), right.path(), "secret.txt", &replacing);
+
+    assert_eq!(std::fs::read(&target).unwrap(), b"new");
+    assert_eq!(
+        std::fs::metadata(&target).unwrap().modified().unwrap(),
+        std::fs::metadata(&source).unwrap().modified().unwrap()
+    );
+    let after = access_list(&target);
+    assert!(
+        !after.contains("(I)"),
+        "the target took inherited entries: {after}"
+    );
+    assert_eq!(
+        before.lines().count(),
+        after.lines().count(),
+        "{before}\n{after}"
+    );
+}
+
 #[test]
 fn copy_preserves_contents_and_modification_time() {
     let left = tempfile::tempdir().unwrap();

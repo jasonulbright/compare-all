@@ -1285,7 +1285,18 @@ fn transfer(
         }
     }
 
-    let copied = copy_into_temporary(ctx, step, source, &temporary, options, source_state.size);
+    // A replacement keeps the access of the file it replaces; a new file takes
+    // the access of its source.
+    let access_of = if replacing { target } else { source };
+    let copied = copy_into_temporary(
+        ctx,
+        step,
+        source,
+        &temporary,
+        access_of,
+        options,
+        source_state.size,
+    );
     let copied = match copied {
         Ok(bytes) => bytes,
         Err(outcome) => {
@@ -1327,9 +1338,30 @@ fn transfer(
         return finish(outcome);
     }
 
-    if let Err(error) = commit(fs, &temporary, target, replacing) {
+    let committed = if replacing {
+        fs.replace(&temporary, target)
+    } else {
+        commit(fs, &temporary, target, false)
+    };
+    if let Err(error) = committed {
         let _ = fs.remove_file(&temporary);
         return finish(StepOutcome::failed(&error));
+    }
+    // A replacement can keep the creation time and the Hidden flag of the
+    // file it replaced, so the source's values are applied again.
+    if replacing && options.preserve_created {
+        if let Some(created) = source_state.created {
+            let _ = fs.set_created(target, created);
+        }
+    }
+    if replacing && options.preserve_attributes {
+        let _ = fs.set_attributes(
+            target,
+            &AttributeChange {
+                hidden: Some(source_state.hidden),
+                ..AttributeChange::default()
+            },
+        );
     }
 
     // A destination that refuses a client-set time keeps a time of its own, so
@@ -1396,7 +1428,8 @@ fn write_backup(
     options: &OperationOptions,
 ) -> io::Result<()> {
     let mut reader = fs.open_read(target)?;
-    fs.write_new(name, &mut *reader, options.buffer_size)
+    fs.write_new(name, &mut *reader, options.buffer_size)?;
+    fs.match_access(target, name)
 }
 
 /// True when the plan recorded an item at the step's target as
@@ -1454,11 +1487,14 @@ fn prepare_target(
     None
 }
 
+/// Copy `source` into the new file `temporary`, which takes the access of
+/// `access_of` before any content is written to it.
 fn copy_into_temporary(
     ctx: &ExecutionContext<'_>,
     step: &PlanStep,
     source: &Path,
     temporary: &Path,
+    access_of: &Path,
     options: &OperationOptions,
     total: u64,
 ) -> Result<u64, StepOutcome> {
@@ -1466,6 +1502,8 @@ fn copy_into_temporary(
     let mut reader = fs.open_read(source).map_err(|e| StepOutcome::failed(&e))?;
     let mut writer = fs
         .create_new(temporary)
+        .map_err(|e| StepOutcome::failed(&e))?;
+    fs.match_access(access_of, temporary)
         .map_err(|e| StepOutcome::failed(&e))?;
 
     let mut buffer = vec![0u8; options.buffer_size.max(4096)];

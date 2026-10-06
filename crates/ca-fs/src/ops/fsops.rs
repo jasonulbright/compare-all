@@ -234,6 +234,24 @@ pub trait FileOps: Send + Sync {
         check_then_rename(self, from, to)
     }
 
+    /// Put the finished copy `from` in place of the existing file `to`,
+    /// keeping the access settings of `to`.
+    ///
+    /// # Errors
+    /// Propagates the underlying I/O error; `to` keeps its content on failure.
+    fn replace(&self, from: &Path, to: &Path) -> io::Result<()> {
+        self.rename(from, to)
+    }
+
+    /// Give the new file `path` the access settings of `model` where the file
+    /// system keeps them as permission bits.
+    ///
+    /// # Errors
+    /// Propagates the underlying I/O error.
+    fn match_access(&self, _model: &Path, _path: &Path) -> io::Result<()> {
+        Ok(())
+    }
+
     /// Write the bytes of `reader` as a new file at `target`, a name that no
     /// item may hold.
     ///
@@ -644,6 +662,32 @@ impl FileOps for RealFs {
 
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
         std::fs::rename(from, to)
+    }
+
+    #[cfg(windows)]
+    fn replace(&self, from: &Path, to: &Path) -> io::Result<()> {
+        ca_io::replace_existing_file(to, from)
+    }
+
+    #[cfg(not(windows))]
+    fn replace(&self, from: &Path, to: &Path) -> io::Result<()> {
+        self.match_access(to, from)?;
+        std::fs::rename(from, to)
+    }
+
+    #[cfg(unix)]
+    fn match_access(&self, model: &Path, path: &Path) -> io::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = match std::fs::metadata(model) {
+            // The set-user-ID and set-group-ID bits do not carry over to new
+            // content, as an ordinary write clears them. The owner keeps read
+            // and write access, which the copy and its checks need.
+            Ok(meta) => (meta.permissions().mode() & 0o1777) | 0o600,
+            // A dangling link has no access of its own to pass on.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
     }
 
     #[cfg(windows)]
