@@ -366,6 +366,27 @@ fn a_rar_reads_through_the_system_tar_or_says_why_not() {
     }
 }
 
+/// A text listing of local files, which the system tar reads as a list of
+/// entries to copy into its output.
+#[test]
+fn a_file_named_as_rar_without_the_rar_signature_is_refused_with_a_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let private = dir.path().join("private.txt");
+    std::fs::write(&private, b"secret-of-user\n").unwrap();
+    let generated = format!(
+        "#mtree\nreadme.txt type=file contents={}\n",
+        private.display().to_string().replace('\\', "/")
+    );
+    let saved: &[u8] = b"#mtree\nreadme.txt type=file contents=C:/path/to/any/readable/file.txt\nwin.ini type=file contents=C:/Windows/win.ini\n";
+    for bytes in [generated.into_bytes(), saved.to_vec()] {
+        match open_memory(bytes, "release.rar") {
+            Ok(fs) => panic!("opened as {:?}: {:?}", fs.format(), names(&fs, "")),
+            Err(VfsError::Corrupt { detail }) => assert!(detail.contains("RAR"), "{detail}"),
+            Err(other) => panic!("expected a refusal that names the format, got {other:?}"),
+        }
+    }
+}
+
 #[test]
 fn a_damaged_rar_is_an_error_not_a_panic() {
     let bytes = rar_bytes(&[], &[("a.txt", b"payload")]);
