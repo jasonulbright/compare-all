@@ -83,6 +83,34 @@ pub fn resolution_of(row: &MergeRow, request: &MergeRequest<'_>) -> Resolution {
     }
 }
 
+/// True when `row` is in the part of the tree `request` merges.
+fn takes_part(row: &MergeRow, request: &MergeRequest<'_>) -> bool {
+    request
+        .selection
+        .is_none_or(|selected| selected.iter().any(|chosen| row.rel.starts_with(chosen)))
+}
+
+/// True when a merge of `request` leaves `row` for a person: the row takes
+/// part, needs a person, and nobody chose a resolution that writes it.
+///
+/// The plan has no step for such a row, so the output holds its merge result
+/// only after a person writes it.
+#[must_use]
+pub fn leaves_for_person(row: &MergeRow, request: &MergeRequest<'_>) -> bool {
+    row.status.needs_person()
+        && takes_part(row, request)
+        && resolution_of(row, request) == Resolution::Leave
+}
+
+/// Every row a merge of `request` leaves for a person, in tree order.
+#[must_use]
+pub fn left_for_person<'t>(tree: &'t MergeTree, request: &MergeRequest<'_>) -> Vec<&'t MergeRow> {
+    tree.rows
+        .iter()
+        .filter(|row| leaves_for_person(row, request))
+        .collect()
+}
+
 /// Turn a compared tree and the user's resolutions into the steps that write
 /// the output folder.
 ///
@@ -117,10 +145,7 @@ pub fn plan_merge(
     }
 
     for row in &tree.rows {
-        let taking_part = request
-            .selection
-            .is_none_or(|selected| selected.iter().any(|chosen| row.rel.starts_with(chosen)));
-        let resolution = if taking_part {
+        let resolution = if takes_part(row, request) {
             resolution_of(row, request)
         } else {
             Resolution::Leave

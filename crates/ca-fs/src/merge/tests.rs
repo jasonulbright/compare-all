@@ -12,8 +12,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use super::{
-    compare3, plan_merge, Change, FolderMergeOptions, MergeBases, MergeFilters, MergeInputs,
-    MergeRefused, MergeRequest, MergeRow, MergeStatus, MergeTree, Pane, Resolution,
+    compare3, left_for_person, plan_merge, Change, FolderMergeOptions, MergeBases, MergeFilters,
+    MergeInputs, MergeRefused, MergeRequest, MergeRow, MergeStatus, MergeTree, Pane, Resolution,
 };
 use crate::cancel::Cancel;
 use crate::criteria::{ContentMethod, ContentTests};
@@ -501,6 +501,73 @@ fn a_take_resolves_a_conflict_the_automatic_merge_leaves_alone() {
     assert_eq!(
         std::fs::read(fixture.path("output").join("conflict.bin")).unwrap(),
         b"\x00right"
+    );
+}
+
+/// The rows the plan writes nothing for are the rows a person still has to
+/// merge: a mergeable and a conflicting row nobody resolved, inside the part
+/// of the tree the merge takes in.
+#[test]
+fn the_rows_left_for_a_person_are_the_unresolved_ones_the_plan_skips() {
+    let fixture = Fixture::new();
+    fixture.write("left", "added.txt", b"from the left");
+    let base = b"one\ntwo\nthree\nfour\nfive\nsix\nseven\n";
+    fixture.write("center", "apart.txt", base);
+    fixture.write(
+        "left",
+        "apart.txt",
+        b"ONE\ntwo\nthree\nfour\nfive\nsix\nseven\n",
+    );
+    fixture.write(
+        "right",
+        "apart.txt",
+        b"one\ntwo\nthree\nfour\nfive\nsix\nSEVEN\n",
+    );
+    fixture.write("center", "conflict.bin", b"\x00base");
+    fixture.write("left", "conflict.bin", b"\x00left");
+    fixture.write("right", "conflict.bin", b"\x00right");
+    let tree = compare(&fixture);
+    let names = |rows: Vec<&MergeRow>| -> Vec<PathBuf> {
+        rows.into_iter().map(|row| row.rel.clone()).collect()
+    };
+
+    let none = BTreeMap::new();
+    let request = automatic(&none);
+    let left = names(left_for_person(&tree, &request));
+    assert_eq!(
+        left,
+        vec![PathBuf::from("apart.txt"), PathBuf::from("conflict.bin")]
+    );
+    let planned = plan(&fixture, &tree, &request);
+    assert!(planned
+        .steps
+        .iter()
+        .any(|step| step.rel == Path::new("added.txt")));
+    assert!(planned.steps.iter().all(|step| !left.contains(&step.rel)));
+
+    let manual = MergeRequest {
+        overrides: &none,
+        selection: None,
+        automatic: false,
+    };
+    assert_eq!(names(left_for_person(&tree, &manual)), left);
+
+    let mut taken = BTreeMap::new();
+    taken.insert(PathBuf::from("conflict.bin"), Resolution::Take(Pane::Right));
+    assert_eq!(
+        names(left_for_person(&tree, &automatic(&taken))),
+        vec![PathBuf::from("apart.txt")]
+    );
+
+    let selection: BTreeSet<PathBuf> = [PathBuf::from("conflict.bin")].into_iter().collect();
+    let selected = MergeRequest {
+        overrides: &none,
+        selection: Some(&selection),
+        automatic: true,
+    };
+    assert_eq!(
+        names(left_for_person(&tree, &selected)),
+        vec![PathBuf::from("conflict.bin")]
     );
 }
 

@@ -31,7 +31,10 @@ pub mod plan;
 #[cfg(test)]
 mod tests;
 
-pub use plan::{automatic_resolution, plan_merge, MergeRefused, MergeRequest, Resolution};
+pub use plan::{
+    automatic_resolution, leaves_for_person, left_for_person, plan_merge, MergeRefused,
+    MergeRequest, Resolution,
+};
 
 /// One of the three inputs of a merge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
