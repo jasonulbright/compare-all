@@ -803,24 +803,21 @@ impl MergeModel {
 
     /// Put the text of `entry`, a record of `lender` no line holds now, in
     /// front of the lender's own text.
+    ///
+    /// A restore the lender still keeps applies once its last record is
+    /// back, whatever characters the records hold: an edit that changes a
+    /// character of the lender after the restore was recorded drops the
+    /// restore at that edit, and a take's restore stands for the selected
+    /// input over edits made before the take. Comparing the returned
+    /// characters here would make the result depend on the take order, and
+    /// a record split by a line break returns in pieces whose first piece
+    /// carries no source.
     pub(super) fn return_to_lender(
         &mut self,
         lender: usize,
         entry: super::Lent,
     ) -> Option<(usize, Range<u32>)> {
         self.uncover_after(lender, &entry);
-        if !entry
-            .source
-            .as_deref()
-            .is_some_and(|source| Self::same_characters_ignoring_line_endings(source, &entry.text))
-        {
-            // The characters that come back differ from the lent source, so
-            // the lender cannot return to its selected input without losing
-            // an edit that remains in the holder.
-            self.touch(lender);
-            self.sections[lender].restore = None;
-            self.sections[lender].restore_from_take = false;
-        }
         let range = self.output_range(lender)?;
         let mut target = None;
         for local in 0..range.end - range.start {
@@ -862,14 +859,6 @@ impl MergeModel {
         self.repair_local(lender, &lines);
         self.apply_restore(lender);
         Some((lender, lines))
-    }
-
-    fn same_characters_ignoring_line_endings(left: &str, right: &str) -> bool {
-        left.chars()
-            .filter(|character| !matches!(*character, '\r' | '\n'))
-            .eq(right
-                .chars()
-                .filter(|character| !matches!(*character, '\r' | '\n')))
     }
 
     /// Give back the text lent to line `local` of `holder`, before that

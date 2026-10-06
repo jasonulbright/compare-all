@@ -64,7 +64,7 @@ fn removing_the_middle_of_joined_text_keeps_the_rest_with_its_section() {
     assert_output_lines_match_pane(&view);
     assert_eq!(view.output_text(), "a\nbchi\nX\nf\n");
     take_at(&mut view, 1, Command::TakeLeft);
-    assert_eq!(view.output_text(), "a\nL\nchi\nX\nf\n");
+    assert_eq!(view.output_text(), "a\nL\nc\nd\ng\nh\ni\nX\nf\n");
     undo_all(&mut view);
     assert_eq!(view.output_text(), "a\nb\nc\nd\ng\nh\ni\nX\nf\n");
 }
