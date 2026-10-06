@@ -42,6 +42,11 @@ const ASSERTED: &[&str] = &[
     "lent-record-off-text",
     "lent-record-invariant",
     "take-reordered-other-section-text",
+    "take-restore-differs-from-selected-input",
+    "take-order-differs",
+    "take-restore-duplicated-token",
+    "take-order-replay-differs",
+    "edit-kept-take-restore",
 ];
 
 /// Every token with its byte range in `text`.
@@ -243,6 +248,8 @@ struct Stats {
     reabsorbs: usize,
     clamps: usize,
     panics: usize,
+    take_order_checks: usize,
+    pending_takes_restored: usize,
 }
 
 struct Gen(Seeded, usize);
@@ -757,6 +764,205 @@ fn summary(view: &MergeView) -> Vec<String> {
         .collect()
 }
 
+/// A section whose take waits for its lent text, with the resolution and
+/// lines that take recorded.
+type PendingTake = (usize, Resolution, Vec<String>);
+
+/// Token counts of the input lines of every section but `skip`, on all
+/// three sides.
+fn input_tokens_outside(model: &crate::model::MergeModel, skip: usize) -> HashMap<String, usize> {
+    let inputs = model.inputs();
+    let mut map = HashMap::new();
+    for (index, section) in model.sections().iter().enumerate() {
+        if index == skip {
+            continue;
+        }
+        for (lines, range) in [
+            (&inputs.center, &section.center),
+            (&inputs.left, &section.left),
+            (&inputs.right, &section.right),
+        ] {
+            for line in lines
+                .get(range.start as usize..range.end as usize)
+                .unwrap_or(&[])
+            {
+                for token in tokens(line) {
+                    *map.entry(token).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+    map
+}
+
+/// The sections whose pending take a take restored, and the problems of
+/// those restores. `pending` holds, from before the take, each section that
+/// waited for its lent text with the resolution and lines its take
+/// recorded. A restored section holds exactly those lines. Every token of
+/// them appears outside the section no more often than sections other than
+/// it showed that token before the take, plus the copies the inputs of
+/// other sections hold: a holder that keeps the lent text next to the
+/// restored lines is a duplicate.
+fn restore_problems(
+    view: &MergeView,
+    op: &str,
+    pending: &[PendingTake],
+    owned_before: &Owned,
+) -> (HashSet<usize>, Vec<(String, String)>) {
+    let model = view.model();
+    let after = owned_text(view).text;
+    let after_counts = counts(&after);
+    let before_counts = counts(&owned_before.text);
+    let mut restored = HashSet::new();
+    let mut problems = Vec::new();
+    for (index, resolution, lines) in pending {
+        let Some(section) = model.sections().get(*index) else {
+            continue;
+        };
+        if model.pending_take(*index).is_some() || section.resolution != *resolution {
+            continue;
+        }
+        let now = model.section_lines(*index);
+        if now != *lines {
+            problems.push((
+                "take-restore-differs-from-selected-input".to_owned(),
+                format!("after {op}: s{index} {now:?} expected {lines:?}; text {after:?}"),
+            ));
+            continue;
+        }
+        restored.insert(*index);
+        let own_before = kept_tokens(owned_before, &|owner| owner == *index);
+        let elsewhere = input_tokens_outside(model, *index);
+        for (token, count) in counts(&now.concat()) {
+            let outside = after_counts
+                .get(&token)
+                .copied()
+                .unwrap_or(0)
+                .saturating_sub(count);
+            let allowed = before_counts
+                .get(&token)
+                .copied()
+                .unwrap_or(0)
+                .saturating_sub(own_before.get(&token).copied().unwrap_or(0))
+                + elsewhere.get(&token).copied().unwrap_or(0);
+            if outside > allowed {
+                problems.push((
+                    "take-restore-duplicated-token".to_owned(),
+                    format!(
+                        "after {op}: s{index} restored {token} with {outside} other \
+                         cop(ies), {allowed} allowed; text {after:?}"
+                    ),
+                ));
+                break;
+            }
+        }
+    }
+    (restored, problems)
+}
+
+/// The first lender whose lent text one holder alone holds, with that
+/// holder.
+fn single_holder_lender(view: &MergeView) -> Option<(usize, usize)> {
+    view.model()
+        .sections()
+        .iter()
+        .enumerate()
+        .find_map(|(lender, section)| {
+            let holder = section.lent_records().first()?.holder;
+            section
+                .lent_records()
+                .iter()
+                .all(|entry| entry.holder == holder)
+                .then_some((lender, holder))
+        })
+}
+
+/// The output text, the lender's resolution and lines, and the saved bytes
+/// after two takes.
+#[derive(PartialEq)]
+struct TakeOrderAfter {
+    text: String,
+    lender: Resolution,
+    lines: Vec<String>,
+    saved: Vec<u8>,
+}
+
+impl std::fmt::Debug for TakeOrderAfter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "text {:?} lender {:?} lines {:?} saved {:?}",
+            self.text,
+            self.lender,
+            self.lines,
+            String::from_utf8_lossy(&self.saved)
+        )
+    }
+}
+
+struct TakeOrderReplay {
+    before: String,
+    after: TakeOrderAfter,
+}
+
+/// `saved` with the folder of `dir` taken out: conflict markers name the
+/// input files by their full paths.
+fn without_folder(saved: &[u8], dir: &tempfile::TempDir) -> Vec<u8> {
+    let folder = dir.path().display().to_string().into_bytes();
+    let mut out = Vec::with_capacity(saved.len());
+    let mut at = 0;
+    while at < saved.len() {
+        if !folder.is_empty() && saved[at..].starts_with(&folder) {
+            at += folder.len();
+        } else {
+            out.push(saved[at]);
+            at += 1;
+        }
+    }
+    out
+}
+
+/// Run `ops` again on a fresh view of `inputs`, then `takes` in order. The
+/// later of the two sections is the lender.
+fn replay_with_takes(
+    inputs: [&str; 3],
+    ops: &[Op],
+    paste: usize,
+    takes: [(usize, Command); 2],
+) -> TakeOrderReplay {
+    PASTE.with(|p| p.set(paste));
+    let (mut view, dir) = open(inputs[0], Some(inputs[1]), inputs[2]);
+    run_until_ready(&mut view);
+    let mut stats = Stats::default();
+    for op in ops {
+        let _ = apply(&mut view, &dir, op, &mut stats);
+    }
+    let before = pane_text(&view);
+    let lender = takes.iter().map(|(section, _)| *section).max().unwrap_or(0);
+    for (section, command) in takes {
+        view.output_pane.clear_selection();
+        view.focus = crate::Pane::Output;
+        view.current = section;
+        view.run(command);
+    }
+    let text = pane_text(&view);
+    let model = view.model();
+    let resolution = model.sections()[lender].resolution;
+    let lines = model
+        .output_range(lender)
+        .map_or_else(Vec::new, |range| split(&model.output_text_range(range)));
+    let saved = without_folder(&save_and_read(&mut view, &dir), &dir);
+    TakeOrderReplay {
+        before,
+        after: TakeOrderAfter {
+            text,
+            lender: resolution,
+            lines,
+            saved,
+        },
+    }
+}
+
 fn op_name(op: &Op) -> &'static str {
     match op {
         Op::Join(_) => "Join",
@@ -799,6 +1005,7 @@ fn run_case(
     let initial = baseline.clone();
     let mut reset = false;
     let mut flags_changed = false;
+    let paste_start = PASTE.with(std::cell::Cell::get);
     crate::model::ownership::RESYNCS.with(|c| c.set(0));
     crate::model::ownership::REABSORBS.with(|c| c.set(0));
     for counter in CLAMP_COUNTERS {
@@ -813,6 +1020,12 @@ fn run_case(
             let before_counts = counts(&before);
             let owned_before = owned_text(&view);
             let sections_before = view.model().sections().len();
+            let pending: Vec<PendingTake> = (0..sections_before)
+                .filter_map(|index| {
+                    let (resolution, lines) = view.model().pending_take(index)?;
+                    Some((index, resolution, lines))
+                })
+                .collect();
             let taken: Option<HashSet<usize>> = match &op {
                 Op::Take(section, _, selection) => {
                     let section = (*section).min(sections_before - 1);
@@ -937,8 +1150,50 @@ fn run_case(
                     ));
                 }
             }
+            // An edit that changes a character of a section drops the
+            // restore its take recorded.
+            if matches!(
+                op,
+                Op::Join(_)
+                    | Op::DeleteAtEnd(_)
+                    | Op::SelectEdit(..)
+                    | Op::Split(_)
+                    | Op::Type(_)
+                    | Op::Frame(_)
+                    | Op::Edge(_)
+                    | Op::ReplaceAll(_)
+            ) && view.model().sections().len() == sections_before
+            {
+                let old = section_chars(&owned_before, sections_before);
+                let new = section_chars(&owned_after, sections_before);
+                if let Some((index, _, _)) = pending.iter().find(|(index, _, _)| {
+                    old[*index] != new[*index] && view.model().pending_take(*index).is_some()
+                }) {
+                    local.push((
+                        "edit-kept-take-restore".to_owned(),
+                        format!(
+                            "after {}: s{index} {:?} -> {:?}; text {after:?}",
+                            op_name(&op),
+                            old[*index],
+                            new[*index]
+                        ),
+                    ));
+                }
+            }
+            let mut restored: HashSet<usize> = HashSet::new();
+            if matches!(op, Op::Take(..) | Op::TakeLine(..) | Op::TakeAll)
+                && view.model().sections().len() == sections_before
+            {
+                let problems;
+                (restored, problems) =
+                    restore_problems(&view, op_name(&op), &pending, &owned_before);
+                stats.pending_takes_restored += restored.len();
+                local.extend(problems);
+            }
             if let Some(taken) = &taken {
-                let untaken = |owner: usize| !taken.contains(&owner);
+                // A restored section changed to exactly its selected input's
+                // lines, with no copy of them left elsewhere.
+                let untaken = |owner: usize| !taken.contains(&owner) && !restored.contains(&owner);
                 for (token, count) in kept_tokens(&owned_before, &untaken) {
                     if after_counts.get(&token).copied().unwrap_or(0) < count {
                         local.push((
@@ -974,7 +1229,7 @@ fn run_case(
                     }
                 }
                 for (index, (old, new)) in chars_before.iter().zip(&chars_after).enumerate() {
-                    if taken.contains(&index) || old == new {
+                    if !untaken(index) || old == new {
                         continue;
                     }
                     let class = if sorted_chars(old) == sorted_chars(new) {
@@ -1053,6 +1308,47 @@ fn run_case(
                         break;
                     }
                     last_rank = Some(rank);
+                }
+            }
+        }
+        if let Some((lender, holder)) = single_holder_lender(&view) {
+            let takes = [
+                (
+                    lender,
+                    [
+                        Command::TakeLeft,
+                        Command::TakeCenter,
+                        Command::TakeRight,
+                        Command::TakeLeftThenRight,
+                    ][case % 4],
+                ),
+                (
+                    holder,
+                    [Command::TakeCenter, Command::TakeRight, Command::TakeLeft][case % 3],
+                ),
+            ];
+            let inputs = [left.as_str(), center.as_str(), right.as_str()];
+            let paste_end = PASTE.with(std::cell::Cell::get);
+            let lender_first = replay_with_takes(inputs, &ops, paste_start, takes);
+            let holder_first = replay_with_takes(inputs, &ops, paste_start, [takes[1], takes[0]]);
+            PASTE.with(|p| p.set(paste_end));
+            let end = pane_text(&view);
+            if lender_first.before != end || holder_first.before != end {
+                local.push((
+                    "take-order-replay-differs".to_owned(),
+                    format!("end {end:?} replays {:?}", lender_first.before),
+                ));
+            } else {
+                stats.take_order_checks += 1;
+                if lender_first.after != holder_first.after {
+                    local.push((
+                        "take-order-differs".to_owned(),
+                        format!(
+                            "s{lender} held by s{holder}, takes {takes:?}: lender first {:?} \
+                             holder first {:?}",
+                            lender_first.after, holder_first.after
+                        ),
+                    ));
                 }
             }
         }
@@ -1293,4 +1589,85 @@ fn replay(seed: u64, target: usize, frames: bool) {
 #[test]
 fn replay_one_randomized_merge_case() {
     replay(0x1007, 31, false);
+}
+
+const TOKEN_INPUTS: [&str; 3] = [
+    "[a]\n[L]\n[c]\n[d]\n[g]\n",
+    "[a]\n[b]\n[c]\n[d]\n[g]\n",
+    "[a]\n[R]\n[c]\n[d]\n[g]\n",
+];
+
+/// Join line 1 twice, so s1 holds the `[c][d]` of s2, then take s2 from
+/// the center. Returns the view with s2's take pending and the state the
+/// oracle needs from before the holder take.
+fn lender_taken_while_lent() -> (MergeView, tempfile::TempDir, Vec<PendingTake>, Owned) {
+    let (mut view, dir) = open(TOKEN_INPUTS[0], Some(TOKEN_INPUTS[1]), TOKEN_INPUTS[2]);
+    run_until_ready(&mut view);
+    for _ in 0..2 {
+        view.output_pane.place(Caret::new(1, 0), false);
+        view.output_pane
+            .move_caret(ca_ui::editor::Motion::LineEnd, false);
+        view.output_pane.delete();
+        view.absorb_output_edits();
+    }
+    assert_eq!(pane_text(&view), "[a]\n[b][c][d]\n[g]\n");
+    view.current = 2;
+    view.run(Command::TakeCenter);
+    let pending: Vec<PendingTake> = (0..view.model().sections().len())
+        .filter_map(|index| {
+            let (resolution, lines) = view.model().pending_take(index)?;
+            Some((index, resolution, lines))
+        })
+        .collect();
+    assert_eq!(
+        pending,
+        vec![(
+            2,
+            Resolution::Center,
+            vec!["[c]\n".to_owned(), "[d]\n".to_owned(), "[g]\n".to_owned()]
+        )]
+    );
+    let owned = owned_text(&view);
+    view.current = 1;
+    view.run(Command::TakeLeft);
+    (view, dir, pending, owned)
+}
+
+#[test]
+fn a_take_restore_with_the_selected_input_and_no_other_copy_passes_the_oracle() {
+    let (view, _dir, pending, owned) = lender_taken_while_lent();
+    assert_eq!(pane_text(&view), "[a]\n[L]\n[c]\n[d]\n[g]\n");
+    let (restored, problems) = restore_problems(&view, "Take", &pending, &owned);
+    assert_eq!(restored, HashSet::from([2]));
+    assert_eq!(problems, Vec::<(String, String)>::new());
+}
+
+/// A holder that keeps the lent text while its lender takes the selected
+/// input back shows that text twice; the oracle reports it although both
+/// sections are exempt from the checks for untaken sections.
+#[test]
+fn a_take_restore_that_leaves_the_lent_text_in_the_holder_is_a_finding() {
+    let (mut view, _dir, pending, owned) = lender_taken_while_lent();
+    view.data
+        .model
+        .set_edited(1, vec!["[L][c][d]\n".to_owned()]);
+    let (restored, problems) = restore_problems(&view, "Take", &pending, &owned);
+    assert_eq!(restored, HashSet::from([2]));
+    let classes: Vec<&str> = problems.iter().map(|(class, _)| class.as_str()).collect();
+    assert_eq!(classes, ["take-restore-duplicated-token"], "{problems:?}");
+}
+
+/// A restore that misses a line of the selected input is not exempt.
+#[test]
+fn a_take_restore_without_a_line_of_the_selected_input_is_a_finding() {
+    let (view, _dir, mut pending, owned) = lender_taken_while_lent();
+    pending[0].2.insert(1, "[x]\n".to_owned());
+    let (restored, problems) = restore_problems(&view, "Take", &pending, &owned);
+    assert!(restored.is_empty());
+    let classes: Vec<&str> = problems.iter().map(|(class, _)| class.as_str()).collect();
+    assert_eq!(
+        classes,
+        ["take-restore-differs-from-selected-input"],
+        "{problems:?}"
+    );
 }
