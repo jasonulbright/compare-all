@@ -2874,7 +2874,7 @@ impl FolderView {
                 Stage::Running(plan)
             }
             Stage::Summary(plan, report) => {
-                if dialogs::summary(ui, self.id.with("summary"), &plan, &report) {
+                if dialogs::summary(ui, self.id.with("summary"), &plan, &report, &[], &[]) {
                     Stage::Idle
                 } else {
                     Stage::Summary(plan, report)

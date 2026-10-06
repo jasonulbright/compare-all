@@ -416,13 +416,18 @@ pub fn outcome_text(outcome: &StepOutcome) -> Option<String> {
     }
 }
 
-/// Everything the batch did not complete.
+/// Everything the batch did not complete, then what the plan left out.
+///
+/// `notes` is drawn under the step count and `listed` inside the scrolling
+/// part, after the steps that did not complete.
 #[must_use]
 pub fn summary(
     ui: &egui::Ui,
     id: egui::Id,
     plan: &OperationPlan,
     report: &ExecutionReport,
+    notes: &[String],
+    listed: &[String],
 ) -> bool {
     modal(ui, id, "Result", |ui| {
         ui.label(format!(
@@ -447,6 +452,12 @@ pub fn summary(
         } else {
             ui.label(format!("{} steps did not complete", unfinished.len()));
         }
+        if !notes.is_empty() {
+            ui.separator();
+            for note in notes {
+                wrapped_text(ui, note);
+            }
+        }
         egui::ScrollArea::vertical()
             .id_salt(id.with("body"))
             .max_height(BODY_HEIGHT)
@@ -459,6 +470,9 @@ pub fn summary(
                         .map_or_else(String::new, |step| describe(&step.action));
                     let text = outcome_text(&result.outcome).unwrap_or_default();
                     wrapped_text(ui, &format!("{action} — {text}"));
+                }
+                for line in listed {
+                    wrapped_text(ui, line);
                 }
             });
         ui.separator();

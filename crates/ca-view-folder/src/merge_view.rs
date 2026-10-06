@@ -10,10 +10,10 @@ use crate::dialogs::{self, modal};
 use crate::opjobs::{self, Answer, Ask, ExecMessage, ProgressState};
 use crate::settings::{merge_options_of, EngineOptions};
 use ca_fs::{
-    compare3_sources, plan_merge, scan_source, scan_with, ExecutionReport, FilterContext,
-    FolderMergeOptions, MergeBases, MergeFilters, MergeInputs, MergeRequest, MergeRow,
-    MergeSources, MergeStatus, MergeTree, OperationOptions, OperationPlan, Pane, Resolution,
-    RulesEngine, ScanResult, Source,
+    compare3_sources, left_for_person, plan_merge, scan_source, scan_with, ExecutionReport,
+    FilterContext, FolderMergeOptions, MergeBases, MergeFilters, MergeInputs, MergeRequest,
+    MergeRow, MergeSources, MergeStatus, MergeTree, OperationOptions, OperationPlan, Pane,
+    Resolution, RulesEngine, ScanResult, Source,
 };
 use ca_session::settings::folder::MergeTarget;
 use ca_session::settings::{FolderMergeSettings, SessionSettings};
@@ -44,6 +44,13 @@ const NO_OUTPUT: &str = "Name an output folder in the session settings first";
 const ARCHIVE_OUTPUT: &str =
     "The output is an archive. A merge writes into a local folder only. Name a folder as the output.";
 const NOT_READY: &str = "Available once the comparison finishes";
+/// What the view says when a merge has nothing to write and leaves no item
+/// for a merge by hand.
+const FINISHED: &str = "The output already holds the merge result.";
+/// How many items a dialog names before it counts the rest.
+const DIALOG_NAMES: usize = 20;
+/// How many items the status text names before it counts the rest.
+const MESSAGE_NAMES: usize = 5;
 
 /// Every command from the shared vocabulary this view answers for.
 const HANDLED: &[Command] = &[
@@ -205,6 +212,155 @@ pub fn action_label(row: &MergeRow, resolution: Resolution, target: &MergeTarget
     }
 }
 
+/// The items one merge leaves for a merge by hand: the plan writes nothing
+/// for them, so the output holds their merge result only after a person
+/// merges each one.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ByHand {
+    mergeable: usize,
+    conflicts: usize,
+    /// The first items in tree order, at most [`DIALOG_NAMES`] of them.
+    first: Vec<ByHandItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ByHandItem {
+    rel: PathBuf,
+    conflict: bool,
+    in_output: bool,
+}
+
+impl ByHand {
+    fn of<'t>(rows: impl IntoIterator<Item = &'t MergeRow>) -> Self {
+        let mut by_hand = Self::default();
+        for row in rows {
+            let conflict = row.status == MergeStatus::Conflict;
+            if conflict {
+                by_hand.conflicts += 1;
+            } else {
+                by_hand.mergeable += 1;
+            }
+            if by_hand.first.len() < DIALOG_NAMES {
+                by_hand.first.push(ByHandItem {
+                    rel: row.rel.clone(),
+                    conflict,
+                    in_output: row.output.is_some(),
+                });
+            }
+        }
+        by_hand
+    }
+
+    /// How many items wait for a merge by hand.
+    #[must_use]
+    pub const fn total(&self) -> usize {
+        self.mergeable + self.conflicts
+    }
+
+    /// True when no item waits for a merge by hand.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.total() == 0
+    }
+
+    /// The sentences that count the items and say what the user can do.
+    fn sentences(&self, has_center: bool) -> [String; 4] {
+        let one = self.total() == 1;
+        let (items, need) = if one {
+            ("item", "needs")
+        } else {
+            ("items", "need")
+        };
+        let conflicts = if self.conflicts == 1 {
+            "conflict"
+        } else {
+            "conflicts"
+        };
+        let takes = if has_center {
+            "Take Left, Take Center or Take Right"
+        } else {
+            "Take Left or Take Right"
+        };
+        [
+            format!(
+                "{} {items} {need} a merge by hand ({} mergeable, {} {conflicts}).",
+                self.total(),
+                self.mergeable,
+                self.conflicts
+            ),
+            if one {
+                "The merge does not write it to the output."
+            } else {
+                "The merge does not write them to the output."
+            }
+            .to_owned(),
+            if one {
+                "To put its merge result in the output, merge it in Text Merge and save it."
+            } else {
+                "To put their merge result in the output, merge each one in Text Merge and save it."
+            }
+            .to_owned(),
+            format!("To keep one input's copy instead, choose {takes} and merge again."),
+        ]
+    }
+
+    /// One line per named item, at most `limit` of them.
+    fn names(&self, limit: usize) -> Vec<String> {
+        self.first
+            .iter()
+            .take(limit)
+            .map(|item| {
+                let kind = if item.conflict {
+                    "conflict"
+                } else {
+                    "mergeable"
+                };
+                if item.in_output {
+                    format!("{} ({kind})", item.rel.display())
+                } else {
+                    format!("{} ({kind}, not in the output)", item.rel.display())
+                }
+            })
+            .collect()
+    }
+
+    /// How many items a list of at most `limit` names leaves out.
+    fn unnamed(&self, limit: usize) -> usize {
+        self.total() - self.first.len().min(limit)
+    }
+
+    /// The whole notice as one paragraph, naming at most `limit` items.
+    fn notice(&self, has_center: bool, limit: usize) -> String {
+        let label = if self.total() == 1 { "Item" } else { "Items" };
+        let names = self.names(limit).join(", ");
+        let tail = match self.unnamed(limit) {
+            0 => String::new(),
+            more => format!(" and {more} more"),
+        };
+        format!(
+            "{} {label}: {names}{tail}.",
+            self.sentences(has_center).join(" ")
+        )
+    }
+
+    /// Draw the count and what the user can do.
+    fn show_sentences(&self, ui: &mut egui::Ui, has_center: bool) {
+        for sentence in self.sentences(has_center) {
+            ca_ui::widgets::wrapped_text(ui, &sentence);
+        }
+    }
+
+    /// One line per item a dialog names, then a count of the rest.
+    fn dialog_lines(&self) -> Vec<String> {
+        let mut lines = self.names(DIALOG_NAMES);
+        match self.unnamed(DIALOG_NAMES) {
+            0 => {}
+            more => lines.push(format!("and {more} more")),
+        }
+        lines
+    }
+}
+
 /// The folders one merge reads and writes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Folders {
@@ -268,8 +424,9 @@ impl Terminal for CompareMessage {
 /// What the planning worker posts back.
 #[derive(Debug)]
 pub enum MergePlanMessage {
-    /// The plan, or why none was built.
-    Done(Result<Box<OperationPlan>, String>),
+    /// The plan with the items it leaves for a merge by hand, or why no plan
+    /// was built.
+    Done(Result<(Box<OperationPlan>, ByHand), String>),
 }
 
 impl Terminal for MergePlanMessage {
@@ -314,6 +471,8 @@ pub struct FolderMergeView {
     cursor: Option<usize>,
     active: Pane,
     stage: Stage,
+    /// The items the last plan leaves for a merge by hand.
+    by_hand: ByHand,
     report: ViewReport,
     actions: Vec<ViewAction>,
     message: Option<String>,
@@ -375,6 +534,7 @@ impl FolderMergeView {
             cursor: None,
             active: Pane::Left,
             stage: Stage::Idle,
+            by_hand: ByHand::default(),
             report: ViewReport::new(
                 ReportKind::Folder,
                 egui::Id::new(("folder-merge-report", instance)),
@@ -663,14 +823,21 @@ impl FolderMergeView {
             if let Some(MergePlanMessage::Done(outcome)) = messages.into_iter().next() {
                 self.plan_job = None;
                 match outcome {
-                    Ok(plan) if plan.steps.is_empty() => {
-                        self.stage = Stage::Idle;
-                        self.message = Some(nothing_to_do(&plan));
+                    Ok((plan, by_hand)) => {
+                        self.by_hand = by_hand;
+                        if plan.steps.is_empty() {
+                            self.stage = Stage::Idle;
+                            self.message =
+                                Some(nothing_to_do(&plan, &self.by_hand, self.has_center()));
+                        } else if self.confirm {
+                            self.stage = Stage::Confirming(plan);
+                        } else {
+                            self.execute(plan);
+                        }
                     }
-                    Ok(plan) if self.confirm => self.stage = Stage::Confirming(plan),
-                    Ok(plan) => self.execute(plan),
                     Err(reason) => {
                         self.stage = Stage::Idle;
+                        self.by_hand = ByHand::default();
                         self.message = Some(reason);
                     }
                 }
@@ -690,7 +857,13 @@ impl FolderMergeView {
                     )),
                 };
                 match message {
-                    ExecMessage::Done(report) => self.stage = Stage::Summary(plan, report),
+                    ExecMessage::Done(report) => {
+                        self.stage = Stage::Summary(plan, report);
+                        if !self.by_hand.is_empty() {
+                            self.message =
+                                Some(self.by_hand.notice(self.has_center(), MESSAGE_NAMES));
+                        }
+                    }
                     ExecMessage::Failed(reason) => self.message = Some(reason),
                 }
             }
@@ -823,7 +996,10 @@ impl FolderMergeView {
                     automatic,
                 };
                 let outcome = plan_merge(&tree, bases, &request, &options)
-                    .map(Box::new)
+                    .map(|plan| {
+                        let by_hand = ByHand::of(left_for_person(&tree, &request));
+                        (Box::new(plan), by_hand)
+                    })
                     .map_err(|refused| refused.to_string());
                 emitter.send(MergePlanMessage::Done(outcome));
             },
@@ -1309,12 +1485,15 @@ impl FolderMergeView {
 
     fn overlays(&mut self, ui: &mut egui::Ui) {
         let id = self.id;
+        let has_center = self.has_center();
         match std::mem::replace(&mut self.stage, Stage::Idle) {
-            Stage::Confirming(plan) => match confirm(ui, id.with("confirm"), &plan) {
-                Some(true) => self.execute(plan),
-                Some(false) => {}
-                None => self.stage = Stage::Confirming(plan),
-            },
+            Stage::Confirming(plan) => {
+                match confirm(ui, id.with("confirm"), &plan, &self.by_hand, has_center) {
+                    Some(true) => self.execute(plan),
+                    Some(false) => {}
+                    None => self.stage = Stage::Confirming(plan),
+                }
+            }
             Stage::Running(plan) => {
                 self.stage = Stage::Running(plan);
                 if let Some(question) = self.pending_question() {
@@ -1339,7 +1518,15 @@ impl FolderMergeView {
                 }
             }
             Stage::Summary(plan, report) => {
-                if dialogs::summary(ui, id.with("summary"), &plan, &report) {
+                let (notes, listed) = if self.by_hand.is_empty() {
+                    (Vec::new(), Vec::new())
+                } else {
+                    (
+                        self.by_hand.sentences(has_center).to_vec(),
+                        self.by_hand.dialog_lines(),
+                    )
+                };
+                if dialogs::summary(ui, id.with("summary"), &plan, &report, &notes, &listed) {
                     self.restart();
                 } else {
                     self.stage = Stage::Summary(plan, report);
@@ -1359,21 +1546,38 @@ impl FolderMergeView {
     }
 }
 
-/// The plan and its refusals, with the two buttons. `None` while neither
-/// button is pressed, `Some(true)` to carry it out.
-fn confirm(ui: &egui::Ui, id: egui::Id, plan: &OperationPlan) -> Option<bool> {
+/// The plan, the items it leaves for a merge by hand and its refusals, with
+/// the two buttons. `None` while neither button is pressed, `Some(true)` to
+/// carry it out.
+fn confirm(
+    ui: &egui::Ui,
+    id: egui::Id,
+    plan: &OperationPlan,
+    by_hand: &ByHand,
+    has_center: bool,
+) -> Option<bool> {
     let shown = modal(ui, id, "Merge", |ui| {
         ui.label(format!(
             "{} steps, {} bytes",
             plan.steps.len(),
             ca_ui::format::format_bytes(plan.total_bytes())
         ));
+        if !by_hand.is_empty() {
+            ui.separator();
+            by_hand.show_sentences(ui, has_center);
+        }
         egui::ScrollArea::vertical()
             .id_salt(id.with("body"))
             .max_height(260.0)
             .show(ui, |ui| {
                 for step in &plan.steps {
                     ca_ui::widgets::wrapped_text(ui, &dialogs::describe(&step.action));
+                }
+                if !by_hand.is_empty() {
+                    ui.separator();
+                    for line in by_hand.dialog_lines() {
+                        ca_ui::widgets::wrapped_text(ui, &line);
+                    }
                 }
                 if !plan.skipped.is_empty() {
                     ui.separator();
@@ -1404,20 +1608,27 @@ fn confirm(ui: &egui::Ui, id: egui::Id, plan: &OperationPlan) -> Option<bool> {
     }
 }
 
-fn nothing_to_do(plan: &OperationPlan) -> String {
-    if plan.skipped.is_empty() {
-        "The output already holds the merge result.".to_owned()
-    } else {
-        format!(
-            "Nothing to write. {} items are left alone: {}",
+/// What the view says about a plan with no step.
+fn nothing_to_do(plan: &OperationPlan, by_hand: &ByHand, has_center: bool) -> String {
+    if plan.skipped.is_empty() && by_hand.is_empty() {
+        return FINISHED.to_owned();
+    }
+    let mut parts = vec!["Nothing is copied.".to_owned()];
+    if !by_hand.is_empty() {
+        parts.push(by_hand.notice(has_center, MESSAGE_NAMES));
+    }
+    if !plan.skipped.is_empty() {
+        parts.push(format!(
+            "{} items are left alone: {}",
             plan.skipped.len(),
             plan.skipped
                 .iter()
                 .map(|skip| format!("{} ({})", skip.path.display(), skip.reason))
                 .collect::<Vec<_>>()
                 .join("; ")
-        )
+        ));
     }
+    parts.join(" ")
 }
 
 fn report_status(row: &MergeRow) -> ca_ui::report::EntryStatus {
