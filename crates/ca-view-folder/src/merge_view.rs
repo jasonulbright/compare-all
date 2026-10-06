@@ -11,10 +11,11 @@ use crate::opjobs::{self, Answer, Ask, ExecMessage, ProgressState};
 use crate::settings::{merge_options_of, EngineOptions};
 use ca_fs::merge::automatic_resolution;
 use ca_fs::{
-    compare3_sources, leaves_for_person, output_written_after_inputs, plan_merge, scan_source,
-    scan_with, ExecutionReport, FilterContext, FolderMergeOptions, MergeBases, MergeFilters,
-    MergeInputs, MergeRequest, MergeRow, MergeSources, MergeStatus, MergeTree, OperationOptions,
-    OperationPlan, Pane, Resolution, RulesEngine, ScanResult, Source,
+    compare3_sources, leaves_for_person, output_copies_an_input, output_holds_conflict_markers,
+    output_written_after_inputs, plan_merge, scan_source, scan_with, ExecutionReport,
+    FilterContext, FolderMergeOptions, MergeBases, MergeFilters, MergeInputs, MergeRequest,
+    MergeRow, MergeSources, MergeStatus, MergeTree, OperationOptions, OperationPlan, Pane,
+    Resolution, RulesEngine, ScanResult, Source,
 };
 use ca_session::settings::folder::MergeTarget;
 use ca_session::settings::{FolderMergeSettings, SessionSettings};
@@ -24,10 +25,12 @@ use ca_ui::report::{ReportKind, ViewReport};
 use ca_ui::theme::folder_merge::{self, FolderMergeClass};
 use ca_ui::theme::Variant;
 use ca_ui::toolbar;
-use ca_ui::view::{self, CommandState, OpenRequest, SessionView, ViewAction, ViewContext};
+use ca_ui::view::{
+    self, CommandState, OpenRequest, SavedFile, SessionView, ViewAction, ViewContext,
+};
 use ca_ui::worker::{Cancel, Emitter, Job, Terminal};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 /// Height of one row.
@@ -50,6 +53,9 @@ const NOT_READY: &str = "Available once the comparison finishes";
 const FINISHED: &str = "The output already holds the merge result.";
 /// The Action column of a row whose output holds a merge by hand.
 const MERGED_BY_HAND: &str = "Merged by hand";
+/// The Action column of a row whose output Text Merge saved with conflicts
+/// still marked.
+const SAVED_WITH_CONFLICTS: &str = "Saved with conflicts";
 /// The status text after a merge of a selection when other items still
 /// differ from the merge result.
 const REST_OF_THE_TREE: &str = "Only the selected items take part in the merge. \
@@ -257,6 +263,102 @@ fn opens_in_text_merge(tree: &MergeTree, row: &MergeRow) -> bool {
         && tree.output_target_is_safe(target_rel(row))
 }
 
+/// True when two path components name the same item under the platform's
+/// rule: letter case does not count on Windows.
+fn same_component(first: Component<'_>, second: Component<'_>) -> bool {
+    if cfg!(windows) {
+        first.as_os_str().to_string_lossy().to_lowercase()
+            == second.as_os_str().to_string_lossy().to_lowercase()
+    } else {
+        first == second
+    }
+}
+
+/// `path` below `root`, compared name by name under the platform's rule.
+/// Trailing separators do not count.
+fn relative_to(path: &Path, root: &Path) -> Option<PathBuf> {
+    let mut rest = path.components();
+    for part in root.components() {
+        if !same_component(part, rest.next()?) {
+            return None;
+        }
+    }
+    Some(rest.collect())
+}
+
+/// The key a relative output path is recorded under: `/` between the names,
+/// and lower case on Windows, where letter case does not count.
+fn path_key(rel: &Path) -> String {
+    let key = rel
+        .components()
+        .map(|part| part.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/");
+    if cfg!(windows) {
+        key.to_lowercase()
+    } else {
+        key
+    }
+}
+
+/// The size and time of one input item, as a comparison listed it.
+type ItemFacts = Option<(u64, Option<std::time::SystemTime>)>;
+
+/// The size and time of the input items of `row`, leaving out the input that
+/// is the output folder itself.
+fn input_facts(row: &MergeRow, output_pane: Option<Pane>) -> [ItemFacts; 3] {
+    [Pane::Left, Pane::Center, Pane::Right].map(|pane| {
+        if output_pane == Some(pane) {
+            return None;
+        }
+        row.entry(pane).map(|entry| (entry.size, entry.modified))
+    })
+}
+
+/// A save of a row's output from Text Merge in this session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SaveRecord {
+    /// Conflicts the saved text still marks.
+    conflicts: u32,
+    /// The input items of the row when the save arrived, as the comparison
+    /// listed them; `None` until a comparison lists the row. A comparison
+    /// that lists any of them with another size or time drops the record.
+    inputs: Option<[ItemFacts; 3]>,
+}
+
+/// The rows of a comparison a save or the output time settles.
+#[derive(Debug, Clone, Default)]
+struct SaveStates {
+    /// Rows merged by hand.
+    merged: BTreeSet<PathBuf>,
+    /// Rows Text Merge saved with conflicts still marked.
+    conflicted: BTreeSet<PathBuf>,
+}
+
+/// What a worker that resolves the path of a save posts back.
+#[derive(Debug)]
+pub enum ResolveMessage {
+    /// The save, and its path below the output folder where it lies there
+    /// once links and junctions are resolved.
+    Done(SavedFile, Option<PathBuf>),
+    /// The worker stopped.
+    Lost,
+}
+
+impl Terminal for ResolveMessage {
+    fn is_terminal(&self) -> bool {
+        true
+    }
+
+    fn cancelled() -> Self {
+        Self::Lost
+    }
+
+    fn panicked(_detail: String) -> Self {
+        Self::Lost
+    }
+}
+
 /// The items of a comparison that wait for a merge by hand: no merge writes
 /// them, and the output does not hold a merge by hand of them.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -272,16 +374,16 @@ pub struct ByHand {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ByHandItem {
     rel: PathBuf,
-    conflict: bool,
-    in_output: bool,
-    text_merge: bool,
+    /// The words in brackets after the path, in order.
+    facts: Vec<&'static str>,
 }
 
 impl ByHand {
-    /// The rows that wait, each with whether Text Merge opens it.
-    fn of<'t>(rows: impl IntoIterator<Item = (&'t MergeRow, bool)>) -> Self {
+    /// The rows that wait, each with whether Text Merge opens it and whether
+    /// Text Merge saved it with conflicts.
+    fn of<'t>(rows: impl IntoIterator<Item = (&'t MergeRow, bool, bool)>) -> Self {
         let mut by_hand = Self::default();
-        for (row, text_merge) in rows {
+        for (row, text_merge, saved_with_conflicts) in rows {
             let conflict = row.status == MergeStatus::Conflict;
             if conflict {
                 by_hand.conflicts += 1;
@@ -292,11 +394,19 @@ impl ByHand {
                 by_hand.text_merge += 1;
             }
             if by_hand.first.len() < DIALOG_NAMES {
+                let mut facts = vec![if conflict { "conflict" } else { "mergeable" }];
+                if !text_merge {
+                    facts.push("Take only");
+                }
+                if saved_with_conflicts {
+                    facts.push("saved with conflicts");
+                }
+                if row.output.is_none() {
+                    facts.push("not in the output");
+                }
                 by_hand.first.push(ByHandItem {
                     rel: row.rel.clone(),
-                    conflict,
-                    in_output: row.output.is_some(),
-                    text_merge,
+                    facts,
                 });
             }
         }
@@ -304,12 +414,8 @@ impl ByHand {
     }
 
     /// The rows of `tree` that wait under `request` with every row taking
-    /// part, leaving out the rows in `merged`.
-    fn waiting_in(
-        tree: &MergeTree,
-        request: &MergeRequest<'_>,
-        merged: &BTreeSet<PathBuf>,
-    ) -> Self {
+    /// part, leaving out the rows merged by hand.
+    fn waiting_in(tree: &MergeTree, request: &MergeRequest<'_>, saves: &SaveStates) -> Self {
         let whole = MergeRequest {
             selection: None,
             ..*request
@@ -317,8 +423,14 @@ impl ByHand {
         Self::of(
             tree.rows
                 .iter()
-                .filter(|row| leaves_for_person(row, &whole) && !merged.contains(&row.rel))
-                .map(|row| (row, opens_in_text_merge(tree, row))),
+                .filter(|row| leaves_for_person(row, &whole) && !saves.merged.contains(&row.rel))
+                .map(|row| {
+                    (
+                        row,
+                        opens_in_text_merge(tree, row),
+                        saves.conflicted.contains(&row.rel),
+                    )
+                }),
         )
     }
 
@@ -409,20 +521,7 @@ impl ByHand {
         self.first
             .iter()
             .take(limit)
-            .map(|item| {
-                let mut facts = vec![if item.conflict {
-                    "conflict"
-                } else {
-                    "mergeable"
-                }];
-                if !item.text_merge {
-                    facts.push("Take only");
-                }
-                if !item.in_output {
-                    facts.push("not in the output");
-                }
-                format!("{} ({})", slash_path(&item.rel), facts.join(", "))
-            })
+            .map(|item| format!("{} ({})", slash_path(&item.rel), item.facts.join(", ")))
             .collect()
     }
 
@@ -801,8 +900,10 @@ pub struct FolderMergeView {
     /// Rows whose output item was written after every input item, as the
     /// last comparison read them.
     written_after: BTreeSet<PathBuf>,
-    /// Output paths Text Merge saved in this session.
-    saved: BTreeSet<PathBuf>,
+    /// Saves from Text Merge in this session, by the key of the output path.
+    saved: BTreeMap<String, SaveRecord>,
+    /// Workers that resolve the path of a save no output spelling matched.
+    resolve_jobs: Vec<Job<ResolveMessage>>,
     /// Items a step left undone that no later merge settled.
     undone: BTreeSet<PathBuf>,
     outcome: Outcome,
@@ -872,7 +973,8 @@ impl FolderMergeView {
             by_hand: ByHand::default(),
             overwrites: Overwrites::default(),
             written_after: BTreeSet::new(),
-            saved: BTreeSet::new(),
+            saved: BTreeMap::new(),
+            resolve_jobs: Vec::new(),
             undone: BTreeSet::new(),
             outcome: Outcome::default(),
             report: ViewReport::new(
@@ -1172,8 +1274,8 @@ impl FolderMergeView {
             nothing_copied: notice.nothing_copied,
             finish: Finish::default(),
         };
-        let merged = self.merged_rels(&tree);
-        self.by_hand = ByHand::waiting_in(&tree, &self.whole_request(), &merged);
+        let saves = self.save_states(&tree);
+        self.by_hand = ByHand::waiting_in(&tree, &self.whole_request(), &saves);
         self.show_notice(rebuilt);
     }
 
@@ -1193,9 +1295,34 @@ impl FolderMergeView {
         for step in &plan.steps {
             if done.contains(&step.index) {
                 self.undone.remove(&step.rel);
-                self.saved.remove(&step.rel);
+                self.saved.remove(&path_key(&step.rel));
             } else {
                 self.undone.insert(step.rel.clone());
+            }
+        }
+    }
+
+    /// Show a finished comparison, with the saves and the notice checked
+    /// against it.
+    fn take_comparison(&mut self, tree: Arc<MergeTree>, written_after: BTreeSet<PathBuf>) {
+        self.check_saves(&tree);
+        self.tree = Some(tree);
+        self.written_after = written_after;
+        self.status = Status::Ready;
+        self.rebuild();
+        self.refresh_notice();
+    }
+
+    /// Record the saves whose path a worker resolved below the output.
+    fn poll_resolves(&mut self) {
+        let mut resolved = Vec::new();
+        self.resolve_jobs.retain_mut(|job| {
+            resolved.extend(job.drain());
+            !job.is_finished()
+        });
+        for message in resolved {
+            if let ResolveMessage::Done(saved, Some(rel)) = message {
+                self.record_save(&rel, saved.conflicts);
             }
         }
     }
@@ -1209,11 +1336,7 @@ impl FolderMergeView {
                 match message {
                     CompareMessage::Progress(step) => self.status = Status::Running(step),
                     CompareMessage::Ready(tree, written_after) => {
-                        self.tree = Some(Arc::from(tree));
-                        self.written_after = written_after;
-                        self.status = Status::Ready;
-                        self.rebuild();
-                        self.refresh_notice();
+                        self.take_comparison(Arc::from(tree), written_after);
                     }
                     CompareMessage::Failed(reason) => self.status = Status::Failed(reason),
                 }
@@ -1294,6 +1417,7 @@ impl FolderMergeView {
                 }
             }
         }
+        self.poll_resolves();
         if self.deferred_comparison.is_some() && self.exec_job.is_none() {
             self.deferred_comparison = None;
             self.restart();
@@ -1406,7 +1530,7 @@ impl FolderMergeView {
         let folders = self.folders.clone();
         let options = self.operations.clone();
         let automatic = self.settings.merge.automatic_merge;
-        let merged = self.merged_rels(&tree);
+        let saves = self.save_states(&tree);
         let undone = self.undone.clone();
         self.stage = Stage::Planning;
         self.say(None);
@@ -1446,8 +1570,8 @@ impl FolderMergeView {
                             })
                             .collect();
                         Box::new(Planned {
-                            by_hand: ByHand::waiting_in(&tree, &request, &merged),
-                            overwrites: Overwrites::of(&plan, &merged),
+                            by_hand: ByHand::waiting_in(&tree, &request, &saves),
+                            overwrites: Overwrites::of(&plan, &saves.merged),
                             finish,
                             settled,
                             plan: Box::new(plan),
@@ -1575,26 +1699,98 @@ impl FolderMergeView {
             .any(|row| leaves_for_person(row, &request) && !self.merged_by_hand(row))
     }
 
-    /// True when a person has to merge `row` and the output holds their
-    /// merge: an output item written after every input item, or a save from
-    /// Text Merge in this session.
-    fn merged_by_hand(&self, row: &MergeRow) -> bool {
-        row.status.needs_person()
-            && (self.written_after.contains(&row.rel) || self.saved.contains(target_rel(row)))
+    /// The save from Text Merge recorded for the output path of `row`.
+    fn save_of(&self, row: &MergeRow) -> Option<&SaveRecord> {
+        if self.saved.is_empty() {
+            return None;
+        }
+        self.saved.get(&path_key(target_rel(row)))
     }
 
-    /// Every row of `tree` merged by hand.
-    fn merged_rels(&self, tree: &MergeTree) -> BTreeSet<PathBuf> {
-        let mut merged = self.written_after.clone();
-        if !self.saved.is_empty() {
-            merged.extend(
-                tree.rows
-                    .iter()
-                    .filter(|row| self.merged_by_hand(row))
-                    .map(|row| row.rel.clone()),
-            );
+    /// True when a person has to merge `row` and the output holds their
+    /// merge: a save from Text Merge in this session that left no conflict,
+    /// or, without such a save, an output file written after every input
+    /// item that copies none of them and marks no conflict.
+    fn merged_by_hand(&self, row: &MergeRow) -> bool {
+        row.status.needs_person()
+            && self.save_of(row).map_or_else(
+                || self.written_after.contains(&row.rel),
+                |save| save.conflicts == 0,
+            )
+    }
+
+    /// True when a person has to merge `row` and Text Merge saved its output
+    /// with conflicts still marked.
+    fn saved_with_conflicts(&self, row: &MergeRow) -> bool {
+        row.status.needs_person() && self.save_of(row).is_some_and(|save| save.conflicts > 0)
+    }
+
+    /// The rows of `tree` merged by hand and saved with conflicts.
+    fn save_states(&self, tree: &MergeTree) -> SaveStates {
+        if self.saved.is_empty() {
+            return SaveStates {
+                merged: self.written_after.clone(),
+                conflicted: BTreeSet::new(),
+            };
         }
-        merged
+        let mut states = SaveStates::default();
+        for row in &tree.rows {
+            if self.merged_by_hand(row) {
+                states.merged.insert(row.rel.clone());
+            } else if self.saved_with_conflicts(row) {
+                states.conflicted.insert(row.rel.clone());
+            }
+        }
+        states
+    }
+
+    /// The input of the merge that is the output folder itself, where one is.
+    const fn output_pane(&self) -> Option<Pane> {
+        match self.settings.merge.target {
+            MergeTarget::Left => Some(Pane::Left),
+            MergeTarget::Right => Some(Pane::Right),
+            _ => None,
+        }
+    }
+
+    /// Record a save of the output item at `rel`, with the input items of its
+    /// row as the comparison on screen lists them.
+    fn record_save(&mut self, rel: &Path, conflicts: u32) {
+        let key = path_key(rel);
+        let output_pane = self.output_pane();
+        let inputs = self.tree.as_deref().and_then(|tree| {
+            tree.rows
+                .iter()
+                .find(|row| path_key(target_rel(row)) == key)
+                .map(|row| input_facts(row, output_pane))
+        });
+        self.saved.insert(key, SaveRecord { conflicts, inputs });
+        self.refresh_notice();
+    }
+
+    /// Drop every save whose row a new comparison lists with an input item
+    /// of another size or time, or does not list; take the input items of a
+    /// save that arrived with no comparison on screen.
+    fn check_saves(&mut self, tree: &MergeTree) {
+        if self.saved.is_empty() {
+            return;
+        }
+        let output_pane = self.output_pane();
+        let mut kept = BTreeMap::new();
+        for row in &tree.rows {
+            let key = path_key(target_rel(row));
+            let Some(mut record) = self.saved.remove(&key) else {
+                continue;
+            };
+            let now = input_facts(row, output_pane);
+            match record.inputs {
+                Some(then) if then != now => continue,
+                Some(_) => {}
+                None => record.inputs = Some(now),
+            }
+            kept.insert(key, record);
+        }
+        self.saved = kept;
     }
 
     /// A merge of every row with the resolutions the view holds now.
@@ -1893,6 +2089,8 @@ impl FolderMergeView {
                     let resolution = self.resolution(row);
                     let action = if resolution == Resolution::Leave && self.merged_by_hand(row) {
                         MERGED_BY_HAND
+                    } else if resolution == Resolution::Leave && self.saved_with_conflicts(row) {
+                        SAVED_WITH_CONFLICTS
                     } else {
                         action_label(row, resolution, &target)
                     };
@@ -2157,16 +2355,7 @@ fn run_compare(
     cancel: &Cancel,
 ) {
     match compare_folders(folders, output, engine, emitter, cancel) {
-        Ok(tree) => {
-            let written_after = tree
-                .rows
-                .iter()
-                .filter(|row| {
-                    row.status.needs_person()
-                        && output_written_after_inputs(row, &engine.compare.quick)
-                })
-                .map(|row| row.rel.clone())
-                .collect();
+        Ok((tree, written_after)) => {
             emitter.send(CompareMessage::Ready(Box::new(tree), written_after));
         }
         Err(reason) => {
@@ -2175,13 +2364,42 @@ fn run_compare(
     }
 }
 
+/// The rows a person has to merge whose output file was written after every
+/// input item, copies none of them and marks no conflict. Reads the output
+/// file of each such row, so it runs on the comparison worker.
+fn written_after_inputs(
+    tree: &MergeTree,
+    folders: &Folders,
+    output: &Path,
+    sources: MergeSources<'_>,
+    engine: &EngineOptions,
+    cancel: &Cancel,
+) -> BTreeSet<PathBuf> {
+    let bases = MergeBases {
+        left: &folders.left,
+        center: folders.center.as_deref(),
+        right: &folders.right,
+        output,
+    };
+    tree.rows
+        .iter()
+        .filter(|row| {
+            row.status.needs_person()
+                && output_written_after_inputs(row, &engine.compare.quick)
+                && !output_copies_an_input(row, bases, Some(sources), cancel.as_fs())
+                && !(row.text && output_holds_conflict_markers(row, output))
+        })
+        .map(|row| row.rel.clone())
+        .collect()
+}
+
 fn compare_folders(
     folders: &Folders,
     output: Option<&Path>,
     engine: &EngineOptions,
     emitter: &Emitter<CompareMessage>,
     cancel: &Cancel,
-) -> Result<MergeTree, String> {
+) -> Result<(MergeTree, BTreeSet<PathBuf>), String> {
     emitter.send(CompareMessage::Progress("Scanning"));
     let open = |path: &Path| -> Result<Source, String> {
         crate::jobs::open_side(path, &engine.archives)
@@ -2263,7 +2481,15 @@ fn compare_folders(
             && right_source.is_local_folder()
             && center_source.as_ref().is_none_or(Source::is_local_folder),
     );
-    Ok(tree)
+    let sources = MergeSources {
+        left: &left_source,
+        center: center_source.as_ref(),
+        right: &right_source,
+    };
+    let written_after = output.map_or_else(BTreeSet::new, |output| {
+        written_after_inputs(&tree, folders, output, sources, engine, cancel)
+    });
+    Ok((tree, written_after))
 }
 
 impl ca_ui::view::ViewFactory for FolderMergeView {
@@ -2437,6 +2663,7 @@ impl SessionView for FolderMergeView {
         self.overrides.clear();
         self.selection.clear();
         self.saved.clear();
+        self.resolve_jobs.clear();
         self.undone.clear();
         self.restart();
     }
@@ -2487,17 +2714,26 @@ impl SessionView for FolderMergeView {
         matches!(self.stage, Stage::Running(_))
     }
 
-    fn file_saved(&mut self, path: &Path) {
-        let Some(rel) = self
-            .output_folder()
-            .and_then(|output| path.strip_prefix(output).ok())
-            .map(Path::to_path_buf)
-        else {
+    fn file_saved(&mut self, saved: &SavedFile) {
+        let Some(output) = self.output_folder().map(Path::to_path_buf) else {
             return;
         };
-        if self.saved.insert(rel) {
-            self.refresh_notice();
+        if let Some(rel) = relative_to(&saved.path, &output) {
+            self.record_save(&rel, saved.conflicts);
+            return;
         }
+        // Resolving a link or junction reads the disk, so a worker does it.
+        let saved = saved.clone();
+        self.resolve_jobs.push(Job::spawn_notifying(
+            move |emitter, _cancel| {
+                let rel = std::fs::canonicalize(&saved.path)
+                    .ok()
+                    .zip(std::fs::canonicalize(&output).ok())
+                    .and_then(|(path, root)| relative_to(&path, &root));
+                emitter.send(ResolveMessage::Done(saved, rel));
+            },
+            self.notify.clone(),
+        ));
     }
 
     fn exit_code(&self) -> Option<i32> {
