@@ -379,6 +379,34 @@ fn detect_from(environment: &Environment, executable: &str) -> Option<Image> {
     Image::detect(environment, Some(Path::new(executable)), &unresolved)
 }
 
+/// What the library path keeps of `value` for a host program started from
+/// the image at `/opt/ca-image`.
+fn library_path_kept_of(value: &str) -> Option<String> {
+    let input = environment(&[("SHARUN_DIR", "/opt/ca-image"), ("LD_LIBRARY_PATH", value)]);
+    let image = detect_from(&input, "/opt/ca-image/bin/ca").unwrap();
+    clean_environment(&input, &image)
+        .get(OsStr::new("LD_LIBRARY_PATH"))
+        .map(|value| value.to_string_lossy().into_owned())
+}
+
+#[test]
+fn an_image_entry_is_removed_and_an_outside_entry_kept_for_any_spelling() {
+    for inside in [
+        "/opt/./ca-image/lib",
+        "/opt//ca-image/lib",
+        "/opt/ca-image/lib",
+    ] {
+        assert_eq!(library_path_kept_of(inside), None, "{inside}");
+    }
+    for outside in ["/opt/ca-image/../vendor/lib", "/opt/vendor/lib"] {
+        assert_eq!(
+            library_path_kept_of(outside).as_deref(),
+            Some(outside),
+            "{outside}"
+        );
+    }
+}
+
 #[test]
 fn a_plain_binary_under_another_image_keeps_the_environment() {
     let terminal = environment(&[
