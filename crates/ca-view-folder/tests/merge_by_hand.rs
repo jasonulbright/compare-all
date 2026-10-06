@@ -695,6 +695,76 @@ fn a_save_through_a_link_to_the_output_marks_its_row() {
     );
 }
 
+/// `both.txt` waits for a merge by hand and `added.txt` is new on the left.
+fn one_mergeable_row_and_one_addition() -> Fixture {
+    let fixture = one_mergeable_row();
+    fixture.write("left", "added.txt", b"from the left\n", T + 4);
+    fixture
+}
+
+/// Hold the next comparison: a merge runs whose only step waits on a
+/// question, and a change of the archive masks asks for a new comparison,
+/// which waits for the merge to end.
+fn hold_a_comparison(fixture: &Fixture, view: &mut FolderMergeView) {
+    view.set_confirm_merge(true);
+    view.run(Command::MergeFolders);
+    assert!(poll_until(view, FolderMergeView::is_confirming));
+    fixture.write("left", "added.txt", b"from the left, longer now\n", T + 20);
+    view.confirm_pending();
+    assert!(poll_until(view, |view| view.pending_question().is_some()));
+    let mut masks = ca_session::options::ArchiveOptions::default();
+    masks.masks.insert("zip".to_owned(), "*.held".to_owned());
+    view.follow_archive_masks(&masks);
+    assert!(view.tree().is_none(), "no comparison is on screen");
+}
+
+/// Let the held comparison run and wait for its result.
+fn release_the_comparison(view: &mut FolderMergeView) {
+    while !view.has_summary() {
+        assert!(poll_until(view, |view| view.has_summary()
+            || view.pending_question().is_some()));
+        if let Some(question) = view.pending_question() {
+            view.answer(&question, ca_view_folder::opjobs::Answer::Proceed);
+        }
+    }
+    assert!(poll_until(view, |view| view.tree().is_some()));
+}
+
+#[test]
+fn a_save_while_no_comparison_is_on_screen_is_dropped_when_an_input_is_written_after_it() {
+    let fixture = one_mergeable_row_and_one_addition();
+    let mut view = fixture.view();
+    hold_a_comparison(&fixture, &mut view);
+    fixture.write("output", "both.txt", b"one\ntwo\nThree\n", T + 30);
+    view.file_saved(&saved_file(fixture.path("output").join("both.txt"), 0));
+    fixture.write("right", "both.txt", b"one\ntwo\nthree, edited\n", T + 60);
+
+    release_the_comparison(&mut view);
+
+    assert_eq!(
+        report_word(&view, "both.txt"),
+        "Merge by hand",
+        "the save outlived an input written after it"
+    );
+    assert_eq!(view.exit_code(), Some(14));
+}
+
+#[test]
+fn a_save_while_no_comparison_is_on_screen_counts_when_no_input_changes() {
+    let fixture = one_mergeable_row_and_one_addition();
+    let mut view = fixture.view();
+    hold_a_comparison(&fixture, &mut view);
+    // The merge result equals the right input byte for byte, so only the save
+    // marks the row.
+    fixture.write("output", "both.txt", b"one\ntwo\nTHREE\n", T + 30);
+    view.file_saved(&saved_file(fixture.path("output").join("both.txt"), 0));
+
+    release_the_comparison(&mut view);
+
+    assert_eq!(report_word(&view, "both.txt"), "Merged by hand");
+    assert_eq!(view.exit_code(), Some(0));
+}
+
 #[test]
 fn the_exit_code_follows_the_resolutions_and_not_the_output() {
     let fixture = Fixture::empty();
