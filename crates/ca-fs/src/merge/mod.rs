@@ -996,3 +996,71 @@ fn compare_places(
         cancel,
     )
 }
+
+/// True when the output file at `row` holds the bytes of an input item of
+/// the row that has its size, or when such a pair cannot be read.
+///
+/// Reads both files of each pair of equal size, so it runs on a worker. A
+/// pair that cannot be read counts as a copy: nothing then proves that a
+/// person wrote the output file.
+#[must_use]
+pub fn output_copies_an_input(
+    row: &MergeRow,
+    bases: MergeBases<'_>,
+    sources: Option<MergeSources<'_>>,
+    cancel: &Cancel,
+) -> bool {
+    let Some(output) = row.output.as_ref() else {
+        return false;
+    };
+    let output_place = Place::Local {
+        base: bases.output.to_path_buf(),
+        rel: output.rel.clone(),
+        facts: EntryFacts::default(),
+    };
+    let at = Where { bases, sources };
+    let tests = crate::criteria::ContentTests {
+        enabled: true,
+        method: crate::criteria::ContentMethod::Binary,
+        ..crate::criteria::ContentTests::default()
+    };
+    [
+        (LEFT, &row.left),
+        (CENTER, &row.center),
+        (RIGHT, &row.right),
+    ]
+    .into_iter()
+    .filter_map(|(position, entry)| entry.as_ref().map(|entry| (position, entry)))
+    .filter(|(_, entry)| !entry.is_dir && entry.size == output.size)
+    .any(|(position, entry)| {
+        let place = at.of(position, Some(entry), EntryFacts::default());
+        compare_places(&output_place, &place, &tests, None, cancel).map_or(true, |outcome| {
+            outcome.is_not_compared() || outcome.is_same(false)
+        })
+    })
+}
+
+/// True when the output file at `row` holds a line that opens a conflict
+/// and a line that closes one, as a text merge writes them for a conflict
+/// it keeps.
+///
+/// Reads the output file, so it runs on a worker. A file that cannot be
+/// read holds no markers.
+#[must_use]
+pub fn output_holds_conflict_markers(row: &MergeRow, output_base: &Path) -> bool {
+    let Some(output) = row.output.as_ref() else {
+        return false;
+    };
+    let Ok(bytes) = std::fs::read(output_base.join(&output.rel)) else {
+        return false;
+    };
+    let mut opened = false;
+    for line in bytes.split(|byte| *byte == b'\n') {
+        if line.starts_with(b"<<<<<<<") {
+            opened = true;
+        } else if opened && line.starts_with(b">>>>>>>") {
+            return true;
+        }
+    }
+    false
+}
