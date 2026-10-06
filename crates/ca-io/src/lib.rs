@@ -67,7 +67,7 @@ pub fn write_atomic_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
 /// parent must already exist.
 pub fn open_log(path: &Path, append: bool) -> io::Result<File> {
     if append {
-        target_permissions(path, false)?;
+        target_permissions(path, false, "append to")?;
     } else {
         write_atomic(path, b"")?;
     }
@@ -81,7 +81,7 @@ pub fn open_log(path: &Path, append: bool) -> io::Result<File> {
 /// Returns [`io::ErrorKind::NotFound`] when the file is absent, or another
 /// error if the target is unsuitable or the removal fails.
 pub fn remove_file(path: &Path) -> io::Result<()> {
-    target_permissions(path, false)?;
+    target_permissions(path, false, "remove")?;
     fs::remove_file(path)
 }
 
@@ -195,7 +195,7 @@ fn replace_impl<T, E: From<io::Error>>(
     let extended_path = windows_extended_path(path)?;
     #[cfg(windows)]
     let path = extended_path.as_deref().unwrap_or(path);
-    let permissions = target_permissions(path, require_absent)?;
+    let permissions = target_permissions(path, require_absent, "replace")?;
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -403,7 +403,11 @@ fn refuse_trimmed_name(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn target_permissions(path: &Path, require_absent: bool) -> io::Result<Option<fs::Permissions>> {
+fn target_permissions(
+    path: &Path,
+    require_absent: bool,
+    operation: &str,
+) -> io::Result<Option<fs::Permissions>> {
     refuse_trimmed_name(path)?;
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
@@ -413,10 +417,21 @@ fn target_permissions(path: &Path, require_absent: bool) -> io::Result<Option<fs
                     "target appeared",
                 ));
             }
-            if !metadata.is_file() || metadata.permissions().readonly() {
+            let refused = if metadata.file_type().is_symlink() {
+                Some("it is a link")
+            } else if metadata.is_dir() {
+                Some("it is a folder")
+            } else if !metadata.is_file() {
+                Some("it is not a regular file")
+            } else if metadata.permissions().readonly() {
+                Some("it is read-only")
+            } else {
+                None
+            };
+            if let Some(reason) = refused {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
-                    "replacement requires a writable regular file",
+                    format!("cannot {operation} {}: {reason}", path.display()),
                 ));
             }
             Ok(Some(metadata.permissions()))
