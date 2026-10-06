@@ -1713,9 +1713,12 @@ impl MergeModel {
         let taken: Vec<usize> = (0..self.sections.len())
             .filter(|&index| {
                 let section = &self.sections[index];
+                // A section that lends text shows its input only once that
+                // text is back, so it is taken like an explicit take does.
                 !(matches!(section.kind, MergeKind::Conflict) || section.conflict)
                     && (section.resolution != self.automatic_for(section.kind)
-                        || matches!(section.resolution, Resolution::Edited))
+                        || matches!(section.resolution, Resolution::Edited)
+                        || !section.lent.is_empty())
             })
             .collect();
         let changed: Vec<(usize, Range<u32>)> = taken
