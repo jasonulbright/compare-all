@@ -787,3 +787,28 @@ fn a_take_of_a_lender_that_a_reload_left_on_its_side_restores_it_in_both_orders(
     assert_eq!(texts[0], texts[1], "lender first, holder first");
     assert_eq!(texts[1], "a\nL\nx\ny\ng\nh\ni\nX\nf\n");
 }
+
+/// After the join, the rows of center `c` and `d` belong to s2, whose first
+/// two lines s1 holds. A line take on such a row replaces the output line
+/// of s2 at the row's index among the rows of s2, not the held line: the
+/// row of `c` replaces `g`, the row of `d` replaces `h`.
+#[test]
+fn a_line_take_on_a_row_whose_line_an_earlier_section_holds_replaces_the_line_at_the_row_index() {
+    for (center_line, expected) in [
+        (2, "a\nbcd\nc\nh\ni\nX\nf\n"),
+        (3, "a\nbcd\ng\nd\ni\nX\nf\n"),
+    ] {
+        let (mut view, dir) = joined(F1, 2);
+        let row = view
+            .model()
+            .rows()
+            .iter()
+            .position(|row| row.line(crate::model::Pane::Center, None) == Some(center_line))
+            .unwrap();
+        view.row = row;
+        view.run(Command::TakeCenterLine);
+        assert_output_lines_match_pane(&view);
+        assert_eq!(view.output_text(), expected);
+        assert_eq!(save_and_read(&mut view, &dir), expected.as_bytes());
+    }
+}
