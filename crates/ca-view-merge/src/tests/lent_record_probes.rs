@@ -259,7 +259,7 @@ fn one_lender_taken_four_times_to_different_sides_undoes_and_redoes_every_step()
 }
 
 #[test]
-fn text_typed_inside_lent_text_stays_when_the_lender_takes_the_side_that_holds_it() {
+fn text_typed_inside_lent_text_stays_until_the_holder_take_restores_the_taken_lender() {
     let (mut view, dir) = f1_x_joined();
     view.output_pane.place(Caret::new(6, 2), false);
     view.output_pane.type_character('Q');
@@ -268,7 +268,7 @@ fn text_typed_inside_lent_text_stays_when_the_lender_takes_the_side_that_holds_i
     take_at(&mut view, 3, Command::TakeLeft);
     assert_eq!(view.output_text(), "a\nb\nc\nd\ng\nh\niXQ\nf\n");
     take_at(&mut view, 2, Command::TakeLeft);
-    assert_eq!(view.output_text(), "a\nb\nc\nd\ng\nh\ni\nXQ\nf\n");
+    assert_eq!(view.output_text(), "a\nb\nc\nd\ng\nh\ni\nX\nf\n");
     saved_matches(&mut view, &dir).unwrap();
     for _ in 0..3 {
         view.run(Command::Undo);
@@ -305,7 +305,7 @@ fn enter_inside_joined_lines_then_taking_the_lender_and_the_holder_keeps_one_cop
     take_at(&mut view, 2, Command::TakeCenter);
     assert_eq!(view.output_text(), "a\nbc\ndg\nh\ni\nX\nf\n");
     take_at(&mut view, 1, Command::TakeLeft);
-    assert_eq!(view.output_text(), "a\nL\nc\ndg\nh\ni\nX\nf\n");
+    assert_eq!(view.output_text(), "a\nL\nc\nd\ng\nh\ni\nX\nf\n");
     saved_matches(&mut view, &dir).unwrap();
     take_at(&mut view, 2, Command::TakeCenter);
     assert_eq!(view.output_text(), "a\nL\nc\nd\ng\nh\ni\nX\nf\n");
@@ -378,7 +378,7 @@ fn lent_text_with_its_middle_removed_goes_when_the_lender_takes_a_side_without_i
 }
 
 #[test]
-fn lent_text_with_its_middle_removed_keeps_the_rest_when_the_lender_takes_the_side_that_holds_it() {
+fn lent_text_with_its_middle_removed_stays_until_the_holder_take_restores_the_taken_lender() {
     let (mut view, _dir) = f5_joined();
     view.output_pane.place(Caret::new(4, 3), false);
     view.output_pane.place(Caret::new(4, 5), true);
@@ -387,7 +387,7 @@ fn lent_text_with_its_middle_removed_keeps_the_rest_when_the_lender_takes_the_si
     take_at(&mut view, 3, Command::TakeLeft);
     assert_eq!(view.output_text(), "a\nb\nc\nc2\nc3X2\nf\n");
     take_at(&mut view, 2, Command::TakeCenter);
-    assert_eq!(view.output_text(), "a\nb\nc\nc2\nc3\nX2\nf\n");
+    assert_eq!(view.output_text(), "a\nb\nc\nc2\nc3\nX1\nX2\nf\n");
 }
 
 // The lender's center side starts with the characters it lent, split over
