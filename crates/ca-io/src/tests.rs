@@ -245,6 +245,19 @@ fn read_only_targets_are_not_replaced() {
 }
 
 /// A Windows path drops a dot or a space at the end of its last name.
+#[cfg(unix)]
+#[test]
+fn replaced_content_drops_the_set_user_and_group_id_bits() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("tool.sh");
+    fs::write(&target, b"#!/bin/sh\n").unwrap();
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o6755)).unwrap();
+    write_atomic(&target, b"#!/bin/sh\necho replaced\n").unwrap();
+    let mode = fs::metadata(&target).unwrap().permissions().mode() & 0o7777;
+    assert_eq!(mode, 0o755, "{mode:o}");
+}
+
 #[cfg(windows)]
 #[test]
 fn a_name_that_ends_in_a_dot_or_a_space_is_refused_and_the_shorter_name_kept() {

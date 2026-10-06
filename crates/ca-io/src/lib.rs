@@ -213,16 +213,9 @@ fn replace_impl<T, E: From<io::Error>>(
     let mut temporary = builder.tempfile_in(parent)?;
     let result = produce(temporary.as_file_mut())?;
     if let Some(permissions) = &permissions {
-        #[cfg(unix)]
-        let permissions = if new_file_mode == 0o600 {
-            use std::os::unix::fs::PermissionsExt;
-            fs::Permissions::from_mode(0o600)
-        } else {
-            permissions.clone()
-        };
-        #[cfg(not(unix))]
-        let permissions = permissions.clone();
-        temporary.as_file().set_permissions(permissions)?;
+        temporary
+            .as_file()
+            .set_permissions(replacement_permissions(permissions, new_file_mode))?;
     }
     finish(temporary.as_file_mut())?;
 
@@ -371,6 +364,24 @@ fn link_unix_backup_with(
             let _ = fs::remove_file(&backup_name);
         })
         .map(Some)
+}
+
+/// The permissions a replacement of a file with `target` permissions gets.
+#[cfg(unix)]
+fn replacement_permissions(target: &fs::Permissions, new_file_mode: u32) -> fs::Permissions {
+    use std::os::unix::fs::PermissionsExt;
+    if new_file_mode == 0o600 {
+        fs::Permissions::from_mode(0o600)
+    } else {
+        // New content does not keep the set-user-ID and set-group-ID bits, as
+        // an ordinary write clears them.
+        fs::Permissions::from_mode(target.mode() & !0o6000)
+    }
+}
+
+#[cfg(not(unix))]
+fn replacement_permissions(target: &fs::Permissions, _new_file_mode: u32) -> fs::Permissions {
+    target.clone()
 }
 
 /// Refuse a path whose last name ends in a dot or a space: a Windows path
