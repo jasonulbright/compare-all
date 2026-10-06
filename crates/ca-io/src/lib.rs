@@ -190,6 +190,7 @@ fn replace_impl<T, E: From<io::Error>>(
     require_absent: bool,
     mut has_conflict: Option<&mut dyn FnMut(&Path) -> bool>,
 ) -> Result<(T, Option<PathBuf>), E> {
+    refuse_trimmed_name(path)?;
     #[cfg(windows)]
     let extended_path = windows_extended_path(path)?;
     #[cfg(windows)]
@@ -372,7 +373,27 @@ fn link_unix_backup_with(
         .map(Some)
 }
 
+/// Refuse a path whose last name ends in a dot or a space: a Windows path
+/// drops that character and then names another file.
+fn refuse_trimmed_name(path: &Path) -> io::Result<()> {
+    let trimmed = cfg!(windows)
+        && path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().ends_with(['.', ' ']));
+    if trimmed {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{} ends in a dot or a space, which a Windows path drops",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn target_permissions(path: &Path, require_absent: bool) -> io::Result<Option<fs::Permissions>> {
+    refuse_trimmed_name(path)?;
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
             if require_absent {
