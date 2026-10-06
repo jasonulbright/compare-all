@@ -10,10 +10,10 @@ use crate::dialogs::{self, modal};
 use crate::opjobs::{self, Answer, Ask, ExecMessage, ProgressState};
 use crate::settings::{merge_options_of, EngineOptions};
 use ca_fs::{
-    compare3_sources, left_for_person, plan_merge, scan_source, scan_with, ExecutionReport,
-    FilterContext, FolderMergeOptions, MergeBases, MergeFilters, MergeInputs, MergeRequest,
-    MergeRow, MergeSources, MergeStatus, MergeTree, OperationOptions, OperationPlan, Pane,
-    Resolution, RulesEngine, ScanResult, Source,
+    compare3_sources, leaves_for_person, left_for_person, plan_merge, scan_source, scan_with,
+    ExecutionReport, FilterContext, FolderMergeOptions, MergeBases, MergeFilters, MergeInputs,
+    MergeRequest, MergeRow, MergeSources, MergeStatus, MergeTree, OperationOptions, OperationPlan,
+    Pane, Resolution, RulesEngine, ScanResult, Source,
 };
 use ca_session::settings::folder::MergeTarget;
 use ca_session::settings::{FolderMergeSettings, SessionSettings};
@@ -725,6 +725,7 @@ impl FolderMergeView {
             self.folders.right.display().to_string(),
         )
         .with_title("Folder Merge Report");
+        let request = self.whole_request();
         let rows = self
             .visible_rows()
             .into_iter()
@@ -733,7 +734,11 @@ impl FolderMergeView {
                 name: row.name.clone(),
                 relative_path: row.rel.to_string_lossy().replace('\\', "/"),
                 is_dir: row.is_dir,
-                status: report_status(row),
+                status: if leaves_for_person(row, &request) {
+                    ca_ui::report::EntryStatus::MergeByHand
+                } else {
+                    report_status(row)
+                },
                 left: side_facts(row.left.as_ref()),
                 right: side_facts(row.right.as_ref()),
                 link: None,
@@ -1118,6 +1123,15 @@ impl FolderMergeView {
 
     fn has_center(&self) -> bool {
         self.folders.center.is_some()
+    }
+
+    /// A merge of every row with the resolutions the view holds now.
+    fn whole_request(&self) -> MergeRequest<'_> {
+        MergeRequest {
+            overrides: &self.overrides,
+            selection: None,
+            automatic: self.settings.merge.automatic_merge,
+        }
     }
 
     fn resolution(&self, row: &MergeRow) -> Resolution {

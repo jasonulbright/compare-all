@@ -5,7 +5,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 #![allow(clippy::disallowed_methods, reason = "test setup writes fixture files")]
 
-use ca_fs::MergeStatus;
+use ca_fs::{MergeStatus, Pane, Resolution};
 use ca_session::SessionKind;
 use ca_ui::command::Command;
 use ca_ui::testing::context;
@@ -322,6 +322,42 @@ fn the_confirmation_the_result_and_the_status_text_name_the_rows_left_for_a_merg
         status.contains(&text),
         "the status text lacks the notice:\n{status}"
     );
+}
+
+#[test]
+fn the_report_marks_each_row_left_for_a_merge_by_hand() {
+    let fixture = Fixture::mixed();
+    let mut view = fixture.view();
+    let (_, payload) = view.report_payload();
+    let ca_ui::report::Payload::Folder(rows) = payload else {
+        panic!("a folder merge writes a folder report");
+    };
+    let word = |name: &str| {
+        rows.iter()
+            .find(|row| row.relative_path == name)
+            .unwrap_or_else(|| panic!("no report row for {name}"))
+            .status
+            .label()
+    };
+    assert_eq!(word("both.txt"), "Merge by hand");
+    assert_eq!(word("clash.txt"), "Merge by hand");
+    assert_eq!(word("added.txt"), "Left only");
+
+    assert!(view.select(Path::new("clash.txt")));
+    view.run(Command::TakeRight);
+    assert_eq!(
+        view.overrides().get(Path::new("clash.txt")),
+        Some(&Resolution::Take(Pane::Right))
+    );
+    let (_, payload) = view.report_payload();
+    let ca_ui::report::Payload::Folder(rows) = payload else {
+        panic!("a folder merge writes a folder report");
+    };
+    let clash = rows
+        .iter()
+        .find(|row| row.relative_path == "clash.txt")
+        .unwrap();
+    assert_eq!(clash.status.label(), "Different");
 }
 
 /// Presses on the drawn view, found by accessible label.
