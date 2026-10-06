@@ -824,6 +824,20 @@ pub(crate) fn skips_unreachable_name(
     true
 }
 
+/// Record `rel` as left alone when the new name `new_name` holds a folder
+/// separator or is a dot segment, and say whether it was. A rename changes the
+/// name only; such a name would move the item into another folder.
+fn skips_folder_name(plan: &mut OperationPlan, rel: &Path, new_name: &str) -> bool {
+    if !(new_name.contains(['/', '\\']) || new_name == "." || new_name == "..") {
+        return false;
+    }
+    plan.skipped.push(PlanSkip::noted(
+        rel.to_path_buf(),
+        format!("the new name {new_name:?} names another folder"),
+    ));
+    true
+}
+
 pub(crate) fn copy_conflicts(node: &Node, from: Side, to: Side) -> Vec<Conflict> {
     match (entry_of(node, from), entry_of(node, to)) {
         (Some(source), Some(target)) => replacement_conflicts(source, target),
@@ -1943,7 +1957,9 @@ pub fn plan_rename(
             if new_name == node.name || new_name.is_empty() {
                 continue;
             }
-            if skips_unreachable_name(&mut plan, &node.rel, Path::new(&new_name)) {
+            if skips_folder_name(&mut plan, &node.rel, &new_name)
+                || skips_unreachable_name(&mut plan, &node.rel, Path::new(&new_name))
+            {
                 continue;
             }
             let parent = node.rel.parent().unwrap_or(Path::new("")).to_path_buf();

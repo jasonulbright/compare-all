@@ -1499,6 +1499,51 @@ fn a_new_name_a_windows_path_does_not_reach_is_refused_while_planning() {
 }
 
 #[test]
+fn a_new_name_that_names_another_folder_is_refused_while_planning() {
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(left.path().join("sub/inner")).unwrap();
+    std::fs::write(left.path().join("sub/a.txt"), b"a").unwrap();
+    let root = compared(left.path(), right.path());
+    let bases = Bases {
+        left: left.path(),
+        right: right.path(),
+    };
+    for name in [
+        "../moved-up.txt",
+        "inner/moved-down.txt",
+        r"inner\moved-down.txt",
+        "..",
+    ] {
+        let action = RenameAction::Regex {
+            find: r"^a\.txt$".to_string(),
+            replace: name.to_string(),
+        };
+        let plan = rename_plan(
+            &root,
+            &["sub/a.txt"],
+            Sides::Left,
+            &action,
+            bases,
+            &options(),
+        )
+        .unwrap();
+        assert!(plan.steps.is_empty(), "{name:?}: {:?}", plan.steps);
+        assert!(
+            plan.skipped
+                .iter()
+                .any(|skip| skip.path == Path::new("sub/a.txt")),
+            "{name:?}: {:?}",
+            plan.skipped
+        );
+        run(&plan);
+    }
+    assert_eq!(std::fs::read(left.path().join("sub/a.txt")).unwrap(), b"a");
+    assert!(!left.path().join("moved-up.txt").exists());
+    assert!(!left.path().join("sub/inner/moved-down.txt").exists());
+}
+
+#[test]
 fn a_rename_on_both_sides_of_a_pair_is_not_refused_as_a_duplicate() {
     let left = tempfile::tempdir().unwrap();
     let right = tempfile::tempdir().unwrap();
