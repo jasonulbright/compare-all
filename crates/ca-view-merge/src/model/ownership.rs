@@ -102,6 +102,15 @@ fn slide_to_line_start(text: &str, line_starts: &[usize], offset: usize, removed
     }
 }
 
+/// The characters of `owner` in `runs`, in order, without line breaks.
+fn characters_of(runs: &[Run], owner: usize) -> String {
+    runs.iter()
+        .filter(|run| run.owner == owner)
+        .flat_map(|run| run.text.chars())
+        .filter(|character| !matches!(character, '\r' | '\n'))
+        .collect()
+}
+
 fn is_terminator_only(text: &str) -> bool {
     !text.is_empty() && text.chars().all(|c| c == '\r' || c == '\n')
 }
@@ -1073,9 +1082,6 @@ impl MergeModel {
         .unwrap_or((fallback_owner, fallback_owner));
 
         let mut modified: BTreeSet<usize> = BTreeSet::new();
-        // Sections whose text on their own lines the edit changes, as
-        // opposed to text they lend to a line of another section.
-        let mut changed_own: BTreeSet<usize> = BTreeSet::new();
         let mut new_runs: Vec<Run> = Vec::new();
         let mut seen = 0usize;
         let mut inserted_done = false;
@@ -1088,9 +1094,6 @@ impl MergeModel {
             let keep_after = (offset + removed).clamp(run_start, run_end) - run_start;
             if keep_after > keep_before {
                 modified.insert(run.owner);
-                if run.owner == run.place {
-                    changed_own.insert(run.owner);
-                }
             }
             let before_end = byte_at(&run.text, keep_before);
             push_run(&mut new_runs, run.owner, run.place, &run.text[..before_end]);
@@ -1111,15 +1114,15 @@ impl MergeModel {
         }
         if !edit.inserted.is_empty() {
             modified.insert(inserter.0);
-            if inserter.0 == inserter.1 {
-                changed_own.insert(inserter.0);
-            }
         }
-        let separators_only = edit
-            .inserted
-            .chars()
-            .chain(edit.removed.chars())
-            .all(|character| matches!(character, '\r' | '\n'));
+        // The sections the edit touched whose characters, line breaks left
+        // out, read the same after it: which run took a line break does not
+        // matter.
+        let same_characters: BTreeSet<usize> = modified
+            .iter()
+            .copied()
+            .filter(|&owner| characters_of(&runs, owner) == characters_of(&new_runs, owner))
+            .collect();
 
         let new_text: String = new_runs.iter().map(|run| run.text.as_str()).collect();
         let mut line_runs: Vec<Vec<Run>> = Vec::new();
@@ -1324,12 +1327,11 @@ impl MergeModel {
             let Some(previous) = before.get(&index) else {
                 continue;
             };
-            // A line break typed or removed inside lent text changes no
-            // character of the lender, so the restore of an explicit take
-            // still applies once the text is back.
-            let keeps_take = separators_only
-                && self.sections[index].restore_from_take
-                && !changed_own.contains(&index);
+            // An edit that leaves the characters of a section the same, line
+            // breaks left out, changes no character of it, so the restore of
+            // an explicit take still applies once its text is back.
+            let keeps_take =
+                self.sections[index].restore_from_take && same_characters.contains(&index);
             if (modified.contains(&index) && !keeps_take) || lost.contains(&index) {
                 if self.sections[index].restore.is_some() {
                     self.touch(index);

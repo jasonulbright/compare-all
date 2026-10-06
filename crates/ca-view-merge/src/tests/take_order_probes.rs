@@ -412,6 +412,71 @@ fn enter_and_typing_inside_lent_text_between_the_takes_keeps_the_typed_text() {
     assert_eq!(outcome.saved, outcome.text.as_bytes());
 }
 
+fn edit_at(view: &mut MergeView, line: u32, column: u32, key: &str) {
+    view.output_pane.clear_selection();
+    view.output_pane.place(Caret::new(line, column), false);
+    match key {
+        "enter" => view.output_pane.enter("\n"),
+        "backspace" => view.output_pane.backspace(),
+        _ => view.output_pane.delete(),
+    }
+    absorb(view);
+}
+
+/// Enter at the end of the joined line `bcd` and Enter at the start of the
+/// lender's next own line `g` leave the same text. Either keeps the pending
+/// take: the lender's characters, line breaks left out, are unchanged.
+#[test]
+fn one_line_break_after_lent_text_keeps_the_pending_take_for_either_caret() {
+    for (line, column) in [(1, 3), (2, 0)] {
+        let edit = move |view: &mut MergeView| {
+            edit_at(view, line, column, "enter");
+            assert_eq!(view.output_text(), "a\nbcd\n\ng\nh\ni\nX\nf\n");
+        };
+        let outcome = in_order(F1, 2, &edit, LENDER_EDIT_HOLDER);
+        assert_restored(&outcome, F1_TAKEN);
+    }
+}
+
+/// Backspace at the start of `g` and Delete at the end of `bcd` remove the
+/// same line break; either keeps the pending take.
+#[test]
+fn one_line_break_removed_after_lent_text_keeps_the_pending_take_for_either_key() {
+    for (line, column, key) in [(2, 0, "backspace"), (1, 3, "delete")] {
+        let edit = move |view: &mut MergeView| {
+            edit_at(view, line, column, key);
+            assert_eq!(view.output_text(), "a\nbcdg\nh\ni\nX\nf\n");
+        };
+        let outcome = in_order(F1, 2, &edit, LENDER_EDIT_HOLDER);
+        assert_restored(&outcome, F1_TAKEN);
+    }
+}
+
+/// Backspace at the end of `bcd` removes the lender's `d`, a character, so
+/// the pending take ends and the deletion stays.
+#[test]
+fn backspace_at_the_end_of_lent_text_between_the_takes_keeps_the_deletion() {
+    let edit = |view: &mut MergeView| {
+        edit_at(view, 1, 3, "backspace");
+        assert_eq!(view.output_text(), "a\nbc\ng\nh\ni\nX\nf\n");
+    };
+    let outcome = in_order(F1, 2, &edit, LENDER_EDIT_HOLDER);
+    assert_eq!(outcome.text, "a\nL\nc\ng\nh\ni\nX\nf\n");
+    assert_eq!(outcome.lender, Resolution::Edited);
+}
+
+/// A line break typed between the lender's own lines changes no character
+/// of the lender either, so the pending take stands.
+#[test]
+fn enter_in_the_lenders_own_lines_between_the_takes_keeps_the_pending_take() {
+    let edit = |view: &mut MergeView| {
+        edit_at(view, 2, 1, "enter");
+        assert_eq!(view.output_text(), "a\nbcd\ng\n\nh\ni\nX\nf\n");
+    };
+    let outcome = in_order(F1, 2, &edit, LENDER_EDIT_HOLDER);
+    assert_restored(&outcome, F1_TAKEN);
+}
+
 /// Four joins give `a\nbcdgh\ni...`; removing `dg` leaves `bch`.
 fn remove_middle_of_lent_text(view: &mut MergeView) {
     assert_eq!(view.output_text(), "a\nbcdgh\ni\nX\nf\n");
