@@ -509,12 +509,39 @@ fn multiarch_triplet() -> Option<&'static str> {
     }
 }
 
-/// Whether `path` is `root` or lies below it.
+/// Whether `path` is `root` or lies below it, judged on the text of both after
+/// [`normalized`].
 fn inside(root: &[u8], path: &[u8]) -> bool {
-    path.starts_with(root)
-        && path
-            .get(root.len())
-            .is_none_or(|separator| *separator == b'/')
+    let root = normalized(root);
+    let path = normalized(path);
+    path.starts_with(&root)
+        && (root.ends_with(b"/")
+            || path
+                .get(root.len())
+                .is_none_or(|separator| *separator == b'/'))
+}
+
+/// `path` without repeated separators and `.` segments, and with each `..`
+/// removed together with the segment before it.
+fn normalized(path: &[u8]) -> Vec<u8> {
+    let absolute = path.first() == Some(&b'/');
+    let mut parts: Vec<&[u8]> = Vec::new();
+    for part in path.split(|byte| *byte == b'/') {
+        match part {
+            b"" | b"." => {}
+            b".." if parts.last().is_some_and(|last| *last != b"..") => {
+                parts.pop();
+            }
+            b".." if absolute => {}
+            _ => parts.push(part),
+        }
+    }
+    let mut out = Vec::with_capacity(path.len());
+    if absolute {
+        out.push(b'/');
+    }
+    out.extend_from_slice(&parts.join(b"/".as_slice()));
+    out
 }
 
 /// The environment a host program started from `image` gets.
