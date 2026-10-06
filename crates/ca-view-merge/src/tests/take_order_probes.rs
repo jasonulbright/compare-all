@@ -581,3 +581,54 @@ fn lender_and_holder_takes_in_every_line_ending_restore_the_selected_input() {
         assert_eq!(holder_first.0, expected, "{inputs:?}");
     }
 }
+
+/// Join, then change line `c` of s2 to `x` in all three inputs and reload:
+/// s2 keeps its automatic resolution, its text no longer starts with the
+/// characters s1 holds, and it keeps the record of them.
+fn joined_then_lender_changed_on_disk() -> (MergeView, tempfile::TempDir) {
+    let (mut view, dir) = joined(F1, 2);
+    for (name, text) in [
+        ("left.txt", F1[0]),
+        ("center.txt", F1[1]),
+        ("right.txt", F1[2]),
+    ] {
+        std::fs::write(dir.path().join(name), text.replace("\nc\n", "\nx\n")).unwrap();
+    }
+    view.run(Command::Reload);
+    run_until_ready(&mut view);
+    assert_output_lines_match_pane(&view);
+    (view, dir)
+}
+
+#[test]
+fn a_take_of_a_lender_that_a_reload_left_on_its_side_restores_it_in_both_orders() {
+    let mut texts = Vec::new();
+    for lender_first in [true, false] {
+        let (mut view, dir) = joined_then_lender_changed_on_disk();
+        assert!(!view.model().sections()[2].lent_records().is_empty());
+        assert_eq!(resolution(&view, 2), "Center");
+        let order = if lender_first {
+            [(2, Command::TakeCenter), (1, Command::TakeLeft)]
+        } else {
+            [(1, Command::TakeLeft), (2, Command::TakeCenter)]
+        };
+        for (section, command) in order {
+            take_at(&mut view, section, command);
+            assert_eq!(view.model().lent_record_problems(), Vec::<String>::new());
+        }
+        let text = view.output_text();
+        assert_eq!(
+            resolution(&view, 2),
+            "Center",
+            "lender first {lender_first}"
+        );
+        assert_eq!(
+            save_and_read(&mut view, &dir),
+            text.as_bytes(),
+            "lender first {lender_first}"
+        );
+        texts.push(text);
+    }
+    assert_eq!(texts[0], texts[1], "lender first, holder first");
+    assert_eq!(texts[1], "a\nL\nx\nd\ng\nh\ni\nX\nf\n");
+}
