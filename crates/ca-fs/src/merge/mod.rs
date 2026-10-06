@@ -32,8 +32,8 @@ pub mod plan;
 mod tests;
 
 pub use plan::{
-    automatic_resolution, leaves_for_person, left_for_person, plan_merge, MergeRefused,
-    MergeRequest, Resolution,
+    automatic_resolution, leaves_for_person, left_for_person, output_written_after_inputs,
+    plan_merge, MergeRefused, MergeRequest, Resolution,
 };
 
 /// One of the three inputs of a merge.
