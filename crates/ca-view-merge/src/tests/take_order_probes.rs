@@ -736,9 +736,9 @@ fn lender_and_holder_takes_in_every_line_ending_restore_the_selected_input() {
     }
 }
 
-/// Join, then change line `c` of s2 to `x` in all three inputs and reload:
-/// s2 keeps its automatic resolution, its text no longer starts with the
-/// characters s1 holds, and it keeps the record of them.
+/// Join, then change lines `c` and `d` of s2 to `x` and `y` in all three
+/// inputs and reload: s2 keeps its automatic resolution, its new text shows
+/// no line of the characters s1 holds, and it keeps the record of them.
 fn joined_then_lender_changed_on_disk() -> (MergeView, tempfile::TempDir) {
     let (mut view, dir) = joined(F1, 2);
     for (name, text) in [
@@ -746,7 +746,7 @@ fn joined_then_lender_changed_on_disk() -> (MergeView, tempfile::TempDir) {
         ("center.txt", F1[1]),
         ("right.txt", F1[2]),
     ] {
-        std::fs::write(dir.path().join(name), text.replace("\nc\n", "\nx\n")).unwrap();
+        std::fs::write(dir.path().join(name), text.replace("\nc\nd\n", "\nx\ny\n")).unwrap();
     }
     view.run(Command::Reload);
     run_until_ready(&mut view);
@@ -759,6 +759,7 @@ fn a_take_of_a_lender_that_a_reload_left_on_its_side_restores_it_in_both_orders(
     let mut texts = Vec::new();
     for lender_first in [true, false] {
         let (mut view, dir) = joined_then_lender_changed_on_disk();
+        assert_eq!(view.output_text(), "a\nbcd\nx\ny\ng\nh\ni\nX\nf\n");
         assert!(!view.model().sections()[2].lent_records().is_empty());
         assert_eq!(resolution(&view, 2), "Center");
         let order = if lender_first {
@@ -784,5 +785,5 @@ fn a_take_of_a_lender_that_a_reload_left_on_its_side_restores_it_in_both_orders(
         texts.push(text);
     }
     assert_eq!(texts[0], texts[1], "lender first, holder first");
-    assert_eq!(texts[1], "a\nL\nx\nd\ng\nh\ni\nX\nf\n");
+    assert_eq!(texts[1], "a\nL\nx\ny\ng\nh\ni\nX\nf\n");
 }

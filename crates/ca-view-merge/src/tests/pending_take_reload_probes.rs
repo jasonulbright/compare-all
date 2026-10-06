@@ -186,3 +186,84 @@ fn a_plain_reload_or_swap_then_a_holder_take_restores_the_taken_lender_once() {
         }
     }
 }
+
+/// Join line 1 twice, so s1 holds the `cd` of s2, then write `from` as `to`
+/// in all three inputs and reload.
+fn joined_then_reloaded(
+    inputs: [&str; 3],
+    from: &str,
+    to: &str,
+) -> (MergeView, tempfile::TempDir) {
+    let (mut view, dir) = joined(inputs, 2);
+    rewrite(&dir, &["left.txt", "center.txt", "right.txt"], from, to);
+    reload(&mut view);
+    (view, dir)
+}
+
+/// `c` of s2 changes to `x` on disk. The new text of s2 shows `d`, a line
+/// of the text s1 holds, so that lent copy leaves s1: each line shows once.
+#[test]
+fn a_reload_with_the_lender_changed_on_disk_shows_each_line_once() {
+    for inputs in [F1, F1_CRLF, CRLF_CENTER] {
+        let (mut view, dir) = joined_then_reloaded(inputs, "\nc", "\nx");
+        let mut reloaded = center_with_line_one_of(inputs, inputs[1]).replace("\nc", "\nx");
+        if inputs == CRLF_CENTER {
+            // The join removed the line break of `b`; the separator the
+            // composition adds follows the output's line ending.
+            reloaded = reloaded.replacen("b\r\n", "b\n", 1);
+        }
+        assert_eq!(view.output_text(), reloaded, "{inputs:?}");
+        assert_eq!(view.model().sections()[2].resolution, Resolution::Center);
+        assert!(view.model().sections()[2].lent_records().is_empty());
+        assert_eq!(save_and_read(&mut view, &dir), reloaded.as_bytes());
+    }
+}
+
+/// One take sequence after a reload, as the output text and the lender's
+/// resolution; `None` stands for Take All Non-Conflicting. Save writes the
+/// pane.
+fn after_takes(
+    inputs: [&str; 3],
+    from: &str,
+    to: &str,
+    takes: &[Option<(usize, Command)>],
+) -> (String, Resolution) {
+    let (mut view, dir) = joined_then_reloaded(inputs, from, to);
+    for take in takes {
+        if let Some((section, command)) = take {
+            take_at(&mut view, *section, *command);
+        } else {
+            view.run(Command::TakeAllNonConflicting);
+            assert_output_lines_match_pane(&view);
+        }
+        assert_eq!(view.model().lent_record_problems(), Vec::<String>::new());
+    }
+    let text = view.output_text();
+    assert_eq!(save_and_read(&mut view, &dir), text.as_bytes());
+    (text, view.model().sections()[2].resolution)
+}
+
+/// After the lender changed on disk, the lender take, Take All
+/// Non-Conflicting and the holder take give one result in every order.
+#[test]
+fn takes_after_a_reload_with_the_lender_changed_give_one_result_in_every_order() {
+    let lender = Some((2, Command::TakeCenter));
+    let holder = Some((1, Command::TakeLeft));
+    let orders: [&[Option<(usize, Command)>]; 4] = [
+        &[lender, holder],
+        &[holder, lender],
+        &[None, holder],
+        &[holder, None],
+    ];
+    for inputs in [F1, F1_CRLF, CRLF_CENTER] {
+        let results: Vec<(String, Resolution)> = orders
+            .iter()
+            .map(|takes| after_takes(inputs, "\nc", "\nx", takes))
+            .collect();
+        let taken = center_with_line_one_of(inputs, inputs[0]).replace("\nc", "\nx");
+        for (order, result) in orders.iter().zip(&results) {
+            assert_eq!(result.0, taken, "{order:?} {inputs:?}");
+            assert_eq!(result.1, Resolution::Center, "{order:?} {inputs:?}");
+        }
+    }
+}
