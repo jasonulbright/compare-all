@@ -893,13 +893,20 @@ pub fn extract_pair(
 ) -> Result<ca_ui::view::OpenRequest, String> {
     let mut copies = Vec::new();
     let mut paths = Vec::new();
-    for source in [&sides.left, &sides.right] {
+    let mut titles = request.titles.clone();
+    for (source, shown, title) in [
+        (&sides.left, &request.left, &mut titles.left),
+        (&sides.right, &request.right, &mut titles.right),
+    ] {
         if source.is_local_folder() {
             paths.push(source.origin().join(rel));
             continue;
         }
         match extract_one(source, rel, directory, cancel) {
             Ok((folder, file)) => {
+                if file.file_name() != rel.file_name() && title.is_none() {
+                    *title = Some(shown.display().to_string());
+                }
                 copies.push(folder);
                 paths.push(file);
             }
@@ -915,6 +922,7 @@ pub fn extract_pair(
     let mut paths = paths.into_iter();
     request.left = paths.next().unwrap_or_default();
     request.right = paths.next().unwrap_or_default();
+    request.titles = titles;
     Ok(request.over_temporaries(copies))
 }
 
@@ -936,6 +944,13 @@ fn extract_one(
     let name = rel
         .file_name()
         .ok_or_else(|| format!("{} names no file", rel.display()))?;
+    // A name that a Windows path reads as a device, or loses a trailing dot
+    // or space from, would write the device or another file; the copy takes
+    // a substitute name that reaches a file.
+    let name = match ca_vfs::platform_refusal(name) {
+        Some((substitute, _)) => std::ffi::OsString::from(substitute),
+        None => name.to_os_string(),
+    };
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_nanos());
