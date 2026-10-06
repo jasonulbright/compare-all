@@ -98,9 +98,14 @@ fn tool() -> VfsResult<&'static Path> {
 
 /// Convert the RAR container into a pax tar held in a temporary file.
 ///
+/// Only a container that starts with the RAR signature reaches `bsdtar`.
+/// `bsdtar` takes any format it recognizes, and one of them is a text listing
+/// that names local files to copy into the output.
+///
 /// # Errors
-/// Returns [`VfsError::Unsupported`] when no usable `bsdtar` exists,
-/// [`VfsError::Corrupt`] when `bsdtar` rejects the container,
+/// Returns [`VfsError::Corrupt`] when the container does not start with the
+/// RAR signature or `bsdtar` rejects it,
+/// [`VfsError::Unsupported`] when no usable `bsdtar` exists,
 /// [`VfsError::LimitExceeded`] when the tar passes the container ceiling,
 /// [`VfsError::Timeout`] when the child passes its deadline, and
 /// [`VfsError::Cancelled`] when the flag is raised.
@@ -109,6 +114,16 @@ pub(crate) fn convert(
     limits: &Limits,
     cancel: &Cancel,
 ) -> VfsResult<ArchiveBacking> {
+    let mut head = Vec::with_capacity(crate::detect::MAGIC_WINDOW);
+    backing
+        .reader()?
+        .take(crate::detect::MAGIC_WINDOW as u64)
+        .read_to_end(&mut head)?;
+    if crate::detect::format_from_magic(&head) != Some(crate::detect::ArchiveFormat::Rar) {
+        return Err(VfsError::corrupt(
+            "the name says RAR, but the file does not start with the RAR signature",
+        ));
+    }
     let program = tool()?;
     let (path, _keep) = on_disk(backing)?;
     let mut source = OsString::from("@");
