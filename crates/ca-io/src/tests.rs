@@ -244,6 +244,23 @@ fn read_only_targets_are_not_replaced() {
     assert_eq!(names(dir.path()), ["output"]);
 }
 
+/// A Windows path drops a dot or a space at the end of its last name.
+#[cfg(windows)]
+#[test]
+fn a_name_that_ends_in_a_dot_or_a_space_is_refused_and_the_shorter_name_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("a.txt");
+    fs::write(&target, b"original").unwrap();
+    for spelling in ["a.txt.", "a.txt "] {
+        let refused = dir.path().join(spelling);
+        let error = write_atomic(&refused, b"via the other spelling").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{error}");
+        let error = remove_file(&refused).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{error}");
+    }
+    assert_eq!(fs::read(&target).unwrap(), b"original");
+}
+
 #[test]
 fn directories_are_not_replaced() {
     let dir = tempfile::tempdir().unwrap();
