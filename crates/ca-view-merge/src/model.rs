@@ -1330,10 +1330,14 @@ impl MergeModel {
             .iter()
             .copied()
             .filter(|&section| {
+                // A section that lends text shows its selected input only
+                // once that text is back, so a take of its own resolution
+                // still has work to do.
                 self.sections.get(section).is_some_and(|entry| {
                     entry.resolution != resolution
                         || matches!(resolution, Resolution::Edited)
                         || (decides && entry.conflict)
+                        || !entry.lent.is_empty()
                 })
             })
             .collect();
