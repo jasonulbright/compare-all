@@ -84,8 +84,10 @@ pub fn run_script(
 pub fn run(script: &Script, session: &mut Session) -> Result<Outcome, RunError> {
     let mut outcome = Outcome::default();
     for statement in &script.statements {
-        let written = text::encode(&statement.command)
-            .unwrap_or_else(|_| statement.command.word().to_string());
+        let written = without_url_passwords(
+            &text::encode(&statement.command)
+                .unwrap_or_else(|_| statement.command.word().to_string()),
+        );
         session.log.command(&written);
         let result = step(session, &statement.command);
         let mut report = StepReport {
@@ -96,7 +98,7 @@ pub fn run(script: &Script, session: &mut Session) -> Result<Outcome, RunError> 
         match result {
             Ok(()) => outcome.steps.push(report),
             Err(error) => {
-                let message = error.to_string();
+                let message = without_url_passwords(&error.to_string());
                 session.log.error(&message);
                 if error.is_not_supported() {
                     outcome
@@ -118,6 +120,32 @@ pub fn run(script: &Script, session: &mut Session) -> Result<Outcome, RunError> 
         }
     }
     Ok(outcome)
+}
+
+/// `text` with `***` in place of the password of each URL that carries one in
+/// its user information, as in `ftp://user:password@host/`.
+fn without_url_passwords(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(scheme_end) = rest.find("://") {
+        let (head, tail) = rest.split_at(scheme_end + 3);
+        out.push_str(head);
+        let authority_end = tail
+            .find(|c: char| c == '/' || c == '"' || c.is_whitespace())
+            .unwrap_or(tail.len());
+        let authority = &tail[..authority_end];
+        match (authority.find(':'), authority.rfind('@')) {
+            (Some(colon), Some(at)) if colon < at => {
+                out.push_str(&authority[..=colon]);
+                out.push_str("***");
+                out.push_str(&authority[at..]);
+            }
+            _ => out.push_str(authority),
+        }
+        rest = &tail[authority_end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Run one command.
