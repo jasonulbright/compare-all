@@ -254,7 +254,8 @@ fn every_fixture_file_carries_the_fixture_time() {
 
 /// A copy whose time alone differs from the ancestor counts as a change, so a
 /// row both sides changed is mergeable and waits for a person. The plan on
-/// screen leaves it out, and the clean report covers only the planned steps.
+/// screen leaves it out, the clean report covers only the planned steps, and
+/// the result names the row as waiting for a merge by hand.
 #[test]
 fn a_copy_whose_time_alone_differs_from_the_ancestor_stays_out_of_the_plan_and_the_output() {
     let fixture = Fixture::new();
@@ -306,6 +307,15 @@ fn a_copy_whose_time_alone_differs_from_the_ancestor_stays_out_of_the_plan_and_t
     assert_eq!(
         fixture.read("output", "added.txt").as_deref(),
         Some(&b"from the left"[..])
+    );
+    let notice = view.message().unwrap_or_default();
+    assert!(
+        notice.starts_with("2 items need a merge by hand (1 mergeable, 1 conflict). "),
+        "the result does not count the rows left for a merge by hand: {notice:?}"
+    );
+    assert!(
+        notice.contains("edited.txt (mergeable, not in the output)"),
+        "the result does not name the row left for a merge by hand: {notice:?}"
     );
 }
 
