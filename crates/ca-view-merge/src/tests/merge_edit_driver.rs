@@ -520,11 +520,12 @@ fn run_case(
                 }
                 _ => None,
             };
-            let lines_before: Vec<String> = view.model().output_lines().iter().cloned().collect();
-            let line_take_line = match &op {
-                Op::TakeLine(row, _) => view
-                    .model()
-                    .output_line_for_row((*row).min(view.model().rows().len().saturating_sub(1))),
+            let line_take = match &op {
+                Op::TakeLine(row, command) => super::randomized_merge_driver::line_take(
+                    &view,
+                    (*row).min(view.model().rows().len().saturating_sub(1)),
+                    *command,
+                ),
                 _ => None,
             };
             let waiting: HashSet<usize> = view
@@ -617,13 +618,9 @@ fn run_case(
                     }
                 }
             }
-            if let Some(line) = line_take_line {
-                let replaced: HashSet<String> = lines_before
-                    .get(line as usize)
-                    .map(|text| tokens(text).into_iter().collect())
-                    .unwrap_or_default();
+            if let Some(plan) = &line_take {
                 for token in before_counts.keys() {
-                    if replaced.contains(token) {
+                    if plan.removable.contains(token) {
                         continue;
                     }
                     if after_counts.get(token).copied().unwrap_or(0) == 0 {

@@ -1560,9 +1560,22 @@ impl MergeModel {
             .line(pane, None)
             .and_then(|line| self.inputs.lines(pane).get(line as usize))
             .cloned();
+        // The rows of the section name its output lines only once the text
+        // it lent is back in front of them.
+        let mut returned = self.take_back_lent(section_index);
         let old_section = self.output_range(section_index)?;
         let old_length = self.sections.get(section_index)?.output_len as usize;
         let exists = step < old_length;
+        // The text that came back is a change of its own when the line
+        // take then finds nothing to replace.
+        let only_returned = |model: &mut Self, returned: &[(usize, Range<u32>)]| {
+            if returned.is_empty() {
+                return None;
+            }
+            model.repair_returned(returned);
+            let at = old_section.start.saturating_add(u32::try_from(step).ok()?);
+            Some((section_index, at..at, at..at))
+        };
         let (local, replacement) = match source {
             Some(text) if exists => {
                 let output_index = old_section.start as usize + step;
@@ -1573,7 +1586,7 @@ impl MergeModel {
                     .get(output_index)
                     .is_some_and(|line| line == &text)
                 {
-                    return None;
+                    return only_returned(self, &returned);
                 }
                 let start = u32::try_from(step).ok()?;
                 (start..start.checked_add(1)?, vec![text])
@@ -1586,13 +1599,11 @@ impl MergeModel {
                 let start = u32::try_from(step).ok()?;
                 (start..start.checked_add(1)?, Vec::new())
             }
-            None => return None,
+            None => return only_returned(self, &returned),
         };
-        let returned = if local.is_empty() {
-            Vec::new()
-        } else {
-            self.give_back_line(section_index, local.start)
-        };
+        if !local.is_empty() {
+            returned.extend(self.give_back_line(section_index, local.start));
+        }
         let global_start = old_section.start.checked_add(local.start)?;
         let old_global = global_start..global_start.checked_add(local.end - local.start)?;
         let new_global =

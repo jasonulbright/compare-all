@@ -788,26 +788,133 @@ fn takes_after_a_reload_that_replaced_the_lent_lines_give_one_result_in_both_ord
     assert_eq!(texts[1], "a\nL\nx\ny\ng\nh\ni\nX\nf\n");
 }
 
+/// The row of the line `line` of the center input.
+fn row_of_center_line(view: &MergeView, line: u32) -> usize {
+    view.model()
+        .rows()
+        .iter()
+        .position(|row| row.line(crate::model::Pane::Center, None) == Some(line))
+        .unwrap()
+}
+
+fn line_take_at(view: &mut MergeView, center_line: u32, command: Command) {
+    view.output_pane.clear_selection();
+    view.focus = crate::Pane::Output;
+    view.row = row_of_center_line(view, center_line);
+    view.run(command);
+    assert_output_lines_match_pane(view);
+    assert_eq!(view.model().lent_record_problems(), Vec::<String>::new());
+}
+
 /// After the join, the rows of center `c` and `d` belong to s2, whose first
-/// two lines s1 holds. A line take on such a row replaces the output line
-/// of s2 at the row's index among the rows of s2, not the held line: the
-/// row of `c` replaces `g`, the row of `d` replaces `h`.
+/// lines s1 holds. A line take on such a row first gives the joined text
+/// back to s2, on the lines s2 held before, and then takes only the line of
+/// that row. Each line shows once and no line of another row changes.
 #[test]
-fn a_line_take_on_a_row_whose_line_an_earlier_section_holds_replaces_the_line_at_the_row_index() {
+fn a_line_take_on_a_row_whose_line_an_earlier_section_holds_gives_that_line_back_first() {
+    let whole = "a\nb\nc\nd\ng\nh\ni\nX\nf\n";
+    for joins in [1, 2] {
+        for center_line in [2, 3] {
+            for command in [Command::TakeCenterLine, Command::TakeLeftLine] {
+                let (mut view, dir) = joined(F1, joins);
+                let joined_text = view.output_text();
+                line_take_at(&mut view, center_line, command);
+                let case = format!("joins {joins} center line {center_line} {command:?}");
+                assert_eq!(view.output_text(), whole, "{case}");
+                assert!(view.model().sections()[2].lent_records().is_empty());
+                assert_eq!(save_and_read(&mut view, &dir), whole.as_bytes(), "{case}");
+                view.run(Command::Undo);
+                assert_output_lines_match_pane(&view);
+                assert_eq!(view.output_text(), joined_text, "{case}");
+                view.run(Command::Redo);
+                assert_output_lines_match_pane(&view);
+                assert_eq!(view.output_text(), whole, "{case}");
+            }
+        }
+    }
+}
+
+// s0 a, s1 conflict b, s2 m n o, s3 left change C D, s4 g.
+const LEFT_CHANGE: [&str; 3] = [
+    "a\nL\nm\nn\no\nC\nD\ng\n",
+    "a\nb\nm\nn\no\nc\nd\ng\n",
+    "a\nR\nm\nn\no\nc\nd\ng\n",
+];
+const LEFT_CHANGE_JOINED: &str = "a\nL\nm\nn\noCD\ng\n";
+
+/// Take the conflict s1 from the left, then join the lines `C` and `D` of
+/// the left change s3 to the line `o` of s2.
+fn left_change_joined() -> (MergeView, tempfile::TempDir) {
+    let (mut view, dir) = open(LEFT_CHANGE[0], Some(LEFT_CHANGE[1]), LEFT_CHANGE[2]);
+    run_until_ready(&mut view);
+    assert_eq!(view.model().sections().len(), 5);
+    take_at(&mut view, 1, Command::TakeLeft);
+    for _ in 0..2 {
+        view.output_pane.place(Caret::new(4, 0), false);
+        view.output_pane.move_caret(Motion::LineEnd, false);
+        view.output_pane.delete();
+        absorb(&mut view);
+    }
+    assert_eq!(view.output_text(), LEFT_CHANGE_JOINED);
+    (view, dir)
+}
+
+fn type_q_inside_the_joined_text(view: &mut MergeView) {
+    view.output_pane.place(Caret::new(4, 2), false);
+    view.output_pane.type_character('Q');
+    absorb(view);
+    assert_eq!(view.output_text(), "a\nL\nm\nn\noCQD\ng\n");
+}
+
+/// The line take changes the line of its own row and no other: the row of
+/// center `c` takes `c` in place of `C`, the row of `d` takes `d` in place
+/// of `D`, and the other line of s3 comes back from the holder unchanged.
+#[test]
+fn a_line_take_on_a_lent_row_takes_only_the_line_of_that_row() {
     for (center_line, expected) in [
-        (2, "a\nbcd\nc\nh\ni\nX\nf\n"),
-        (3, "a\nbcd\ng\nd\ni\nX\nf\n"),
+        (5, "a\nL\nm\nn\no\nc\nD\ng\n"),
+        (6, "a\nL\nm\nn\no\nC\nd\ng\n"),
     ] {
-        let (mut view, dir) = joined(F1, 2);
-        let row = view
-            .model()
-            .rows()
-            .iter()
-            .position(|row| row.line(crate::model::Pane::Center, None) == Some(center_line))
-            .unwrap();
-        view.row = row;
-        view.run(Command::TakeCenterLine);
+        let (mut view, dir) = left_change_joined();
+        line_take_at(&mut view, center_line, Command::TakeCenterLine);
+        assert_eq!(view.output_text(), expected);
+        assert_eq!(resolution(&view, 3), "Edited");
+        assert_eq!(save_and_read(&mut view, &dir), expected.as_bytes());
+        view.run(Command::Undo);
         assert_output_lines_match_pane(&view);
+        assert_eq!(view.output_text(), LEFT_CHANGE_JOINED);
+    }
+}
+
+/// A Take Left of s3 after `Q` was typed inside its joined text waits for
+/// that text. The line take gives the text back, so the take applies: s3
+/// holds its left lines, then the line of the row.
+#[test]
+fn a_line_take_on_a_lent_row_applies_a_pending_take_of_its_section_first() {
+    let (mut view, dir) = left_change_joined();
+    type_q_inside_the_joined_text(&mut view);
+    take_at(&mut view, 3, Command::TakeLeft);
+    assert_eq!(view.output_text(), "a\nL\nm\nn\noCQD\ng\n");
+    assert!(view.model().pending_take(3).is_some());
+    line_take_at(&mut view, 6, Command::TakeCenterLine);
+    let expected = "a\nL\nm\nn\no\nC\nd\ng\n";
+    assert_eq!(view.output_text(), expected);
+    assert_eq!(save_and_read(&mut view, &dir), expected.as_bytes());
+}
+
+/// Text typed inside the joined text is text of s3 and comes back with it,
+/// on the line the holder showed: s3 then has one line. The row of center
+/// `c` holds that line and the line take replaces it. The row of `d` has
+/// no output line, so the line of the input goes to the end of s3.
+#[test]
+fn a_line_take_on_a_lent_row_gives_changed_text_back_as_the_holder_showed_it() {
+    for (center_line, expected) in [
+        (5, "a\nL\nm\nn\no\nc\ng\n"),
+        (6, "a\nL\nm\nn\no\nCQD\nd\ng\n"),
+    ] {
+        let (mut view, dir) = left_change_joined();
+        type_q_inside_the_joined_text(&mut view);
+        line_take_at(&mut view, center_line, Command::TakeCenterLine);
         assert_eq!(view.output_text(), expected);
         assert_eq!(save_and_read(&mut view, &dir), expected.as_bytes());
     }

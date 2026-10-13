@@ -982,6 +982,81 @@ impl MergeModel {
             .collect()
     }
 
+    /// Give back every text `lender` lent, before a line take on one of its
+    /// rows. A row of a section names the output line at the row's place
+    /// among the section's lines, and the first lines of a lender sit on its
+    /// holder's line, so until they are back the row names a later line.
+    ///
+    /// Returned text that holds the characters the lender lent, line breaks
+    /// left out, comes back on the lines the lender held before it lent
+    /// them, so each row names its line again. Text an edit changed comes
+    /// back as the holder showed it.
+    pub(super) fn take_back_lent(&mut self, lender: usize) -> Vec<(usize, Range<u32>)> {
+        let Some(section) = self.sections.get(lender) else {
+            return Vec::new();
+        };
+        if section.lent.is_empty() {
+            return Vec::new();
+        }
+        let from_take = section.restore_from_take;
+        let own = section.output_len;
+        let mut records: Vec<&super::Lent> = section.lent.iter().collect();
+        records.sort_by_key(|entry| entry.seq);
+        let source: String = records
+            .iter()
+            .filter_map(|entry| entry.source.as_deref())
+            .collect();
+        let mut giving: Vec<((usize, u32), super::Lent)> = records
+            .iter()
+            .filter_map(|entry| Some((self.record_at(entry)?, (*entry).clone())))
+            .collect();
+        giving.sort_by_key(|(at, record)| (*at, record.seq));
+        let mut returned = Vec::new();
+        // Last in output order first. The holder shows the text until its
+        // line is cut, so each text leaves that line once the lender has it.
+        for (_, record) in giving.into_iter().rev() {
+            if let Some(given) = self.give_back(lender, record.seq) {
+                returned.push(given);
+                self.strip_record(&record, None);
+            }
+        }
+        // A restore a take recorded has rebuilt the lender from its input.
+        if from_take || !self.sections[lender].lent.is_empty() {
+            return returned;
+        }
+        let Some(range) = self.output_range(lender) else {
+            return returned;
+        };
+        let front = (range.end - range.start).saturating_sub(own);
+        let start = range.start as usize;
+        let shown = self
+            .unrepaired_lines(start..start + front as usize)
+            .concat();
+        let bare = |text: &str| -> String {
+            text.chars()
+                .filter(|character| !matches!(character, '\r' | '\n'))
+                .collect()
+        };
+        if front == 0
+            || shown == source
+            || bare(&shown) != bare(&source)
+            || (own > 0 && !source.ends_with(['\r', '\n']))
+        {
+            return returned;
+        }
+        let lines = super::split(&source);
+        let Ok(count) = u32::try_from(lines.len()) else {
+            return returned;
+        };
+        let conflict = self.sections[lender].conflict;
+        if self.edit_output_range(lender, 0..front, lines) {
+            self.sections[lender].conflict = conflict;
+            self.refresh_section_totals(lender);
+            returned.push((lender, 0..count));
+        }
+        returned
+    }
+
     /// Mend the seams around text a take gave back.
     pub(super) fn repair_returned(&mut self, returned: &[(usize, Range<u32>)]) {
         for (lender, local) in returned {
