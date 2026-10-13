@@ -429,21 +429,29 @@ fn replacement_permissions(target: &fs::Permissions, _new_file_mode: u32) -> fs:
 
 /// Refuse a path that Windows reads as the name of another file: a folder or
 /// file name that ends in a dot or a space loses that character, and a colon
-/// in a name starts the name of a stream of the file before the colon.
+/// in a name starts the name of a stream or names a device.
+///
+/// A path with the `\\?\` prefix is taken as written, so a name that ends in
+/// a dot or a space there is the name of the item itself and is accepted.
 fn refuse_other_spelling(path: &Path) -> io::Result<()> {
+    use std::path::Component;
     if !cfg!(windows) {
         return Ok(());
     }
+    let as_written = matches!(
+        path.components().next(),
+        Some(Component::Prefix(prefix)) if prefix.kind().is_verbatim()
+    );
     let names = || {
         path.components().filter_map(|component| match component {
-            std::path::Component::Normal(name) => Some(name.to_string_lossy()),
+            Component::Normal(name) => Some(name.to_string_lossy()),
             _ => None,
         })
     };
-    let reason = if names().any(|name| name.ends_with(['.', ' '])) {
+    let reason = if !as_written && names().any(|name| name.ends_with(['.', ' '])) {
         "holds a name that ends in a dot or a space, which a Windows path drops"
     } else if names().any(|name| name.contains(':')) {
-        "holds a colon, which names a stream of another file"
+        "holds a colon, which names a stream of another file or a device"
     } else {
         return Ok(());
     };

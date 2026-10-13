@@ -319,6 +319,41 @@ fn a_stream_name_or_a_trimmed_folder_name_is_refused_before_any_change_on_disk()
     }
 }
 
+/// A path with the `\\?\` prefix names an item exactly, so a folder whose
+/// stored name ends in a dot is reached only through such a path.
+#[cfg(windows)]
+#[test]
+fn a_name_that_ends_in_a_dot_is_accepted_in_a_path_that_windows_takes_as_written() {
+    let dir = tempfile::tempdir().unwrap();
+    let as_written = fs::canonicalize(dir.path()).unwrap();
+    assert!(as_written.to_string_lossy().starts_with(r"\\?\"));
+    let folder = as_written.join("real.");
+    fs::create_dir(&folder).unwrap();
+    assert_eq!(names(dir.path()), ["real."]);
+
+    for name in ["a.txt", "b.txt."] {
+        let file = folder.join(name);
+        write_atomic(&file, b"first").unwrap();
+        write_atomic(&file, b"second").unwrap();
+        assert_eq!(fs::read(&file).unwrap(), b"second");
+        drop(open_log(&file, true).unwrap());
+    }
+    assert_eq!(names(&folder), ["a.txt", "b.txt."]);
+
+    // The same names in a path that Windows trims are still refused.
+    let trimmed = dir.path().join("real.").join("a.txt");
+    let error = write_atomic(&trimmed, b"third").unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{error}");
+    // A colon starts a stream name in every kind of path.
+    let error = write_atomic(&folder.join("a.txt:extra"), b"third").unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{error}");
+
+    for name in ["a.txt", "b.txt."] {
+        remove_file(&folder.join(name)).unwrap();
+    }
+    fs::remove_dir(&folder).unwrap();
+}
+
 #[test]
 fn a_refusal_names_the_kind_of_item_and_the_operation() {
     let dir = tempfile::tempdir().unwrap();
