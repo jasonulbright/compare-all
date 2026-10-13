@@ -192,6 +192,16 @@ pub struct ItemIdentity {
     pub number: u64,
 }
 
+/// The file whose access settings the temporary of a copy takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessOf<'a> {
+    /// The copy replaces this file and keeps its settings.
+    Replaced(&'a Path),
+    /// The copy is a new item. It takes the settings of this source, less
+    /// what the platform withholds from every new file.
+    Source(&'a Path),
+}
+
 /// The file system calls a plan step is built from.
 pub trait FileOps: Send + Sync {
     /// Read a path's state without following a link.
@@ -243,13 +253,35 @@ pub trait FileOps: Send + Sync {
         self.rename(from, to)
     }
 
-    /// Give the new file `path` the access settings of `model` where the file
-    /// system keeps them as permission bits.
+    /// [`FileOps::create_new`] for the temporary of a copy. Where the file
+    /// system keeps access settings as permission bits, the file has the bits
+    /// `access` names from the moment it exists.
     ///
     /// # Errors
-    /// Propagates the underlying I/O error.
-    fn match_access(&self, _model: &Path, _path: &Path) -> io::Result<()> {
-        Ok(())
+    /// Returns [`io::ErrorKind::AlreadyExists`] when the path is taken.
+    fn create_new_like(
+        &self,
+        path: &Path,
+        _access: AccessOf<'_>,
+    ) -> io::Result<Box<dyn SyncWrite>> {
+        self.create_new(path)
+    }
+
+    /// [`FileOps::write_new`] for a copy of the file `model`. Where the file
+    /// system keeps access settings as permission bits, the copy and its
+    /// temporary are never open to more users than `model`.
+    ///
+    /// # Errors
+    /// Returns [`io::ErrorKind::AlreadyExists`] when an item holds `target`,
+    /// and propagates every other error.
+    fn write_new_like(
+        &self,
+        target: &Path,
+        reader: &mut dyn Read,
+        buffer_size: usize,
+        _model: &Path,
+    ) -> io::Result<()> {
+        self.write_new(target, reader, buffer_size)
     }
 
     /// Write the bytes of `reader` as a new file at `target`, a name that no
@@ -619,6 +651,22 @@ fn copy_all<W: Write + ?Sized>(
     }
 }
 
+/// The permission bits a copy takes from the file `model`, or `None` when
+/// `model` is a link to nothing and so has no bits to pass on.
+///
+/// The set-user-ID and set-group-ID bits do not carry over to new content, as
+/// an ordinary write clears them. The owner keeps read and write access,
+/// which the copy and its checks need.
+#[cfg(unix)]
+fn carried_mode(model: &Path) -> io::Result<Option<u32>> {
+    use std::os::unix::fs::PermissionsExt;
+    match std::fs::metadata(model) {
+        Ok(meta) => Ok(Some((meta.permissions().mode() & 0o1777) | 0o600)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 /// [`FileOps`] backed by the real file system.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RealFs;
@@ -676,25 +724,62 @@ impl FileOps for RealFs {
         ca_io::replace_existing_file(to, from)
     }
 
-    #[cfg(not(windows))]
+    #[cfg(unix)]
     fn replace(&self, from: &Path, to: &Path) -> io::Result<()> {
-        self.match_access(to, from)?;
+        use std::os::unix::fs::PermissionsExt;
+        if let Some(mode) = carried_mode(to)? {
+            std::fs::set_permissions(from, std::fs::Permissions::from_mode(mode))?;
+        }
+        std::fs::rename(from, to)
+    }
+
+    #[cfg(not(any(windows, unix)))]
+    fn replace(&self, from: &Path, to: &Path) -> io::Result<()> {
         std::fs::rename(from, to)
     }
 
     #[cfg(unix)]
-    fn match_access(&self, model: &Path, path: &Path) -> io::Result<()> {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = match std::fs::metadata(model) {
-            // The set-user-ID and set-group-ID bits do not carry over to new
-            // content, as an ordinary write clears them. The owner keeps read
-            // and write access, which the copy and its checks need.
-            Ok(meta) => (meta.permissions().mode() & 0o1777) | 0o600,
-            // A dangling link has no access of its own to pass on.
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(error),
+    fn create_new_like(&self, path: &Path, access: AccessOf<'_>) -> io::Result<Box<dyn SyncWrite>> {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut options = File::options();
+        options.write(true).create_new(true);
+        let file = match access {
+            // The system takes the umask bits out of the mode a file is
+            // created with, so the file never has a bit the umask withholds.
+            AccessOf::Source(source) => options
+                .mode(carried_mode(source)?.unwrap_or(0o666) & 0o777)
+                .open(path)?,
+            AccessOf::Replaced(target) => {
+                let file = options.mode(0o600).open(path)?;
+                if let Some(mode) = carried_mode(target)? {
+                    file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+                }
+                file
+            }
         };
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+        Ok(Box::new(file))
+    }
+
+    #[cfg(unix)]
+    fn write_new_like(
+        &self,
+        target: &Path,
+        reader: &mut dyn Read,
+        buffer_size: usize,
+        model: &Path,
+    ) -> io::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let Some(mode) = carried_mode(model)? else {
+            return self.write_new(target, reader, buffer_size);
+        };
+        ca_io::replace_new_with_mode(
+            target,
+            |written: &mut dyn Write| copy_all(reader, written, buffer_size),
+            || Ok(()),
+            mode,
+        )?;
+        // The umask can withhold a bit that the model has.
+        std::fs::set_permissions(target, std::fs::Permissions::from_mode(mode))
     }
 
     #[cfg(windows)]

@@ -642,6 +642,199 @@ fn a_copy_over_an_owner_only_target_keeps_its_access_list() {
     );
 }
 
+/// The permission bits the process umask withholds from a new item.
+#[cfg(unix)]
+fn withheld_bits(scratch: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    let probe = scratch.join("umask-probe");
+    std::fs::create_dir(&probe).unwrap();
+    let mode = std::fs::metadata(&probe).unwrap().permissions().mode();
+    std::fs::remove_dir(&probe).unwrap();
+    !mode & 0o777
+}
+
+#[cfg(unix)]
+#[test]
+fn a_copy_to_a_new_name_takes_no_bit_that_the_umask_withholds() {
+    use std::os::unix::fs::PermissionsExt;
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    let withheld = withheld_bits(right.path());
+    for source_mode in [0o600_u32, 0o644, 0o666, 0o777] {
+        let name = format!("mode-{source_mode:o}.txt");
+        let source = left.path().join(&name);
+        std::fs::write(&source, b"content").unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(source_mode)).unwrap();
+        copy_left_to_right(left.path(), right.path(), &name, &options());
+        let copied = std::fs::metadata(right.path().join(&name)).unwrap();
+        assert_eq!(
+            copied.permissions().mode() & 0o7777,
+            source_mode & !withheld,
+            "source {source_mode:o}, umask {withheld:o}"
+        );
+    }
+}
+
+/// [`FileOps`] on the real file system that records the permission bits of
+/// every item of `folder` each time a copy asks its source for a block.
+#[cfg(unix)]
+struct WatchFs {
+    folder: PathBuf,
+    seen: std::sync::Arc<Mutex<Vec<(String, u32)>>>,
+}
+
+#[cfg(unix)]
+struct WatchReader {
+    inner: Box<dyn Read + Send>,
+    folder: PathBuf,
+    seen: std::sync::Arc<Mutex<Vec<(String, u32)>>>,
+}
+
+#[cfg(unix)]
+impl Read for WatchReader {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        use std::os::unix::fs::PermissionsExt;
+        for entry in std::fs::read_dir(&self.folder)?.flatten() {
+            if let Ok(meta) = entry.metadata() {
+                self.seen.lock().unwrap().push((
+                    entry.file_name().to_string_lossy().into_owned(),
+                    meta.permissions().mode() & 0o7777,
+                ));
+            }
+        }
+        self.inner.read(buffer)
+    }
+}
+
+#[cfg(unix)]
+impl FileOps for WatchFs {
+    fn probe(&self, path: &Path) -> io::Result<TargetState> {
+        RealFs.probe(path)
+    }
+    fn create_dir(&self, path: &Path) -> io::Result<()> {
+        RealFs.create_dir(path)
+    }
+    fn open_read(&self, path: &Path) -> io::Result<Box<dyn Read + Send>> {
+        Ok(Box::new(WatchReader {
+            inner: RealFs.open_read(path)?,
+            folder: self.folder.clone(),
+            seen: std::sync::Arc::clone(&self.seen),
+        }))
+    }
+    fn create_new(&self, path: &Path) -> io::Result<Box<dyn SyncWrite>> {
+        RealFs.create_new(path)
+    }
+    fn create_new_like(
+        &self,
+        path: &Path,
+        access: crate::ops::fsops::AccessOf<'_>,
+    ) -> io::Result<Box<dyn SyncWrite>> {
+        RealFs.create_new_like(path, access)
+    }
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        RealFs.rename(from, to)
+    }
+    fn rename_no_replace(&self, from: &Path, to: &Path) -> io::Result<()> {
+        RealFs.rename_no_replace(from, to)
+    }
+    fn replace(&self, from: &Path, to: &Path) -> io::Result<()> {
+        RealFs.replace(from, to)
+    }
+    fn write_new(
+        &self,
+        target: &Path,
+        reader: &mut dyn Read,
+        buffer_size: usize,
+    ) -> io::Result<()> {
+        RealFs.write_new(target, reader, buffer_size)
+    }
+    fn write_new_like(
+        &self,
+        target: &Path,
+        reader: &mut dyn Read,
+        buffer_size: usize,
+        model: &Path,
+    ) -> io::Result<()> {
+        RealFs.write_new_like(target, reader, buffer_size, model)
+    }
+    fn remove_file(&self, path: &Path) -> io::Result<()> {
+        RealFs.remove_file(path)
+    }
+    fn remove_dir(&self, path: &Path) -> io::Result<()> {
+        RealFs.remove_dir(path)
+    }
+    fn move_to_trash(&self, path: &Path) -> io::Result<()> {
+        RealFs.move_to_trash(path)
+    }
+    fn set_modified(&self, path: &Path, time: SystemTime) -> io::Result<()> {
+        RealFs.set_modified(path, time)
+    }
+    fn set_created(&self, path: &Path, time: SystemTime) -> io::Result<()> {
+        RealFs.set_created(path, time)
+    }
+    fn set_attributes(&self, path: &Path, change: &AttributeChange) -> io::Result<()> {
+        RealFs.set_attributes(path, change)
+    }
+    fn same_volume(&self, from: &Path, to: &Path) -> bool {
+        RealFs.same_volume(from, to)
+    }
+    fn read_dir(&self, path: &Path) -> io::Result<Vec<PathBuf>> {
+        RealFs.read_dir(path)
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn the_backup_and_the_copy_of_a_private_file_are_private_while_they_are_written() {
+    use std::os::unix::fs::PermissionsExt;
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    for (folder, byte) in [(left.path(), b'n'), (right.path(), b'o')] {
+        let path = folder.join("secret.txt");
+        std::fs::write(&path, vec![byte; 3 * 4096]).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let backed_up = OperationOptions {
+        overwrite: true,
+        backup: Some(BackupOptions::default()),
+        ..options()
+    };
+    let root = compared(left.path(), right.path());
+    let bases = Bases {
+        left: left.path(),
+        right: right.path(),
+    };
+    let plan = plan_copy(
+        &selection(&root, &["secret.txt"]),
+        Side::Left,
+        bases,
+        &backed_up,
+    );
+    let watch = WatchFs {
+        folder: right.path().to_path_buf(),
+        seen: std::sync::Arc::default(),
+    };
+    let cancel = Cancel::new();
+    let report = execute(
+        &plan,
+        &ExecutionContext::new(&watch, &cancel, Journaling::Disabled),
+    );
+    assert!(report.is_clean(), "{:?}", report.results);
+
+    let seen = watch.seen.lock().unwrap();
+    let names: BTreeSet<&str> = seen.iter().map(|(name, _)| name.as_str()).collect();
+    assert!(names.len() >= 3, "no temporary was seen: {names:?}");
+    for (name, mode) in seen.iter() {
+        assert_eq!(mode & 0o077, 0, "{name} had mode {mode:o}");
+    }
+    let backup = std::fs::metadata(right.path().join("secret.txt.bak")).unwrap();
+    assert_eq!(backup.permissions().mode() & 0o7777, 0o600);
+    assert_eq!(
+        std::fs::read(right.path().join("secret.txt.bak")).unwrap(),
+        vec![b'o'; 3 * 4096]
+    );
+}
+
 /// Run one copy step from `source` over the existing item `target`.
 #[cfg(windows)]
 fn replace_by_copy(base: &Path, source: &Path, target: &Path) -> StepOutcome {

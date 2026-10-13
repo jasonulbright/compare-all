@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::cancel::Cancel;
 use crate::journal::{now_unix_seconds, JournalRecord, JournalWriter};
-use crate::ops::fsops::{same_item, AttributeChange, FileOps, Reach, TargetState};
+use crate::ops::fsops::{same_item, AccessOf, AttributeChange, FileOps, Reach, TargetState};
 use crate::ops::plan::{
     onto_itself, path_is_within, Conflict, OperationOptions, OperationPlan, PathState, PlanStep,
     StepAction, Verify,
@@ -1285,9 +1285,11 @@ fn transfer(
         }
     }
 
-    // A replacement keeps the access of the file it replaces; a new file takes
-    // the access of its source.
-    let access_of = if replacing { target } else { source };
+    let access_of = if replacing {
+        AccessOf::Replaced(target)
+    } else {
+        AccessOf::Source(source)
+    };
     let copied = copy_into_temporary(
         ctx,
         step,
@@ -1428,8 +1430,7 @@ fn write_backup(
     options: &OperationOptions,
 ) -> io::Result<()> {
     let mut reader = fs.open_read(target)?;
-    fs.write_new(name, &mut *reader, options.buffer_size)?;
-    fs.match_access(target, name)
+    fs.write_new_like(name, &mut *reader, options.buffer_size, target)
 }
 
 /// True when the plan recorded an item at the step's target as
@@ -1487,23 +1488,21 @@ fn prepare_target(
     None
 }
 
-/// Copy `source` into the new file `temporary`, which takes the access of
-/// `access_of` before any content is written to it.
+/// Copy `source` into the new file `temporary`, which has the access that
+/// `access_of` names from the moment it exists.
 fn copy_into_temporary(
     ctx: &ExecutionContext<'_>,
     step: &PlanStep,
     source: &Path,
     temporary: &Path,
-    access_of: &Path,
+    access_of: AccessOf<'_>,
     options: &OperationOptions,
     total: u64,
 ) -> Result<u64, StepOutcome> {
     let fs = ctx.fs;
     let mut reader = fs.open_read(source).map_err(|e| StepOutcome::failed(&e))?;
     let mut writer = fs
-        .create_new(temporary)
-        .map_err(|e| StepOutcome::failed(&e))?;
-    fs.match_access(access_of, temporary)
+        .create_new_like(temporary, access_of)
         .map_err(|e| StepOutcome::failed(&e))?;
 
     let mut buffer = vec![0u8; options.buffer_size.max(4096)];
