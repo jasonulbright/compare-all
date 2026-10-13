@@ -838,6 +838,58 @@ fn the_backup_and_the_copy_of_a_private_file_are_private_while_they_are_written(
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn the_backup_has_every_bit_of_the_saved_file_while_it_is_written() {
+    use std::os::unix::fs::PermissionsExt;
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    for (folder, byte) in [(left.path(), b'n'), (right.path(), b'o')] {
+        std::fs::write(folder.join("shared.txt"), vec![byte; 3 * 4096]).unwrap();
+    }
+    // The process umask withholds some of these bits from a new file.
+    let target = right.path().join("shared.txt");
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o666)).unwrap();
+    let backed_up = OperationOptions {
+        overwrite: true,
+        backup: Some(BackupOptions::default()),
+        ..options()
+    };
+    let root = compared(left.path(), right.path());
+    let bases = Bases {
+        left: left.path(),
+        right: right.path(),
+    };
+    let plan = plan_copy(
+        &selection(&root, &["shared.txt"]),
+        Side::Left,
+        bases,
+        &backed_up,
+    );
+    let watch = WatchFs {
+        folder: right.path().to_path_buf(),
+        seen: std::sync::Arc::default(),
+    };
+    let cancel = Cancel::new();
+    let report = execute(
+        &plan,
+        &ExecutionContext::new(&watch, &cancel, Journaling::Disabled),
+    );
+    assert!(report.is_clean(), "{:?}", report.results);
+
+    let seen = watch.seen.lock().unwrap();
+    let temporaries: Vec<&(String, u32)> = seen
+        .iter()
+        .filter(|(name, _)| name.starts_with(".compare-all-"))
+        .collect();
+    assert!(!temporaries.is_empty(), "no backup temporary was seen");
+    for (name, mode) in temporaries {
+        assert_eq!(*mode, 0o666, "{name} had mode {mode:o}");
+    }
+    let backup = std::fs::metadata(right.path().join("shared.txt.bak")).unwrap();
+    assert_eq!(backup.permissions().mode() & 0o7777, 0o666);
+}
+
 /// Leave `path` with one access entry, full control for the current user,
 /// and return its access list.
 #[cfg(windows)]
