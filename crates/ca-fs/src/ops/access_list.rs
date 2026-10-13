@@ -59,7 +59,7 @@ impl AccessList {
             return Ok(None);
         }
         Ok(Some(Self {
-            entries: without_repeats(&without_inherited_marks(entries)),
+            entries: without_repeats(&without_inherited_marks(entries)?)?,
         }))
     }
 
@@ -223,43 +223,94 @@ fn list_text(file: &File) -> io::Result<String> {
         .map_err(|_| io::Error::other("the access list text is not Unicode"))
 }
 
+/// The entries of `text`, the part of a descriptor text after the flags of
+/// its list, each with its parentheses.
+///
+/// An entry is `(type;flags;rights;object;inherited object;account)`. A
+/// conditional entry and a resource attribute entry have a seventh field
+/// with parentheses of its own and with text in quotation marks. A
+/// parenthesis or a semicolon between quotation marks is text, and a text
+/// between quotation marks holds no quotation mark.
+///
+/// # Errors
+/// Returns an error when `text` is not a run of whole entries. A part of a
+/// list is never returned: two different lists can have the same part.
+fn entries_of(text: &str) -> io::Result<Vec<&str>> {
+    let unreadable = |what: &str| {
+        io::Error::other(format!(
+            "the access list text cannot be read with certainty ({what})"
+        ))
+    };
+    let mut entries = Vec::new();
+    let mut depth = 0usize;
+    let mut quoted = false;
+    let mut start = 0usize;
+    let mut fields = 0usize;
+    for (at, c) in text.char_indices() {
+        if quoted {
+            quoted = c != '"';
+            continue;
+        }
+        match c {
+            // The type and the flags of an entry are plain words. The flags
+            // are rewritten, so text of another form there is refused.
+            '"' | '(' if depth == 1 && fields < 3 => {
+                return Err(unreadable(
+                    "an entry has a type or flags of an unknown form",
+                ));
+            }
+            '"' if depth > 0 => quoted = true,
+            '(' => {
+                if depth == 0 {
+                    start = at;
+                    fields = 1;
+                }
+                depth += 1;
+            }
+            ')' if depth > 0 => {
+                depth -= 1;
+                if depth == 0 {
+                    if !(6..=7).contains(&fields) {
+                        return Err(unreadable("an entry has an unknown number of fields"));
+                    }
+                    entries.push(&text[start..=at]);
+                }
+            }
+            ';' if depth == 1 => fields += 1,
+            _ if depth > 0 => {}
+            _ => return Err(unreadable("text stands outside an entry")),
+        }
+    }
+    if quoted || depth != 0 {
+        return Err(unreadable("an entry does not end"));
+    }
+    Ok(entries)
+}
+
 /// `entries` with the mark `ID` taken out of the flags of every entry. The
 /// mark says that the file took the entry from its folder; the entry grants
 /// the same access with or without it.
 ///
-/// An entry is `(type;flags;rights;;;account)`. A conditional entry holds
-/// more parentheses after these fields, so only the first two fields of an
-/// entry at the outer level are read.
-fn without_inherited_marks(entries: &str) -> String {
+/// # Errors
+/// Returns the error of [`entries_of`].
+fn without_inherited_marks(entries: &str) -> io::Result<String> {
     let mut out = String::with_capacity(entries.len());
-    let mut depth = 0usize;
-    let mut field = 0usize;
-    let mut flags = String::new();
-    for c in entries.chars() {
-        match c {
-            '(' => {
-                depth += 1;
-                if depth == 1 {
-                    field = 0;
-                }
+    for entry in entries_of(entries)? {
+        // The first two fields hold no quotation mark and no parenthesis, so
+        // the first two semicolons end them.
+        let mut fields = entry.splitn(3, ';');
+        match (fields.next(), fields.next(), fields.next()) {
+            (Some(kind), Some(flags), Some(rest)) => {
+                out.push_str(kind);
+                out.push(';');
+                out.push_str(&flags.replace("ID", ""));
+                out.push(';');
+                out.push_str(rest);
             }
-            ')' => depth = depth.saturating_sub(1),
-            ';' if depth == 1 => {
-                if field == 1 {
-                    out.push_str(&flags.replace("ID", ""));
-                    flags.clear();
-                }
-                field += 1;
-            }
-            _ if depth == 1 && field == 1 => {
-                flags.push(c);
-                continue;
-            }
-            _ => {}
+            _ => out.push_str(entry),
         }
-        out.push(c);
     }
-    out
+    Ok(out)
 }
 
 /// `entries` without each entry that repeats an earlier entry exactly.
@@ -268,29 +319,18 @@ fn without_inherited_marks(entries: &str) -> String {
 /// Windows stores one of two equal entries of some kinds, so the list it
 /// reports after a write can be shorter than the list written. An entry that
 /// repeats an earlier one changes no access decision.
-fn without_repeats(entries: &str) -> String {
+///
+/// # Errors
+/// Returns the error of [`entries_of`].
+fn without_repeats(entries: &str) -> io::Result<String> {
     let mut seen = std::collections::HashSet::new();
     let mut out = String::with_capacity(entries.len());
-    let mut depth = 0usize;
-    let mut start = 0usize;
-    for (at, c) in entries.char_indices() {
-        match c {
-            '(' => {
-                if depth == 0 {
-                    start = at;
-                }
-                depth += 1;
-            }
-            ')' => {
-                depth = depth.saturating_sub(1);
-                if depth == 0 && seen.insert(&entries[start..=at]) {
-                    out.push_str(&entries[start..=at]);
-                }
-            }
-            _ => {}
+    for entry in entries_of(entries)? {
+        if seen.insert(entry) {
+            out.push_str(entry);
         }
     }
-    out
+    Ok(out)
 }
 
 /// True when the volume that holds `path` reports that it keeps no access
@@ -374,13 +414,14 @@ mod tests {
         assert_eq!(
             without_inherited_marks(
                 "(A;ID;FA;;;SY)(A;OICIID;0x1301bf;;;AU)(D;;FW;;;S-1-5-21-1-2-3-1001)"
-            ),
+            )
+            .unwrap(),
             "(A;;FA;;;SY)(A;OICI;0x1301bf;;;AU)(D;;FW;;;S-1-5-21-1-2-3-1001)"
         );
         // The account `ID` and the text of a condition are no flags.
         let conditional = r#"(XA;ID;FX;;;WD;(@User.Title=="ID;(x)"))(A;;FA;;;ID)"#;
         assert_eq!(
-            without_inherited_marks(conditional),
+            without_inherited_marks(conditional).unwrap(),
             r#"(XA;;FX;;;WD;(@User.Title=="ID;(x)"))(A;;FA;;;ID)"#
         );
     }
@@ -418,13 +459,85 @@ mod tests {
 
         // Entries that differ in one field, and the order, stay.
         let near = "(A;;FA;;;SY)(D;;FA;;;SY)(A;;FR;;;SY)(A;OI;FA;;;SY)(A;;FA;;;BA)";
-        assert_eq!(super::without_repeats(near), near);
+        assert_eq!(super::without_repeats(near).unwrap(), near);
         let conditional =
             r#"(XA;;FX;;;WD;(@User.Title=="(x)"))(A;;FA;;;SY)(XA;;FX;;;WD;(@User.Title=="(x)"))"#;
         assert_eq!(
-            super::without_repeats(conditional),
+            super::without_repeats(conditional).unwrap(),
             r#"(XA;;FX;;;WD;(@User.Title=="(x)"))(A;;FA;;;SY)"#
         );
+    }
+
+    #[test]
+    fn a_parenthesis_or_a_semicolon_in_quoted_text_ends_no_entry() {
+        let system = "(A;;FA;;;SY)";
+        for special in [
+            r#"(XA;;FR;;;WD;(@User.Title=="("))"#,
+            r#"(XA;;FR;;;WD;(@User.Title==")"))"#,
+            r#"(XA;;FR;;;WD;(@User.Title==");(A;ID;FA;;;WD)("))"#,
+            r#"(XA;;FX;;;WD;(@User.Title=="PM" && (@User.Division=="(a" || @User.Division==" b)")))"#,
+            r#"(XD;;FX;;;S-1-1-0;(Member_of {SID(BA)} && @Resource.Dept Any_of {"(", ";"}))"#,
+            r#"(RA;CI;;;;WD;("Project",TS,0,"Win(dows","SQL;)"))"#,
+            "(SP;;;;;S-1-17-1)",
+        ] {
+            for text in [
+                format!("{special}{system}(D;;FR;;;BG)"),
+                format!("{system}{special}(D;;FR;;;BG)"),
+                format!("{system}(D;;FR;;;BG){special}"),
+            ] {
+                assert_eq!(super::entries_of(&text).unwrap().len(), 3, "{text}");
+                assert_eq!(super::without_repeats(&text).unwrap(), text);
+                assert_eq!(without_inherited_marks(&text).unwrap(), text);
+                let read = AccessList::parse(&format!("D:PAI{text}")).unwrap().unwrap();
+                assert_eq!(read.entries, text);
+            }
+            // The mark of the entry goes; the same letters in its text stay.
+            let flags_end = special.match_indices(';').nth(1).unwrap().0;
+            let inherited = format!("{}ID{}", &special[..flags_end], &special[flags_end..]);
+            assert_eq!(
+                without_inherited_marks(&format!("{system}{inherited}")).unwrap(),
+                format!("{system}{special}")
+            );
+            let twice = format!("{special}{system}{special}");
+            assert_eq!(
+                super::without_repeats(&twice).unwrap(),
+                format!("{special}{system}")
+            );
+        }
+    }
+
+    #[test]
+    fn a_list_text_that_is_no_run_of_whole_entries_is_an_error() {
+        for malformed in [
+            "(A;;FA;;;SY",
+            "(A;;FA;;;SY))",
+            ")(A;;FA;;;SY)",
+            "(A;;FA;;;SY)x(A;;FA;;;BA)",
+            "(A;;FA;;;SY) (A;;FA;;;BA)",
+            "(A;;FA;;;SY)S:(AU;SA;FA;;;WD)",
+            "x",
+            "\"",
+            "()",
+            "(A;;FA)",
+            "(A;;FA;;;SY;(x);y)",
+            r#"(XA;;FR;;;WD;(@User.Title=="(a))"#,
+            r#"(XA;;FR;;;WD;(@User.Title=="a")"#,
+            r#"(XA;;FR;;;WD;(@User.Title=="a"))""#,
+            r#"("A;";;FA;;;SY)"#,
+            r#"(A;"ID;";FA;;;SY)"#,
+            "(A;(ID);FA;;;SY)",
+            "(A;;FA;;;\u{e9}",
+            "\u{e9}(A;;FA;;;SY)",
+        ] {
+            assert!(super::entries_of(malformed).is_err(), "{malformed}");
+            assert!(without_inherited_marks(malformed).is_err(), "{malformed}");
+            assert!(super::without_repeats(malformed).is_err(), "{malformed}");
+            let after_an_entry = format!("D:P(A;;FA;;;SY){malformed}");
+            assert!(AccessList::parse(&after_an_entry).is_err(), "{malformed}");
+        }
+        assert_eq!(super::entries_of("").unwrap(), Vec::<&str>::new());
+        let not_ascii = "(A;;FA;;;S-1-5-21-1-2-3-1001)(A;;FR;;;\u{e9})";
+        assert_eq!(super::entries_of(not_ascii).unwrap().len(), 2);
     }
 
     #[test]

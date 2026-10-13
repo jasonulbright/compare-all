@@ -1212,6 +1212,57 @@ fn the_backup_of_a_file_with_an_entry_that_its_folder_also_gives_is_written() {
     }
 }
 
+#[cfg(windows)]
+#[test]
+fn the_backup_of_a_file_with_a_parenthesis_in_the_text_of_a_conditional_entry_has_the_whole_list() {
+    use crate::ops::access_list::{set_for_test, text_for_test};
+    let account = current_account();
+    let dir = tempfile::tempdir().unwrap();
+    for (name, list) in [
+        (
+            "opening first.txt",
+            format!(r#"D:P(XA;;FR;;;WD;(@User.Title=="("))(A;;FA;;;{account})(A;;FR;;;BU)"#),
+        ),
+        (
+            "opening last.txt",
+            format!(r#"D:P(A;;FA;;;{account})(A;;FR;;;BU)(XA;;FR;;;WD;(@User.Title=="("))"#),
+        ),
+        (
+            "opening in the middle.txt",
+            format!(
+                r#"D:P(A;;FA;;;{account})(XA;;FR;;;WD;(@User.Title=="("))(D;;FR;;;BG)(A;;FR;;;WD)"#
+            ),
+        ),
+        (
+            "closing first.txt",
+            format!(r#"D:P(XA;;FR;;;WD;(@User.Title==")"))(A;;FA;;;{account})"#),
+        ),
+        (
+            "semicolon.txt",
+            format!(r#"D:P(A;;FA;;;{account})(XA;;FR;;;WD;(@User.Title==";)("))(A;;FR;;;BU)"#),
+        ),
+    ] {
+        let target = dir.path().join(name);
+        std::fs::write(&target, b"old").unwrap();
+        set_for_test(&target, Some(&list));
+        let before = text_for_test(&target);
+        assert_eq!(
+            before.matches("FR;;;").count(),
+            list.matches("FR;;;").count()
+        );
+
+        let outcome = replace_with_a_backup(dir.path(), name);
+
+        assert!(outcome.is_done(), "{name}: {outcome:?}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"new");
+        let backup = dir.path().join(format!("{name}.bak"));
+        assert_eq!(std::fs::read(&backup).unwrap(), b"old");
+        assert_eq!(text_for_test(&backup), before, "{name}");
+        assert_eq!(text_for_test(&target), before, "{name}");
+    }
+    assert_eq!(temporaries_in(dir.path()), Vec::<String>::new());
+}
+
 /// A reader that, at each block, tries to open every temporary of `folder`
 /// for reading and reads its access list.
 #[cfg(windows)]
