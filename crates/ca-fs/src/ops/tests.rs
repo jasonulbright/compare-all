@@ -1121,6 +1121,38 @@ fn a_write_through_a_second_name_of_the_target_does_not_change_the_backup() {
     );
 }
 
+#[cfg(windows)]
+#[test]
+fn a_replaced_target_keeps_its_hidden_and_system_flags() {
+    use std::os::windows::fs::MetadataExt;
+    const HIDDEN_AND_SYSTEM: u32 = 0x2 | 0x4;
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    std::fs::write(left.path().join("a.txt"), b"new").unwrap();
+    let target = right.path().join("a.txt");
+    std::fs::write(&target, b"old").unwrap();
+    RealFs
+        .set_attributes(
+            &target,
+            &AttributeChange {
+                hidden: Some(true),
+                system: Some(true),
+                ..AttributeChange::default()
+            },
+        )
+        .unwrap();
+    let replacing = OperationOptions {
+        overwrite: true,
+        ..options()
+    };
+
+    copy_left_to_right(left.path(), right.path(), "a.txt", &replacing);
+
+    assert_eq!(std::fs::read(&target).unwrap(), b"new");
+    let flags = std::fs::metadata(&target).unwrap().file_attributes();
+    assert_eq!(flags & HIDDEN_AND_SYSTEM, HIDDEN_AND_SYSTEM, "{flags:#x}");
+}
+
 /// Run one copy step from `source` over the existing item `target`.
 #[cfg(windows)]
 fn replace_by_copy(base: &Path, source: &Path, target: &Path) -> StepOutcome {
