@@ -1234,6 +1234,19 @@ fn transfer(
         Err(error) => return bracket(StepOutcome::failed(&error)),
     };
 
+    // A rename keeps the destination's data intact until the instant it is
+    // replaced, so it is preferred whenever the volumes allow it. It is given
+    // up when a check is asked for and there is something to lose, because
+    // only the copy path can verify before it replaces.
+    let verifying_over_something = options.verify != Verify::None && existing.is_some();
+    let renames = moving && !verifying_over_something && fs.same_volume(source, target);
+    let replaces_a_file = existing.as_ref().is_some_and(|state| !state.is_dir);
+    if replaces_a_file && !renames {
+        if let Some(reason) = fs.replace_refusal(target) {
+            return bracket(StepOutcome::skipped(reason));
+        }
+    }
+
     // One record covers the rename and the copy it can fall back to, so it
     // names the temporary the copy writes and the backup the step settles on.
     let backup = match backup_name(fs, target, existing.as_ref(), options) {
@@ -1257,12 +1270,7 @@ fn transfer(
         *backup_taken = Some(name.clone());
     }
 
-    // A rename keeps the destination's data intact until the instant it is
-    // replaced, so it is preferred whenever the volumes allow it. It is given
-    // up when a check is asked for and there is something to lose, because
-    // only the copy path can verify before it replaces.
-    let verifying_over_something = options.verify != Verify::None && existing.is_some();
-    if moving && !verifying_over_something && fs.same_volume(source, target) {
+    if renames {
         if let Some(outcome) = prepare_target(fs, target, existing.as_ref(), options) {
             return finish(outcome);
         }
@@ -1285,6 +1293,11 @@ fn transfer(
         }
     }
 
+    if replaces_a_file {
+        if let Some(reason) = fs.replace_refusal(target) {
+            return finish(StepOutcome::skipped(reason));
+        }
+    }
     let access_of = if replacing {
         AccessOf::Replaced(target)
     } else {

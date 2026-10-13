@@ -253,6 +253,13 @@ pub trait FileOps: Send + Sync {
         self.rename(from, to)
     }
 
+    /// The reason [`FileOps::replace`] cannot put a copy in place of the
+    /// existing file `to` and keep its access settings, or `None` when it
+    /// can. The executor asks before it takes a backup or copies a byte.
+    fn replace_refusal(&self, _to: &Path) -> Option<&'static str> {
+        None
+    }
+
     /// [`FileOps::create_new`] for the temporary of a copy. Where the file
     /// system keeps access settings as permission bits, the file has the bits
     /// `access` names from the moment it exists.
@@ -725,14 +732,22 @@ impl FileOps for RealFs {
 
     #[cfg(windows)]
     fn replace(&self, from: &Path, to: &Path) -> io::Result<()> {
-        // The replacement call refuses a link with error 1464 and takes
-        // Unicode text only. A rename puts the copy in place of a link, and
-        // it takes any name the volume stores.
-        let is_link = std::fs::symlink_metadata(to).is_ok_and(|meta| meta.file_type().is_symlink());
-        if is_link || from.to_str().is_none() || to.to_str().is_none() {
+        // The replacement call refuses a link with error 1464. A rename puts
+        // the copy in place of the link, which has no access list of its own
+        // to keep.
+        if std::fs::symlink_metadata(to).is_ok_and(|meta| meta.file_type().is_symlink()) {
             return std::fs::rename(from, to);
         }
         ca_io::replace_existing_file(to, from)
+    }
+
+    #[cfg(windows)]
+    fn replace_refusal(&self, to: &Path) -> Option<&'static str> {
+        // The replacement call takes Unicode text only, and a rename gives
+        // the target the access list of its folder.
+        to.to_str()
+            .is_none()
+            .then_some("target name is not Unicode, so a copy cannot keep its access list")
     }
 
     #[cfg(unix)]
