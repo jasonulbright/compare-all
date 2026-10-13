@@ -278,3 +278,34 @@ fn swap_sides_that_gives_text_back_to_a_holder_keeps_its_records_on_their_text()
     assert_eq!(view.model().lent_record_problems(), Vec::<String>::new());
     assert_eq!(view.output_text().matches("[u18]").count(), 1);
 }
+
+/// s1 holds the `c` of s2. The other lines of s2 are removed but `i`, the
+/// `X` of s3 is joined to `i`, and `i` is removed: the one line of s2 holds
+/// text of s3 only. A take of s1 gives `c` back to s2 in front of that
+/// line, so the text of s2 shows before the text of s3.
+#[test]
+fn text_given_back_goes_in_front_of_text_of_a_later_section_on_the_lenders_line() {
+    let (mut view, dir) = f1();
+    join_line_one(&mut view, 1);
+    assert_eq!(view.output_text(), "a\nbc\nd\ng\nh\ni\nX\nf\n");
+    view.output_pane.place(Caret::new(2, 0), false);
+    view.output_pane.place(Caret::new(5, 0), true);
+    view.output_pane.backspace();
+    absorb(&mut view);
+    view.output_pane.clear_selection();
+    view.output_pane.place(Caret::new(2, 1), false);
+    view.output_pane.delete();
+    absorb(&mut view);
+    view.output_pane.place(Caret::new(2, 1), false);
+    view.output_pane.backspace();
+    absorb(&mut view);
+    assert_eq!(view.output_text(), "a\nbc\nX\nf\n");
+    assert_eq!(view.model().lent_record_problems(), Vec::<String>::new());
+    take_at(&mut view, 1, Command::TakeLeft);
+    assert_eq!(view.output_text(), "a\nL\nc\nX\nf\n");
+    assert_eq!(view.model().lent_record_problems(), Vec::<String>::new());
+    assert_eq!(save_and_read(&mut view, &dir), b"a\nL\nc\nX\nf\n");
+    take_at(&mut view, 3, Command::TakeLeft);
+    take_at(&mut view, 2, Command::TakeCenter);
+    assert_eq!(view.output_text(), "a\nL\nc\nd\ng\nh\ni\nX\nf\n");
+}
