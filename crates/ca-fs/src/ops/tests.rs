@@ -1141,7 +1141,7 @@ fn the_backup_of_a_file_with_no_access_list_at_all_is_an_ordinary_copy() {
 
 /// The security identifier of the account that runs the test.
 #[cfg(windows)]
-fn current_account() -> String {
+fn current_identifier() -> String {
     let out = std::process::Command::new("whoami.exe")
         .args(["/user", "/fo", "csv", "/nh"])
         .output()
@@ -1150,6 +1150,25 @@ fn current_account() -> String {
     let account = line.trim().rsplit(',').next().unwrap().trim_matches('"');
     assert!(account.starts_with("S-1-"), "{line}");
     account.to_owned()
+}
+
+/// The account that runs the test, as Windows writes it in the text of an
+/// access list: by a short name for a well-known account, by its security
+/// identifier for every other account.
+#[cfg(windows)]
+fn current_account() -> String {
+    account_as_written(&current_identifier())
+}
+
+/// The account `identifier` as Windows writes it in the text of an access
+/// list.
+#[cfg(windows)]
+fn account_as_written(identifier: &str) -> String {
+    let text = crate::ops::access_list::as_written_for_test(&format!("D:(A;;FA;;;{identifier})"));
+    let account = text
+        .strip_prefix("D:(A;;FA;;;")
+        .and_then(|rest| rest.strip_suffix(')'));
+    account.unwrap_or_else(|| panic!("{text}")).to_owned()
 }
 
 /// A folder under `base` that gives its new files full control for the
@@ -1260,6 +1279,44 @@ fn the_backup_of_a_file_with_a_parenthesis_in_the_text_of_a_conditional_entry_ha
         assert_eq!(text_for_test(&backup), before, "{name}");
         assert_eq!(text_for_test(&target), before, "{name}");
     }
+    assert_eq!(temporaries_in(dir.path()), Vec::<String>::new());
+}
+
+#[cfg(windows)]
+#[test]
+fn the_backup_of_a_file_with_accounts_that_have_a_short_name_in_the_list_text_is_written() {
+    use crate::ops::access_list::{set_for_test, text_for_test};
+    let identifier = current_identifier();
+    // The accounts 500 and 501 of the machine of a local account have short
+    // names, as the users group has on every machine.
+    let machine = identifier.rsplit_once('-').unwrap().0;
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("short names.txt");
+    std::fs::write(&target, b"old").unwrap();
+    set_for_test(
+        &target,
+        Some(&format!(
+            "D:P(A;;FA;;;{identifier})(A;;FR;;;S-1-5-32-545)(A;;FR;;;{machine}-500)\
+             (D;;FW;;;{machine}-501)"
+        )),
+    );
+    let before = text_for_test(&target);
+    assert!(before.contains("(A;;FR;;;BU)"), "{before}");
+    assert!(!before.contains("S-1-5-32-545"), "{before}");
+    assert!(
+        before.contains(&format!("(A;;FA;;;{})", current_account())),
+        "{before}"
+    );
+    assert_eq!(account_as_written("S-1-5-18"), "SY");
+
+    let outcome = replace_with_a_backup(dir.path(), "short names.txt");
+
+    assert!(outcome.is_done(), "{outcome:?}");
+    assert_eq!(std::fs::read(&target).unwrap(), b"new");
+    let backup = dir.path().join("short names.txt.bak");
+    assert_eq!(std::fs::read(&backup).unwrap(), b"old");
+    assert_eq!(text_for_test(&backup), before);
+    assert_eq!(text_for_test(&target), before);
     assert_eq!(temporaries_in(dir.path()), Vec::<String>::new());
 }
 
