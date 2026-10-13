@@ -43,11 +43,10 @@ struct Reported {
     size: ListSize,
 }
 
-/// The number of entries of a stored access list and the bytes they use.
+/// The number of entries of a stored access list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ListSize {
     entries: u32,
-    bytes: u32,
 }
 
 impl ListSize {
@@ -55,15 +54,10 @@ impl ListSize {
     /// descriptor has none.
     fn of(descriptor: &SecurityDescriptor) -> io::Result<Self> {
         let Some(list) = descriptor.dacl() else {
-            return Ok(Self {
-                entries: 0,
-                bytes: 0,
-            });
+            return Ok(Self { entries: 0 });
         };
-        let size = GetAclInformationSize(list)?;
         Ok(Self {
-            entries: size.AceCount,
-            bytes: size.AclBytesInUse,
+            entries: GetAclInformationSize(list)?.AceCount,
         })
     }
 }
@@ -87,10 +81,12 @@ impl Reported {
     /// conditional entry as it is. The text of one stored entry can then
     /// read as several entries, or as one entry with another condition, and
     /// a list written from the text gives access that the stored list does
-    /// not give. The text is taken only when it has as many entries as the
+    /// not give. No call tells the readings of such a text apart, so a text
+    /// with a quotation mark is never taken. Every text value of an entry
+    /// stands between quotation marks, and a quotation mark in the name of
+    /// an attribute is written as a code, so a text with no quotation mark
+    /// has one reading. It is taken when it has as many entries as the
     /// stored list and Windows reads it back to a list of that many entries.
-    /// A text with a quotation mark must also read back to a list of the
-    /// same number of bytes.
     fn agrees_with_its_text(&self) -> io::Result<()> {
         let entries = &self.text[self.text.find('(').unwrap_or(self.text.len())..];
         let read = entries_of(entries)?.len();
@@ -100,17 +96,21 @@ impl Reported {
                 self.size.entries
             )));
         }
+        if self.text.contains('"') {
+            return Err(unreadable(
+                "an entry holds text in quotation marks, and such text can stand for another \
+                 stored list",
+            ));
+        }
         let again: LocalBox<SecurityDescriptor> = self.text.parse().map_err(|error| {
             io::Error::other(format!(
                 "Windows cannot read the text of the access list again ({error}); {TEXT_ADVICE}"
             ))
         })?;
         let again = ListSize::of(&again)?;
-        if again.entries != self.size.entries
-            || (self.text.contains('"') && again.bytes != self.size.bytes)
-        {
+        if again.entries != self.size.entries {
             return Err(unreadable(
-                "Windows reads the text back to a list of another size",
+                "Windows reads the text back to a list with another number of entries",
             ));
         }
         Ok(())
@@ -351,10 +351,7 @@ fn reported(file: &File) -> io::Result<Reported> {
         .next()
         .is_some_and(|flags| flags.contains(NO_LIST));
     let size = if no_list {
-        ListSize {
-            entries: 0,
-            bytes: 0,
-        }
+        ListSize { entries: 0 }
     } else {
         ListSize::of(&descriptor)?
     };
@@ -715,15 +712,10 @@ mod tests {
         let text = format!(
             r#"D:P(A;;FA;;;{account})(XA;;FR;;;WD;(@USER.Title == "a"))(A;;FA;;;WD)(XA;;FR;;;WD;(@USER.t == "b"))"#
         );
-        let as_text = Reported::from_text(&text).unwrap();
-        assert_eq!(as_text.size.entries, 4);
-        assert!(AccessList::read(&as_text).unwrap().is_some());
+        assert_eq!(Reported::from_text(&text).unwrap().size.entries, 4);
         let stored = Reported {
-            text: text.clone(),
-            size: ListSize {
-                entries: 2,
-                bytes: as_text.size.bytes,
-            },
+            text,
+            size: ListSize { entries: 2 },
         };
         let error = AccessList::read(&stored).unwrap_err().to_string();
         assert!(
@@ -732,36 +724,33 @@ mod tests {
         );
         assert!(error.contains("turn the backup off"), "{error}");
 
-        // One stored entry whose text reads as one entry with another
-        // condition: the stored list has another number of bytes.
-        let text = format!(
-            r#"D:P(A;;FA;;;{account})(XA;;FR;;;WD;(@USER.Title == "a" || @USER.t != "b"))"#
-        );
-        let as_text = Reported::from_text(&text).unwrap();
-        assert!(AccessList::read(&as_text).unwrap().is_some());
-        let stored = Reported {
-            text,
-            size: ListSize {
-                entries: 2,
-                bytes: as_text.size.bytes + 20,
-            },
-        };
-        let error = AccessList::read(&stored).unwrap_err().to_string();
-        assert!(error.contains("a list of another size"), "{error}");
+        // A text with a quotation mark and the entry count of the stored
+        // list can still stand for an entry with another condition.
+        let quoted = "an entry holds text in quotation marks";
+        for conditional in [
+            r#"(XA;;FR;;;WD;(@USER.Title == "a" || @USER.t != "b"))"#,
+            r#"(XA;;FR;;;WD;(@USER.Title == "("))"#,
+            r#"(XD;;FR;;;WD;(@RESOURCE.Dept Any_of {"a", "b"}))"#,
+        ] {
+            let text = format!("D:P(A;;FA;;;{account}){conditional}");
+            let as_text = Reported::from_text(&text).unwrap();
+            assert_eq!(as_text.size.entries, 2);
+            let error = AccessList::read(&as_text).unwrap_err().to_string();
+            assert!(error.contains(quoted), "{error}");
+            assert!(error.contains("turn the backup off"), "{error}");
+        }
 
-        // A list with no quotation mark is taken by its count alone.
-        let plain = Reported::from_text(&format!("D:PAI(A;;FA;;;{account})(A;;FR;;;BU)")).unwrap();
-        let padded = Reported {
-            text: plain.text.clone(),
-            size: ListSize {
-                entries: 2,
-                bytes: plain.size.bytes + 4,
-            },
-        };
-        assert_eq!(
-            AccessList::read(&padded).unwrap(),
-            AccessList::read(&plain).unwrap()
-        );
+        // A conditional entry with no text in quotation marks, and a list
+        // with no conditional entry, are taken by the entry count.
+        for taken in [
+            "(XA;;FR;;;WD;(@USER.Level >= 3))",
+            "(XD;;FW;;;BG;(Member_of {SID(BA)}))",
+            "(A;;FR;;;BU)",
+        ] {
+            let text = format!("D:PAI(A;;FA;;;{account}){taken}");
+            let read = AccessList::read(&Reported::from_text(&text).unwrap());
+            assert!(read.unwrap().is_some(), "{taken}");
+        }
         assert_eq!(
             AccessList::read(&Reported::from_text("D:P").unwrap())
                 .unwrap()

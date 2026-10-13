@@ -1233,11 +1233,18 @@ fn the_backup_of_a_file_with_an_entry_that_its_folder_also_gives_is_written() {
 
 #[cfg(windows)]
 #[test]
-fn the_backup_of_a_file_with_a_parenthesis_in_the_text_of_a_conditional_entry_has_the_whole_list() {
+fn a_file_with_quoted_text_in_a_conditional_entry_gets_no_backup_and_one_without_gets_it() {
     use crate::ops::access_list::{set_for_test, text_for_test};
     let account = current_account();
     let dir = tempfile::tempdir().unwrap();
     for (name, list) in [
+        (
+            "no quoted text.txt",
+            format!(
+                "D:P(A;;FA;;;{account})(XA;;FR;;;WD;(@User.Level>=3))\
+                 (XD;;FW;;;BG;(Member_of {{SID(BA)}}))(A;;FR;;;BU)"
+            ),
+        ),
         (
             "opening first.txt",
             format!(r#"D:P(XA;;FR;;;WD;(@User.Title=="("))(A;;FA;;;{account})(A;;FR;;;BU)"#),
@@ -1272,11 +1279,34 @@ fn the_backup_of_a_file_with_a_parenthesis_in_the_text_of_a_conditional_entry_ha
 
         let outcome = replace_with_a_backup(dir.path(), name);
 
-        assert!(outcome.is_done(), "{name}: {outcome:?}");
-        assert_eq!(std::fs::read(&target).unwrap(), b"new");
         let backup = dir.path().join(format!("{name}.bak"));
-        assert_eq!(std::fs::read(&backup).unwrap(), b"old");
-        assert_eq!(text_for_test(&backup), before, "{name}");
+        if name == "no quoted text.txt" {
+            assert!(outcome.is_done(), "{name}: {outcome:?}");
+            assert_eq!(std::fs::read(&target).unwrap(), b"new");
+            assert_eq!(std::fs::read(&backup).unwrap(), b"old");
+            assert_eq!(text_for_test(&backup), before, "{name}");
+            assert_eq!(text_for_test(&target), before, "{name}");
+            continue;
+        }
+        // The text of such an entry can stand for another stored list, so
+        // the backup could be open to more users than the file.
+        let StepOutcome::Failed { message } = &outcome else {
+            panic!("{name}: {outcome:?}");
+        };
+        for part in [
+            format!("{} cannot take the access list of ", backup.display()),
+            format!("{}, so nothing was replaced", target.display()),
+            "the access list text cannot be read with certainty".to_owned(),
+            "an entry holds text in quotation marks".to_owned(),
+            "turn the backup off to replace the file without a backup".to_owned(),
+        ] {
+            assert!(
+                message.contains(&part),
+                "{name}: {part} is not in: {message}"
+            );
+        }
+        assert_eq!(std::fs::read(&target).unwrap(), b"old", "{name}");
+        assert!(!backup.exists(), "{name}");
         assert_eq!(text_for_test(&target), before, "{name}");
     }
     assert_eq!(temporaries_in(dir.path()), Vec::<String>::new());
@@ -1387,7 +1417,7 @@ fn a_list_whose_text_does_not_stand_for_it_with_certainty_gets_no_backup() {
         (
             "another condition in the text.txt",
             Err(r#"Conditional 'a" || @USER.t != "b'"#),
-            [uncertain, "a list of another size"],
+            [uncertain, "an entry holds text in quotation marks"],
         ),
         (
             "no text.txt",
