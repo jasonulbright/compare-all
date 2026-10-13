@@ -303,3 +303,25 @@ fn a_second_reload_keeps_the_lines_a_changed_lender_left_out() {
     assert_eq!(finals[0], "a\nL\ncd\ng\nH\ni\nX\nf\n");
     assert_eq!(finals[0], finals[1]);
 }
+
+/// A reload asks every lent record of a changed section whether the new
+/// text starts with it. The answer reads the lines in place: only the
+/// record the new text leaves out copies them, once.
+#[test]
+fn a_reload_copies_the_lines_of_a_changed_section_only_for_a_record_it_leaves_out() {
+    use crate::model::RELOAD_LINES_COPIED;
+    for (from, to, copied) in [("\nc\nd\n", "\nx\ny\n", 0), ("\nh\n", "\nH\n", 5)] {
+        let (mut view, dir) = open(F1[0], Some(F1[1]), F1[2]);
+        run_until_ready(&mut view);
+        join(&mut view, 1);
+        join(&mut view, 1);
+        rewrite(&dir, &ALL, from, to);
+        RELOAD_LINES_COPIED.with(|lines| lines.set(0));
+        reload(&mut view);
+        assert_eq!(
+            RELOAD_LINES_COPIED.with(std::cell::Cell::get),
+            copied,
+            "{to:?}"
+        );
+    }
+}
