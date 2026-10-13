@@ -933,3 +933,100 @@ fn a_pending_take_that_restores_a_lender_holding_later_text_gives_that_text_back
     let outcome = in_order(F1, 2, &edit, LENDER_EDIT_HOLDER);
     assert_restored(&outcome, F1_TAKEN);
 }
+
+/// Taking a lender after its last lent separator was removed must leave the
+/// model and pane in sync, including when later sections are taken.
+#[test]
+fn removing_the_last_lent_separator_keeps_later_takes_in_sync() {
+    fn take_without_check(view: &mut MergeView, section: usize, command: Command) {
+        view.output_pane.clear_selection();
+        view.focus = crate::Pane::Output;
+        view.current = section;
+        view.run(command);
+    }
+
+    for split_first in [false, true] {
+        let (mut view, dir) = open(F1[0], Some(F1[1]), F1[2]);
+        run_until_ready(&mut view);
+
+        view.output_pane.place(Caret::new(1, 0), false);
+        view.output_pane.move_caret(Motion::LineEnd, false);
+        view.output_pane.delete();
+        absorb(&mut view);
+        assert_eq!(view.output_text(), "a\nbc\nd\ng\nh\ni\nX\nf\n");
+
+        if split_first {
+            view.output_pane.place(Caret::new(1, 1), false);
+            let ending = view.terminator();
+            view.output_pane.enter(ending);
+            absorb(&mut view);
+            view.output_pane.clear_selection();
+            view.output_pane.place(Caret::new(2, 0), false);
+            view.output_pane.place(Caret::new(2, 1), true);
+        } else {
+            view.output_pane.clear_selection();
+            view.output_pane.place(Caret::new(1, 0), false);
+            view.output_pane.place(Caret::new(1, 2), true);
+        }
+        view.output_pane.backspace();
+        absorb(&mut view);
+        take_without_check(&mut view, 2, Command::TakeCenter);
+
+        let empty_line = if split_first { 2 } else { 1 };
+        view.output_pane.place(Caret::new(empty_line, 0), false);
+        view.output_pane.delete();
+        view.absorb_output_edits();
+        view.output_pane.clear_selection();
+        let aligned_after_separator_removal =
+            view.output_text() == view.output_pane.buffer().text();
+
+        take_without_check(&mut view, 3, Command::TakeCenter);
+        take_without_check(&mut view, 2, Command::TakeCenter);
+        take_without_check(&mut view, 1, Command::TakeLeft);
+        let expected = "a\nL\nc\nd\ng\nh\ni\ne\nf\n";
+        assert!(aligned_after_separator_removal, "split first {split_first}");
+        assert_eq!(view.output_text(), view.output_pane.buffer().text());
+        assert_eq!(view.output_text(), expected, "split first {split_first}");
+        assert_eq!(save_and_read(&mut view, &dir), expected.as_bytes());
+    }
+}
+
+/// Returning the same conflict text after a no-op line take preserves the
+/// conflict state regardless of how many joins were used to lend it.
+#[test]
+fn no_op_line_take_preserves_conflict_state_after_multiple_joins() {
+    const INPUTS: [&str; 3] = ["a\nL1\nL2\nf\n", "a\nb\nc\nf\n", "a\nR1\nR2\nf\n"];
+    let mut states = Vec::new();
+    for joins in [1, 2] {
+        let (mut view, dir) = open(INPUTS[0], Some(INPUTS[1]), INPUTS[2]);
+        run_until_ready(&mut view);
+        for _ in 0..joins {
+            view.output_pane.place(Caret::new(0, 0), false);
+            view.output_pane.move_caret(Motion::LineEnd, false);
+            view.output_pane.delete();
+            absorb(&mut view);
+        }
+        let row = view
+            .model()
+            .rows()
+            .iter()
+            .position(|row| row.line(crate::model::Pane::Center, None) == Some(1))
+            .expect("center row for the first conflict line");
+        view.row = row;
+        view.run(Command::TakeCenterLine);
+        assert_eq!(view.output_text(), view.output_pane.buffer().text());
+        assert_eq!(view.output_text(), "a\nb\nc\nf\n");
+        let section = &view.model().sections()[1];
+        states.push((
+            section.resolution,
+            section.conflict,
+            view.model().totals().conflicts_remaining,
+        ));
+        if joins == 2 {
+            let _saved = save_and_read(&mut view, &dir);
+            assert_eq!(view.exit_code(), Some(14));
+        }
+    }
+    assert_eq!(states[0], states[1]);
+    assert_eq!(states[1], (crate::model::Resolution::Unresolved, true, 1));
+}

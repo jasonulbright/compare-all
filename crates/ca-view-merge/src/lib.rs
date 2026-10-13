@@ -2962,6 +2962,7 @@ mod tests {
     mod pending_take_reload_probes;
     mod randomized_merge_driver;
     mod take_order_probes;
+    mod two_way_lent_probes;
 
     use super::{Job, MergeSaveMessage, MergeView, Question, GIVEN_BACK};
     use crate::model::Resolution;
