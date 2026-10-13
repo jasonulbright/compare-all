@@ -310,6 +310,78 @@ fn a_7z_header_whose_coder_names_a_dictionary_past_the_limit_is_refused_with_a_m
     }
 }
 
+/// A 7z that holds the one file `a.txt`, packed as five bytes in one block
+/// that chains `coders` copies of the coder record `coder`.
+fn sevenz_chain(coder: &[u8], coders: u8) -> Vec<u8> {
+    let packed = b"hello";
+    let size = u8::try_from(packed.len()).unwrap();
+    // Header, main streams, pack info: one stream of five bytes at offset 0.
+    let mut header = vec![0x01, 0x04, 0x06, 0x00, 0x01, 0x09, size, 0x00];
+    // Unpack info: one block, its coders, the pair that binds each coder to
+    // the one before it, and one output size per coder.
+    header.extend_from_slice(&[0x07, 0x0B, 0x01, 0x00, coders]);
+    for _ in 0..coders {
+        header.extend_from_slice(coder);
+    }
+    for pair in 1..coders {
+        header.extend_from_slice(&[pair, pair - 1]);
+    }
+    header.push(0x0C);
+    header.extend(std::iter::repeat_n(size, usize::from(coders)));
+    header.push(0x00);
+    // Empty substreams info, end of the main streams.
+    header.extend_from_slice(&[0x08, 0x00, 0x00]);
+    // Files info: one file and its name.
+    let name: Vec<u8> = "a.txt\0"
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    header.extend_from_slice(&[0x05, 0x01, 0x11]);
+    header.push(u8::try_from(name.len() + 1).unwrap());
+    header.push(0x00);
+    header.extend_from_slice(&name);
+    header.extend_from_slice(&[0x00, 0x00]);
+
+    let mut record = Vec::new();
+    record.extend_from_slice(&(packed.len() as u64).to_le_bytes());
+    record.extend_from_slice(&(header.len() as u64).to_le_bytes());
+    record.extend_from_slice(&crc32fast::hash(&header).to_le_bytes());
+    let mut out = vec![b'7', b'z', 0xBC, 0xAF, 0x27, 0x1C, 0x00, 0x04];
+    out.extend_from_slice(&crc32fast::hash(&record).to_le_bytes());
+    out.extend_from_slice(&record);
+    out.extend_from_slice(packed);
+    out.extend_from_slice(&header);
+    out
+}
+
+fn read_chained_entry(bytes: Vec<u8>) -> ca_vfs::VfsResult<usize> {
+    let fs = open_memory(bytes, "x.7z")?;
+    let mut file = fs.open(&VfsPath::parse("a.txt").unwrap(), &Cancel::new())?;
+    let mut content = Vec::new();
+    file.read_to_end(&mut content).unwrap();
+    Ok(content.len())
+}
+
+#[test]
+fn a_7z_block_that_chains_more_coders_than_the_limit_is_refused_with_a_message() {
+    // A Delta coder with no properties claims no memory.
+    const DELTA: &[u8] = &[0x01, 0x03];
+    assert_eq!(read_chained_entry(sevenz_chain(DELTA, 32)).unwrap(), 5);
+
+    let error = read_chained_entry(sevenz_chain(DELTA, 33)).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            VfsError::LimitExceeded {
+                kind: LimitKind::CoderChain,
+                limit: 32,
+            }
+        ),
+        "{error:?}"
+    );
+    assert_eq!(error.to_string(), "coder chain limit exceeded: 32 coders");
+}
+
 // --- a file and a directory of the same name -----------------------------
 
 #[test]

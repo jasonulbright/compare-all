@@ -21,6 +21,8 @@ pub enum LimitKind {
     /// A decoder would claim more memory for its dictionary or model than
     /// the reader allows.
     DecoderMemory,
+    /// One block of a container chains more coders than the reader allows.
+    CoderChain,
 }
 
 impl LimitKind {
@@ -34,12 +36,14 @@ impl LimitKind {
             Self::ExpansionRatio => "expansion ratio",
             Self::NestingDepth => "nesting depth",
             Self::DecoderMemory => "decoder memory",
+            Self::CoderChain => "coder chain",
         }
     }
 
     fn unit(self) -> &'static str {
         match self {
             Self::ArchiveEntries => " entries",
+            Self::CoderChain => " coders",
             Self::EntrySize | Self::ArchiveSize | Self::DecoderMemory => " bytes",
             Self::ExpansionRatio | Self::NestingDepth => "",
         }
