@@ -379,6 +379,13 @@ impl FileOps for SourceOps {
         self.create_new(path)
     }
 
+    fn second_name(&self, target: &Path, name: &Path) -> io::Result<bool> {
+        if self.state.route(target).is_none() && self.state.route(name).is_none() {
+            return self.state.local.second_name(target, name);
+        }
+        Ok(false)
+    }
+
     fn write_new_like(
         &self,
         target: &Path,

@@ -740,6 +740,9 @@ impl FileOps for WatchFs {
     fn replace(&self, from: &Path, to: &Path) -> io::Result<()> {
         RealFs.replace(from, to)
     }
+    fn second_name(&self, target: &Path, name: &Path) -> io::Result<bool> {
+        RealFs.second_name(target, name)
+    }
     fn write_new(
         &self,
         target: &Path,
@@ -833,6 +836,62 @@ fn the_backup_and_the_copy_of_a_private_file_are_private_while_they_are_written(
         std::fs::read(right.path().join("secret.txt.bak")).unwrap(),
         vec![b'o'; 3 * 4096]
     );
+}
+
+/// Leave `path` with one access entry, full control for the current user,
+/// and return its access list.
+#[cfg(windows)]
+fn restrict_to_owner(path: &Path) -> String {
+    let user = std::env::var("USERNAME").unwrap();
+    let status = std::process::Command::new("icacls")
+        .arg(path)
+        .args(["/inheritance:r", "/grant:r"])
+        .arg(format!("{user}:F"))
+        .stdout(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let list = access_list(path);
+    assert!(!list.contains("(I)"), "{list}");
+    list
+}
+
+#[cfg(windows)]
+#[test]
+fn the_backup_of_an_owner_only_target_keeps_its_access_list() {
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    let target = right.path().join("secret.txt");
+    std::fs::write(left.path().join("secret.txt"), b"new").unwrap();
+    std::fs::write(&target, b"old").unwrap();
+    let before = restrict_to_owner(&target);
+
+    let backed_up = OperationOptions {
+        overwrite: true,
+        backup: Some(BackupOptions::default()),
+        ..options()
+    };
+    copy_left_to_right(left.path(), right.path(), "secret.txt", &backed_up);
+
+    assert_eq!(std::fs::read(&target).unwrap(), b"new");
+    let backup = right.path().join("secret.txt.bak");
+    assert_eq!(std::fs::read(&backup).unwrap(), b"old");
+    let saved = access_list(&backup);
+    assert!(
+        !saved.contains("(I)"),
+        "the backup took inherited entries: {saved}"
+    );
+    assert_eq!(
+        before.lines().count(),
+        saved.lines().count(),
+        "{before}\n{saved}"
+    );
+    let after = access_list(&target);
+    assert!(!after.contains("(I)"), "{after}");
+
+    // The backup holds the old content after the target changes again.
+    std::fs::write(&target, b"newer").unwrap();
+    assert_eq!(std::fs::read(&backup).unwrap(), b"old");
 }
 
 /// Run one copy step from `source` over the existing item `target`.
