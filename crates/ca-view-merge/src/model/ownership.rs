@@ -11,7 +11,7 @@
 //! take removes them from the holder's line. No take loses or repeats a line
 //! of another section. Characters an edit removes are gone for every section.
 
-use super::{automatic_len, MergeModel, Resolution, Section};
+use super::{MergeModel, Resolution, Section};
 use ca_text::AppliedEdit;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
@@ -545,11 +545,58 @@ impl MergeModel {
         self.shift_held_lines(index, range, inserted);
     }
 
+    /// The input lines the resolution of `state` selects, as up to two runs
+    /// of lines. Nothing for an edited section.
+    fn selection_of(&self, state: &Section) -> Option<(&[String], &[String])> {
+        fn part<'a>(lines: &'a [String], range: &Range<u32>) -> Option<&'a [String]> {
+            lines.get(range.start as usize..range.end as usize)
+        }
+        let inputs = &self.inputs;
+        let left = part(&inputs.left, &state.left);
+        let center = part(&inputs.center, &state.center);
+        let right = part(&inputs.right, &state.right);
+        let none: &[String] = &[];
+        match state.resolution {
+            Resolution::Left => Some((left?, none)),
+            Resolution::Right => Some((right?, none)),
+            Resolution::Unresolved if inputs.two_way => Some((left?, none)),
+            Resolution::Center | Resolution::Unresolved => Some((center?, none)),
+            Resolution::LeftThenRight => Some((left?, right?)),
+            Resolution::RightThenLeft => Some((right?, left?)),
+            Resolution::Edited => None,
+        }
+    }
+
+    /// Whether the output lines of `index` are the lines the resolution of
+    /// `state` selects from the inputs, separators a composition added left
+    /// out.
+    fn shows_selection_of(&self, index: usize, state: &Section) -> bool {
+        let (Some(shown), Some((first, second))) =
+            (self.output_range(index), self.selection_of(state))
+        else {
+            return false;
+        };
+        let shown = shown.start as usize..shown.end as usize;
+        first.len() + second.len() == shown.len()
+            && first.iter().chain(second).zip(shown).all(|(line, at)| {
+                let repair = self.output_repairs.get(at).copied().unwrap_or(0);
+                self.output.get(at).is_some_and(|text| {
+                    text.get(..text.len().saturating_sub(repair)) == Some(line.as_str())
+                })
+            })
+    }
+
     /// Restore the state `index` kept for when its lent text is back.
     /// Rebuild its output because edits to the holder may have changed line
     /// boundaries while the text was away. Only `lent` shows what is still
     /// away, so a caller that holds more of the section's text calls this
     /// once that text is placed.
+    ///
+    /// A state a take did not record names the input the section showed
+    /// before it lent text. It applies only when the section shows exactly
+    /// the lines of that input again. Text that came back changed, or on
+    /// other lines, leaves an edited section: a section named after an input
+    /// while it holds other text refuses the take that restores it.
     pub(super) fn apply_restore(&mut self, index: usize) {
         let Some(live) = self.sections.get(index) else {
             return;
@@ -557,13 +604,16 @@ impl MergeModel {
         let Some(restore) = live.restore.as_deref() else {
             return;
         };
+        if !live.lent.is_empty() {
+            return;
+        }
         let restore_from_take = live.restore_from_take;
         let mut state = live.clone();
         state.resolution = restore.resolution;
         state.conflict = restore.conflict || live.conflict;
-        if !live.lent.is_empty()
-            || (!restore_from_take && automatic_len(&self.inputs, &state) != live.output_len)
-        {
+        if !restore_from_take && !self.shows_selection_of(index, &state) {
+            self.touch(index);
+            self.sections[index].restore = None;
             return;
         }
         let mut returned = Vec::new();
@@ -839,10 +889,10 @@ impl MergeModel {
     /// Put the text of `entry`, a record of `lender` no line holds now, in
     /// front of the lender's own text, then apply the lender's restore.
     ///
-    /// The restore applies once the lender's last record is back. The
-    /// returned characters are not compared with the lent source: an edit
-    /// after the restore was recorded that changes a character of the
-    /// lender has already dropped it.
+    /// The restore applies once the lender's last record is back. A restore
+    /// a take recorded rebuilds the lender from the selected input whatever
+    /// characters return. Any other restore applies only to a lender that
+    /// shows the lines of its input again.
     pub(super) fn return_to_lender(
         &mut self,
         lender: usize,

@@ -2952,6 +2952,7 @@ impl ca_ui::view::ViewFactory for MergeView {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
+    mod changed_reload_probes;
     mod frame_undo_probes;
     mod lent_record_probes;
     mod lent_text_probes;
