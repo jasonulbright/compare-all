@@ -807,7 +807,7 @@ fn error_1175_leaves_both_files_under_their_names_and_the_next_call_replaces() {
 fn error_1175_of_the_replacement_call_is_tried_again_within_the_bound() {
     let unremoved = || io::Error::from_raw_os_error(1175);
     let mut calls = 0;
-    let done = retrying_unremoved(|| {
+    let done = retrying_unremoved(Path::new("output"), |_| {
         calls += 1;
         if calls < 8 {
             Err(unremoved())
@@ -818,7 +818,7 @@ fn error_1175_of_the_replacement_call_is_tried_again_within_the_bound() {
     assert_eq!(done.unwrap(), 8);
 
     let mut calls = 0;
-    let error = retrying_unremoved(|| -> io::Result<()> {
+    let error = retrying_unremoved(Path::new("output"), |_| -> io::Result<()> {
         calls += 1;
         Err(unremoved())
     })
@@ -829,7 +829,7 @@ fn error_1175_of_the_replacement_call_is_tried_again_within_the_bound() {
     // error keeps its single attempt here.
     for other in [5, 32, 33, 87, 1176, 1177] {
         let mut calls = 0;
-        let error = retrying_unremoved(|| -> io::Result<()> {
+        let error = retrying_unremoved(Path::new("output"), |_| -> io::Result<()> {
             calls += 1;
             Err(io::Error::from_raw_os_error(other))
         })
@@ -907,6 +907,118 @@ fn a_handle_of_another_program_on_the_reserved_backup_name_does_not_fail_the_rep
         assert_eq!(names(dir.path()), ["output"]);
     }
     println!("reserved backup names that the second thread held: {held}");
+}
+
+/// Runs `replace` while a second thread opens the first reserved backup name
+/// that `folder` shows and holds it until `replace` returns. Returns true
+/// when the thread held a name.
+#[cfg(windows)]
+fn while_the_first_reserved_name_is_held(folder: &Path, replace: impl FnOnce()) -> bool {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    const READ_CONTROL: u32 = 0x0002_0000;
+    const SHARE_ALL: u32 = 7;
+
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let watcher = {
+        let (stop, folder) = (std::sync::Arc::clone(&stop), folder.to_path_buf());
+        std::thread::spawn(move || {
+            let mut held = None;
+            while !stop.load(Ordering::Relaxed) {
+                if held.is_some() {
+                    std::thread::yield_now();
+                    continue;
+                }
+                let Ok(entries) = fs::read_dir(&folder) else {
+                    continue;
+                };
+                held = entries
+                    .flatten()
+                    .filter(|entry| {
+                        entry
+                            .file_name()
+                            .to_string_lossy()
+                            .starts_with(".compare-all-backup-")
+                    })
+                    .find_map(|entry| {
+                        fs::OpenOptions::new()
+                            .access_mode(READ_CONTROL)
+                            .share_mode(SHARE_ALL)
+                            .open(entry.path())
+                            .ok()
+                    });
+            }
+            held.is_some()
+        })
+    };
+    replace();
+    stop.store(true, Ordering::Relaxed);
+    watcher.join().unwrap()
+}
+
+#[cfg(windows)]
+#[test]
+fn error_1175_for_a_file_that_the_account_can_only_read_does_not_fail_the_next_attempt() {
+    use std::process::Command;
+
+    let mut held = 0;
+    for round in 0..200 {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("output");
+        fs::write(&target, b"original").unwrap();
+        // The owner and every user may read the file; the list gives no
+        // right to write it, to delete it or to change the list.
+        let applied = Command::new("icacls")
+            .arg(&target)
+            .args([
+                "/inheritance:r",
+                "/grant:r",
+                "*S-1-3-4:(R)",
+                "*S-1-5-11:(R)",
+            ])
+            .output()
+            .unwrap();
+        assert!(applied.status.success(), "{applied:?}");
+        let replaced = if round % 2 == 0 {
+            while_the_first_reserved_name_is_held(dir.path(), || {
+                write_atomic(&target, b"replacement").unwrap();
+            })
+        } else {
+            let replacement = dir.path().join("new");
+            fs::write(&replacement, b"replacement").unwrap();
+            while_the_first_reserved_name_is_held(dir.path(), || {
+                replace_existing_file(&target, &replacement).unwrap();
+            })
+        };
+        held += usize::from(replaced);
+        assert_eq!(fs::read(&target).unwrap(), b"replacement");
+        assert_eq!(names(dir.path()), ["output"]);
+        if held >= 6 && round % 2 == 1 {
+            break;
+        }
+    }
+    assert!(held > 0, "no reserved backup name was held in 200 rounds");
+}
+
+#[test]
+#[cfg(windows)]
+fn a_failure_after_error_1175_names_the_file_and_the_cause() {
+    let mut calls = 0;
+    let error = retrying_unremoved(Path::new("output"), |again| -> io::Result<()> {
+        calls += 1;
+        assert_eq!(again, calls > 1);
+        Err(io::Error::from_raw_os_error(if calls < 3 {
+            1175
+        } else {
+            5
+        }))
+    })
+    .unwrap_err();
+    assert_eq!(calls, 3);
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    let message = error.to_string();
+    assert!(message.starts_with("output was not replaced: another program held"));
+    assert!(message.contains("(os error 1175)") && message.contains("(os error 5)"));
 }
 
 #[cfg(windows)]
