@@ -2,9 +2,9 @@ use super::*;
 use ca_ui::editor::Caret;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-const SEEDS: [u64; 21] = [
+const SEEDS: [u64; 23] = [
     0x1001, 0x1002, 0x1003, 0x1004, 0x1005, 0x1006, 0x1007, 0x1008, 0x1009, 0x100a, 0x3001, 0x3002,
-    0x3003, 0x3004, 0x3005, 0x3006, 0x3007, 0x3008, 0x3009, 0x300a, 0x6101,
+    0x3003, 0x3004, 0x3005, 0x3006, 0x3007, 0x3008, 0x3009, 0x300a, 0x6101, 0x7107, 0x9107,
 ];
 const CASES: usize = 600;
 const CLAMP_COUNTERS: [&std::thread::LocalKey<std::cell::Cell<usize>>; 3] = [
@@ -1816,7 +1816,7 @@ fn run(frames: bool) {
             "reported"
         };
         println!("CLASS {class} ({asserted}): {} case(s)", list.len());
-        for set in ["seed 0x1", "seed 0x3", "seed 0x6"] {
+        for set in ["seed 0x1", "seed 0x3", "seed 0x6", "seed 0x7", "seed 0x9"] {
             let in_set = list
                 .iter()
                 .filter(|(_, text)| text.starts_with(set))
