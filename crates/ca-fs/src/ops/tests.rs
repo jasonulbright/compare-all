@@ -977,13 +977,26 @@ fn the_backup_of_an_owner_only_target_keeps_its_access_list() {
 /// Run one copy step from `source` over the existing item `target`.
 #[cfg(windows)]
 fn replace_by_copy(base: &Path, source: &Path, target: &Path) -> StepOutcome {
+    let replacing = OperationOptions {
+        overwrite: true,
+        ..options()
+    };
+    replace_by_copy_with(base, source, target, replacing)
+}
+
+/// Run one copy step from `source` over the existing item `target` with
+/// `options`.
+#[cfg(windows)]
+fn replace_by_copy_with(
+    base: &Path,
+    source: &Path,
+    target: &Path,
+    options: OperationOptions,
+) -> StepOutcome {
     let mut plan = OperationPlan::new(
         crate::ops::plan::OperationKind::Copy,
         vec![base.to_path_buf()],
-        OperationOptions {
-            overwrite: true,
-            ..options()
-        },
+        options,
     );
     plan.steps.push(PlanStep {
         index: 0,
@@ -1026,7 +1039,7 @@ fn a_copy_over_a_file_link_puts_the_copy_in_place_of_the_link() {
 
 #[cfg(windows)]
 #[test]
-fn a_copy_over_a_name_that_is_not_unicode_replaces_the_file() {
+fn a_copy_over_a_name_that_is_not_unicode_is_refused_before_a_backup_or_a_copy() {
     use std::os::windows::ffi::OsStringExt;
     let base = tempfile::tempdir().unwrap();
     let source = base.path().join("source.txt");
@@ -1041,10 +1054,21 @@ fn a_copy_over_a_name_that_is_not_unicode_replaces_the_file() {
         return;
     }
 
-    let outcome = replace_by_copy(base.path(), &source, &target);
+    let backed_up = OperationOptions {
+        overwrite: true,
+        backup: Some(BackupOptions::default()),
+        ..options()
+    };
+    let outcome = replace_by_copy_with(base.path(), &source, &target, backed_up);
 
-    assert!(outcome.is_done(), "{outcome:?}");
-    assert_eq!(std::fs::read(&target).unwrap(), b"new");
+    // The replacement that keeps an access list takes Unicode text only, so
+    // the step ends before it changes the folder.
+    assert!(
+        matches!(&outcome, StepOutcome::Skipped { reason } if reason.contains("not Unicode")),
+        "{outcome:?}"
+    );
+    assert_eq!(std::fs::read(&target).unwrap(), b"old");
+    assert_eq!(std::fs::read_dir(base.path()).unwrap().count(), 2);
 }
 
 #[test]

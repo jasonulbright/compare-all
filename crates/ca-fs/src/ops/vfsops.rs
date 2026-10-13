@@ -371,6 +371,13 @@ impl FileOps for SourceOps {
         self.rename(from, to)
     }
 
+    fn replace_refusal(&self, to: &Path) -> Option<&'static str> {
+        if self.state.route(to).is_none() {
+            return self.state.local.replace_refusal(to);
+        }
+        None
+    }
+
     fn create_new_like(&self, path: &Path, access: AccessOf<'_>) -> io::Result<Box<dyn SyncWrite>> {
         let (AccessOf::Replaced(model) | AccessOf::Source(model)) = access;
         if self.state.route(path).is_none() && self.state.route(model).is_none() {
