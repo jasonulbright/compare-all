@@ -197,6 +197,7 @@ fn finalization_failure_does_not_commit_or_leave_temporary_files() {
                 Err(io::Error::other("injected flush/sync failure"))
             },
             0o666,
+            |_, _| Ok(()),
             false,
             None,
         );

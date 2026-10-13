@@ -51,6 +51,7 @@ pub fn write_atomic_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
             file.sync_all()
         },
         0o600,
+        |_, _| Ok(()),
         false,
         None,
     )
@@ -123,6 +124,7 @@ pub fn replace_checked<T, E: From<io::Error>>(
             file.sync_all()
         },
         0o666,
+        |_, _| Ok(()),
         false,
         None,
     )
@@ -151,6 +153,7 @@ pub fn replace_checked_preserving_conflict<T, E: From<io::Error>>(
             file.sync_all()
         },
         0o666,
+        |_, _| Ok(()),
         false,
         Some(&mut has_conflict),
     )
@@ -175,24 +178,32 @@ pub fn replace_new_checked<T, E: From<io::Error>>(
             file.sync_all()
         },
         0o666,
+        |_, _| Ok(()),
         true,
         None,
     )
     .map(|(value, _)| value)
 }
 
-/// Like [`replace_new_checked`], for a file that Unix creates with the
-/// permission bits `mode`, less the bits the process umask withholds. The
-/// temporary has those bits from the moment it exists.
+/// Like [`replace_new_checked`], for a file whose access the caller sets
+/// before the file holds a byte.
+///
+/// Unix creates the temporary with the permission bits `mode`, less the bits
+/// the process umask withholds. `prepare` then gets the open, empty temporary
+/// and its path, and can set the access of the file there. A rename keeps
+/// that access, so the file is never open to more users under its temporary
+/// name or under `path` than `prepare` allows. An error from `prepare`
+/// removes the temporary.
 ///
 /// # Errors
 /// Returns [`io::ErrorKind::AlreadyExists`] if another writer creates the
 /// target before commit, or another preparation, write or sync error.
-pub fn replace_new_with_mode<T, E: From<io::Error>>(
+pub fn replace_new_prepared<T, E: From<io::Error>>(
     path: &Path,
     produce: impl FnOnce(&mut dyn Write) -> Result<T, E>,
     check: impl FnMut() -> Result<(), E>,
     mode: u32,
+    prepare: impl FnOnce(&File, &Path) -> io::Result<()>,
 ) -> Result<T, E> {
     replace_impl(
         path,
@@ -203,18 +214,21 @@ pub fn replace_new_with_mode<T, E: From<io::Error>>(
             file.sync_all()
         },
         mode,
+        prepare,
         true,
         None,
     )
     .map(|(value, _)| value)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn replace_impl<T, E: From<io::Error>>(
     path: &Path,
     produce: impl FnOnce(&mut dyn Write) -> Result<T, E>,
     mut check: impl FnMut() -> Result<(), E>,
     finish: impl FnOnce(&mut File) -> io::Result<()>,
     new_file_mode: u32,
+    prepare: impl FnOnce(&File, &Path) -> io::Result<()>,
     require_absent: bool,
     mut has_conflict: Option<&mut dyn FnMut(&Path) -> bool>,
 ) -> Result<(T, Option<PathBuf>), E> {
@@ -239,6 +253,7 @@ fn replace_impl<T, E: From<io::Error>>(
     #[cfg(not(unix))]
     let _ = new_file_mode;
     let mut temporary = builder.tempfile_in(parent)?;
+    prepare(temporary.as_file(), temporary.path())?;
     let result = produce(temporary.as_file_mut())?;
     if let Some(permissions) = &permissions {
         temporary
