@@ -272,11 +272,11 @@ fn takes_after_a_reload_with_the_lender_changed_give_one_result_in_every_order()
 }
 
 /// `c` and `d` of s2 change to `x` and `y` on disk. The new text of s2
-/// shows no line of the joined `cd`, so s1 keeps it and s2 still lends it on
-/// its automatic side. Take All Non-Conflicting takes s2 like an explicit
-/// take: one result in both orders with the holder take.
+/// does not start with the joined `cd`, so that copy leaves s1 and s2 lends
+/// nothing. Take All Non-Conflicting, the lender take and the holder take
+/// give one result in every order.
 #[test]
-fn take_all_takes_a_lender_left_on_its_side_by_a_reload_like_an_explicit_take() {
+fn takes_after_a_reload_that_replaced_the_lent_lines_give_one_result_in_every_order() {
     let lender = Some((2, Command::TakeCenter));
     let holder = Some((1, Command::TakeLeft));
     let orders: [&[Option<(usize, Command)>]; 4] = [
@@ -287,8 +287,9 @@ fn take_all_takes_a_lender_left_on_its_side_by_a_reload_like_an_explicit_take() 
     ];
     for inputs in [F1, F1_CRLF, CRLF_CENTER] {
         let (view, _dir) = joined_then_reloaded(inputs, C_D_TO_X_Y);
-        assert!(!view.model().sections()[2].lent_records().is_empty());
+        assert!(view.model().sections()[2].lent_records().is_empty());
         assert_eq!(view.model().sections()[2].resolution, Resolution::Center);
+        assert!(!view.output_text().contains("cd"), "{inputs:?}");
         let taken = center_with_line_one_of(inputs, inputs[0])
             .replace("\nc", "\nx")
             .replace("\nd", "\ny");

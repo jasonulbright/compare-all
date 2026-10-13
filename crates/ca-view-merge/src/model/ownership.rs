@@ -156,9 +156,10 @@ thread_local! {
 impl MergeModel {
     /// Every way the lent records break their invariants: each record sits
     /// on a line of an earlier section, holds characters that line shows at
-    /// its column and overlaps no other record; order numbers are unique and
-    /// issued; the oldest record of a lender carries a source; and each
-    /// section names the last lender it holds text of.
+    /// its column and overlaps no other record; a lender is an edited
+    /// section; order numbers are unique and issued; the oldest record of a
+    /// lender carries a source; and each section names the last lender it
+    /// holds text of.
     #[cfg(test)]
     pub(crate) fn lent_record_problems(&self) -> Vec<String> {
         let mut problems = Vec::new();
@@ -206,6 +207,12 @@ impl MergeModel {
                     .entry(line)
                     .or_default()
                     .push((start, start + count, lender));
+            }
+            if !section.lent.is_empty() && !matches!(section.resolution, Resolution::Edited) {
+                problems.push(format!(
+                    "s{lender} lends text as {:?}, not as an edited section",
+                    section.resolution
+                ));
             }
             let oldest = section.lent.iter().min_by_key(|entry| entry.seq);
             if oldest.is_some_and(|entry| entry.source.is_none()) {
@@ -346,9 +353,24 @@ impl MergeModel {
         let Some(record) = self.lent_record(lender, seq).cloned() else {
             return;
         };
+        self.strip_record(&record, Some((lender, seq)));
+    }
+
+    /// Remove the text of `record` from its holder's line. `kept` names the
+    /// lender and the order number of the record while a section keeps it;
+    /// without it the record belongs to no section. Other records on the
+    /// line keep their characters. The holder keeps its wait for review.
+    pub(super) fn strip_record(&mut self, record: &super::Lent, kept: Option<(usize, u64)>) {
         let holder = record.holder;
+        let lose = |model: &mut Self| {
+            if let Some((lender, seq)) = kept {
+                if let Some(removed) = model.remove_lent(lender, seq, true) {
+                    model.uncover_after(lender, &removed);
+                }
+            }
+        };
         let Some(range) = self.output_range(holder) else {
-            let _ = self.remove_lent(lender, seq, true);
+            lose(self);
             return;
         };
         let line = (range.start + record.offset) as usize;
@@ -357,10 +379,10 @@ impl MergeModel {
         let column = record.column as usize;
         let start = byte_at(&text, column);
         let end = byte_at(&text, column + record.text.chars().count());
-        if record.offset >= range.end - range.start || text.get(start..end) != Some(&record.text) {
-            if let Some(removed) = self.remove_lent(lender, seq, true) {
-                self.uncover_after(lender, &removed);
-            }
+        if record.offset >= range.end - range.start
+            || text.get(start..end) != Some(record.text.as_str())
+        {
+            lose(self);
             return;
         }
         // A separator the composition added stays a separator: the seam
@@ -374,7 +396,7 @@ impl MergeModel {
         let removed_chars = record.text.chars().count();
         let mut others = Vec::new();
         for (other, other_seq, _, _) in self.records_on_line(holder, line) {
-            if (other, other_seq) == (lender, seq) {
+            if Some((other, other_seq)) == kept {
                 continue;
             }
             if let Some(mut entry) = self.remove_lent(other, other_seq, false) {
@@ -384,8 +406,10 @@ impl MergeModel {
                 others.push((other, entry));
             }
         }
-        if let Some(removed) = self.remove_lent(lender, seq, false) {
-            self.uncover_after(lender, &removed);
+        if let Some((lender, seq)) = kept {
+            if let Some(removed) = self.remove_lent(lender, seq, false) {
+                self.uncover_after(lender, &removed);
+            }
         }
         let conflict = self.sections[holder].conflict;
         let replacement = if stripped.is_empty() {
