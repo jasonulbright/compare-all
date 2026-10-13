@@ -1817,8 +1817,30 @@ fn run_case(
     }
 }
 
+/// The seeds and the cases per seed of a run. `MERGE_DRIVER_SEEDS`, a comma
+/// separated list of hexadecimal seeds, and `MERGE_DRIVER_CASES` replace the
+/// tracked ones, for a run on seeds no change was fitted to.
+fn plan(cases: usize) -> (Vec<u64>, usize) {
+    let seeds = std::env::var("MERGE_DRIVER_SEEDS")
+        .ok()
+        .map(|list| {
+            list.split(',')
+                .filter_map(|seed| {
+                    u64::from_str_radix(seed.trim().trim_start_matches("0x"), 16).ok()
+                })
+                .collect::<Vec<u64>>()
+        })
+        .filter(|seeds| !seeds.is_empty())
+        .unwrap_or_else(|| SEEDS.to_vec());
+    let cases = std::env::var("MERGE_DRIVER_CASES")
+        .ok()
+        .and_then(|count| count.trim().parse().ok())
+        .unwrap_or(cases);
+    (seeds, cases)
+}
+
 fn run(frames: bool, two_way: bool, cases: usize) {
-    let seeds = SEEDS.to_vec();
+    let (seeds, cases) = plan(cases);
     let mut stats = Stats::default();
     let mut findings: BTreeMap<String, Vec<(usize, String)>> = BTreeMap::new();
     let mut empty = 0;
