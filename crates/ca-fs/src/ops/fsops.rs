@@ -666,6 +666,13 @@ impl FileOps for RealFs {
 
     #[cfg(windows)]
     fn replace(&self, from: &Path, to: &Path) -> io::Result<()> {
+        // The replacement call refuses a link with error 1464 and takes
+        // Unicode text only. A rename puts the copy in place of a link, and
+        // it takes any name the volume stores.
+        let is_link = std::fs::symlink_metadata(to).is_ok_and(|meta| meta.file_type().is_symlink());
+        if is_link || from.to_str().is_none() || to.to_str().is_none() {
+            return std::fs::rename(from, to);
+        }
         ca_io::replace_existing_file(to, from)
     }
 
