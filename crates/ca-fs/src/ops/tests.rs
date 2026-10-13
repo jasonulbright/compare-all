@@ -1868,6 +1868,37 @@ fn a_new_name_that_names_another_folder_is_refused_while_planning() {
     assert!(!left.path().join("sub/inner/moved-down.txt").exists());
 }
 
+#[cfg(windows)]
+#[test]
+fn a_new_name_with_a_colon_is_refused_while_planning() {
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    std::fs::write(left.path().join("a.txt"), b"a").unwrap();
+    std::fs::write(left.path().join("b.txt"), b"b").unwrap();
+    let root = compared(left.path(), right.path());
+    let bases = Bases {
+        left: left.path(),
+        right: right.path(),
+    };
+    for name in ["Q:moved.txt", "b.txt:stream", "b.txt::$$DATA"] {
+        let action = RenameAction::Regex {
+            find: r"^a\.txt$".to_string(),
+            replace: name.to_string(),
+        };
+        let plan = rename_plan(&root, &["a.txt"], Sides::Left, &action, bases, &options()).unwrap();
+        assert!(plan.steps.is_empty(), "{name:?}: {:?}", plan.steps);
+        assert!(
+            plan.skipped
+                .iter()
+                .any(|skip| skip.path == Path::new("a.txt") && skip.reason.contains("colon")),
+            "{name:?}: {:?}",
+            plan.skipped
+        );
+    }
+    assert_eq!(std::fs::read(left.path().join("a.txt")).unwrap(), b"a");
+    assert_eq!(std::fs::read(left.path().join("b.txt")).unwrap(), b"b");
+}
+
 #[test]
 fn a_rename_on_both_sides_of_a_pair_is_not_refused_as_a_duplicate() {
     let left = tempfile::tempdir().unwrap();
