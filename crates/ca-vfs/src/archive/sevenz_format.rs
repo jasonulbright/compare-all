@@ -267,6 +267,7 @@ fn skip_block(cursor: &mut HeaderCursor<'_>) -> VfsResult<u64> {
         return Err(coder_chain_limit());
     }
     let (mut inputs, mut outputs) = (0u64, 0u64);
+    let mut claimed = 0u64;
     for _ in 0..coders {
         let flags = cursor.byte()?;
         if flags & 0x80 != 0 {
@@ -286,7 +287,7 @@ fn skip_block(cursor: &mut HeaderCursor<'_>) -> VfsResult<u64> {
         } else {
             &[]
         };
-        claim_memory(&mut 0, method, properties)?;
+        claim_memory(&mut claimed, method, properties)?;
     }
     let pairs = outputs.checked_sub(1).ok_or_else(malformed)?;
     for _ in 0..pairs {
@@ -306,8 +307,9 @@ fn malformed() -> VfsError {
     VfsError::corrupt("7z header is truncated or malformed")
 }
 
-/// Most memory one coder may name for its dictionary or model, the same
-/// ceiling the xz and LZMA readers apply.
+/// Most memory the coders of one block may name together for their
+/// dictionaries and models, the same ceiling the xz and LZMA readers apply to
+/// one stream. The decoders of a block are all open while the block is read.
 const CODER_MEMORY_LIMIT: u64 = super::span::DICTIONARY_LIMIT_KIB as u64 * 1024;
 
 const METHOD_LZMA: &[u8] = &[0x03, 0x01, 0x01];
@@ -370,8 +372,9 @@ fn check_blocks(archive: &sevenz_rust2::Archive) -> VfsResult<()> {
         if block.coders.len() as u64 > MAX_BLOCK_CODERS {
             return Err(coder_chain_limit());
         }
+        let mut claimed = 0u64;
         for coder in &block.coders {
-            claim_memory(&mut 0, coder.encoder_method_id(), coder.properties())?;
+            claim_memory(&mut claimed, coder.encoder_method_id(), coder.properties())?;
         }
     }
     Ok(())
@@ -710,6 +713,16 @@ mod tests {
         assert!(check_coder(METHOD_PPMD, &field(192 << 20)).is_ok());
         assert!(check_coder(METHOD_PPMD, &field(1 << 30)).is_err());
         assert!(check_coder(&[0x00], &[]).is_ok());
+    }
+
+    #[test]
+    fn the_coders_of_one_block_share_the_memory_ceiling() {
+        // LZMA2 property 30 names 128 MiB.
+        let mut claimed = 0;
+        assert!(claim_memory(&mut claimed, METHOD_LZMA2, &[30]).is_ok());
+        assert!(claim_memory(&mut claimed, &[0x03], &[]).is_ok());
+        assert!(claim_memory(&mut claimed, METHOD_LZMA2, &[30]).is_ok());
+        assert!(claim_memory(&mut claimed, METHOD_LZMA2, &[0]).is_err());
     }
 
     /// The header bytes of one block that chains `coders` Delta coders.

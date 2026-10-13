@@ -382,6 +382,15 @@ fn a_7z_block_that_chains_more_coders_than_the_limit_is_refused_with_a_message()
     assert_eq!(error.to_string(), "coder chain limit exceeded: 32 coders");
 }
 
+#[test]
+fn a_7z_block_whose_coders_together_name_memory_past_the_limit_is_refused() {
+    // Two LZMA2 coders, and property byte 32 names 256 MiB for each.
+    const LZMA2_256_MIB: &[u8] = &[0x21, 0x21, 0x01, 32];
+    let error = read_chained_entry(sevenz_chain(LZMA2_256_MIB, 2)).unwrap_err();
+    assert!(is_decoder_memory_refusal(&error), "{error:?}");
+    assert!(error.to_string().contains("268435456"), "{error}");
+}
+
 // --- a file and a directory of the same name -----------------------------
 
 #[test]
