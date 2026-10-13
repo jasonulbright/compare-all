@@ -265,7 +265,6 @@ fn swap_sides_that_gives_text_back_to_a_holder_keeps_its_records_on_their_text()
     run_until_ready(&mut view);
     assert_output_lines_match_pane(&view);
     assert_eq!(view.model().lent_record_problems(), Vec::<String>::new());
-    println!("after swap: {:?}", view.output_text());
     let holder = view
         .model()
         .sections()
@@ -273,7 +272,6 @@ fn swap_sides_that_gives_text_back_to_a_holder_keeps_its_records_on_their_text()
         .position(crate::model::Section::holds_joined_lines)
         .unwrap();
     take_at(&mut view, holder, Command::TakeLeft);
-    println!("after holder take: {:?}", view.output_text());
     assert_eq!(view.model().lent_record_problems(), Vec::<String>::new());
     assert_eq!(view.output_text().matches("[u18]").count(), 1);
 }
