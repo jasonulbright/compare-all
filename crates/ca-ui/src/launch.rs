@@ -91,14 +91,28 @@ pub trait Spawner: Send + Sync + 'static {
     /// # Errors
     /// Returns what to tell the user when the program cannot be started.
     fn spawn(&self, command: &LaunchCommand) -> Result<(), String>;
+
+    /// Start `command`, a program that ends as soon as it has passed its
+    /// request on, and wait for it to end. The call blocks, so it runs on a
+    /// worker.
+    ///
+    /// # Errors
+    /// Returns what to tell the user when the program cannot be started or
+    /// ends with a failure status.
+    fn run(&self, command: &LaunchCommand) -> Result<(), String> {
+        self.spawn(command)
+    }
 }
 
 /// The spawner that starts a real process.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SystemSpawner;
 
-impl Spawner for SystemSpawner {
-    fn spawn(&self, command: &LaunchCommand) -> Result<(), String> {
+/// How long [`Spawner::run`] waits for the program to end.
+const RUN_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+impl SystemSpawner {
+    fn start(command: &LaunchCommand) -> Result<std::process::Child, String> {
         let mut process = ca_io::host_command::host_command(&command.program);
         add_arguments(&mut process, command);
         process
@@ -108,14 +122,45 @@ impl Spawner for SystemSpawner {
         if let Some(directory) = &command.working_directory {
             process.current_dir(directory);
         }
-        // The child is not waited for, so the program keeps running after the
-        // comparison it was started from is closed.
-        process.spawn().map(|_| ()).map_err(|error| {
+        process.spawn().map_err(|error| {
             format!(
                 "{} could not be started: {error}",
                 command.program.display()
             )
         })
+    }
+}
+
+impl Spawner for SystemSpawner {
+    fn spawn(&self, command: &LaunchCommand) -> Result<(), String> {
+        // The child is not waited for, so the program keeps running after the
+        // comparison it was started from is closed.
+        Self::start(command).map(|_| ())
+    }
+
+    fn run(&self, command: &LaunchCommand) -> Result<(), String> {
+        let mut child = Self::start(command)?;
+        let deadline = std::time::Instant::now() + RUN_WAIT;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) if status.success() => return Ok(()),
+                Ok(Some(status)) => {
+                    return Err(format!("{} ended with {status}", command.program.display()));
+                }
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                // A program that still runs has reported no failure. It is
+                // left to end by itself.
+                Ok(None) => return Ok(()),
+                Err(error) => {
+                    return Err(format!(
+                        "{} could not be waited for: {error}",
+                        command.program.display()
+                    ));
+                }
+            }
+        }
     }
 }
 
@@ -373,19 +418,72 @@ pub fn reveal(
     notify: Arc<dyn Fn() + Send + Sync>,
 ) -> Job<LaunchMessage> {
     let path = path.to_path_buf();
-    let description = path.display().to_string();
     Job::spawn_notifying(
         move |emitter, _| {
-            // The command reads the file system, so it is built on this
-            // worker.
-            let command = system_explorer_command(&path, selection);
-            emitter.send(match spawner.spawn(&command) {
-                Ok(()) => LaunchMessage::Started { description },
-                Err(reason) => LaunchMessage::Failed { reason },
-            });
+            // The command reads the file system and can wait for a program,
+            // so it is built and started on this worker.
+            emitter.send(show_on(
+                std::env::consts::OS,
+                &path,
+                selection,
+                spawner.as_ref(),
+                mac_folder,
+            ));
         },
         notify,
     )
+}
+
+/// Show `path` in the file manager of the platform named `os` and say what
+/// happened.
+///
+/// The file managers open another folder for an item that is gone and
+/// report nothing, so the item is looked for first. `open` on macOS ends
+/// when it has passed the item on, with a failure status when it could not,
+/// so it is waited for. The Windows file manager ends with the same status
+/// for every outcome, and `xdg-open` can run as long as the file manager it
+/// starts; neither is waited for.
+fn show_on(
+    os: &str,
+    path: &std::path::Path,
+    selection: Selection,
+    spawner: &dyn Spawner,
+    mac_folder: impl FnOnce(&std::path::Path) -> MacFolder,
+) -> LaunchMessage {
+    let shown = path.display();
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {}
+        // Linux and macOS give the second kind for a path under a file.
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return LaunchMessage::Failed {
+                reason: format!("{shown} no longer exists."),
+            };
+        }
+        Err(error) => {
+            return LaunchMessage::Failed {
+                reason: format!("{shown} cannot be shown: {error}"),
+            };
+        }
+    }
+    let command = explorer_command_on(os, path, selection, std::path::Path::is_dir, mac_folder);
+    let started = if os == "macos" {
+        spawner
+            .run(&command)
+            .map_err(|reason| format!("{shown} could not be shown: {reason}"))
+    } else {
+        spawner.spawn(&command)
+    };
+    match started {
+        Ok(()) => LaunchMessage::Started {
+            description: shown.to_string(),
+        },
+        Err(reason) => LaunchMessage::Failed { reason },
+    }
 }
 
 /// Hand `path` to the platform's handler on a worker.
@@ -724,6 +822,134 @@ mod tests {
             started[0].arguments.last().map(String::as_str),
             Some(folder.as_str())
         );
+    }
+
+    /// A spawner whose program starts and then ends with a failure status.
+    #[derive(Default)]
+    struct EndsWithFailure {
+        not_waited_for: Mutex<Vec<LaunchCommand>>,
+        waited_for: Mutex<Vec<LaunchCommand>>,
+    }
+
+    impl Spawner for EndsWithFailure {
+        fn spawn(&self, command: &LaunchCommand) -> Result<(), String> {
+            self.not_waited_for.lock().unwrap().push(command.clone());
+            Ok(())
+        }
+
+        fn run(&self, command: &LaunchCommand) -> Result<(), String> {
+            self.waited_for.lock().unwrap().push(command.clone());
+            Err("the program ended with exit status: 1".to_owned())
+        }
+    }
+
+    #[test]
+    fn an_item_that_is_gone_gets_a_message_that_names_it_and_no_program_starts() {
+        let base = tempfile::tempdir().unwrap();
+        let gone = base.path().join("gone, moved.txt");
+        let under_a_file = base.path().join("note.txt").join("inside");
+        std::fs::write(base.path().join("note.txt"), b"text").unwrap();
+        for path in [&gone, &under_a_file] {
+            let expected = LaunchMessage::Failed {
+                reason: format!("{} no longer exists.", path.display()),
+            };
+            for os in ["windows", "macos", "linux"] {
+                for selection in [Selection::Files, Selection::Folders] {
+                    let recorder = Arc::new(Recorder::default());
+                    let message =
+                        super::show_on(os, path, selection, &recorder, |_| MacFolder::Plain);
+                    assert_eq!(message, expected, "{os}");
+                    assert!(recorder.started.lock().unwrap().is_empty(), "{os}");
+                }
+            }
+            let recorder = Arc::new(Recorder::default());
+            let mut job = super::reveal(
+                path,
+                Selection::Folders,
+                Arc::new(Arc::clone(&recorder)),
+                Arc::new(|| {}),
+            );
+            assert_eq!(settle(&mut job), expected);
+            assert!(recorder.started.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn a_failure_status_of_the_mac_command_is_no_start_and_names_the_item() {
+        let base = tempfile::tempdir().unwrap();
+        let file = base.path().join("note.txt");
+        std::fs::write(&file, b"text").unwrap();
+        for (path, selection) in [
+            (file.as_path(), Selection::Files),
+            (base.path(), Selection::Folders),
+        ] {
+            let spawner = EndsWithFailure::default();
+            let message = super::show_on("macos", path, selection, &spawner, |_| MacFolder::Plain);
+            let LaunchMessage::Failed { reason } = message else {
+                panic!("{message:?}");
+            };
+            assert!(reason.contains(&path.display().to_string()), "{reason}");
+            assert!(reason.contains("ended with exit status: 1"), "{reason}");
+            assert_eq!(spawner.waited_for.lock().unwrap().len(), 1);
+            assert!(spawner.not_waited_for.lock().unwrap().is_empty());
+
+            // The other file managers give no status to read.
+            for os in ["windows", "linux"] {
+                let spawner = EndsWithFailure::default();
+                let message = super::show_on(os, path, selection, &spawner, |_| MacFolder::Plain);
+                assert!(matches!(message, LaunchMessage::Started { .. }), "{os}");
+                assert!(spawner.waited_for.lock().unwrap().is_empty(), "{os}");
+                assert_eq!(spawner.not_waited_for.lock().unwrap().len(), 1, "{os}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_system_spawner_reports_the_failure_status_of_a_program_it_waits_for() {
+        let ending_with = |code: &str| {
+            let (program, option) = if cfg!(target_os = "windows") {
+                ("cmd.exe", "/c")
+            } else {
+                ("/bin/sh", "-c")
+            };
+            LaunchCommand {
+                program: PathBuf::from(program),
+                arguments: vec![option.to_owned(), format!("exit {code}")],
+                working_directory: None,
+                arguments_as_written: false,
+            }
+        };
+        assert_eq!(super::SystemSpawner.run(&ending_with("0")), Ok(()));
+        let reason = super::SystemSpawner.run(&ending_with("3")).unwrap_err();
+        assert!(reason.contains("ended with"), "{reason}");
+        assert!(reason.contains('3'), "{reason}");
+        // A start that is not waited for reports the start only.
+        assert_eq!(super::SystemSpawner.spawn(&ending_with("3")), Ok(()));
+        let missing = LaunchCommand {
+            program: PathBuf::from("compare-all-no-such-program"),
+            ..LaunchCommand::default()
+        };
+        assert!(super::SystemSpawner.run(&missing).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_link_whose_target_is_gone_is_reported_and_named_on_macos() {
+        let base = tempfile::tempdir().unwrap();
+        let link = base.path().join("broken link");
+        std::os::unix::fs::symlink(base.path().join("gone"), &link).unwrap();
+        let message = super::show_on(
+            "macos",
+            &link,
+            Selection::Files,
+            &super::SystemSpawner,
+            super::mac_folder,
+        );
+        let LaunchMessage::Failed { reason } = message else {
+            panic!("{message:?}");
+        };
+        assert!(reason.contains(&link.display().to_string()), "{reason}");
+        assert!(reason.contains("could not be shown"), "{reason}");
     }
 
     #[test]
