@@ -133,14 +133,41 @@ impl SystemSpawner {
 
 impl Spawner for SystemSpawner {
     fn spawn(&self, command: &LaunchCommand) -> Result<(), String> {
-        // The child is not waited for, so the program keeps running after the
-        // comparison it was started from is closed.
-        Self::start(command).map(|_| ())
+        // No caller waits for the child, so the program keeps running after
+        // the comparison it was started from is closed.
+        Self::start(command).map(collect_when_ended)
     }
 
     fn run(&self, command: &LaunchCommand) -> Result<(), String> {
+        Self::run_within(command, RUN_WAIT)
+    }
+}
+
+/// Take the entry of `child` out of the process table when the program ends.
+///
+/// On Unix a child that ended stays in the process table until its parent
+/// asks for its status. A thread of its own asks, so no caller waits. When
+/// the thread cannot be started the child is left as it is. Windows keeps no
+/// such entry.
+fn collect_when_ended(child: std::process::Child) {
+    #[cfg(unix)]
+    {
+        let mut child = child;
+        let _ = std::thread::Builder::new()
+            .name("launched-program".to_owned())
+            .spawn(move || {
+                let _ = child.wait();
+            });
+    }
+    #[cfg(not(unix))]
+    drop(child);
+}
+
+impl SystemSpawner {
+    /// [`Spawner::run`] with the bound `wait`.
+    fn run_within(command: &LaunchCommand, wait: std::time::Duration) -> Result<(), String> {
         let mut child = Self::start(command)?;
-        let deadline = std::time::Instant::now() + RUN_WAIT;
+        let deadline = std::time::Instant::now() + wait;
         loop {
             match child.try_wait() {
                 Ok(Some(status)) if status.success() => return Ok(()),
@@ -152,7 +179,10 @@ impl Spawner for SystemSpawner {
                 }
                 // A program that still runs has reported no failure. It is
                 // left to end by itself.
-                Ok(None) => return Ok(()),
+                Ok(None) => {
+                    collect_when_ended(child);
+                    return Ok(());
+                }
                 Err(error) => {
                     return Err(format!(
                         "{} could not be waited for: {error}",
@@ -943,6 +973,62 @@ mod tests {
             ..LaunchCommand::default()
         };
         assert!(super::SystemSpawner.run(&missing).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_program_that_no_caller_waits_for_leaves_no_ended_process_in_the_table() {
+        let base = tempfile::tempdir().unwrap();
+        let writing_its_id = |name: &str, then: &str| {
+            let marker = base.path().join(name);
+            let command = LaunchCommand {
+                program: PathBuf::from("/bin/sh"),
+                arguments: vec![
+                    "-c".to_owned(),
+                    format!("echo $$ > '{}'; {then}", marker.display()),
+                ],
+                working_directory: None,
+                arguments_as_written: false,
+            };
+            (marker, command)
+        };
+        let (spawned, command) = writing_its_id("spawned", "exit 0");
+        assert_eq!(super::SystemSpawner.spawn(&command), Ok(()));
+        // The program ends after the bound of the wait.
+        let (late, command) = writing_its_id("late", "sleep 1");
+        assert_eq!(
+            super::SystemSpawner::run_within(&command, Duration::from_millis(100)),
+            Ok(())
+        );
+
+        for marker in [spawned, late] {
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            let id = loop {
+                let text = std::fs::read_to_string(&marker).unwrap_or_default();
+                if let Ok(id) = text.trim().parse::<u32>() {
+                    break id;
+                }
+                assert!(std::time::Instant::now() < deadline, "{}", marker.display());
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            // The process table has no line for a program that ended and
+            // whose status was asked for.
+            loop {
+                let listed = ca_io::host_command::host_command("ps")
+                    .args(["-o", "stat=", "-p", &id.to_string()])
+                    .output()
+                    .unwrap();
+                let state = String::from_utf8_lossy(&listed.stdout).trim().to_owned();
+                if state.is_empty() {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "process {id} stays in the table with state {state}"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
     }
 
     #[cfg(target_os = "macos")]
