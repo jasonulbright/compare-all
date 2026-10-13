@@ -927,9 +927,13 @@ impl MergeModel {
         Some(placed)
     }
 
-    /// Put the text of `entry`, a record of `lender` no line holds now, in
-    /// front of the lender's own text. The caller applies the restore once
-    /// no piece of the lender's text is still away.
+    /// Put the text of `entry`, a record of `lender` no line holds now, at
+    /// the start of the lender's lines. Text a section lent is the start of
+    /// its text, so it goes in front of the lender's own text, and in front
+    /// of text of later sections the lender's lines hold: placed after
+    /// such text it shows after text of a later section, on a row that
+    /// names another line. The caller applies the restore once no piece of
+    /// the lender's text is still away.
     pub(super) fn place_returned(
         &mut self,
         lender: usize,
@@ -937,32 +941,13 @@ impl MergeModel {
     ) -> Option<(usize, Range<u32>)> {
         self.uncover_after(lender, &entry);
         let range = self.output_range(lender)?;
-        let mut target = None;
-        for local in 0..range.end - range.start {
-            let line = (range.start + local) as usize;
-            let text = self.output.get(line)?;
-            let repair = self.output_repairs.get(line).copied().unwrap_or(0);
-            let limit = text.chars().count().saturating_sub(repair);
-            let records = self.records_on_line(lender, line);
-            let (runs, _) = Self::split_line(lender, text, &records);
-            let mut column = 0usize;
-            for run in &runs {
-                if run.owner == lender && column < limit {
-                    target = Some((local, column, text[byte_at(text, column)..].chars().next()));
-                    break;
-                }
-                column += run.text.chars().count();
-            }
-            if target.is_some() {
-                break;
-            }
-        }
         let conflict = self.sections[lender].conflict;
-        let lines = if let Some((local, column, following)) = target {
+        let lines = if range.end > range.start {
+            let following = self.output.get(range.start as usize)?.chars().next();
             let mut text = entry.text;
             self.end_before(&mut text, following);
-            let (count, _) = self.insert_into_line(lender, local, column, &text)?;
-            local..local + count
+            let (count, _) = self.insert_into_line(lender, 0, 0, &text)?;
+            0..count
         } else {
             let parts = super::split(&entry.text);
             let count = u32::try_from(parts.len()).ok()?;
