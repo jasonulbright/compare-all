@@ -203,10 +203,10 @@ pub fn system_open_command(path: &std::path::Path) -> LaunchCommand {
 
 /// The command that shows `path` in the platform's file manager.
 ///
-/// Files are selected where the platform offers that operation. On macOS a
-/// folder is selected in its parent too; elsewhere a folder is opened
-/// directly. The path is always one process argument; it is never
-/// interpolated into a shell command.
+/// Files are selected where the platform offers that operation. A folder is
+/// opened directly, except a folder that macOS can read as a package, which
+/// is selected in its parent. The path is always one process argument; it is
+/// never interpolated into a shell command.
 #[must_use]
 pub fn system_explorer_command(path: &std::path::Path, selection: Selection) -> LaunchCommand {
     explorer_command_on(std::env::consts::OS, path, selection)
@@ -218,8 +218,10 @@ fn explorer_command_on(os: &str, path: &std::path::Path, selection: Selection) -
         return windows_explorer_command(path, selection);
     }
     let (program, arguments) = match (os, selection) {
-        // An application bundle is a folder, and `open` on it starts the
-        // application, so a folder is revealed like a file.
+        ("macos", Selection::Folders) if !may_be_package(path) => (
+            std::path::PathBuf::from("/usr/bin/open"),
+            vec![path_argument(path)],
+        ),
         ("macos", _) => (
             std::path::PathBuf::from("/usr/bin/open"),
             vec!["-R".to_owned(), path_argument(path)],
@@ -240,6 +242,13 @@ fn explorer_command_on(os: &str, path: &std::path::Path, selection: Selection) -
         arguments,
         working_directory: None,
     }
+}
+
+/// True when macOS can read the folder `path` as a package. The system takes
+/// a folder for a package from the extension of its name, and `open` on an
+/// application bundle starts the application.
+fn may_be_package(path: &std::path::Path) -> bool {
+    path.extension().is_some()
 }
 
 fn windows_explorer_command(path: &std::path::Path, selection: Selection) -> LaunchCommand {
@@ -436,12 +445,25 @@ mod tests {
     }
 
     #[test]
-    fn showing_a_folder_in_the_mac_file_manager_reveals_it_and_never_opens_it() {
-        for folder in ["/tmp/left/Probe.app", "/tmp/left/plain folder"] {
+    fn the_mac_file_manager_opens_a_plain_folder_and_reveals_a_package() {
+        let arguments = |folder: &str| {
             let command =
                 explorer_command_on("macos", std::path::Path::new(folder), Selection::Folders);
             assert_eq!(command.program, PathBuf::from("/usr/bin/open"));
-            assert_eq!(command.arguments, ["-R", folder]);
+            command.arguments
+        };
+        for package in [
+            "/tmp/left/Probe.app",
+            "/tmp/left/Probe.APP",
+            "/tmp/left/Setup.pkg",
+            "/tmp/left/Notes.rtfd",
+            "/tmp/left/Tool.bundle",
+            "/tmp/left/release.v2",
+        ] {
+            assert_eq!(arguments(package), ["-R", package]);
+        }
+        for plain in ["/tmp/left/plain folder", "/tmp/left/.settings", "/tmp/left"] {
+            assert_eq!(arguments(plain), [plain]);
         }
     }
 
