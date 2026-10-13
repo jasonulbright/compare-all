@@ -1560,6 +1560,170 @@ fn a_backup_folder_on_a_volume_with_no_access_lists_is_refused_with_the_ways_out
     assert_eq!(std::fs::read_dir(share.path()).unwrap().count(), 0);
 }
 
+/// [`FileOps`] on the real file system, where the volume of the folder
+/// `without_lists` answers that it keeps no access lists.
+#[cfg(windows)]
+struct NoListsUnder {
+    without_lists: PathBuf,
+}
+
+#[cfg(windows)]
+impl FileOps for NoListsUnder {
+    fn probe(&self, path: &Path) -> io::Result<TargetState> {
+        RealFs.probe(path)
+    }
+    fn create_dir(&self, path: &Path) -> io::Result<()> {
+        RealFs.create_dir(path)
+    }
+    fn open_read(&self, path: &Path) -> io::Result<Box<dyn Read + Send>> {
+        RealFs.open_read(path)
+    }
+    fn create_new(&self, path: &Path) -> io::Result<Box<dyn SyncWrite>> {
+        RealFs.create_new(path)
+    }
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        RealFs.rename(from, to)
+    }
+    fn rename_no_replace(&self, from: &Path, to: &Path) -> io::Result<()> {
+        RealFs.rename_no_replace(from, to)
+    }
+    fn replace(&self, from: &Path, to: &Path) -> io::Result<()> {
+        RealFs.replace(from, to)
+    }
+    fn replace_refusal(&self, to: &Path) -> Option<&'static str> {
+        RealFs.replace_refusal(to)
+    }
+    fn write_new(
+        &self,
+        target: &Path,
+        reader: &mut dyn Read,
+        buffer_size: usize,
+    ) -> io::Result<()> {
+        RealFs.write_new(target, reader, buffer_size)
+    }
+    fn write_new_like(
+        &self,
+        target: &Path,
+        reader: &mut dyn Read,
+        buffer_size: usize,
+        model: &Path,
+    ) -> io::Result<()> {
+        crate::ops::fsops::write_new_with_the_list_of(target, reader, buffer_size, model, |path| {
+            path.starts_with(&self.without_lists)
+        })
+    }
+    fn remove_file(&self, path: &Path) -> io::Result<()> {
+        RealFs.remove_file(path)
+    }
+    fn remove_dir(&self, path: &Path) -> io::Result<()> {
+        RealFs.remove_dir(path)
+    }
+    fn move_to_trash(&self, path: &Path) -> io::Result<()> {
+        RealFs.move_to_trash(path)
+    }
+    fn set_modified(&self, path: &Path, time: SystemTime) -> io::Result<()> {
+        RealFs.set_modified(path, time)
+    }
+    fn set_created(&self, path: &Path, time: SystemTime) -> io::Result<()> {
+        RealFs.set_created(path, time)
+    }
+    fn set_attributes(&self, path: &Path, change: &AttributeChange) -> io::Result<()> {
+        RealFs.set_attributes(path, change)
+    }
+    fn same_volume(&self, from: &Path, to: &Path) -> bool {
+        RealFs.same_volume(from, to)
+    }
+    fn read_dir(&self, path: &Path) -> io::Result<Vec<PathBuf>> {
+        RealFs.read_dir(path)
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn a_backup_folder_that_answers_that_it_keeps_no_access_lists_is_refused_and_nothing_stays() {
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work");
+    let vault = dir.path().join("vault");
+    std::fs::create_dir(&work).unwrap();
+    std::fs::create_dir(&vault).unwrap();
+    let source = work.join("source.txt");
+    let target = work.join("a.txt");
+    std::fs::write(&source, b"new").unwrap();
+    std::fs::write(&target, b"old").unwrap();
+    let list = crate::ops::access_list::text_for_test(&target);
+    let step = |target: &Path| PlanStep {
+        index: 0,
+        action: StepAction::CopyFile {
+            source: source.clone(),
+            target: target.to_path_buf(),
+        },
+        bytes: 0,
+        conflicts: vec![Conflict::TargetExists],
+        backup: None,
+        side: None,
+        rel: PathBuf::from("a.txt"),
+        expected: crate::ops::plan::StepExpectation::default(),
+    };
+    let mut plan = OperationPlan::new(
+        crate::ops::plan::OperationKind::Copy,
+        vec![work.clone(), vault.clone()],
+        OperationOptions {
+            overwrite: true,
+            backup: Some(BackupOptions {
+                folder: Some(vault.clone()),
+                ..BackupOptions::default()
+            }),
+            ..options()
+        },
+    );
+    plan.steps.push(step(&target));
+    let cancel = Cancel::new();
+    let run_on = |without_lists: &Path| {
+        let fs = NoListsUnder {
+            without_lists: without_lists.to_path_buf(),
+        };
+        execute(
+            &plan,
+            &ExecutionContext::new(&fs, &cancel, Journaling::Disabled),
+        )
+        .results
+        .remove(0)
+        .outcome
+    };
+
+    let outcome = run_on(&vault);
+
+    let StepOutcome::Failed { message } = &outcome else {
+        panic!("{outcome:?}");
+    };
+    for part in [
+        vault.join("a.txt.bak").display().to_string(),
+        format!("cannot take the access list of {}", target.display()),
+        "nothing was replaced".to_owned(),
+        "the backup folder is on a volume that keeps no access lists".to_owned(),
+        "choose a backup folder on a volume that keeps access lists, or turn the backup off"
+            .to_owned(),
+    ] {
+        assert!(message.contains(&part), "{part} is not in: {message}");
+    }
+    assert_eq!(std::fs::read(&target).unwrap(), b"old");
+    assert_eq!(crate::ops::access_list::text_for_test(&target), list);
+    assert_eq!(std::fs::read(&source).unwrap(), b"new");
+    assert_eq!(std::fs::read_dir(&vault).unwrap().count(), 0);
+    let mut left: Vec<_> = std::fs::read_dir(&work)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    left.sort();
+    assert_eq!(left, ["a.txt", "source.txt"]);
+
+    // The same plan completes when the answer is for another folder.
+    let outcome = run_on(&dir.path().join("elsewhere"));
+    assert!(outcome.is_done(), "{outcome:?}");
+    assert_eq!(std::fs::read(&target).unwrap(), b"new");
+    assert_eq!(std::fs::read(vault.join("a.txt.bak")).unwrap(), b"old");
+}
+
 #[cfg(windows)]
 #[test]
 fn a_write_through_a_second_name_of_the_target_does_not_change_the_backup() {
