@@ -812,3 +812,17 @@ fn a_line_take_on_a_row_whose_line_an_earlier_section_holds_replaces_the_line_at
         assert_eq!(save_and_read(&mut view, &dir), expected.as_bytes());
     }
 }
+
+/// After the lender take, Backspace at the start of `X` joins the line of
+/// s3 to the last own line of s2: a line break only, so the take stays
+/// pending, and s2 now holds the `X` of s3. When the holder take gives
+/// `cd` back, s2 takes its input again and gives `X` back to s3 first.
+#[test]
+fn a_pending_take_that_restores_a_lender_holding_later_text_gives_that_text_back() {
+    let edit = |view: &mut MergeView| {
+        edit_at(view, 5, 0, "backspace");
+        assert_eq!(view.output_text(), "a\nbcd\ng\nh\niX\nf\n");
+    };
+    let outcome = in_order(F1, 2, &edit, LENDER_EDIT_HOLDER);
+    assert_restored(&outcome, F1_TAKEN);
+}
