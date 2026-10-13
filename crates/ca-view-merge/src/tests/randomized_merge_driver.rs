@@ -48,6 +48,7 @@ const ASSERTED: &[&str] = &[
     "take-order-replay-differs",
     "edit-kept-take-restore",
     "reload-duplicated-token",
+    "line-take-duplicated-lent-token",
 ];
 
 /// Every token with its byte range in `text`.
@@ -814,6 +815,126 @@ fn reload_duplicate(view: &MergeView, before_counts: &HashMap<String, usize>) ->
     })
 }
 
+/// What a line take is to change, read before the take.
+pub(super) struct LineTake {
+    /// The tokens the take may remove: those of the output line it
+    /// replaces, when its row has one; those of the row's section, when a
+    /// take of it waits for its lent text, applies first and drops the other
+    /// text of the section; and those the returned text parts from its
+    /// holder's text or the lines it comes back on part.
+    pub(super) removable: HashSet<String>,
+    /// The line of the input the take puts on the row.
+    taken: Option<String>,
+    /// The tokens of the text the row's section lent to earlier lines.
+    lent: HashSet<String>,
+}
+
+/// The line take `command` on `row`. A section that lent text takes it back
+/// first, in front of its own lines: a pending take then gives the section
+/// the lines of its selected input; otherwise text that holds the lent
+/// characters comes back on the lines of the lent source, and other text as
+/// the holders show it.
+pub(super) fn line_take(view: &MergeView, row: usize, command: Command) -> Option<LineTake> {
+    let model = view.model();
+    let section = model.section_of_row(row)?;
+    let step = row.checked_sub(model.row_of_section(section)?)?;
+    let pane = match command {
+        Command::TakeLeftLine => crate::model::Pane::Left,
+        Command::TakeCenterLine => crate::model::Pane::Center,
+        _ => crate::model::Pane::Right,
+    };
+    let taken = model
+        .rows()
+        .get(row)?
+        .line(pane, None)
+        .and_then(|line| model.inputs().lines(pane).get(line as usize))
+        .cloned();
+    let records = model.sections()[section].lent_records();
+    let own = model.section_lines(section);
+    let pending = model.pending_take(section);
+    let lines = if records.is_empty() {
+        own
+    } else if let Some(resolution) = pending {
+        selected_input_lines(model, section, resolution)?
+    } else {
+        let mut placed: Vec<(u32, u32, &str)> = records
+            .iter()
+            .filter_map(|entry| {
+                let start = model.output_range(entry.holder)?.start;
+                Some((start + entry.offset, entry.column, entry.text.as_str()))
+            })
+            .collect();
+        placed.sort_unstable();
+        let ending = view.terminator();
+        let mut shown = String::new();
+        for (index, (_, _, text)) in placed.iter().enumerate() {
+            shown.push_str(text);
+            let follows = index + 1 < placed.len() || !own.is_empty();
+            if follows && !text.ends_with(['\r', '\n']) {
+                shown.push_str(ending);
+            }
+        }
+        let mut oldest: Vec<_> = records.iter().collect();
+        oldest.sort_by_key(|entry| entry.seq);
+        let source: String = oldest
+            .iter()
+            .filter_map(|entry| entry.source.as_deref())
+            .collect();
+        let bare = |text: &str| -> String {
+            text.chars()
+                .filter(|character| !matches!(character, '\r' | '\n'))
+                .collect()
+        };
+        let whole = own.is_empty() || source.ends_with(['\r', '\n']);
+        let back = if whole && bare(&shown) == bare(&source) {
+            source
+        } else {
+            shown
+        };
+        let mut lines = split(&back);
+        lines.extend(own);
+        lines
+    };
+    // A token with characters of the row's section and of another section
+    // sits where lent text meets its holder's text, and the text that goes
+    // back parts it.
+    let owned = owned_text(view);
+    let parted = token_spans(&owned.text)
+        .into_iter()
+        .filter(|(_, start, end)| {
+            let owners = &owned.owners[*start..*end];
+            owners.contains(&section) && single_owner(owners).is_none()
+        })
+        .map(|(token, _, _)| token);
+    let dropped = pending
+        .map(|_| kept_tokens(&owned, &|owner| owner == section))
+        .unwrap_or_default();
+    // A token of the lent text that the lines the text comes back on no
+    // longer hold: a line break of those lines parts it.
+    let back = counts(&lines.concat());
+    let unmade = records
+        .iter()
+        .flat_map(|entry| tokens(&entry.text))
+        .filter(|token| !back.contains_key(token));
+    let removable: HashSet<String> = lines
+        .get(step)
+        .map(|line| tokens(line))
+        .unwrap_or_default()
+        .into_iter()
+        .chain(parted)
+        .chain(unmade)
+        .chain(dropped.into_keys())
+        .collect();
+    Some(LineTake {
+        removable,
+        taken,
+        lent: records
+            .iter()
+            .flat_map(|entry| tokens(&entry.text))
+            .collect(),
+    })
+}
+
 /// A section whose take waits for its lent text, with the resolution that
 /// take recorded.
 type PendingTake = (usize, Resolution);
@@ -1134,11 +1255,12 @@ fn run_case(
                 }
                 _ => None,
             };
-            let lines_before: Vec<String> = view.model().output_lines().iter().cloned().collect();
-            let line_take_line = match &op {
-                Op::TakeLine(row, _) => view
-                    .model()
-                    .output_line_for_row((*row).min(view.model().rows().len().saturating_sub(1))),
+            let line_take = match &op {
+                Op::TakeLine(row, command) => line_take(
+                    &view,
+                    (*row).min(view.model().rows().len().saturating_sub(1)),
+                    *command,
+                ),
                 _ => None,
             };
             let waiting: HashSet<usize> = view
@@ -1331,18 +1453,29 @@ fn run_case(
                     break;
                 }
             }
-            if let Some(line) = line_take_line {
-                let replaced: HashSet<String> = lines_before
-                    .get(line as usize)
-                    .map(|text| tokens(text).into_iter().collect())
-                    .unwrap_or_default();
+            if let Some(plan) = &line_take {
                 for token in before_counts.keys() {
-                    if replaced.contains(token) {
+                    if plan.removable.contains(token) {
                         continue;
                     }
                     if after_counts.get(token).copied().unwrap_or(0) == 0 {
                         local.push((
                             "line-take-lost-token".to_owned(),
+                            format!("{token}; before {before:?} after {after:?}"),
+                        ));
+                    }
+                }
+                let taken: HashSet<String> = plan
+                    .taken
+                    .as_deref()
+                    .map(|text| tokens(text).into_iter().collect())
+                    .unwrap_or_default();
+                for token in &plan.lent {
+                    let had = before_counts.get(token).copied().unwrap_or(0);
+                    if !taken.contains(token) && after_counts.get(token).copied().unwrap_or(0) > had
+                    {
+                        local.push((
+                            "line-take-duplicated-lent-token".to_owned(),
                             format!("{token}; before {before:?} after {after:?}"),
                         ));
                     }
