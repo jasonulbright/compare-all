@@ -221,6 +221,7 @@ pub fn replace_new_prepared<T, E: From<io::Error>>(
     .map(|(value, _)| value)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn replace_impl<T, E: From<io::Error>>(
     path: &Path,
     produce: impl FnOnce(&mut dyn Write) -> Result<T, E>,
