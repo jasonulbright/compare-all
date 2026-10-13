@@ -642,6 +642,79 @@ fn a_copy_over_an_owner_only_target_keeps_its_access_list() {
     );
 }
 
+/// Run one copy step from `source` over the existing item `target`.
+#[cfg(windows)]
+fn replace_by_copy(base: &Path, source: &Path, target: &Path) -> StepOutcome {
+    let mut plan = OperationPlan::new(
+        crate::ops::plan::OperationKind::Copy,
+        vec![base.to_path_buf()],
+        OperationOptions {
+            overwrite: true,
+            ..options()
+        },
+    );
+    plan.steps.push(PlanStep {
+        index: 0,
+        action: StepAction::CopyFile {
+            source: source.to_path_buf(),
+            target: target.to_path_buf(),
+        },
+        bytes: 0,
+        conflicts: vec![Conflict::TargetExists],
+        backup: None,
+        side: None,
+        rel: PathBuf::from(target.file_name().unwrap()),
+        expected: crate::ops::plan::StepExpectation::default(),
+    });
+    run(&plan).results.remove(0).outcome
+}
+
+#[cfg(windows)]
+#[test]
+fn a_copy_over_a_file_link_puts_the_copy_in_place_of_the_link() {
+    let base = tempfile::tempdir().unwrap();
+    let source = base.path().join("source.txt");
+    let real = base.path().join("real.txt");
+    let link = base.path().join("link.txt");
+    std::fs::write(&source, b"new").unwrap();
+    std::fs::write(&real, b"old").unwrap();
+    if let Err(error) = std::os::windows::fs::symlink_file(&real, &link) {
+        println!("skipped: this account cannot create a file link: {error}");
+        return;
+    }
+
+    let outcome = replace_by_copy(base.path(), &source, &link);
+
+    assert!(outcome.is_done(), "{outcome:?}");
+    let meta = std::fs::symlink_metadata(&link).unwrap();
+    assert!(!meta.file_type().is_symlink());
+    assert_eq!(std::fs::read(&link).unwrap(), b"new");
+    assert_eq!(std::fs::read(&real).unwrap(), b"old");
+}
+
+#[cfg(windows)]
+#[test]
+fn a_copy_over_a_name_that_is_not_unicode_replaces_the_file() {
+    use std::os::windows::ffi::OsStringExt;
+    let base = tempfile::tempdir().unwrap();
+    let source = base.path().join("source.txt");
+    std::fs::write(&source, b"new").unwrap();
+    // An unpaired surrogate has no Unicode text form.
+    let mut wide: Vec<u16> = "odd-".encode_utf16().collect();
+    wide.push(0xD800);
+    wide.extend(".txt".encode_utf16());
+    let target = base.path().join(std::ffi::OsString::from_wide(&wide));
+    if let Err(error) = std::fs::write(&target, b"old") {
+        println!("skipped: this volume refuses the name: {error}");
+        return;
+    }
+
+    let outcome = replace_by_copy(base.path(), &source, &target);
+
+    assert!(outcome.is_done(), "{outcome:?}");
+    assert_eq!(std::fs::read(&target).unwrap(), b"new");
+}
+
 #[test]
 fn copy_preserves_contents_and_modification_time() {
     let left = tempfile::tempdir().unwrap();
