@@ -19,7 +19,7 @@ use std::time::SystemTime;
 use ca_vfs::{ArchiveEdit, Cancel as VfsCancel, VfsError, VfsPath};
 
 use crate::ops::fsops::{
-    check_then_rename, write_new_through, AttributeChange, FileOps, ItemIdentity, RealFs,
+    check_then_rename, write_new_through, AccessOf, AttributeChange, FileOps, ItemIdentity, RealFs,
     SyncWrite, TargetState,
 };
 use crate::source::{Source, SourceKind};
@@ -371,11 +371,28 @@ impl FileOps for SourceOps {
         self.rename(from, to)
     }
 
-    fn match_access(&self, model: &Path, path: &Path) -> io::Result<()> {
-        if self.state.route(model).is_none() && self.state.route(path).is_none() {
-            return self.state.local.match_access(model, path);
+    fn create_new_like(&self, path: &Path, access: AccessOf<'_>) -> io::Result<Box<dyn SyncWrite>> {
+        let (AccessOf::Replaced(model) | AccessOf::Source(model)) = access;
+        if self.state.route(path).is_none() && self.state.route(model).is_none() {
+            return self.state.local.create_new_like(path, access);
         }
-        Ok(())
+        self.create_new(path)
+    }
+
+    fn write_new_like(
+        &self,
+        target: &Path,
+        reader: &mut dyn Read,
+        buffer_size: usize,
+        model: &Path,
+    ) -> io::Result<()> {
+        if self.state.route(target).is_none() && self.state.route(model).is_none() {
+            return self
+                .state
+                .local
+                .write_new_like(target, reader, buffer_size, model);
+        }
+        self.write_new(target, reader, buffer_size)
     }
 
     fn write_new(

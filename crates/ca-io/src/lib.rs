@@ -181,6 +181,34 @@ pub fn replace_new_checked<T, E: From<io::Error>>(
     .map(|(value, _)| value)
 }
 
+/// Like [`replace_new_checked`], for a file that Unix creates with the
+/// permission bits `mode`, less the bits the process umask withholds. The
+/// temporary has those bits from the moment it exists.
+///
+/// # Errors
+/// Returns [`io::ErrorKind::AlreadyExists`] if another writer creates the
+/// target before commit, or another preparation, write or sync error.
+pub fn replace_new_with_mode<T, E: From<io::Error>>(
+    path: &Path,
+    produce: impl FnOnce(&mut dyn Write) -> Result<T, E>,
+    check: impl FnMut() -> Result<(), E>,
+    mode: u32,
+) -> Result<T, E> {
+    replace_impl(
+        path,
+        produce,
+        check,
+        |file| {
+            file.flush()?;
+            file.sync_all()
+        },
+        mode,
+        true,
+        None,
+    )
+    .map(|(value, _)| value)
+}
+
 fn replace_impl<T, E: From<io::Error>>(
     path: &Path,
     produce: impl FnOnce(&mut dyn Write) -> Result<T, E>,
