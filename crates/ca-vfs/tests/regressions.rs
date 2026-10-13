@@ -391,6 +391,38 @@ fn a_7z_block_whose_coders_together_name_memory_past_the_limit_is_refused() {
     assert!(error.to_string().contains("268435456"), "{error}");
 }
 
+/// A 7z that another archiver wrote with its strongest preset and its branch
+/// filter with side streams: one block of four coders and a packed header.
+const SEVENZ_BRANCH_FILTER_SIDE_STREAMS: &[u8] =
+    include_bytes!("fixtures/branch-filter-side-streams.7z");
+
+#[test]
+fn a_7z_block_with_a_branch_filter_and_side_streams_is_read() {
+    let fs = open_memory(SEVENZ_BRANCH_FILTER_SIDE_STREAMS.to_vec(), "x.7z").unwrap();
+    let mut listed: Vec<String> = fs
+        .list(&VfsPath::root(), &Cancel::new())
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.name)
+        .collect();
+    listed.sort();
+    assert_eq!(listed, ["a.txt", "probe.dll"]);
+
+    let read = |name: &str| {
+        let mut file = fs
+            .open(&VfsPath::parse(name).unwrap(), &Cancel::new())
+            .unwrap();
+        let mut content = Vec::new();
+        file.read_to_end(&mut content).unwrap();
+        content
+    };
+    assert_eq!(read("a.txt"), b"plain text entry\n");
+    let library = read("probe.dll");
+    assert_eq!(library.len(), 1_720);
+    assert!(library.starts_with(b"compare-all branch filter fixture line 001\n"));
+    assert!(library.ends_with(b"line 040\n"));
+}
+
 // --- a file and a directory of the same name -----------------------------
 
 #[test]
