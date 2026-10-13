@@ -130,22 +130,47 @@ fn without_url_passwords(text: &str) -> String {
     while let Some(scheme_end) = rest.find("://") {
         let (head, tail) = rest.split_at(scheme_end + 3);
         out.push_str(head);
-        let authority_end = tail
-            .find(|c: char| c == '/' || c == '"' || c.is_whitespace())
+        // A password can hold a space, so only the closing quotation mark of
+        // a quoted URL, or the line end, ends the text that can be password.
+        let scheme_start = head[..scheme_end]
+            .trim_end_matches(|c: char| c.is_ascii_alphanumeric() || c == '+')
+            .len();
+        let quoted = head[..scheme_start].ends_with('"');
+        let end = tail
+            .find(|c: char| c == '\n' || (quoted && c == '"'))
             .unwrap_or(tail.len());
-        let authority = &tail[..authority_end];
-        match (authority.find(':'), authority.rfind('@')) {
-            (Some(colon), Some(at)) if colon < at => {
-                out.push_str(&authority[..=colon]);
+        rest = match password_span(&tail[..end]) {
+            Some((colon, at)) => {
+                out.push_str(&tail[..=colon]);
                 out.push_str("***");
-                out.push_str(&authority[at..]);
+                &tail[at..]
             }
-            _ => out.push_str(authority),
-        }
-        rest = &tail[authority_end..];
+            None => tail,
+        };
     }
     out.push_str(rest);
     out
+}
+
+/// Where the `:` before a password and the `@` after it stand in `url`, the
+/// text of a URL after its scheme.
+///
+/// The password ends at the last `@`: a password that holds an unescaped `/`
+/// or `@` continues past the first one.
+fn password_span(url: &str) -> Option<(usize, usize)> {
+    let authority = &url[..url.find('/').unwrap_or(url.len())];
+    let colon = authority.find(':')?;
+    let at = url.rfind('@').filter(|at| colon < *at)?;
+    // With no `@` in the authority, a colon before a port number, or inside
+    // a bracketed address, starts no password, and a later `@` is path text.
+    let host_and_port = authority.ends_with(']')
+        || authority.rsplit_once(':').is_some_and(|(host, port)| {
+            !host.is_empty() && !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit())
+        });
+    if !authority.contains('@') && host_and_port {
+        return None;
+    }
+    Some((colon, at))
 }
 
 /// Run one command.
