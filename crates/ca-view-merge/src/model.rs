@@ -1983,6 +1983,18 @@ impl MergeModel {
             let mut lent: Vec<Lent> = decision.lent.clone();
             lent.sort_by_key(|entry| entry.seq);
             let lender = moved.get(&decision.index).copied();
+            // The text a record with a source and the records it covers
+            // show, by the order number of the first.
+            let mut shown: HashMap<u64, String> = HashMap::new();
+            let mut first = None;
+            for entry in &lent {
+                if entry.source.is_some() {
+                    first = Some(entry.seq);
+                }
+                if let Some(seq) = first {
+                    shown.entry(seq).or_default().push_str(&entry.text);
+                }
+            }
             // Whether the last record with a source left the holder; the
             // records it covers follow it.
             let mut dropping = false;
@@ -1996,21 +2008,32 @@ impl MergeModel {
                     }
                     (None, Some(lender)) => returning.texts.push((at, lender, entry)),
                     (Some(holder), None) => {
-                        let Some(target) = self.uncarried_successor(holder, &carried) else {
-                            continue;
-                        };
                         // A lender whose input changed shows its new text.
-                        // When that text starts with the lent characters, it
-                        // leaves them out while the holder shows them. When
-                        // it shows a line of them elsewhere, the lent copy
+                        // When that text follows the holder's text and starts
+                        // with the lent characters, it leaves them out while
+                        // the holder shows them. When the changed region
+                        // shows a line those characters hold, the lent copy
                         // leaves the holder, so no line shows twice.
                         // Otherwise the holder keeps the lent copy.
-                        if let Some(source) = entry.source.clone() {
-                            if self.leave_out_lent_text(target, holder, entry.clone()) {
+                        let successor = self.uncarried_successor(holder, &carried);
+                        let Some(target) = successor.or_else(|| {
+                            Self::uncarried_region(decision.index, moved, &carried)
+                                .filter(|&start| start > holder && start < self.sections.len())
+                        }) else {
+                            continue;
+                        };
+                        if entry.source.is_some() {
+                            if successor.is_some()
+                                && self.leave_out_lent_text(target, holder, entry.clone())
+                            {
                                 dropping = false;
                                 continue;
                             }
-                            dropping = self.shows_a_line_of(target, &source);
+                            let text = shown.get(&entry.seq).map_or("", String::as_str);
+                            dropping = self.uncarried_show_a_line_of(target, &carried, text);
+                        }
+                        if successor.is_none() && !dropping {
+                            continue;
                         }
                         let seq = entry.seq;
                         self.sections[target].lent.push(Lent { holder, ..entry });
@@ -2144,24 +2167,59 @@ impl MergeModel {
         true
     }
 
-    /// Whether section `index`, before a rebuild, shows a line of `text`,
-    /// line endings left out. Empty lines do not count.
-    fn shows_a_line_of(&self, index: usize, text: &str) -> bool {
-        let Some(section) = self.sections.get(index) else {
-            return false;
-        };
-        let shown = if matches!(section.resolution, Resolution::Edited) {
-            section.edited.clone()
-        } else {
-            self.contribution(index, section)
-        };
+    /// The first new section of the region an uncarried section `old` of
+    /// the earlier merge became: the first uncarried section after the
+    /// last carried section that came before `old`.
+    fn uncarried_region(
+        old: usize,
+        moved: &HashMap<usize, usize>,
+        carried: &std::collections::HashSet<usize>,
+    ) -> Option<usize> {
+        let start = moved
+            .iter()
+            .filter(|(earlier, _)| **earlier < old)
+            .map(|(_, new)| *new + 1)
+            .max()
+            .unwrap_or(0);
+        (start..=start + carried.len()).find(|index| !carried.contains(index))
+    }
+
+    /// Whether the sections from `first` on that the reload did not carry,
+    /// up to the next carried section with output lines, show a line whose
+    /// characters `text` holds, before a rebuild. Line breaks do not count:
+    /// an edit that joined lines of `text` changed no character of them.
+    /// The changed region of a lender can become several sections. Empty
+    /// lines do not count.
+    fn uncarried_show_a_line_of(
+        &self,
+        first: usize,
+        carried: &std::collections::HashSet<usize>,
+        text: &str,
+    ) -> bool {
         let bare = |line: &str| line.trim_end_matches(['\r', '\n']).to_owned();
-        let shown: std::collections::HashSet<String> =
-            shown.iter().map(|line| bare(line)).collect();
-        ca_diff::split_lines(text)
-            .into_iter()
-            .map(bare)
-            .any(|line| !line.is_empty() && shown.contains(&line))
+        let mut shown: Vec<String> = Vec::new();
+        for index in first..self.sections.len() {
+            let section = &self.sections[index];
+            let lines = if matches!(section.resolution, Resolution::Edited) {
+                section.edited.clone()
+            } else {
+                self.contribution(index, section)
+            };
+            if carried.contains(&index) {
+                if lines.is_empty() {
+                    continue;
+                }
+                break;
+            }
+            shown.extend(lines.iter().map(|line| bare(line)));
+        }
+        let characters: String = text
+            .chars()
+            .filter(|character| !matches!(character, '\r' | '\n'))
+            .collect();
+        shown
+            .iter()
+            .any(|line| !line.is_empty() && characters.contains(line.as_str()))
     }
 
     fn fingerprint(&self, section: &Section) -> Fingerprint {

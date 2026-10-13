@@ -299,3 +299,63 @@ fn take_all_takes_a_lender_left_on_its_side_by_a_reload_like_an_explicit_take() 
         }
     }
 }
+
+/// The user joins `c` and `d` inside s2, then joins that line to s1: s1
+/// holds `cd` as one line. `c` then changes to `x` on disk. The new text of
+/// s2 shows `d`, whose characters the joined copy holds, so that copy
+/// leaves s1: a joined line counts by its characters, not its line breaks.
+#[test]
+fn a_reload_drops_a_joined_copy_whose_lines_the_lender_had_joined_before_lending() {
+    for inputs in [F1, F1_CRLF, CRLF_CENTER] {
+        let (mut view, dir) = open(inputs[0], Some(inputs[1]), inputs[2]);
+        run_until_ready(&mut view);
+        for line in [2, 1] {
+            view.output_pane.place(Caret::new(line, 0), false);
+            view.output_pane.move_caret(Motion::LineEnd, false);
+            view.output_pane.delete();
+            absorb(&mut view);
+        }
+        assert!(
+            view.output_text()
+                .replace('\r', "")
+                .starts_with("a\nbcd\ng\n"),
+            "{:?}",
+            view.output_text()
+        );
+        rewrite(&dir, &["left.txt", "center.txt", "right.txt"], "\nc", "\nx");
+        reload(&mut view);
+        let text = view.output_text();
+        assert!(
+            text.replace('\r', "").starts_with("a\nb\nx\nd\ng\nh\ni\n"),
+            "{inputs:?}: {text:?}"
+        );
+        assert_eq!(text.matches('d').count(), 1, "{text:?}");
+        assert_eq!(save_and_read(&mut view, &dir), text.as_bytes());
+    }
+}
+
+/// The user removes every line of s2 and the line break in front of `X`,
+/// so s1 holds the `X` of s3 with s2 between them, then takes s2 again
+/// and types in it. `Z` then follows `X` in the left input on disk. The
+/// new text of s3 shows `X`, so the joined copy leaves s1, also with the
+/// lines of an edited section between the holder and the changed region.
+#[test]
+fn a_reload_drops_a_joined_copy_held_across_a_section_with_lines() {
+    let (mut view, dir) = open(F1[0], Some(F1[1]), F1[2]);
+    run_until_ready(&mut view);
+    view.output_pane.place(Caret::new(1, 1), false);
+    view.output_pane.place(Caret::new(7, 0), true);
+    view.output_pane.backspace();
+    absorb(&mut view);
+    assert_eq!(view.output_text(), "a\nbX\nf\n");
+    take_at(&mut view, 2, Command::TakeCenter);
+    view.output_pane.place(Caret::new(2, 1), false);
+    view.output_pane.type_character('q');
+    absorb(&mut view);
+    assert_eq!(view.output_text(), "a\nbX\ncq\nd\ng\nh\ni\nf\n");
+    rewrite(&dir, &["left.txt"], "\nX", "\nX\nZ");
+    reload(&mut view);
+    let text = view.output_text();
+    assert_eq!(text, "a\nb\ncq\nd\ng\nh\ni\nX\nZ\nf\n");
+    assert_eq!(save_and_read(&mut view, &dir), text.as_bytes());
+}
