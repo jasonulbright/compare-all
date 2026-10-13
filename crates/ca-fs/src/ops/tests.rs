@@ -1457,6 +1457,60 @@ fn a_copy_over_a_file_on_a_wsl_share_replaces_it_with_and_without_a_backup() {
 
 #[cfg(windows)]
 #[test]
+fn a_backup_folder_on_a_volume_with_no_access_lists_is_refused_with_the_ways_out() {
+    let Some(share) = folder_on_the_wsl_share() else {
+        println!("skipped: COMPARE_ALL_WSL_SHARE names no folder on a WSL share");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source.txt");
+    let target = dir.path().join("a.txt");
+    std::fs::write(&source, b"new").unwrap();
+    std::fs::write(&target, b"old").unwrap();
+    let mut plan = OperationPlan::new(
+        crate::ops::plan::OperationKind::Copy,
+        vec![dir.path().to_path_buf(), share.path().to_path_buf()],
+        OperationOptions {
+            overwrite: true,
+            backup: Some(BackupOptions {
+                folder: Some(share.path().to_path_buf()),
+                ..BackupOptions::default()
+            }),
+            ..options()
+        },
+    );
+    plan.steps.push(PlanStep {
+        index: 0,
+        action: StepAction::CopyFile {
+            source,
+            target: target.clone(),
+        },
+        bytes: 0,
+        conflicts: vec![Conflict::TargetExists],
+        backup: None,
+        side: None,
+        rel: PathBuf::from("a.txt"),
+        expected: crate::ops::plan::StepExpectation::default(),
+    });
+
+    let outcome = run(&plan).results.remove(0).outcome;
+
+    let StepOutcome::Failed { message } = &outcome else {
+        panic!("{outcome:?}");
+    };
+    for part in [
+        "a.txt.bak cannot take the access list of ",
+        "the backup folder is on a volume that keeps no access lists",
+        "choose a backup folder on a volume that keeps access lists, or turn the backup off",
+    ] {
+        assert!(message.contains(part), "{part} is not in: {message}");
+    }
+    assert_eq!(std::fs::read(&target).unwrap(), b"old");
+    assert_eq!(std::fs::read_dir(share.path()).unwrap().count(), 0);
+}
+
+#[cfg(windows)]
+#[test]
 fn a_write_through_a_second_name_of_the_target_does_not_change_the_backup() {
     let left = tempfile::tempdir().unwrap();
     let right = tempfile::tempdir().unwrap();

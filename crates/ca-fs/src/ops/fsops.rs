@@ -865,6 +865,13 @@ impl FileOps for RealFs {
         let Some(list) = super::access_list::AccessList::of(model).map_err(refused)? else {
             return self.write_new(target, reader, buffer_size);
         };
+        // The copy would be open to every user of that volume.
+        if super::access_list::volume_keeps_no_lists(target) {
+            return Err(refused(io::Error::other(format!(
+                "the backup folder is on a volume that keeps no access lists; {}",
+                super::access_list::NO_LISTS_ADVICE
+            ))));
+        }
         let mut temporary = None;
         let written = ca_io::replace_new_created(
             target,
