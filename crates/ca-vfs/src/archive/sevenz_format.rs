@@ -307,10 +307,16 @@ fn malformed() -> VfsError {
     VfsError::corrupt("7z header is truncated or malformed")
 }
 
-/// Most memory the coders of one block may name together for their
-/// dictionaries and models, the same ceiling the xz and LZMA readers apply to
-/// one stream. The decoders of a block are all open while the block is read.
+/// Most memory one coder may name for its dictionary or model, the same
+/// ceiling the xz and LZMA readers apply to one stream.
 const CODER_MEMORY_LIMIT: u64 = super::span::DICTIONARY_LIMIT_KIB as u64 * 1024;
+
+/// Most memory the coders of one block may name together. The decoders of a
+/// block are all open while the block is read. A block whose branch filter
+/// has side streams holds one main coder and two coders of 1 MiB each, so the
+/// ceiling admits one coder at [`CODER_MEMORY_LIMIT`] with such side coders,
+/// and no second coder of that size.
+const BLOCK_MEMORY_LIMIT: u64 = CODER_MEMORY_LIMIT + CODER_MEMORY_LIMIT / 16;
 
 const METHOD_LZMA: &[u8] = &[0x03, 0x01, 0x01];
 const METHOD_LZMA2: &[u8] = &[0x21];
@@ -350,14 +356,16 @@ fn coder_chain_limit() -> VfsError {
     }
 }
 
-/// Add the memory one more coder of a block names to `claimed`, and refuse
-/// the block when its coders together name more than [`CODER_MEMORY_LIMIT`].
+/// Add the memory one more coder of a block names to `claimed`. Refuse the
+/// coder when it names more than [`CODER_MEMORY_LIMIT`], and the block when
+/// its coders together name more than [`BLOCK_MEMORY_LIMIT`].
 ///
 /// The decoder library allocates whatever dictionary a coder names, so the
 /// check runs on the raw properties before the library sees them.
 fn claim_memory(claimed: &mut u64, method: &[u8], properties: &[u8]) -> VfsResult<()> {
-    *claimed = claimed.saturating_add(coder_memory(method, properties).unwrap_or(0));
-    if *claimed > CODER_MEMORY_LIMIT {
+    let named = coder_memory(method, properties).unwrap_or(0);
+    *claimed = claimed.saturating_add(named);
+    if named > CODER_MEMORY_LIMIT || *claimed > BLOCK_MEMORY_LIMIT {
         return Err(VfsError::LimitExceeded {
             kind: LimitKind::DecoderMemory,
             limit: CODER_MEMORY_LIMIT,
@@ -722,7 +730,47 @@ mod tests {
         assert!(claim_memory(&mut claimed, METHOD_LZMA2, &[30]).is_ok());
         assert!(claim_memory(&mut claimed, &[0x03], &[]).is_ok());
         assert!(claim_memory(&mut claimed, METHOD_LZMA2, &[30]).is_ok());
-        assert!(claim_memory(&mut claimed, METHOD_LZMA2, &[0]).is_err());
+        // Property 0 names 4 KiB, which the room above one full coder holds.
+        assert!(claim_memory(&mut claimed, METHOD_LZMA2, &[0]).is_ok());
+        assert!(claim_memory(&mut claimed, METHOD_LZMA2, &[30]).is_err());
+    }
+
+    /// The header bytes of one block as an archiver writes it for a branch
+    /// filter with side streams: two LZMA coders for the side streams, the
+    /// LZMA2 main coder, and the filter with four inputs and one output.
+    fn branch_filter_block(main_property: u8, side_dictionary: u32) -> Vec<u8> {
+        let mut bytes = vec![4];
+        for _ in 0..2 {
+            bytes.extend_from_slice(&[0x23, 0x03, 0x01, 0x01, 0x05, 0x6c]);
+            bytes.extend_from_slice(&side_dictionary.to_le_bytes());
+        }
+        bytes.extend_from_slice(&[0x21, 0x21, 0x01, main_property]);
+        bytes.extend_from_slice(&[0x14, 0x03, 0x03, 0x01, 0x1b, 0x04, 0x01]);
+        // Three pairs bind the coders; four packed streams feed the block.
+        bytes.extend_from_slice(&[0x05, 0x00, 0x04, 0x01, 0x03, 0x02]);
+        bytes.extend_from_slice(&[0x02, 0x06, 0x01, 0x00]);
+        bytes
+    }
+
+    #[test]
+    fn a_branch_filter_block_with_its_main_coder_at_the_ceiling_is_accepted() {
+        // Property 32 names 256 MiB; each side coder names 1 MiB.
+        let block = branch_filter_block(32, 1 << 20);
+        let outputs = skip_block(&mut HeaderCursor { bytes: &block });
+        assert!(matches!(outputs, Ok(4)), "{outputs:?}");
+
+        let is_memory_refusal = |block: &[u8]| {
+            matches!(
+                skip_block(&mut HeaderCursor { bytes: block }),
+                Err(VfsError::LimitExceeded {
+                    kind: LimitKind::DecoderMemory,
+                    ..
+                })
+            )
+        };
+        assert!(is_memory_refusal(&branch_filter_block(33, 1 << 20)));
+        assert!(is_memory_refusal(&branch_filter_block(32, 256 << 20)));
+        assert!(is_memory_refusal(&branch_filter_block(32, 32 << 20)));
     }
 
     /// The header bytes of one block that chains `coders` Delta coders.
