@@ -840,6 +840,34 @@ fn the_backup_and_the_copy_of_a_private_file_are_private_while_they_are_written(
 
 #[cfg(unix)]
 #[test]
+fn a_read_only_target_that_is_replaced_gets_the_write_bit_for_its_owner_alone() {
+    use std::os::unix::fs::PermissionsExt;
+    let cleared = OperationOptions {
+        overwrite: true,
+        clear_read_only_targets: true,
+        ..options()
+    };
+    for (target_mode, replaced_mode) in [(0o400_u32, 0o600_u32), (0o444, 0o644), (0o440, 0o640)] {
+        let left = tempfile::tempdir().unwrap();
+        let right = tempfile::tempdir().unwrap();
+        std::fs::write(left.path().join("a.txt"), b"new").unwrap();
+        let target = right.path().join("a.txt");
+        std::fs::write(&target, b"old").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(target_mode)).unwrap();
+
+        copy_left_to_right(left.path(), right.path(), "a.txt", &cleared);
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"new");
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777,
+            replaced_mode,
+            "target {target_mode:o}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn the_backup_has_every_bit_of_the_saved_file_while_it_is_written() {
     use std::os::unix::fs::PermissionsExt;
     let left = tempfile::tempdir().unwrap();
