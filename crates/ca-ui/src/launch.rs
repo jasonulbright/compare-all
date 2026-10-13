@@ -643,6 +643,8 @@ mod tests {
         std::fs::write(&file, b"#!/bin/sh\n").unwrap();
         let gone = file.join("inside");
         let text = |path: &std::path::Path| path.display().to_string();
+        // The Windows command has backslashes on every host of the test.
+        let windows_text = |path: &std::path::Path| text(path).replace('/', "\\");
         let arguments = |os: &str, path: &std::path::Path| {
             explorer_command_on(
                 os,
@@ -656,21 +658,21 @@ mod tests {
 
         assert_eq!(
             arguments("windows", &file),
-            [format!("/select,\"{}\"", text(&file))]
+            [format!("/select,\"{}\"", windows_text(&file))]
         );
         assert_eq!(arguments("macos", &file), ["-R".to_owned(), text(&file)]);
         assert_eq!(arguments("linux", &file), [text(base.path())]);
         // The parent of the path that is gone is the file.
         assert_eq!(
             arguments("windows", &gone),
-            [format!("/select,\"{}\"", text(&gone))]
+            [format!("/select,\"{}\"", windows_text(&gone))]
         );
         assert_eq!(arguments("macos", &gone), ["-R".to_owned(), text(&gone)]);
         assert_eq!(arguments("linux", &gone), [text(base.path())]);
 
         assert_eq!(
             arguments("windows", base.path()),
-            [format!("\"{}\"", text(base.path()))]
+            [format!("\"{}\"", windows_text(base.path()))]
         );
         for os in ["macos", "linux"] {
             assert_eq!(arguments(os, base.path()), [text(base.path())], "{os}");
