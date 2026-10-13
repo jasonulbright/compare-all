@@ -54,7 +54,9 @@ pub use ops::exec::{
     execute, AbortOnError, ConflictDecision, ContinueOnError, Decision, Drift, ErrorPolicy,
     ExecutionContext, ExecutionReport, Journaling, Progress, StepOutcome, StepResult,
 };
-pub use ops::fsops::{AttributeChange, FileOps, ItemIdentity, RealFs, SyncWrite, TargetState};
+pub use ops::fsops::{
+    AccessOf, AttributeChange, FileOps, ItemIdentity, RealFs, SyncWrite, TargetState,
+};
 pub use ops::vfsops::{write_refusal, Mount, SourceOps};
 
 pub use merge::{
