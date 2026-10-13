@@ -1092,6 +1092,56 @@ fn a_step_that_replaces_nothing_leaves_the_target_under_one_name() {
     }
 }
 
+/// A folder for one test on the share that `COMPARE_ALL_WSL_SHARE` names: a
+/// folder under `\\wsl.localhost\`, a volume with no replacement call and no
+/// access lists. `None` when the variable names no folder.
+#[cfg(windows)]
+fn folder_on_the_wsl_share() -> Option<tempfile::TempDir> {
+    let share = PathBuf::from(std::env::var_os("COMPARE_ALL_WSL_SHARE")?);
+    tempfile::Builder::new()
+        .prefix("compare-all-test-")
+        .tempdir_in(share)
+        .ok()
+}
+
+#[cfg(windows)]
+#[test]
+fn a_copy_over_a_file_on_a_wsl_share_replaces_it_with_and_without_a_backup() {
+    let Some(base) = folder_on_the_wsl_share() else {
+        println!("skipped: COMPARE_ALL_WSL_SHARE names no folder on a WSL share");
+        return;
+    };
+    for backup in [None, Some(BackupOptions::default())] {
+        let source = base.path().join("source.txt");
+        let target = base.path().join("a.txt");
+        std::fs::write(&source, b"new").unwrap();
+        std::fs::write(&target, b"old").unwrap();
+        let replacing = OperationOptions {
+            overwrite: true,
+            backup: backup.clone(),
+            ..options()
+        };
+        let outcome = replace_by_copy_with(base.path(), &source, &target, replacing);
+        assert!(outcome.is_done(), "{outcome:?}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"new");
+        let mut names: Vec<String> = std::fs::read_dir(base.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        if backup.is_some() {
+            assert_eq!(names, ["a.txt", "a.txt.bak", "source.txt"]);
+            assert_eq!(
+                std::fs::read(base.path().join("a.txt.bak")).unwrap(),
+                b"old"
+            );
+            std::fs::remove_file(base.path().join("a.txt.bak")).unwrap();
+        } else {
+            assert_eq!(names, ["a.txt", "source.txt"]);
+        }
+    }
+}
+
 #[cfg(windows)]
 #[test]
 fn a_write_through_a_second_name_of_the_target_does_not_change_the_backup() {
