@@ -397,7 +397,16 @@ fn mac_folder(_path: &std::path::Path) -> MacFolder {
 /// one in the text would end the quoted part, so it is taken out, and the
 /// text then names no item.
 fn windows_explorer_command(path: &std::path::Path, selection: Selection) -> LaunchCommand {
-    let quoted = format!("\"{}\"", path_argument(path).replace('"', ""));
+    let text = path_argument(path).replace('"', "");
+    // The file manager opens another folder for a path with a forward
+    // slash. After the prefix `\\?\` a forward slash is no separator, and
+    // the path is taken as written.
+    let text = if text.starts_with(r"\\?\") {
+        text
+    } else {
+        text.replace('/', "\\")
+    };
+    let quoted = format!("\"{text}\"");
     let arguments = match selection {
         Selection::Files => vec![format!("/select,{quoted}")],
         Selection::Folders => vec![quoted],
@@ -603,7 +612,7 @@ mod tests {
         let file = std::path::Path::new("/tmp/a file's name.txt");
         let command = system_explorer_command(file, Selection::Files);
         #[cfg(target_os = "windows")]
-        assert_eq!(command.arguments, ["/select,\"/tmp/a file's name.txt\""]);
+        assert_eq!(command.arguments, [r#"/select,"\tmp\a file's name.txt""#]);
         #[cfg(target_os = "macos")]
         assert_eq!(command.arguments, ["-R", "/tmp/a file's name.txt"]);
         #[cfg(not(any(target_os = "windows", target_os = "macos")))]
@@ -632,6 +641,8 @@ mod tests {
         std::fs::write(&file, b"#!/bin/sh\n").unwrap();
         let gone = file.join("inside");
         let text = |path: &std::path::Path| path.display().to_string();
+        // The Windows command has backslashes on every host of the test.
+        let windows_text = |path: &std::path::Path| text(path).replace('/', "\\");
         let arguments = |os: &str, path: &std::path::Path| {
             explorer_command_on(
                 os,
@@ -645,21 +656,21 @@ mod tests {
 
         assert_eq!(
             arguments("windows", &file),
-            [format!("/select,\"{}\"", text(&file))]
+            [format!("/select,\"{}\"", windows_text(&file))]
         );
         assert_eq!(arguments("macos", &file), ["-R".to_owned(), text(&file)]);
         assert_eq!(arguments("linux", &file), [text(base.path())]);
         // The parent of the path that is gone is the file.
         assert_eq!(
             arguments("windows", &gone),
-            [format!("/select,\"{}\"", text(&gone))]
+            [format!("/select,\"{}\"", windows_text(&gone))]
         );
         assert_eq!(arguments("macos", &gone), ["-R".to_owned(), text(&gone)]);
         assert_eq!(arguments("linux", &gone), [text(base.path())]);
 
         assert_eq!(
             arguments("windows", base.path()),
-            [format!("\"{}\"", text(base.path()))]
+            [format!("\"{}\"", windows_text(base.path()))]
         );
         for os in ["macos", "linux"] {
             assert_eq!(arguments(os, base.path()), [text(base.path())], "{os}");
@@ -998,6 +1009,36 @@ mod tests {
         }
         assert!(!super::system_open_command("/work/a,b".as_ref()).arguments_as_written);
         assert!(!entry().command(&context()).arguments_as_written);
+    }
+
+    #[test]
+    fn the_windows_file_manager_gets_a_path_with_backslashes_only() {
+        for (path, written) in [
+            ("C:/work/a,b/inside.txt", r"C:\work\a,b\inside.txt"),
+            (r"C:\work/plain", r"C:\work\plain"),
+            ("//server/share/folder", r"\\server\share\folder"),
+            ("work/plain", r"work\plain"),
+            // A path with this prefix is taken as written.
+            (r"\\?\C:\work\a/b", r"\\?\C:\work\a/b"),
+            (r"\\?\UNC\server\share\a/b", r"\\?\UNC\server\share\a/b"),
+        ] {
+            let open = windows_explorer_command(path.as_ref(), Selection::Folders);
+            assert_eq!(open.arguments, [format!("\"{written}\"")], "{path}");
+            let select = windows_explorer_command(path.as_ref(), Selection::Files);
+            assert_eq!(
+                select.arguments,
+                [format!("/select,\"{written}\"")],
+                "{path}"
+            );
+        }
+        let through_the_builder = explorer_command_on(
+            "windows",
+            "C:/work/plain".as_ref(),
+            Selection::Folders,
+            |_| true,
+            |_| MacFolder::Plain,
+        );
+        assert_eq!(through_the_builder.arguments, [r#""C:\work\plain""#]);
     }
 
     #[test]
