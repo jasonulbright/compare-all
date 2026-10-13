@@ -484,7 +484,7 @@ fn a_reload_with_the_lender_changed_on_disk_keeps_one_copy() {
     run_until_ready(&mut view);
     assert_output_lines_match_pane(&view);
     let text = view.output_text();
-    assert_eq!(text, "a\nbcc2c3XfMg\nMM\n");
+    assert_eq!(text, "a\nbcc2c3Xfg\nMM\n");
     assert_eq!(text.matches("c2").count(), 1, "{text:?}");
     assert_eq!(text.matches('g').count(), 1, "{text:?}");
     take_at(&mut view, 1, Command::TakeLeft);
@@ -635,8 +635,11 @@ fn a_reload_that_gives_text_back_to_a_carried_holder_keeps_its_records_on_their_
     records_on_their_text(&view).unwrap();
 }
 
+/// s1 was taken from the right and its `[r3]` joined to s0. The right input
+/// then changes in s1: the reload drops the take with the text it took, and
+/// a second reload gives the same text as the first.
 #[test]
-fn a_second_reload_keeps_the_record_the_first_reload_moved() {
+fn a_second_reload_after_a_taken_lender_changed_gives_the_text_of_the_first() {
     let inputs = ["~\n[l1]\n[l2]\n[u4]\n", "~\n[u4]", "~\n[r3]\n[u4]\n"];
     let mut finals = Vec::new();
     for reloads in [1, 2] {
@@ -653,8 +656,9 @@ fn a_second_reload_keeps_the_record_the_first_reload_moved() {
             run_until_ready(&mut view);
             assert_output_lines_match_pane(&view);
         }
+        assert_eq!(view.output_text(), "~\n[u4]", "reloads {reloads}");
         take_at(&mut view, 0, Command::TakeRight);
-        assert_eq!(view.output_text(), "~\n[r3]\n[u4]", "reloads {reloads}");
+        assert_eq!(view.output_text(), "~\n[u4]", "reloads {reloads}");
         finals.push(view.output_text());
     }
     assert_eq!(finals[0], finals[1]);

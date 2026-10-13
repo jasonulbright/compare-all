@@ -978,10 +978,11 @@ struct Returning {
     /// The earlier place of each record a carried holder still shows, by
     /// lender and order number.
     earlier: HashMap<(usize, u64), (usize, u32, u32)>,
-    /// Records, by lender and order number, whose text leaves the carried
-    /// holder once the new output is built: the lender's input changed and
-    /// its new text shows a line of that text, though not at its start.
-    dropped: Vec<(usize, u64)>,
+    /// Records no section keeps, placed on the carried holder that shows
+    /// their text. The text leaves that holder once the new output is built:
+    /// the lender's input changed and its new text does not leave the text
+    /// out.
+    dropped: Vec<Lent>,
 }
 
 /// How many sections before this one hold `print`, counting this one in.
@@ -1961,8 +1962,12 @@ impl MergeModel {
         decisions.sort_by_key(|decision| decision.index);
         let mut returning = self.carry_lent_text(&decisions, &moved);
         self.rebuild();
-        for (lender, seq) in std::mem::take(&mut returning.dropped) {
-            self.strip_lent(lender, seq);
+        // Last in output order first: a strip moves only the text after it
+        // on its line and the lines after it in its section.
+        let mut dropped = std::mem::take(&mut returning.dropped);
+        dropped.sort_by_key(|record| (record.holder, record.offset, record.column));
+        for record in dropped.iter().rev() {
+            self.strip_record(record, None);
         }
         self.return_carried_text(returning);
         for index in 0..self.sections.len() {
@@ -1973,10 +1978,11 @@ impl MergeModel {
 
     /// Point lent text at the carried sections. A lender that was not
     /// carried but whose holder was leaves out the text the holder still
-    /// shows, or, when its new text shows a line of that text elsewhere, the
-    /// text leaves the holder, so no line appears twice. Returns the text whose
-    /// holder was not carried: the reload gave that holder its input, so the
-    /// text goes back to its lender once the new output is built.
+    /// shows when its new text starts with it; otherwise the text leaves the
+    /// holder, so the output shows no text of a section the reload replaced
+    /// and no line twice. Returns the text whose holder was not carried: the
+    /// reload gave that holder its input, so the text goes back to its
+    /// lender once the new output is built.
     fn carry_lent_text(
         &mut self,
         decisions: &[&Decision],
@@ -1988,24 +1994,30 @@ impl MergeModel {
             let mut lent: Vec<Lent> = decision.lent.clone();
             lent.sort_by_key(|entry| entry.seq);
             let lender = moved.get(&decision.index).copied();
-            // The text a record with a source and the records it covers
-            // show, by the order number of the first.
-            let mut shown: HashMap<u64, String> = HashMap::new();
+            // Whether every record a record with a source covers, itself
+            // included, sits on a carried holder, by the order number of
+            // that record. The source stands for the characters of all of
+            // them, so a lender can leave it out only while all show.
+            let mut whole: HashMap<u64, bool> = HashMap::new();
             let mut first = None;
             for entry in &lent {
                 if entry.source.is_some() {
                     first = Some(entry.seq);
                 }
                 if let Some(seq) = first {
-                    shown.entry(seq).or_default().push_str(&entry.text);
+                    *whole.entry(seq).or_insert(true) &= moved.contains_key(&entry.holder);
                 }
             }
-            // Whether the last record with a source left the holder; the
-            // records it covers follow it.
-            let mut dropping = false;
+            // The new section that left out the characters of the last
+            // record with a source; the records that record covers follow
+            // it.
+            let mut left_out: Option<usize> = None;
             for entry in lent {
                 let holder = moved.get(&entry.holder).copied();
                 let at = (entry.holder, entry.offset, entry.column);
+                if entry.source.is_some() {
+                    left_out = None;
+                }
                 match (holder, lender) {
                     (Some(holder), Some(lender)) if holder < lender => {
                         returning.earlier.insert((lender, entry.seq), at);
@@ -2016,35 +2028,25 @@ impl MergeModel {
                         // A lender whose input changed shows its new text.
                         // When that text follows the holder's text and starts
                         // with the lent characters, it leaves them out while
-                        // the holder shows them. When the changed region
-                        // shows a line those characters hold, the lent copy
-                        // leaves the holder, so no line shows twice.
-                        // Otherwise the holder keeps the lent copy.
-                        let successor = self.uncarried_successor(holder, &carried);
-                        let Some(target) = successor.or_else(|| {
-                            Self::uncarried_region(decision.index, moved, &carried)
-                                .filter(|&start| start > holder && start < self.sections.len())
-                        }) else {
-                            continue;
-                        };
+                        // the holder shows them. Otherwise the lent copy is
+                        // text of a section the reload replaced, and it
+                        // leaves the holder.
                         if entry.source.is_some() {
-                            if successor.is_some()
-                                && self.leave_out_lent_text(target, holder, entry.clone())
-                            {
-                                dropping = false;
+                            let target = self
+                                .uncarried_successor(holder, &carried)
+                                .filter(|_| whole.get(&entry.seq).copied().unwrap_or(false))
+                                .filter(|&target| {
+                                    self.leave_out_lent_text(target, holder, entry.clone())
+                                });
+                            if target.is_some() {
+                                left_out = target;
                                 continue;
                             }
-                            let text = shown.get(&entry.seq).map_or("", String::as_str);
-                            dropping = self.uncarried_show_a_line_of(target, &carried, text);
-                        }
-                        if successor.is_none() && !dropping {
+                        } else if let Some(target) = left_out.filter(|&target| holder < target) {
+                            self.sections[target].lent.push(Lent { holder, ..entry });
                             continue;
                         }
-                        let seq = entry.seq;
-                        self.sections[target].lent.push(Lent { holder, ..entry });
-                        if dropping {
-                            returning.dropped.push((target, seq));
-                        }
+                        returning.dropped.push(Lent { holder, ..entry });
                     }
                     _ => {}
                 }
@@ -2170,61 +2172,6 @@ impl MergeModel {
         target.conflict = false;
         target.lent.push(Lent { holder, ..entry });
         true
-    }
-
-    /// The first new section of the region an uncarried section `old` of
-    /// the earlier merge became: the first uncarried section after the
-    /// last carried section that came before `old`.
-    fn uncarried_region(
-        old: usize,
-        moved: &HashMap<usize, usize>,
-        carried: &std::collections::HashSet<usize>,
-    ) -> Option<usize> {
-        let start = moved
-            .iter()
-            .filter(|(earlier, _)| **earlier < old)
-            .map(|(_, new)| *new + 1)
-            .max()
-            .unwrap_or(0);
-        (start..=start + carried.len()).find(|index| !carried.contains(index))
-    }
-
-    /// Whether the sections from `first` on that the reload did not carry,
-    /// up to the next carried section with output lines, show a line whose
-    /// characters `text` holds, before a rebuild. Line breaks do not count:
-    /// an edit that joined lines of `text` changed no character of them.
-    /// The changed region of a lender can become several sections. Empty
-    /// lines do not count.
-    fn uncarried_show_a_line_of(
-        &self,
-        first: usize,
-        carried: &std::collections::HashSet<usize>,
-        text: &str,
-    ) -> bool {
-        let bare = |line: &str| line.trim_end_matches(['\r', '\n']).to_owned();
-        let mut shown: Vec<String> = Vec::new();
-        for index in first..self.sections.len() {
-            let section = &self.sections[index];
-            let lines = if matches!(section.resolution, Resolution::Edited) {
-                section.edited.clone()
-            } else {
-                self.contribution(index, section)
-            };
-            if carried.contains(&index) {
-                if lines.is_empty() {
-                    continue;
-                }
-                break;
-            }
-            shown.extend(lines.iter().map(|line| bare(line)));
-        }
-        let characters: String = text
-            .chars()
-            .filter(|character| !matches!(character, '\r' | '\n'))
-            .collect();
-        shown
-            .iter()
-            .any(|line| !line.is_empty() && characters.contains(line.as_str()))
     }
 
     fn fingerprint(&self, section: &Section) -> Fingerprint {

@@ -158,3 +158,148 @@ fn text_back_on_other_lines_than_the_input_has_stays_edited_through_a_reload() {
     assert_eq!(view.output_text(), text);
     assert_eq!(view.model().sections()[2].resolution, Resolution::Edited);
 }
+
+// s0 a, s1 conflict b, s2 c d g h i, s3 left change X, s4 f.
+const F1: [&str; 3] = [
+    "a\nL\nc\nd\ng\nh\ni\nX\nf\n",
+    "a\nb\nc\nd\ng\nh\ni\ne\nf\n",
+    "a\nR\nc\nd\ng\nh\ni\ne\nf\n",
+];
+
+/// The text of every line the output shows more than once.
+fn lines_shown_twice(view: &MergeView) -> Vec<String> {
+    let text = view.output_text();
+    let lines = ca_diff::split_lines(&text);
+    let mut twice: Vec<String> = lines
+        .iter()
+        .filter(|line| lines.iter().filter(|other| other == line).count() > 1)
+        .map(|line| (*line).to_owned())
+        .collect();
+    twice.dedup();
+    twice
+}
+
+/// s1 holds the joined `cd` of s2. Every input then replaces the lines `c`
+/// and `d`, or drops them. The new text of s2 does not start with the
+/// joined copy, so the copy is text of a section the reload replaced and
+/// leaves s1. A take of s1 alone then gives s2 nothing back.
+#[test]
+fn a_reload_that_replaced_the_lent_lines_takes_the_joined_copy_out_of_the_holder() {
+    for (to, lender) in [
+        ("\nx\ny\n", "x\ny\ng"),
+        ("\n", "g"),
+        ("\nd\nc\n", "d\nc\ng"),
+    ] {
+        let (mut view, dir) = open(F1[0], Some(F1[1]), F1[2]);
+        run_until_ready(&mut view);
+        join(&mut view, 1);
+        join(&mut view, 1);
+        assert_eq!(view.output_text(), "a\nbcd\ng\nh\ni\nX\nf\n");
+        rewrite(&dir, &ALL, "\nc\nd\n", to);
+        reload(&mut view);
+        assert_eq!(
+            view.output_text(),
+            format!("a\nb\n{lender}\nh\ni\nX\nf\n"),
+            "{to:?}"
+        );
+        assert_eq!(lines_shown_twice(&view), Vec::<String>::new(), "{to:?}");
+        assert!(view
+            .model()
+            .sections()
+            .iter()
+            .all(|section| section.lent_records().is_empty()));
+        take(&mut view, 1, Command::TakeLeft);
+        let taken = format!("a\nL\n{lender}\nh\ni\nX\nf\n");
+        assert_eq!(view.output_text(), taken, "{to:?}");
+        assert_eq!(view.model().sections()[2].resolution, Resolution::Center);
+        assert_eq!(save_and_read(&mut view, &dir), taken.as_bytes(), "{to:?}");
+    }
+}
+
+/// The joined copy `abcd` holds the characters of a new line `bc`, but no
+/// line of the new text is a line of the copy. Whole lines decide, and both
+/// replacements take the copy out of the holder.
+#[test]
+fn a_reload_compares_the_joined_copy_with_the_new_text_by_whole_lines() {
+    for new_line in ["bc", "xy"] {
+        let (mut view, dir) = open(G[0], Some(G[1]), G[2]);
+        run_until_ready(&mut view);
+        join(&mut view, 1);
+        join(&mut view, 1);
+        assert_eq!(view.output_text(), "a\nbabcd\ng\nh\ni\nX\nf\n");
+        rewrite(&dir, &ALL, "\nab\ncd\n", &format!("\n{new_line}\nzz\n"));
+        reload(&mut view);
+        assert_eq!(
+            view.output_text(),
+            format!("a\nb\n{new_line}\nzz\ng\nh\ni\nX\nf\n")
+        );
+        take(&mut view, 1, Command::TakeLeft);
+        assert_eq!(
+            view.output_text(),
+            format!("a\nL\n{new_line}\nzz\ng\nh\ni\nX\nf\n")
+        );
+    }
+}
+
+/// Text typed inside the joined copy is text of the lender. A reload that
+/// replaced the lender's lines drops it with the copy; the text the user
+/// typed in the holder's own part of the line stays.
+#[test]
+fn a_reload_that_replaced_the_lent_lines_keeps_text_typed_in_the_holders_part() {
+    let (mut view, dir) = open(F1[0], Some(F1[1]), F1[2]);
+    run_until_ready(&mut view);
+    join(&mut view, 1);
+    join(&mut view, 1);
+    at(&mut view, 1, 2);
+    view.output_pane.type_character('Q');
+    absorb(&mut view);
+    at(&mut view, 1, 0);
+    view.output_pane.type_character('P');
+    absorb(&mut view);
+    assert_eq!(view.output_text(), "a\nPbcQd\ng\nh\ni\nX\nf\n");
+    rewrite(&dir, &ALL, "\nc\nd\n", "\nx\ny\n");
+    reload(&mut view);
+    assert_eq!(view.output_text(), "a\nPb\nx\ny\ng\nh\ni\nX\nf\n");
+    assert_eq!(view.model().sections()[1].resolution, Resolution::Edited);
+    assert_eq!(view.model().sections()[2].resolution, Resolution::Center);
+}
+
+/// s2 holds the `X` of the left change s3. The left input then changes
+/// `X`: the reload shows the new line once, on its own line, and the old
+/// `X` leaves s2.
+#[test]
+fn a_reload_that_changed_a_later_lender_takes_its_old_line_out_of_the_holder() {
+    let (mut view, dir) = open(F1[0], Some(F1[1]), F1[2]);
+    run_until_ready(&mut view);
+    join(&mut view, 6);
+    assert_eq!(view.output_text(), "a\nb\nc\nd\ng\nh\niX\nf\n");
+    rewrite(&dir, &["left.txt"], "\nX\n", "\nY\n");
+    reload(&mut view);
+    assert_eq!(view.output_text(), "a\nb\nc\nd\ng\nh\ni\nY\nf\n");
+    take(&mut view, 2, Command::TakeCenter);
+    assert_eq!(view.output_text(), "a\nb\nc\nd\ng\nh\ni\nY\nf\n");
+}
+
+/// A lender that changed on disk in a later line still starts with the
+/// lines its holder shows, so it leaves them out. A second reload keeps
+/// that record, and the holder take gives the lines back once.
+#[test]
+fn a_second_reload_keeps_the_lines_a_changed_lender_left_out() {
+    let mut finals = Vec::new();
+    for reloads in [1, 2] {
+        let (mut view, dir) = open(F1[0], Some(F1[1]), F1[2]);
+        run_until_ready(&mut view);
+        join(&mut view, 1);
+        join(&mut view, 1);
+        rewrite(&dir, &ALL, "\nh\n", "\nH\n");
+        for _ in 0..reloads {
+            reload(&mut view);
+            assert_eq!(view.output_text(), "a\nbcd\ng\nH\ni\nX\nf\n");
+            assert_eq!(view.model().sections()[2].lent_records().len(), 1);
+        }
+        take(&mut view, 1, Command::TakeLeft);
+        finals.push(view.output_text());
+    }
+    assert_eq!(finals[0], "a\nL\ncd\ng\nH\ni\nX\nf\n");
+    assert_eq!(finals[0], finals[1]);
+}
