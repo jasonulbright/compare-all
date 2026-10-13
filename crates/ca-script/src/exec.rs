@@ -229,25 +229,31 @@ fn text_without_url_passwords(text: &str) -> String {
 /// only after a colon. With no `@` there, a colon in the authority and a
 /// later `@` can be a password that holds a `/`: a name with a port number
 /// and a path with an `@` have the same form, so that text is hidden too.
-/// A numeric or bracketed address before the colon is no user name. The
+/// A numeric or bracketed address with a decimal port after the colon is no
+/// user name. A bracketed text with other text after the colon is one. The
 /// password ends at the last `@` of the URL, because a password can hold an
 /// unescaped `/` or `@`.
 fn password_span(url: &str) -> Option<(usize, usize)> {
     let authority = &url[..url.find('/').unwrap_or(url.len())];
     let at = url.rfind('@')?;
-    let colon = match authority.rfind('@') {
-        Some(user_end) => authority[..user_end].find(':')?,
-        None if authority.starts_with('[') => return None,
-        None => {
-            let colon = authority.find(':')?;
-            let port = &authority[colon + 1..];
-            let numeric_host = authority[..colon].parse::<std::net::Ipv4Addr>().is_ok();
-            if numeric_host && !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) {
-                return None;
-            }
-            colon
-        }
+    if let Some(user_end) = authority.rfind('@') {
+        return Some((authority[..user_end].find(':')?, at));
+    }
+    // The colons inside the brackets of an address separate no password.
+    // `closing` is the place of the closing bracket.
+    let closing = match authority.strip_prefix('[') {
+        Some(bracketed) => Some(bracketed.find(']')? + 1),
+        None => None,
     };
+    let colon = closing.unwrap_or(0) + authority[closing.unwrap_or(0)..].find(':')?;
+    let port = &authority[colon + 1..];
+    let numeric_host = match closing {
+        Some(closing) => colon == closing + 1,
+        None => authority[..colon].parse::<std::net::Ipv4Addr>().is_ok(),
+    };
+    if numeric_host && !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
     Some((colon, at))
 }
 
@@ -1425,6 +1431,43 @@ mod tests {
                 command_without_url_passwords(&line),
                 "load ftp://alice:***@h:1/pub right"
             );
+        }
+    }
+
+    #[test]
+    fn a_password_with_a_slash_after_a_user_name_in_brackets_is_hidden() {
+        for (line, logged) in [
+            (
+                "load ftp://[::1]:se/cret@h:1/pub right",
+                "load ftp://[::1]:***@h:1/pub right",
+            ),
+            (
+                "load ftp://[::1]:/secret@h/pub right",
+                "load ftp://[::1]:***@h/pub right",
+            ),
+            (
+                "load ftp://[alice]x:se/cret@h/pub right",
+                "load ftp://[alice]x:***@h/pub right",
+            ),
+            (
+                "load ftp://[alice]:21x/cret@h/pub right",
+                "load ftp://[alice]:***@h/pub right",
+            ),
+        ] {
+            assert_eq!(command_without_url_passwords(line), logged);
+            assert_eq!(
+                error_without_url_passwords(&line["load ".len()..], line),
+                logged["load ".len()..]
+            );
+        }
+        // An address in brackets, alone or with a decimal port, is a host.
+        for line in [
+            "load ftp://[::1]/pub/a@b right",
+            "load ftp://[::1]:21/pub/a@b right",
+            "load ftp://[fe80::1%eth0]:2121/a@b right",
+            "load ftp://[::1/pub/a@b right",
+        ] {
+            assert_eq!(command_without_url_passwords(line), line);
         }
     }
 
