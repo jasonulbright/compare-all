@@ -373,7 +373,8 @@ fn replace_impl<T, E: From<io::Error>>(
     if permissions.is_some() {
         // ReplaceFile must open the replacement itself. Close our writing
         // handle first, while retaining ownership of the temporary path.
-        let replacement = temporary.into_temp_path();
+        let mut replacement = temporary.into_temp_path();
+        let mut unremoved = false;
         loop {
             let guard = COMMIT_LOCK
                 .lock()
@@ -390,10 +391,12 @@ fn replace_impl<T, E: From<io::Error>>(
                 Err(error)
                     if (retryable(&error) || unable_to_remove_replaced(&error)) && attempt < 7 =>
                 {
+                    unremoved |= renewed_after_unremoved(&error, &mut replacement, parent);
                     std::thread::sleep(backoff);
                     backoff = (backoff * 2).min(Duration::from_millis(200));
                     attempt += 1;
                 }
+                Err(error) if unremoved => return Err(after_unremoved(path, error).into()),
                 Err(error) => return Err(error.into()),
             }
         }
@@ -466,15 +469,92 @@ pub fn replace_existing_file(target: &Path, replacement: &Path) -> io::Result<()
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    retrying_unremoved(|| {
+    let mut renewed: Option<tempfile::TempPath> = None;
+    retrying_unremoved(target, |again| {
+        if again {
+            let earlier = renewed.as_deref().unwrap_or(replacement);
+            // Without a copy the earlier replacement is used again.
+            if let Ok(copy) = renewed_replacement(earlier, parent) {
+                renewed = Some(copy);
+            }
+        }
         let guard = COMMIT_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let outcome = replace_existing_windows(target, replacement, parent);
+        let outcome =
+            replace_existing_windows(target, renewed.as_deref().unwrap_or(replacement), parent);
         drop(guard);
         outcome
-    })
-    .map(drop)
+    })?;
+    if let Some(mut used) = renewed {
+        // The call moved the copy to the name of the target. The file of the
+        // caller still holds the same content under its own name.
+        used.disable_cleanup(true);
+        fs::remove_file(replacement).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "{} was replaced; the temporary file {} could not be removed: {error}",
+                    target.display(),
+                    replacement.display()
+                ),
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// A copy of the file `replacement` under a new temporary name in `parent`.
+///
+/// After error 1175 the replacement holds the access list of the replaced
+/// file. When that list gives this account read access only, the next call
+/// fails with an access error on the replacement, and the list can deny a
+/// change of itself. The list lets the account read the file, or the first
+/// call had failed on the replaced file. A copy has the list of its folder,
+/// as the replacement had before the first call.
+///
+/// # Errors
+/// Returns the error of the copy and leaves no file.
+#[cfg(windows)]
+fn renewed_replacement(replacement: &Path, parent: &Path) -> io::Result<tempfile::TempPath> {
+    let copy = new_temporary(parent, None, None)?.into_temp_path();
+    fs::copy(replacement, &copy)?;
+    Ok(copy)
+}
+
+/// True when `error` is error 1175. `replacement` is then a copy of the
+/// earlier replacement, or the earlier replacement when no copy can be made.
+#[cfg(windows)]
+fn renewed_after_unremoved(
+    error: &io::Error,
+    replacement: &mut tempfile::TempPath,
+    parent: &Path,
+) -> bool {
+    if !unable_to_remove_replaced(error) {
+        return false;
+    }
+    if let Ok(copy) = renewed_replacement(replacement, parent) {
+        *replacement = copy;
+    }
+    true
+}
+
+/// The error to report when an attempt that followed error 1175 for
+/// `target` failed with `error`. Another error alone does not name the
+/// cause.
+#[cfg(windows)]
+fn after_unremoved(target: &Path, error: io::Error) -> io::Error {
+    if unable_to_remove_replaced(&error) {
+        return error;
+    }
+    io::Error::new(
+        error.kind(),
+        format!(
+            "{} was not replaced: another program held a file that the replacement uses (os \
+             error 1175), and the next attempt failed: {error}; try again",
+            target.display()
+        ),
+    )
 }
 
 /// True for Windows error 1175 of the replacement call, which a handle of
@@ -484,26 +564,31 @@ pub fn replace_existing_file(target: &Path, replacement: &Path) -> io::Result<()
 /// replacement keep their names. Both keep their content, and the backup
 /// name still holds the empty file that reserved it. The failed attempt
 /// removes that file; when another handle keeps it, it stays empty. Each
-/// attempt reserves a new backup name, so another attempt starts from the
-/// state of the first one.
+/// attempt reserves a new backup name. The replacement does not keep its
+/// access list, so another attempt uses a copy of it.
 #[cfg(windows)]
 fn unable_to_remove_replaced(error: &io::Error) -> bool {
     error.raw_os_error() == Some(1175)
 }
 
-/// Run `attempt`, one replacement call, again after error 1175, with the
-/// bound and the delays of the other commit retries.
+/// Run `attempt`, one replacement call for `target`, again after error 1175,
+/// with the bound and the delays of the other commit retries. The call gets
+/// `true` when it follows a failed one.
 #[cfg(windows)]
-fn retrying_unremoved<T>(mut attempt: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+fn retrying_unremoved<T>(
+    target: &Path,
+    mut attempt: impl FnMut(bool) -> io::Result<T>,
+) -> io::Result<T> {
     let mut backoff = Duration::from_millis(5);
     let mut repeats = 0;
     loop {
-        match attempt() {
+        match attempt(repeats > 0) {
             Err(error) if unable_to_remove_replaced(&error) && repeats < 7 => {
                 std::thread::sleep(backoff);
                 backoff = (backoff * 2).min(Duration::from_millis(200));
                 repeats += 1;
             }
+            Err(error) if repeats > 0 => return Err(after_unremoved(target, error)),
             outcome => return outcome,
         }
     }
