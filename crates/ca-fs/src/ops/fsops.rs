@@ -738,6 +738,57 @@ fn naming_a_leftover(error: io::Error, temporary: &Path) -> io::Error {
     }
 }
 
+/// [`FileOps::write_new_like`] on the local disk. `keeps_no_lists` says
+/// whether the volume of a path keeps no access lists; it is asked about
+/// `target` before a temporary exists.
+#[cfg(windows)]
+pub(crate) fn write_new_with_the_list_of(
+    target: &Path,
+    reader: &mut dyn Read,
+    buffer_size: usize,
+    model: &Path,
+    keeps_no_lists: impl FnOnce(&Path) -> bool,
+) -> io::Result<()> {
+    let refused = |error: io::Error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "{} cannot take the access list of {}, so nothing was replaced: {error}",
+                target.display(),
+                model.display()
+            ),
+        )
+    };
+    let Some(list) = super::access_list::AccessList::of(model).map_err(refused)? else {
+        return RealFs.write_new(target, reader, buffer_size);
+    };
+    // The copy would be open to every user of that volume.
+    if keeps_no_lists(target) {
+        return Err(refused(io::Error::other(format!(
+            "the backup folder is on a volume that keeps no access lists; {}",
+            super::access_list::NO_LISTS_ADVICE
+        ))));
+    }
+    let mut temporary = None;
+    let written = ca_io::replace_new_created(
+        target,
+        |written: &mut dyn Write| copy_all(reader, written, buffer_size),
+        || Ok(()),
+        // The copy has the list of the model from before its first byte,
+        // and a rename keeps a list, so the copy is never open to more
+        // users than the model.
+        |path| {
+            let file = list.create(path).map_err(refused)?;
+            temporary = Some(path.to_path_buf());
+            Ok(file)
+        },
+    );
+    match (written, temporary) {
+        (Err(error), Some(temporary)) => Err(naming_a_leftover(error, &temporary)),
+        (written, _) => written,
+    }
+}
+
 /// [`FileOps`] backed by the real file system.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RealFs;
@@ -852,44 +903,13 @@ impl FileOps for RealFs {
         buffer_size: usize,
         model: &Path,
     ) -> io::Result<()> {
-        let refused = |error: io::Error| {
-            io::Error::new(
-                error.kind(),
-                format!(
-                    "{} cannot take the access list of {}, so nothing was replaced: {error}",
-                    target.display(),
-                    model.display()
-                ),
-            )
-        };
-        let Some(list) = super::access_list::AccessList::of(model).map_err(refused)? else {
-            return self.write_new(target, reader, buffer_size);
-        };
-        // The copy would be open to every user of that volume.
-        if super::access_list::volume_keeps_no_lists(target) {
-            return Err(refused(io::Error::other(format!(
-                "the backup folder is on a volume that keeps no access lists; {}",
-                super::access_list::NO_LISTS_ADVICE
-            ))));
-        }
-        let mut temporary = None;
-        let written = ca_io::replace_new_created(
+        write_new_with_the_list_of(
             target,
-            |written: &mut dyn Write| copy_all(reader, written, buffer_size),
-            || Ok(()),
-            // The copy has the list of the model from before its first byte,
-            // and a rename keeps a list, so the copy is never open to more
-            // users than the model.
-            |path| {
-                let file = list.create(path).map_err(refused)?;
-                temporary = Some(path.to_path_buf());
-                Ok(file)
-            },
-        );
-        match (written, temporary) {
-            (Err(error), Some(temporary)) => Err(naming_a_leftover(error, &temporary)),
-            (written, _) => written,
-        }
+            reader,
+            buffer_size,
+            model,
+            super::access_list::volume_keeps_no_lists,
+        )
     }
 
     #[cfg(unix)]
