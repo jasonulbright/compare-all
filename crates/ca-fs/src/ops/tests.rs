@@ -740,9 +740,6 @@ impl FileOps for WatchFs {
     fn replace(&self, from: &Path, to: &Path) -> io::Result<()> {
         RealFs.replace(from, to)
     }
-    fn second_name(&self, target: &Path, name: &Path) -> io::Result<bool> {
-        RealFs.second_name(target, name)
-    }
     fn write_new(
         &self,
         target: &Path,
@@ -972,6 +969,156 @@ fn the_backup_of_an_owner_only_target_keeps_its_access_list() {
     // The backup holds the old content after the target changes again.
     std::fs::write(&target, b"newer").unwrap();
     assert_eq!(std::fs::read(&backup).unwrap(), b"old");
+}
+
+/// The access entries of `path`, without the mark that says the file took
+/// an entry from its folder.
+#[cfg(windows)]
+fn access_entries(path: &Path) -> Vec<String> {
+    let text = access_list(path).replace(&path.display().to_string(), "");
+    let mut entries: Vec<String> = text
+        .lines()
+        .map(|line| line.trim().replace("(I)", ""))
+        .filter(|line| !line.is_empty() && !line.starts_with("Successfully"))
+        .collect();
+    entries.sort();
+    entries
+}
+
+#[cfg(windows)]
+#[test]
+fn the_backup_has_the_access_entries_of_the_target_in_its_folder_and_in_another() {
+    let user = std::env::var("USERNAME").unwrap();
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    // A folder that gives its new files one entry, and a target with the
+    // entries of an ordinary folder.
+    let vault = right.path().join("vault");
+    std::fs::create_dir(&vault).unwrap();
+    let status = std::process::Command::new("icacls")
+        .arg(&vault)
+        .args(["/inheritance:r", "/grant:r"])
+        .arg(format!("{user}:(OI)(CI)F"))
+        .stdout(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success());
+    for name in ["beside.txt", "moved.txt"] {
+        std::fs::write(left.path().join(name), b"new").unwrap();
+        std::fs::write(right.path().join(name), b"old").unwrap();
+    }
+    let ordinary = access_entries(&right.path().join("beside.txt"));
+    assert!(ordinary.len() > 1, "{ordinary:?}");
+
+    let beside = OperationOptions {
+        overwrite: true,
+        backup: Some(BackupOptions::default()),
+        ..options()
+    };
+    copy_left_to_right(left.path(), right.path(), "beside.txt", &beside);
+    let in_vault = OperationOptions {
+        overwrite: true,
+        backup: Some(BackupOptions {
+            folder: Some(vault.clone()),
+            ..BackupOptions::default()
+        }),
+        ..options()
+    };
+    copy_left_to_right(left.path(), right.path(), "moved.txt", &in_vault);
+
+    for backup in [
+        right.path().join("beside.txt.bak"),
+        vault.join("moved.txt.bak"),
+    ] {
+        assert_eq!(std::fs::read(&backup).unwrap(), b"old");
+        assert_eq!(access_entries(&backup), ordinary, "{}", backup.display());
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn a_step_that_replaces_nothing_leaves_the_target_under_one_name() {
+    use std::os::windows::fs::OpenOptionsExt;
+    const SHARE_READ_AND_WRITE: u32 = 0x1 | 0x2;
+    let backed_up = OperationOptions {
+        overwrite: true,
+        backup: Some(BackupOptions::default()),
+        ..options()
+    };
+    for read_only in [true, false] {
+        let base = tempfile::tempdir().unwrap();
+        let source = base.path().join("source.txt");
+        std::fs::write(&source, b"new").unwrap();
+        let target = base.path().join("a.txt");
+        std::fs::write(&target, b"old").unwrap();
+        let writable = std::fs::metadata(&target).unwrap().permissions();
+        // A read-only target is skipped. A target that another handle holds
+        // open with no consent to its removal fails the replacement.
+        let held = if read_only {
+            let mut permissions = writable.clone();
+            permissions.set_readonly(true);
+            std::fs::set_permissions(&target, permissions).unwrap();
+            None
+        } else {
+            Some(
+                std::fs::File::options()
+                    .read(true)
+                    .share_mode(SHARE_READ_AND_WRITE)
+                    .open(&target)
+                    .unwrap(),
+            )
+        };
+
+        let outcome = replace_by_copy_with(base.path(), &source, &target, backed_up.clone());
+        if read_only {
+            assert!(
+                matches!(&outcome, StepOutcome::Skipped { reason } if reason == "target is read-only"),
+                "{outcome:?}"
+            );
+        } else {
+            assert!(matches!(outcome, StepOutcome::Failed { .. }), "{outcome:?}");
+        }
+        drop(held);
+
+        // A write into the target reaches no other name of the folder.
+        std::fs::set_permissions(&target, writable).unwrap();
+        std::fs::write(&target, b"edited").unwrap();
+        for entry in std::fs::read_dir(base.path()).unwrap() {
+            let path = entry.unwrap().path();
+            if path != target && path != source {
+                assert_eq!(std::fs::read(&path).unwrap(), b"old", "{}", path.display());
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn a_write_through_a_second_name_of_the_target_does_not_change_the_backup() {
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    std::fs::write(left.path().join("a.txt"), b"new").unwrap();
+    let target = right.path().join("a.txt");
+    let other = right.path().join("other-name.txt");
+    std::fs::write(&target, b"old").unwrap();
+    if let Err(error) = std::fs::hard_link(&target, &other) {
+        println!("skipped: this volume refuses a second name: {error}");
+        return;
+    }
+    let backed_up = OperationOptions {
+        overwrite: true,
+        backup: Some(BackupOptions::default()),
+        ..options()
+    };
+
+    copy_left_to_right(left.path(), right.path(), "a.txt", &backed_up);
+    std::fs::write(&other, b"edited").unwrap();
+
+    assert_eq!(std::fs::read(&target).unwrap(), b"new");
+    assert_eq!(
+        std::fs::read(right.path().join("a.txt.bak")).unwrap(),
+        b"old"
+    );
 }
 
 /// Run one copy step from `source` over the existing item `target`.
