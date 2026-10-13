@@ -2961,6 +2961,7 @@ mod tests {
     mod merge_edit_probes;
     mod pending_take_reload_probes;
     mod randomized_merge_driver;
+    mod reload_cost_probes;
     mod take_order_probes;
     mod two_way_lent_probes;
 
