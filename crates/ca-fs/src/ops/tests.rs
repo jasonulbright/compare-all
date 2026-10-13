@@ -1139,6 +1139,79 @@ fn the_backup_of_a_file_with_no_access_list_at_all_is_an_ordinary_copy() {
     assert_eq!(temporaries_in(dir.path()), Vec::<String>::new());
 }
 
+/// The security identifier of the account that runs the test.
+#[cfg(windows)]
+fn current_account() -> String {
+    let out = std::process::Command::new("whoami.exe")
+        .args(["/user", "/fo", "csv", "/nh"])
+        .output()
+        .unwrap();
+    let line = String::from_utf8_lossy(&out.stdout).into_owned();
+    let account = line.trim().rsplit(',').next().unwrap().trim_matches('"');
+    assert!(account.starts_with("S-1-"), "{line}");
+    account.to_owned()
+}
+
+/// A folder under `base` that gives its new files full control for the
+/// account of the test and for the system, and nothing else.
+#[cfg(windows)]
+fn folder_with_two_entries(base: &Path, account: &str) -> PathBuf {
+    let folder = base.join("two entries");
+    std::fs::create_dir(&folder).unwrap();
+    crate::ops::access_list::set_for_test(
+        &folder,
+        Some(&format!("D:P(A;OICI;FA;;;{account})(A;OICI;FA;;;SY)")),
+    );
+    folder
+}
+
+#[cfg(windows)]
+#[test]
+fn the_backup_of_a_file_with_an_entry_that_its_folder_also_gives_is_written() {
+    use crate::ops::access_list::{set_for_test, text_for_test};
+    let account = current_account();
+    let dir = tempfile::tempdir().unwrap();
+    let folder = folder_with_two_entries(dir.path(), &account);
+    for (name, own_entries) in [
+        ("system.txt", "(A;;FA;;;SY)".to_owned()),
+        (
+            "guests and account.txt",
+            format!("(A;;FR;;;BG)(A;;FA;;;{account})"),
+        ),
+    ] {
+        let target = folder.join(name);
+        std::fs::write(&target, b"old").unwrap();
+        set_for_test(&target, Some(&format!("D:{own_entries}")));
+        let before = text_for_test(&target);
+        assert!(
+            before.starts_with(&format!("D:AI{own_entries}(A;ID;FA;;;")),
+            "{before}"
+        );
+
+        let outcome = replace_with_a_backup(&folder, name);
+
+        assert!(outcome.is_done(), "{name}: {outcome:?}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"new");
+        assert_eq!(text_for_test(&target), before);
+        let backup = folder.join(format!("{name}.bak"));
+        assert_eq!(std::fs::read(&backup).unwrap(), b"old");
+        // Each account of the file has its entry once, and no entry comes
+        // from the folder of the backup.
+        let saved = text_for_test(&backup);
+        assert!(saved.starts_with("D:PAI("), "{saved}");
+        assert!(!saved.contains(";ID;"), "{saved}");
+        for entry in [
+            own_entries.as_str(),
+            "(A;;FA;;;SY)",
+            &format!("(A;;FA;;;{account})"),
+        ] {
+            assert!(saved.contains(entry), "{entry} is not in {saved}");
+        }
+        assert_eq!(saved.matches("(A;;FA;;;SY)").count(), 1, "{saved}");
+        assert_eq!(temporaries_in(&folder), Vec::<String>::new());
+    }
+}
+
 /// A folder for one test on the share that `COMPARE_ALL_WSL_SHARE` names: a
 /// folder under `\\wsl.localhost\`, a volume with no replacement call and no
 /// access lists. `None` when the variable names no folder.
