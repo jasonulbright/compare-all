@@ -27,6 +27,7 @@ unicode-normalization.workspace = true
 [target.'cfg(windows)'.dependencies]
 winsafe = { version = "0.0.24", features = ["kernel", "advapi"] }
 winapi-util = "0.1.11"
+windows-permissions = "0.2.4"
 
 [dev-dependencies]
 ca-vfs = { workspace = true, features = ["testing"] }

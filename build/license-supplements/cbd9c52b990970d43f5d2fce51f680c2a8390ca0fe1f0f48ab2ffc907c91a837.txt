@@ -1,0 +1,30 @@
+[package]
+name = "windows-permissions"
+version = "0.2.4"
+authors = ["Daniel Dulaney <dan@dulaney.xyz>"]
+edition = "2018"
+description = "Safe Rust bindings to Windows permissions APIs"
+repository = "https://github.com/danieldulaney/windows-permissions-rs"
+readme = "README.md"
+keywords = ["windows", "security", "permissions"]
+categories = ["api-bindings", "authentication", "os::windows-apis"]
+license = "MIT"
+
+[package.metadata.docs.rs]
+targets = ["x86_64-pc-windows-msvc", "i686-pc-windows-msvc"]
+
+[dependencies]
+winapi = { version = "0.3.9", features = [
+    "std",
+    "aclapi",
+    "handleapi",
+    "sddl",
+    "securitybaseapi",
+    "winerror",
+    "winnt",
+    ]}
+bitflags = "1"
+
+[dev-dependencies]
+itertools = "0.8"
+tempfile = "3"
