@@ -566,6 +566,29 @@ impl MergeModel {
         {
             return;
         }
+        let mut returned = Vec::new();
+        if restore_from_take {
+            // The rebuild replaces every line of the section, so the text it
+            // holds for later sections goes back to them first, last in
+            // output order first, as a take of the section does.
+            let mut giving: Vec<((usize, u32), usize, u64)> = self
+                .held_by(index)
+                .into_iter()
+                .filter_map(|(lender, seq)| {
+                    let at = self.record_at(self.lent_record(lender, seq)?)?;
+                    Some((at, lender, seq))
+                })
+                .collect();
+            giving.sort_unstable();
+            for (_, lender, seq) in giving.into_iter().rev() {
+                if let Some(given) = self.give_back(lender, seq) {
+                    returned.push(given);
+                }
+            }
+            if let Some(live) = self.sections.get(index) {
+                state.joined_through = live.joined_through;
+            }
+        }
         state.restore = None;
         state.restore_from_take = false;
         state.edited.clear();
@@ -575,6 +598,7 @@ impl MergeModel {
         self.sections[index] = state;
         if restore_from_take {
             self.rebuild_changed_sections(&[index], true);
+            self.repair_returned(&returned);
         } else {
             self.refresh_section_totals(index);
         }
