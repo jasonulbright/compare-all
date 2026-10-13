@@ -12,7 +12,8 @@ use std::path::Path;
 
 use windows_permissions::constants::{SeObjectType, SecurityInformation};
 use windows_permissions::wrappers::{
-    ConvertSecurityDescriptorToStringSecurityDescriptor, GetSecurityInfo, SetSecurityInfo,
+    ConvertSecurityDescriptorToStringSecurityDescriptor, GetAclInformationSize, GetSecurityInfo,
+    SetSecurityInfo,
 };
 use windows_permissions::{LocalBox, SecurityDescriptor};
 
@@ -35,6 +36,94 @@ pub(crate) struct AccessList {
     entries: String,
 }
 
+/// What a file reports of its access list: the descriptor text, and the
+/// size of the stored list that the text was written from.
+struct Reported {
+    text: String,
+    size: ListSize,
+}
+
+/// The number of entries of a stored access list and the bytes they use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ListSize {
+    entries: u32,
+    bytes: u32,
+}
+
+impl ListSize {
+    /// The size of the list of `descriptor`, or of an empty list when the
+    /// descriptor has none.
+    fn of(descriptor: &SecurityDescriptor) -> io::Result<Self> {
+        let Some(list) = descriptor.dacl() else {
+            return Ok(Self {
+                entries: 0,
+                bytes: 0,
+            });
+        };
+        let size = GetAclInformationSize(list)?;
+        Ok(Self {
+            entries: size.AceCount,
+            bytes: size.AclBytesInUse,
+        })
+    }
+}
+
+impl Reported {
+    /// The list of a file that reports the descriptor text `text`, read as
+    /// Windows reads the text.
+    #[cfg(test)]
+    fn from_text(text: &str) -> io::Result<Self> {
+        let descriptor: LocalBox<SecurityDescriptor> = text.parse()?;
+        Ok(Self {
+            text: text.to_owned(),
+            size: ListSize::of(&descriptor)?,
+        })
+    }
+
+    /// Fails when the text does not stand for the stored list with
+    /// certainty.
+    ///
+    /// Windows writes a quotation mark inside the text value of a
+    /// conditional entry as it is. The text of one stored entry can then
+    /// read as several entries, or as one entry with another condition, and
+    /// a list written from the text gives access that the stored list does
+    /// not give. The text is taken only when it has as many entries as the
+    /// stored list and Windows reads it back to a list of that many entries.
+    /// A text with a quotation mark must also read back to a list of the
+    /// same number of bytes.
+    fn agrees_with_its_text(&self) -> io::Result<()> {
+        let entries = &self.text[self.text.find('(').unwrap_or(self.text.len())..];
+        let read = entries_of(entries)?.len();
+        if u32::try_from(read).ok() != Some(self.size.entries) {
+            return Err(unreadable(&format!(
+                "the text has {read} entries and the list has {}",
+                self.size.entries
+            )));
+        }
+        let again: LocalBox<SecurityDescriptor> = self.text.parse()?;
+        let again = ListSize::of(&again)?;
+        if again.entries != self.size.entries
+            || (self.text.contains('"') && again.bytes != self.size.bytes)
+        {
+            return Err(unreadable(
+                "Windows reads the text back to a list of another size",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// What a user can do when the access list of a file has no text form that
+/// stands for it with certainty.
+const TEXT_ADVICE: &str = "turn the backup off to replace the file without a backup";
+
+/// The error for a list text that is not taken, with the cause `what`.
+fn unreadable(what: &str) -> io::Error {
+    io::Error::other(format!(
+        "the access list text cannot be read with certainty ({what}); {TEXT_ADVICE}"
+    ))
+}
+
 impl AccessList {
     /// The access list of the file `model`, or `None` when a copy of the file
     /// needs none: the volume keeps no access lists, or the file has none,
@@ -46,7 +135,20 @@ impl AccessList {
         if volume_keeps_no_lists(model) {
             return Ok(None);
         }
-        Self::parse(&list_text(&File::open(model)?)?)
+        Self::read(&reported(&File::open(model)?)?)
+    }
+
+    /// The list that a file reports, or `None` for a file with no list.
+    ///
+    /// # Errors
+    /// Returns an error when the text does not stand for the stored list
+    /// with certainty.
+    fn read(reported: &Reported) -> io::Result<Option<Self>> {
+        let list = Self::parse(&reported.text)?;
+        if list.is_some() {
+            reported.agrees_with_its_text()?;
+        }
+        Ok(list)
     }
 
     /// The list that the descriptor text `text` holds.
@@ -105,6 +207,12 @@ impl AccessList {
         let list = descriptor
             .dacl()
             .ok_or_else(|| io::Error::other("the access list has no entries to apply"))?;
+        let wanted = entries_of(&self.entries)?.len();
+        if u32::try_from(wanted).ok() != Some(ListSize::of(&descriptor)?.entries) {
+            return Err(unreadable(
+                "Windows reads the text to a list with another number of entries",
+            ));
+        }
         SetSecurityInfo(
             file,
             SeObjectType::SE_FILE_OBJECT,
@@ -115,8 +223,8 @@ impl AccessList {
             None,
         )
         .map_err(|error| not_kept(&error))?;
-        let kept = list_text(file).map_err(|error| not_kept(&error))?;
-        if Self::parse(&kept)?.as_ref() == Some(self) {
+        let kept = reported(file).map_err(|error| not_kept(&error))?;
+        if Self::read(&kept)?.as_ref() == Some(self) {
             Ok(())
         } else {
             Err(not_kept(&"it reports another list"))
@@ -211,16 +319,37 @@ fn names_no_list(mut flags: &str) -> io::Result<bool> {
     Ok(no_list)
 }
 
-/// The access list of the open file `file` as descriptor text.
-fn list_text(file: &File) -> io::Result<String> {
+/// What the open file `file` reports of its access list.
+///
+/// # Errors
+/// Returns the error of the read.
+fn reported(file: &File) -> io::Result<Reported> {
     let descriptor = GetSecurityInfo(
         file,
         SeObjectType::SE_FILE_OBJECT,
         SecurityInformation::Dacl,
     )?;
-    ConvertSecurityDescriptorToStringSecurityDescriptor(&descriptor, SecurityInformation::Dacl)?
-        .into_string()
-        .map_err(|_| io::Error::other("the access list text is not Unicode"))
+    let text = ConvertSecurityDescriptorToStringSecurityDescriptor(
+        &descriptor,
+        SecurityInformation::Dacl,
+    )?
+    .into_string()
+    .map_err(|_| io::Error::other("the access list text is not Unicode"))?;
+    // The list accessor of the descriptor panics for a file with no list at
+    // all, so such a descriptor is not measured.
+    let no_list = text
+        .split('(')
+        .next()
+        .is_some_and(|flags| flags.contains(NO_LIST));
+    let size = if no_list {
+        ListSize {
+            entries: 0,
+            bytes: 0,
+        }
+    } else {
+        ListSize::of(&descriptor)?
+    };
+    Ok(Reported { text, size })
 }
 
 /// The entries of `text`, the part of a descriptor text after the flags of
@@ -229,18 +358,15 @@ fn list_text(file: &File) -> io::Result<String> {
 /// An entry is `(type;flags;rights;object;inherited object;account)`. A
 /// conditional entry and a resource attribute entry have a seventh field
 /// with parentheses of its own and with text in quotation marks. A
-/// parenthesis or a semicolon between quotation marks is text, and a text
-/// between quotation marks holds no quotation mark.
+/// parenthesis or a semicolon between quotation marks is text. Windows
+/// writes a quotation mark inside such a text as it is, so the text of one
+/// stored entry can read as several entries here: the count of this reader
+/// is compared with the count of the stored list before a list is taken.
 ///
 /// # Errors
 /// Returns an error when `text` is not a run of whole entries. A part of a
 /// list is never returned: two different lists can have the same part.
 fn entries_of(text: &str) -> io::Result<Vec<&str>> {
-    let unreadable = |what: &str| {
-        io::Error::other(format!(
-            "the access list text cannot be read with certainty ({what})"
-        ))
-    };
     let mut entries = Vec::new();
     let mut depth = 0usize;
     let mut quoted = false;
@@ -389,7 +515,7 @@ pub(crate) fn text_for_test(path: &Path) -> String {
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
         .open(path)
         .unwrap();
-    list_text(&item).unwrap()
+    reported(&item).unwrap().text
 }
 
 /// The descriptor text `text` as Windows writes it. Windows writes a
@@ -569,6 +695,71 @@ mod tests {
         assert_eq!(super::entries_of("").unwrap(), Vec::<&str>::new());
         let not_ascii = "(A;;FA;;;S-1-5-21-1-2-3-1001)(A;;FR;;;\u{e9})";
         assert_eq!(super::entries_of(not_ascii).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_text_with_another_number_of_entries_than_the_stored_list_is_refused() {
+        use super::{ListSize, Reported};
+        let account = "S-1-5-21-1-2-3-1001";
+        // The text of a stored list of two entries, the second with a
+        // quotation mark in its text value.
+        let text = format!(
+            r#"D:P(A;;FA;;;{account})(XA;;FR;;;WD;(@USER.Title == "a"))(A;;FA;;;WD)(XA;;FR;;;WD;(@USER.t == "b"))"#
+        );
+        let as_text = Reported::from_text(&text).unwrap();
+        assert_eq!(as_text.size.entries, 4);
+        assert!(AccessList::read(&as_text).unwrap().is_some());
+        let stored = Reported {
+            text: text.clone(),
+            size: ListSize {
+                entries: 2,
+                bytes: as_text.size.bytes,
+            },
+        };
+        let error = AccessList::read(&stored).unwrap_err().to_string();
+        assert!(
+            error.contains("the text has 4 entries and the list has 2"),
+            "{error}"
+        );
+        assert!(error.contains("turn the backup off"), "{error}");
+
+        // One stored entry whose text reads as one entry with another
+        // condition: the stored list has another number of bytes.
+        let text = format!(
+            r#"D:P(A;;FA;;;{account})(XA;;FR;;;WD;(@USER.Title == "a" || @USER.t != "b"))"#
+        );
+        let as_text = Reported::from_text(&text).unwrap();
+        assert!(AccessList::read(&as_text).unwrap().is_some());
+        let stored = Reported {
+            text,
+            size: ListSize {
+                entries: 2,
+                bytes: as_text.size.bytes + 20,
+            },
+        };
+        let error = AccessList::read(&stored).unwrap_err().to_string();
+        assert!(error.contains("a list of another size"), "{error}");
+
+        // A list with no quotation mark is taken by its count alone.
+        let plain = Reported::from_text(&format!("D:PAI(A;;FA;;;{account})(A;;FR;;;BU)")).unwrap();
+        let padded = Reported {
+            text: plain.text.clone(),
+            size: ListSize {
+                entries: 2,
+                bytes: plain.size.bytes + 4,
+            },
+        };
+        assert_eq!(
+            AccessList::read(&padded).unwrap(),
+            AccessList::read(&plain).unwrap()
+        );
+        assert_eq!(
+            AccessList::read(&Reported::from_text("D:P").unwrap())
+                .unwrap()
+                .unwrap()
+                .entries,
+            ""
+        );
     }
 
     #[test]

@@ -1320,6 +1320,109 @@ fn the_backup_of_a_file_with_accounts_that_have_a_short_name_in_the_list_text_is
     assert_eq!(temporaries_in(dir.path()), Vec::<String>::new());
 }
 
+/// The `PowerShell` function `Conditional`, which makes a stored conditional
+/// entry that gives every user read access when the attribute `Title` equals
+/// the text given to the function.
+#[cfg(windows)]
+const CONDITIONAL_ENTRY: &str = r"
+function Conditional([string]$literal) {
+    $unicode = [Text.Encoding]::Unicode
+    $name = $unicode.GetBytes('Title'); $text = $unicode.GetBytes($literal)
+    $data = [Collections.Generic.List[byte]]::new()
+    $data.AddRange([byte[]](0x61, 0x72, 0x74, 0x78))
+    $data.Add(0xf9); $data.AddRange([BitConverter]::GetBytes([uint32]$name.Length)); $data.AddRange($name)
+    $data.Add(0x10); $data.AddRange([BitConverter]::GetBytes([uint32]$text.Length)); $data.AddRange($text)
+    $data.Add(0x80)
+    while ($data.Count % 4) { $data.Add(0) }
+    [Security.AccessControl.CommonAce]::new(0, 'AccessAllowed', 0x120089, [Security.Principal.SecurityIdentifier]'S-1-1-0', $true, $data.ToArray())
+}
+";
+
+/// Give the file `path` a protected list of two stored entries: full control
+/// for the account of the test, and `second`, an expression of `PowerShell`
+/// for an entry. The list goes to the file in its stored form, so it can
+/// hold what no list text can.
+#[cfg(windows)]
+fn set_stored_entries(path: &Path, second: &str) {
+    let script = path.with_extension("ps1");
+    let body = [
+        "$ErrorActionPreference = 'Stop'",
+        CONDITIONAL_ENTRY,
+        "$me = [Security.Principal.WindowsIdentity]::GetCurrent().User",
+        "$list = [Security.AccessControl.RawAcl]::new(2, 2)",
+        "$list.InsertAce(0, [Security.AccessControl.CommonAce]::new(0, 'AccessAllowed', 0x1f01ff, $me, $false, $null))",
+        &format!("$list.InsertAce(1, ({second}))"),
+        "$descriptor = [Security.AccessControl.RawSecurityDescriptor]::new('DiscretionaryAclPresent, DiscretionaryAclProtected, SelfRelative', $null, $null, $null, $list)",
+        "$bytes = [byte[]]::new($descriptor.BinaryLength); $descriptor.GetBinaryForm($bytes, 0)",
+        "$security = [Security.AccessControl.FileSecurity]::new()",
+        "$security.SetSecurityDescriptorBinaryForm($bytes, 'Access')",
+        &format!("[IO.File]::SetAccessControl('{}', $security)", path.display()),
+    ]
+    .join("\r\n");
+    std::fs::write(&script, body).unwrap();
+    let set = ca_io::host_command::host_command("powershell.exe")
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+        .arg(&script)
+        .output()
+        .unwrap();
+    assert!(set.status.success(), "{set:?}");
+    std::fs::remove_file(script).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn a_list_whose_text_does_not_stand_for_it_with_certainty_gets_no_backup() {
+    use crate::ops::access_list::{set_for_test, text_for_test};
+    let dir = tempfile::tempdir().unwrap();
+    let uncertain = "the access list text cannot be read with certainty";
+    for (name, list, causes) in [
+        (
+            "more entries in the text.txt",
+            Err(r#"Conditional 'a"))(A;;FA;;;WD)(XA;;FR;;;WD;(@USER.t == "b'"#),
+            [uncertain, "the text has 4 entries and the list has 2"],
+        ),
+        (
+            "another condition in the text.txt",
+            Err(r#"Conditional 'a" || @USER.t != "b'"#),
+            [uncertain, "a list of another size"],
+        ),
+    ] {
+        let target = dir.path().join(name);
+        std::fs::write(&target, b"old").unwrap();
+        match &list {
+            Ok::<String, _>(text) => set_for_test(&target, Some(text)),
+            Err(second) => set_stored_entries(&target, second),
+        }
+        // A list with no text form has no text to compare.
+        let before = (name != "no text.txt").then(|| text_for_test(&target));
+
+        let outcome = replace_with_a_backup(dir.path(), name);
+
+        let StepOutcome::Failed { message } = &outcome else {
+            panic!("{name}: {outcome:?}");
+        };
+        let backup = dir.path().join(format!("{name}.bak"));
+        for part in [
+            format!("{} cannot take the access list of ", backup.display()),
+            format!("{}, so nothing was replaced", target.display()),
+            causes[0].to_owned(),
+            causes[1].to_owned(),
+            "turn the backup off to replace the file without a backup".to_owned(),
+        ] {
+            assert!(
+                message.contains(&part),
+                "{name}: {part} is not in: {message}"
+            );
+        }
+        assert_eq!(std::fs::read(&target).unwrap(), b"old", "{name}");
+        assert!(!backup.exists(), "{name}");
+        assert_eq!(temporaries_in(dir.path()), Vec::<String>::new(), "{name}");
+        if let Some(before) = before {
+            assert_eq!(text_for_test(&target), before, "{name}");
+        }
+    }
+}
+
 /// A reader that, at each block, tries to open every temporary of `folder`
 /// for reading and reads its access list.
 #[cfg(windows)]
