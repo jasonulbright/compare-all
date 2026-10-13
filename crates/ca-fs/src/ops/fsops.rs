@@ -801,14 +801,16 @@ impl FileOps for RealFs {
         let Some(mode) = carried_mode(model)? else {
             return self.write_new(target, reader, buffer_size);
         };
-        ca_io::replace_new_with_mode(
+        ca_io::replace_new_prepared(
             target,
             |written: &mut dyn Write| copy_all(reader, written, buffer_size),
             || Ok(()),
             mode,
-        )?;
-        // The umask can withhold a bit that the model has.
-        std::fs::set_permissions(target, std::fs::Permissions::from_mode(mode))
+            // The umask can withhold a bit that the model has. The bits are
+            // set through the open file: a call by path follows a link that
+            // another user puts at the name.
+            |file, _| file.set_permissions(std::fs::Permissions::from_mode(mode)),
+        )
     }
 
     #[cfg(windows)]
