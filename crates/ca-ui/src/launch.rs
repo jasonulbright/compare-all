@@ -272,9 +272,10 @@ pub fn system_open_command(path: &std::path::Path) -> LaunchCommand {
 /// handles the file. Every other item is selected in its folder, or its
 /// folder is opened where the platform has no selection. On macOS a folder
 /// that the system takes for a package is shown from the inside without a
-/// request to open it, because that request starts a program. The path is
-/// always one process argument; it is never interpolated into a shell
-/// command.
+/// request to open it, because that request starts a program. On macOS and
+/// Linux the path is one process argument. On Windows it is a part between
+/// quotation marks of the command line that the file manager reads. No
+/// platform passes it through a shell.
 ///
 /// The call reads the file system, so a caller on the interface thread hands
 /// it to a worker.
@@ -394,8 +395,9 @@ fn mac_folder(_path: &std::path::Path) -> MacFolder {
 /// quotation marks and reads the first part as an item to open. The path
 /// therefore stands between quotation marks in both forms, and the command
 /// reaches the program as written. A Windows name holds no quotation mark;
-/// one in the text would end the quoted part, so it is taken out, and the
-/// text then names no item.
+/// one in the text would end the quoted part, so it is taken out. The text
+/// that stays can name another item, which is then opened or selected as
+/// any item is; no part of the text is read as a second argument.
 fn windows_explorer_command(path: &std::path::Path, selection: Selection) -> LaunchCommand {
     let text = path_argument(path).replace('"', "");
     // The file manager opens another folder for a path with a forward
