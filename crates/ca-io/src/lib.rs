@@ -387,7 +387,9 @@ fn replace_impl<T, E: From<io::Error>>(
                     sync_directory(parent);
                     return Ok((result, retained));
                 }
-                Err(error) if retryable(&error) && attempt < 7 => {
+                Err(error)
+                    if (retryable(&error) || unable_to_remove_replaced(&error)) && attempt < 7 =>
+                {
                     std::thread::sleep(backoff);
                     backoff = (backoff * 2).min(Duration::from_millis(200));
                     attempt += 1;
@@ -464,12 +466,47 @@ pub fn replace_existing_file(target: &Path, replacement: &Path) -> io::Result<()
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let guard = COMMIT_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let outcome = replace_existing_windows(target, replacement, parent);
-    drop(guard);
-    outcome.map(drop)
+    retrying_unremoved(|| {
+        let guard = COMMIT_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let outcome = replace_existing_windows(target, replacement, parent);
+        drop(guard);
+        outcome
+    })
+    .map(drop)
+}
+
+/// True for Windows error 1175 of the replacement call, which a handle of
+/// another program on the reserved backup name gives.
+///
+/// The call documents that after this error the replaced file and the
+/// replacement keep their names. Both keep their content, and the backup
+/// name still holds the empty file that reserved it. The failed attempt
+/// removes that file; when another handle keeps it, it stays empty. Each
+/// attempt reserves a new backup name, so another attempt starts from the
+/// state of the first one.
+#[cfg(windows)]
+fn unable_to_remove_replaced(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(1175)
+}
+
+/// Run `attempt`, one replacement call, again after error 1175, with the
+/// bound and the delays of the other commit retries.
+#[cfg(windows)]
+fn retrying_unremoved<T>(mut attempt: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    let mut backoff = Duration::from_millis(5);
+    let mut repeats = 0;
+    loop {
+        match attempt() {
+            Err(error) if unable_to_remove_replaced(&error) && repeats < 7 => {
+                std::thread::sleep(backoff);
+                backoff = (backoff * 2).min(Duration::from_millis(200));
+                repeats += 1;
+            }
+            outcome => return outcome,
+        }
+    }
 }
 
 fn retain_conflict_backup(
