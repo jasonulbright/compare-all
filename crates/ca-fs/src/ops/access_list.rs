@@ -96,7 +96,10 @@ impl AccessList {
     /// Give the open file `file` this list and nothing from its folder.
     fn apply_to(&self, file: &mut File) -> io::Result<()> {
         let not_kept = |cause: &dyn std::fmt::Display| {
-            io::Error::other(format!("the volume did not keep the access list ({cause})"))
+            io::Error::other(format!(
+                "the volume of the backup folder did not keep the access list ({cause}); \
+                 {NO_LISTS_ADVICE}"
+            ))
         };
         let descriptor: LocalBox<SecurityDescriptor> = format!("D:P{}", self.entries).parse()?;
         let list = descriptor
@@ -120,6 +123,11 @@ impl AccessList {
         }
     }
 }
+
+/// What a user can do when the volume of the backup folder keeps no access
+/// lists.
+pub(crate) const NO_LISTS_ADVICE: &str =
+    "choose a backup folder on a volume that keeps access lists, or turn the backup off";
 
 /// Fails when this account may not rename or remove the file at `path`,
 /// which another handle holds open and shares for that.
