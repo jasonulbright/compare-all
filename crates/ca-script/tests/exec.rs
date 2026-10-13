@@ -1066,6 +1066,61 @@ fn a_location_with_no_password_is_logged_as_written() {
 }
 
 #[test]
+fn a_line_with_two_locations_is_logged_as_two_locations() {
+    for (arguments, logged) in [
+        (
+            "ftp://alice:hunter2@127.0.0.1:1/left ftp://carol:hunter3@127.0.0.1:1/right",
+            "load ftp://alice:***@127.0.0.1:1/left ftp://carol:***@127.0.0.1:1/right",
+        ),
+        (
+            "ftp://bob@127.0.0.1:1/left ftp://carol@127.0.0.1:1/right",
+            "load ftp://bob@127.0.0.1:1/left ftp://carol@127.0.0.1:1/right",
+        ),
+        (
+            "ftp://bob@127.0.0.1:1/pub \"C:/mail/x@y\"",
+            "load ftp://bob@127.0.0.1:1/pub C:/mail/x@y",
+        ),
+        (
+            "\"ftp://bob@127.0.0.1:1/pub/a@b\" \"C:/mail/x y\"",
+            "load ftp://bob@127.0.0.1:1/pub/a@b \"C:/mail/x y\"",
+        ),
+    ] {
+        let fixture = Fixture::new();
+        let target = fixture.root().join("run.log");
+        let mut session = fixture.session();
+        session.log.set_fixed_time(Some(0));
+        let source = format!("log verbose \"{}\"\nload {arguments}\n", target.display());
+        let _ = run_script(&source, &Substitution::none(), &mut session);
+        let text = std::fs::read_to_string(&target).expect("log");
+        assert!(
+            text.contains(logged),
+            "{logged:?} is not in the log: {text}"
+        );
+        assert!(!text.contains("hunter"), "{text}");
+    }
+}
+
+#[test]
+fn a_password_with_digits_before_its_first_slash_reaches_neither_the_log_nor_the_error() {
+    for password in ["123/4", "8080/hunter2"] {
+        let fixture = Fixture::new();
+        let target = fixture.root().join("run.log");
+        let mut session = fixture.session();
+        session.log.set_fixed_time(Some(0));
+        let source = format!(
+            "log verbose \"{}\"\nload \"ftp://alice:{password}@127.0.0.1:1/pub\" \"{}\"\n",
+            target.display(),
+            fixture.right().display()
+        );
+        let error = run_script(&source, &Substitution::none(), &mut session).unwrap_err();
+        let text = std::fs::read_to_string(&target).expect("log");
+        assert!(text.contains("ftp://alice:***@127.0.0.1:1/pub"), "{text}");
+        assert!(!text.contains(password), "{text}");
+        assert!(!error.to_string().contains(password), "{error}");
+    }
+}
+
+#[test]
 fn append_adds_to_the_log_instead_of_replacing_it() {
     let fixture = Fixture::new();
     let target = fixture.root().join("run.log");

@@ -84,10 +84,9 @@ pub fn run_script(
 pub fn run(script: &Script, session: &mut Session) -> Result<Outcome, RunError> {
     let mut outcome = Outcome::default();
     for statement in &script.statements {
-        let written = without_url_passwords(
-            &text::encode(&statement.command)
-                .unwrap_or_else(|_| statement.command.word().to_string()),
-        );
+        let encoded = text::encode(&statement.command)
+            .unwrap_or_else(|_| statement.command.word().to_string());
+        let written = command_without_url_passwords(&encoded);
         session.log.command(&written);
         let result = step(session, &statement.command);
         let mut report = StepReport {
@@ -98,7 +97,7 @@ pub fn run(script: &Script, session: &mut Session) -> Result<Outcome, RunError> 
         match result {
             Ok(()) => outcome.steps.push(report),
             Err(error) => {
-                let message = without_url_passwords(&error.to_string());
+                let message = error_without_url_passwords(&error.to_string(), &encoded);
                 session.log.error(&message);
                 if error.is_not_supported() {
                     outcome
@@ -122,22 +121,92 @@ pub fn run(script: &Script, session: &mut Session) -> Result<Outcome, RunError> 
     Ok(outcome)
 }
 
-/// `text` with `***` in place of the password of each URL that carries one in
-/// its user information, as in `ftp://user:password@host/`.
-fn without_url_passwords(text: &str) -> String {
+/// One part of an encoded command line: the text between two quotation
+/// marks, or a run of text with no white space outside them. An argument
+/// never spans two parts, so a password is hidden inside one part only.
+fn command_parts(line: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut quoted = false;
+    for (index, c) in line.char_indices() {
+        let ends = c == '"' || (!quoted && c.is_whitespace());
+        if ends {
+            parts.push(&line[start..index]);
+            parts.push(&line[index..index + c.len_utf8()]);
+            start = index + c.len_utf8();
+            quoted ^= c == '"';
+        }
+    }
+    parts.push(&line[start..]);
+    parts
+}
+
+/// The encoded command `line` with `***` in place of the password of each
+/// location that carries one, as in `ftp://user:password@host/`.
+fn command_without_url_passwords(line: &str) -> String {
+    command_parts(line)
+        .into_iter()
+        .map(part_without_url_password)
+        .collect()
+}
+
+/// `part`, one argument of a command, without the password of its URL.
+fn part_without_url_password(part: &str) -> std::borrow::Cow<'_, str> {
+    let Some(scheme_end) = part.find("://") else {
+        return part.into();
+    };
+    let (head, tail) = part.split_at(scheme_end + 3);
+    match password_span(tail) {
+        Some((colon, at)) => format!("{head}{}***{}", &tail[..=colon], &tail[at..]).into(),
+        None => part.into(),
+    }
+}
+
+/// The error `text` of the command that `line` encodes, without URL
+/// passwords.
+///
+/// An argument of the command that the text repeats is hidden as it is in the
+/// command log. In the rest of the text the end of a URL is not known, so a
+/// URL runs to the next URL, to a quotation mark or to the line end.
+fn error_without_url_passwords(text: &str, line: &str) -> String {
+    let arguments: Vec<&str> = command_parts(line)
+        .into_iter()
+        .filter(|part| part.contains("://"))
+        .collect();
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    loop {
+        let next = arguments
+            .iter()
+            .filter_map(|argument| rest.find(argument).map(|at| (at, *argument)))
+            .min_by_key(|(at, argument)| (*at, std::cmp::Reverse(argument.len())));
+        let Some((at, argument)) = next else {
+            out.push_str(&text_without_url_passwords(rest));
+            return out;
+        };
+        out.push_str(&text_without_url_passwords(&rest[..at]));
+        out.push_str(&part_without_url_password(argument));
+        rest = &rest[at + argument.len()..];
+    }
+}
+
+/// `text` with `***` in place of the password of each URL in it.
+fn text_without_url_passwords(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(scheme_end) = rest.find("://") {
         let (head, tail) = rest.split_at(scheme_end + 3);
         out.push_str(head);
-        // A password can hold a space, so only the closing quotation mark of
-        // a quoted URL, or the line end, ends the text that can be password.
-        let scheme_start = head[..scheme_end]
-            .trim_end_matches(|c: char| c.is_ascii_alphanumeric() || c == '+')
-            .len();
-        let quoted = head[..scheme_start].ends_with('"');
+        let next_scheme = tail.find("://").map(|next| {
+            tail[..next]
+                .trim_end_matches(|c: char| c.is_ascii_alphanumeric() || c == '+')
+                .len()
+        });
         let end = tail
-            .find(|c: char| c == '\n' || (quoted && c == '"'))
+            .find(['\n', '"'])
+            .into_iter()
+            .chain(next_scheme)
+            .min()
             .unwrap_or(tail.len());
         rest = match password_span(&tail[..end]) {
             Some((colon, at)) => {
@@ -153,23 +222,32 @@ fn without_url_passwords(text: &str) -> String {
 }
 
 /// Where the `:` before a password and the `@` after it stand in `url`, the
-/// text of a URL after its scheme.
+/// text of one URL after its scheme.
 ///
-/// The password ends at the last `@`: a password that holds an unescaped `/`
-/// or `@` continues past the first one.
+/// The authority ends at the first `/`. With an `@` in the authority, the
+/// text before the last one is the user information, and it holds a password
+/// only after a colon. With no `@` there, a colon in the authority and a
+/// later `@` can be a password that holds a `/`: a name with a port number
+/// and a path with an `@` have the same form, so that text is hidden too.
+/// A numeric or bracketed address before the colon is no user name. The
+/// password ends at the last `@` of the URL, because a password can hold an
+/// unescaped `/` or `@`.
 fn password_span(url: &str) -> Option<(usize, usize)> {
     let authority = &url[..url.find('/').unwrap_or(url.len())];
-    let colon = authority.find(':')?;
-    let at = url.rfind('@').filter(|at| colon < *at)?;
-    // With no `@` in the authority, a colon before a port number, or inside
-    // a bracketed address, starts no password, and a later `@` is path text.
-    let host_and_port = authority.ends_with(']')
-        || authority.rsplit_once(':').is_some_and(|(host, port)| {
-            !host.is_empty() && !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit())
-        });
-    if !authority.contains('@') && host_and_port {
-        return None;
-    }
+    let at = url.rfind('@')?;
+    let colon = match authority.rfind('@') {
+        Some(user_end) => authority[..user_end].find(':')?,
+        None if authority.starts_with('[') => return None,
+        None => {
+            let colon = authority.find(':')?;
+            let port = &authority[colon + 1..];
+            let numeric_host = authority[..colon].parse::<std::net::Ipv4Addr>().is_ok();
+            if numeric_host && !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            colon
+        }
+    };
     Some((colon, at))
 }
 
@@ -1270,7 +1348,7 @@ pub fn supported_content_criteria() -> &'static [ContentCriterion] {
 mod tests {
     #![allow(clippy::expect_used)]
 
-    use super::carry_out;
+    use super::{carry_out, command_without_url_passwords, error_without_url_passwords};
     use crate::state::{Session, SessionOptions};
     use ca_fs::{Conflict, OperationKind, OperationOptions, OperationPlan};
     use std::path::PathBuf;
@@ -1294,5 +1372,79 @@ mod tests {
         let error = carry_out(&mut session, &plan, "sync")
             .expect_err("a refusal must not produce a clean dry run");
         assert!(error.to_string().contains("listing was incomplete"));
+    }
+
+    #[test]
+    fn each_location_of_a_command_line_is_logged_as_written_less_its_password() {
+        let unchanged = [
+            "load ftp://bob@h:1/left ftp://carol@h:1/right",
+            "load \"ftp://bob@h:1/pub/a@b\" right",
+            "load ftp://bob@h:1/pub \"C:/mail/x@y\"",
+            "load ftp://h:1/pub \"C:/mail/x@y\"",
+            "load ftp://127.0.0.1:1/pub/a@b right",
+            "load ftp://h/pub/a@b ftp://[::1]:1/pub/a@b",
+            "load \"C:/mail/x@y\" filters:\"a:b@c\"",
+        ];
+        for line in unchanged {
+            assert_eq!(command_without_url_passwords(line), line);
+        }
+        let hidden = [
+            // A name with a port and a path with an `@` has the form of a
+            // user with a password that holds a slash.
+            (
+                "load ftp://files.example:21/pub/a@b right",
+                "load ftp://files.example:***@b right",
+            ),
+            (
+                "load ftp://alice:one@h:1/left ftp://carol:two@h:1/right",
+                "load ftp://alice:***@h:1/left ftp://carol:***@h:1/right",
+            ),
+            (
+                "load ftp://alice:one@h:1/pub \"C:/mail/x@y\"",
+                "load ftp://alice:***@h:1/pub \"C:/mail/x@y\"",
+            ),
+            (
+                "load \"ftp://alice:o ne/2 x@h:1/pub\" \"ftp://bob@h:1/a@b\"",
+                "load \"ftp://alice:***@h:1/pub\" \"ftp://bob@h:1/a@b\"",
+            ),
+            (
+                "load ftp://bob@example.com:one@h:1/pub right",
+                "load ftp://bob@example.com:***@h:1/pub right",
+            ),
+        ];
+        for (line, logged) in hidden {
+            assert_eq!(command_without_url_passwords(line), logged);
+        }
+    }
+
+    #[test]
+    fn a_password_with_digits_before_its_first_slash_is_hidden() {
+        for password in ["123/4", "8080/secret", "1/2/3", "/secret"] {
+            let line = format!("load ftp://alice:{password}@h:1/pub right");
+            assert_eq!(
+                command_without_url_passwords(&line),
+                "load ftp://alice:***@h:1/pub right"
+            );
+        }
+    }
+
+    #[test]
+    fn an_error_text_hides_the_password_and_keeps_the_text_after_the_location() {
+        let line = "load \"ftp://alice:o ne@h:1/pub\" \"ftp://bob@h:1/right\"";
+        assert_eq!(
+            error_without_url_passwords(
+                "ftp://alice:o ne@h:1/pub and ftp://bob@h:1/right: refused for x@y",
+                line
+            ),
+            "ftp://alice:***@h:1/pub and ftp://bob@h:1/right: refused for x@y"
+        );
+        // A URL that is no argument of the command runs to the next URL.
+        assert_eq!(
+            error_without_url_passwords(
+                "ftp://dave:t wo@h/a is not ftp://erin@h:1/b or ftp://bob@h:1/c",
+                "load left right"
+            ),
+            "ftp://dave:***@h/a is not ftp://erin@h:1/b or ftp://bob@h:1/c"
+        );
     }
 }
