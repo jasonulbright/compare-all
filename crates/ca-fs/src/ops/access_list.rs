@@ -145,15 +145,28 @@ fn without_inherited_marks(entries: &str) -> String {
 /// lists, as FAT and exFAT do. A volume that does not answer counts as one
 /// that keeps them.
 fn volume_keeps_no_lists(path: &Path) -> bool {
-    let Ok(absolute) = std::path::absolute(path) else {
-        return false;
-    };
-    let Ok(root) = winsafe::GetVolumePathName(&absolute.to_string_lossy()) else {
-        return false;
-    };
+    volume_flags(path).is_some_and(|flags| !flags.has(winsafe::co::FILE_VOL::PERSISTENT_ACLS))
+}
+
+/// True when the volume that holds `path` reports that it keeps no access
+/// lists and no named streams, so a rename over a file there drops nothing
+/// that a replacement keeps. A volume that does not answer counts as one
+/// that keeps them.
+pub(crate) fn volume_keeps_nothing_of_a_replaced_file(path: &Path) -> bool {
+    volume_flags(path).is_some_and(|flags| {
+        !flags.has(winsafe::co::FILE_VOL::PERSISTENT_ACLS)
+            && !flags.has(winsafe::co::FILE_VOL::NAMED_STREAMS)
+    })
+}
+
+/// What the volume that holds `path` reports about itself, or `None` when it
+/// does not answer.
+fn volume_flags(path: &Path) -> Option<winsafe::co::FILE_VOL> {
+    let absolute = std::path::absolute(path).ok()?;
+    let root = winsafe::GetVolumePathName(&absolute.to_string_lossy()).ok()?;
     let mut flags = winsafe::co::FILE_VOL::default();
-    winsafe::GetVolumeInformation(Some(&root), None, None, None, Some(&mut flags), None).is_ok()
-        && !flags.has(winsafe::co::FILE_VOL::PERSISTENT_ACLS)
+    winsafe::GetVolumeInformation(Some(&root), None, None, None, Some(&mut flags), None).ok()?;
+    Some(flags)
 }
 
 #[cfg(test)]

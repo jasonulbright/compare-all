@@ -675,6 +675,49 @@ fn carried_mode(model: &Path) -> io::Result<Option<u32>> {
     }
 }
 
+/// Put the finished copy `from` in place of the file `to` with `replace`,
+/// which keeps the access list and the named streams of `to`.
+///
+/// Some volumes do not support that call. The call then changes neither
+/// file. When `nothing_to_keep` says that the volume of `to` keeps no access
+/// lists and no named streams, a rename loses nothing of `to`, and `from` is
+/// renamed over it. On a volume that keeps them, a rename gives `to` the
+/// access list of its folder, so the error is returned.
+///
+/// # Errors
+/// Returns the error of `replace` or of the rename. `to` keeps its content.
+#[cfg(windows)]
+fn replace_or_rename(
+    from: &Path,
+    to: &Path,
+    replace: impl FnOnce(&Path, &Path) -> io::Result<()>,
+    nothing_to_keep: impl FnOnce(&Path) -> bool,
+) -> io::Result<()> {
+    // ERROR_INVALID_FUNCTION, ERROR_NOT_SUPPORTED, ERROR_CALL_NOT_IMPLEMENTED:
+    // the answers of a volume that has no such operation.
+    const UNSUPPORTED: [i32; 3] = [1, 50, 120];
+    let error = match replace(from, to) {
+        Ok(()) => return Ok(()),
+        Err(error) => error,
+    };
+    if !error
+        .raw_os_error()
+        .is_some_and(|code| UNSUPPORTED.contains(&code))
+    {
+        return Err(error);
+    }
+    if nothing_to_keep(to) {
+        return std::fs::rename(from, to);
+    }
+    Err(io::Error::new(
+        error.kind(),
+        format!(
+            "the volume of {} cannot replace a file and keep its access list, so nothing was replaced: {error}",
+            to.display()
+        ),
+    ))
+}
+
 /// [`FileOps`] backed by the real file system.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RealFs;
@@ -728,7 +771,12 @@ impl FileOps for RealFs {
         if std::fs::symlink_metadata(to).is_ok_and(|meta| meta.file_type().is_symlink()) {
             return std::fs::rename(from, to);
         }
-        ca_io::replace_existing_file(to, from)
+        replace_or_rename(
+            from,
+            to,
+            |from, to| ca_io::replace_existing_file(to, from),
+            super::access_list::volume_keeps_nothing_of_a_replaced_file,
+        )
     }
 
     #[cfg(windows)]
@@ -1157,6 +1205,49 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         assert!(!super::lacks_recycle_bin(&dir.path().join("a.txt")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_volume_with_no_replacement_call_gets_a_rename_only_when_it_keeps_no_lists() {
+        use std::io;
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("copy");
+        let to = dir.path().join("target");
+        let refuse = |code: i32| move |_: &_, _: &_| Err(io::Error::from_raw_os_error(code));
+        let content = |path: &std::path::Path| std::fs::read(path).unwrap();
+        for unsupported in [1, 50, 120] {
+            std::fs::write(&from, b"new").unwrap();
+            std::fs::write(&to, b"old").unwrap();
+            let kept =
+                super::replace_or_rename(&from, &to, refuse(unsupported), |_| false).unwrap_err();
+            assert!(
+                kept.to_string().contains("keep its access list"),
+                "{unsupported}: {kept}"
+            );
+            assert_eq!(content(&to), b"old", "{unsupported}");
+            assert_eq!(content(&from), b"new", "{unsupported}");
+
+            super::replace_or_rename(&from, &to, refuse(unsupported), |_| true).unwrap();
+            assert_eq!(content(&to), b"new", "{unsupported}");
+            assert!(!from.exists(), "{unsupported}");
+        }
+        // Access denied and a sharing violation say nothing about the volume.
+        for other in [5, 32, 1175] {
+            std::fs::write(&from, b"new").unwrap();
+            std::fs::write(&to, b"old").unwrap();
+            let error = super::replace_or_rename(&from, &to, refuse(other), |_| true).unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(other));
+            assert_eq!(content(&to), b"old", "{other}");
+        }
+        super::replace_or_rename(&from, &to, |_, _| Ok(()), |_| true).unwrap();
+        assert_eq!(
+            content(&to),
+            b"old",
+            "a replacement that worked got a rename"
+        );
+
+        assert!(!super::super::access_list::volume_keeps_nothing_of_a_replaced_file(&to));
     }
 
     #[test]
