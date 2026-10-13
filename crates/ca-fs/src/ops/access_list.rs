@@ -55,7 +55,7 @@ impl AccessList {
             return Ok(None);
         }
         Ok(Some(Self {
-            entries: without_inherited_marks(entries),
+            entries: without_repeats(&without_inherited_marks(entries)),
         }))
     }
 
@@ -161,6 +161,37 @@ fn without_inherited_marks(entries: &str) -> String {
             _ => {}
         }
         out.push(c);
+    }
+    out
+}
+
+/// `entries` without each entry that repeats an earlier entry exactly.
+///
+/// An entry of a file can equal an entry the file took from its folder.
+/// Windows stores one of two equal entries of some kinds, so the list it
+/// reports after a write can be shorter than the list written. An entry that
+/// repeats an earlier one changes no access decision.
+fn without_repeats(entries: &str) -> String {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = String::with_capacity(entries.len());
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (at, c) in entries.char_indices() {
+        match c {
+            '(' => {
+                if depth == 0 {
+                    start = at;
+                }
+                depth += 1;
+            }
+            ')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 && seen.insert(&entries[start..=at]) {
+                    out.push_str(&entries[start..=at]);
+                }
+            }
+            _ => {}
+        }
     }
     out
 }
@@ -277,6 +308,26 @@ mod tests {
         let protected = AccessList::parse("D:PAI(A;;FA;;;SY)").unwrap().unwrap();
         assert_eq!(inherited, protected);
         assert!(AccessList::parse("O:SY").is_err());
+    }
+
+    #[test]
+    fn an_entry_that_repeats_an_earlier_entry_is_read_once() {
+        // The file holds an entry that its folder gives too.
+        let both = "D:AI(A;;FA;;;SY)(A;ID;0x1200a9;;;BU)(A;ID;FA;;;SY)(A;ID;FA;;;BA)";
+        let read = AccessList::parse(both).unwrap().unwrap();
+        assert_eq!(read.entries, "(A;;FA;;;SY)(A;;0x1200a9;;;BU)(A;;FA;;;BA)");
+        let stored = AccessList::parse("D:PAI(A;;FA;;;SY)(A;;0x1200a9;;;BU)(A;;FA;;;BA)");
+        assert_eq!(stored.unwrap().unwrap(), read);
+
+        // Entries that differ in one field, and the order, stay.
+        let near = "(A;;FA;;;SY)(D;;FA;;;SY)(A;;FR;;;SY)(A;OI;FA;;;SY)(A;;FA;;;BA)";
+        assert_eq!(super::without_repeats(near), near);
+        let conditional =
+            r#"(XA;;FX;;;WD;(@User.Title=="(x)"))(A;;FA;;;SY)(XA;;FX;;;WD;(@User.Title=="(x)"))"#;
+        assert_eq!(
+            super::without_repeats(conditional),
+            r#"(XA;;FX;;;WD;(@User.Title=="(x)"))(A;;FA;;;SY)"#
+        );
     }
 
     #[test]
