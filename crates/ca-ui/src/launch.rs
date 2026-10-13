@@ -204,28 +204,55 @@ pub fn system_open_command(path: &std::path::Path) -> LaunchCommand {
 /// The command that shows `path` in the platform's file manager.
 ///
 /// Files are selected where the platform offers that operation. A folder is
-/// opened directly, except a folder that macOS can read as a package, which
-/// is selected in its parent. The path is always one process argument; it is
-/// never interpolated into a shell command.
+/// opened directly. On macOS a folder that the system takes for a package is
+/// shown from the inside without a request to open it, because that request
+/// starts a program. The path is always one process argument; it is never
+/// interpolated into a shell command.
+///
+/// On macOS the command for a folder reads the folder, so a caller on the
+/// interface thread hands this call to a worker.
 #[must_use]
 pub fn system_explorer_command(path: &std::path::Path, selection: Selection) -> LaunchCommand {
-    explorer_command_on(std::env::consts::OS, path, selection)
+    explorer_command_on(std::env::consts::OS, path, selection, mac_folder)
 }
 
-/// [`system_explorer_command`] for the platform named `os`.
-fn explorer_command_on(os: &str, path: &std::path::Path, selection: Selection) -> LaunchCommand {
+/// How macOS treats a folder that it is asked to open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+enum MacFolder {
+    /// The file manager opens a window on the folder.
+    Plain,
+    /// The system takes the folder for a package: an application bundle, a
+    /// document package or a folder with the bundle flag. A request to open
+    /// it starts an application. `inside` is one item of the folder, or
+    /// `None` when the folder is empty or cannot be read.
+    Package { inside: Option<std::path::PathBuf> },
+}
+
+/// [`system_explorer_command`] for the platform named `os`. `mac_folder`
+/// answers for a folder on macOS and is not called otherwise.
+fn explorer_command_on(
+    os: &str,
+    path: &std::path::Path,
+    selection: Selection,
+    mac_folder: impl FnOnce(&std::path::Path) -> MacFolder,
+) -> LaunchCommand {
     if os == "windows" {
         return windows_explorer_command(path, selection);
     }
+    let open = |arguments: Vec<String>| (std::path::PathBuf::from("/usr/bin/open"), arguments);
+    let select = |item: &std::path::Path| open(vec!["-R".to_owned(), path_argument(item)]);
     let (program, arguments) = match (os, selection) {
-        ("macos", Selection::Folders) if !may_be_package(path) => (
-            std::path::PathBuf::from("/usr/bin/open"),
-            vec![path_argument(path)],
-        ),
-        ("macos", _) => (
-            std::path::PathBuf::from("/usr/bin/open"),
-            vec!["-R".to_owned(), path_argument(path)],
-        ),
+        ("macos", Selection::Folders) => match mac_folder(path) {
+            MacFolder::Plain => open(vec![path_argument(path)]),
+            // Selecting an item of the package opens a window on the inside
+            // of the package and starts nothing.
+            MacFolder::Package {
+                inside: Some(inside),
+            } => select(&inside),
+            MacFolder::Package { inside: None } => select(path),
+        },
+        ("macos", Selection::Files) => select(path),
         (_, Selection::Files) => (
             std::path::PathBuf::from("xdg-open"),
             vec![path_argument(
@@ -244,11 +271,37 @@ fn explorer_command_on(os: &str, path: &std::path::Path, selection: Selection) -
     }
 }
 
-/// True when macOS can read the folder `path` as a package. The system takes
-/// a folder for a package from the extension of its name, and `open` on an
-/// application bundle starts the application.
-fn may_be_package(path: &std::path::Path) -> bool {
-    path.extension().is_some()
+/// What the system says about the folder `path`, through its links.
+///
+/// The answer comes from the service that decides what a request to open the
+/// folder starts, so it also covers a package type that an installed
+/// application declares and a folder with the bundle flag.
+#[cfg(target_os = "macos")]
+fn mac_folder(path: &std::path::Path) -> MacFolder {
+    use objc2_app_kit::NSWorkspace;
+    use objc2_foundation::NSString;
+
+    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    // A name that is no Unicode text cannot be asked about. It is shown the
+    // way that starts nothing.
+    let package = resolved.to_str().is_none_or(|text| {
+        NSWorkspace::sharedWorkspace().isFilePackageAtPath(&NSString::from_str(text))
+    });
+    if !package {
+        return MacFolder::Plain;
+    }
+    let mut items: Vec<std::path::PathBuf> = std::fs::read_dir(path)
+        .map(|entries| entries.flatten().map(|entry| entry.path()).collect())
+        .unwrap_or_default();
+    items.sort();
+    MacFolder::Package {
+        inside: items.into_iter().next(),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn mac_folder(_path: &std::path::Path) -> MacFolder {
+    MacFolder::Plain
 }
 
 fn windows_explorer_command(path: &std::path::Path, selection: Selection) -> LaunchCommand {
@@ -270,10 +323,13 @@ pub fn reveal(
     spawner: Arc<dyn Spawner>,
     notify: Arc<dyn Fn() + Send + Sync>,
 ) -> Job<LaunchMessage> {
-    let command = system_explorer_command(path, selection);
+    let path = path.to_path_buf();
     let description = path.display().to_string();
     Job::spawn_notifying(
         move |emitter, _| {
+            // The command for a folder on macOS reads the folder, so it is
+            // built on this worker.
+            let command = system_explorer_command(&path, selection);
             emitter.send(match spawner.spawn(&command) {
                 Ok(()) => LaunchMessage::Started { description },
                 Err(reason) => LaunchMessage::Failed { reason },
@@ -360,7 +416,7 @@ pub fn spawn(
 mod tests {
     use super::{
         commands_of, explorer_command_on, label_of, offered, spawn, system_explorer_command,
-        windows_explorer_command, LaunchMessage, Selection, Spawner,
+        windows_explorer_command, LaunchMessage, MacFolder, Selection, Spawner,
     };
     use ca_session::options::{
         LaunchCommand, LaunchContext, LaunchSide, OpenWithEntry, OpenWithOptions,
@@ -431,7 +487,7 @@ mod tests {
         );
         for os in ["windows", "macos", "linux"] {
             for selection in [Selection::Files, Selection::Folders] {
-                let command = explorer_command_on(os, file, selection);
+                let command = explorer_command_on(os, file, selection, |_| MacFolder::Plain);
                 assert!(
                     command
                         .arguments
@@ -445,26 +501,108 @@ mod tests {
     }
 
     #[test]
-    fn the_mac_file_manager_opens_a_plain_folder_and_reveals_a_package() {
-        let arguments = |folder: &str| {
-            let command =
-                explorer_command_on("macos", std::path::Path::new(folder), Selection::Folders);
+    fn the_mac_file_manager_opens_a_plain_folder_and_never_asks_to_open_a_package() {
+        let arguments = |folder: &str, kind: MacFolder| {
+            let command = explorer_command_on(
+                "macos",
+                std::path::Path::new(folder),
+                Selection::Folders,
+                |_| kind,
+            );
             assert_eq!(command.program, PathBuf::from("/usr/bin/open"));
             command.arguments
         };
-        for package in [
-            "/tmp/left/Probe.app",
-            "/tmp/left/Probe.APP",
-            "/tmp/left/Setup.pkg",
-            "/tmp/left/Notes.rtfd",
-            "/tmp/left/Tool.bundle",
+        // The name does not decide: a folder with an extension that is no
+        // package opens, and a package with a plain name does not.
+        for plain in [
+            "/tmp/left/plain folder",
             "/tmp/left/release.v2",
+            "/tmp/left",
         ] {
-            assert_eq!(arguments(package), ["-R", package]);
+            assert_eq!(arguments(plain, MacFolder::Plain), [plain]);
         }
-        for plain in ["/tmp/left/plain folder", "/tmp/left/.settings", "/tmp/left"] {
-            assert_eq!(arguments(plain), [plain]);
+        for package in ["/tmp/left/Probe.app", "/tmp/left/link to a bundle"] {
+            let inside = PathBuf::from(package).join("Contents");
+            let shown = arguments(
+                package,
+                MacFolder::Package {
+                    inside: Some(inside.clone()),
+                },
+            );
+            assert_eq!(shown, ["-R".to_owned(), inside.display().to_string()]);
+            let empty = arguments(package, MacFolder::Package { inside: None });
+            assert_eq!(empty, ["-R", package]);
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_system_says_which_folder_is_a_package_also_through_a_link() {
+        let base = tempfile::tempdir().unwrap();
+        let folder = |name: &str| {
+            let path = base.path().join(name);
+            std::fs::create_dir(&path).unwrap();
+            path
+        };
+        let plain = folder("plain");
+        let dotted = folder("release.v2");
+        let bundle = folder("Probe.app");
+        let empty = folder("Empty.app");
+        std::fs::create_dir(bundle.join("Contents")).unwrap();
+        std::fs::write(bundle.join("Zebra.txt"), b"x").unwrap();
+        let link_to_bundle = base.path().join("link to a bundle");
+        std::os::unix::fs::symlink(&bundle, &link_to_bundle).unwrap();
+        let link_to_plain = base.path().join("link.app");
+        std::os::unix::fs::symlink(&plain, &link_to_plain).unwrap();
+
+        for path in [&plain, &dotted, &link_to_plain] {
+            assert_eq!(super::mac_folder(path), MacFolder::Plain, "{path:?}");
+        }
+        assert_eq!(
+            super::mac_folder(&bundle),
+            MacFolder::Package {
+                inside: Some(bundle.join("Contents"))
+            }
+        );
+        assert_eq!(
+            super::mac_folder(&link_to_bundle),
+            MacFolder::Package {
+                inside: Some(link_to_bundle.join("Contents"))
+            }
+        );
+        assert_eq!(
+            super::mac_folder(&empty),
+            MacFolder::Package { inside: None }
+        );
+
+        // The whole command for the link asks for no open of the bundle.
+        let command = system_explorer_command(&link_to_bundle, Selection::Folders);
+        assert_eq!(
+            command.arguments,
+            [
+                "-R".to_owned(),
+                link_to_bundle.join("Contents").display().to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn showing_a_folder_builds_its_command_on_the_worker_and_starts_it() {
+        let recorder = Arc::new(Recorder::default());
+        let base = tempfile::tempdir().unwrap();
+        let mut job = super::reveal(
+            base.path(),
+            Selection::Folders,
+            Arc::new(Arc::clone(&recorder)),
+            Arc::new(|| {}),
+        );
+        assert!(matches!(settle(&mut job), LaunchMessage::Started { .. }));
+        let started = recorder.started.lock().unwrap();
+        assert_eq!(started.len(), 1);
+        assert_eq!(
+            started[0].arguments.last().map(String::as_str),
+            Some(base.path().display().to_string().as_str())
+        );
     }
 
     fn context() -> LaunchContext {
