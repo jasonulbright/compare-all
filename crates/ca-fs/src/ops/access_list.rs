@@ -354,11 +354,29 @@ pub(crate) fn volume_keeps_nothing_of_a_replaced_file(path: &Path) -> bool {
 /// What the volume that holds `path` reports about itself, or `None` when it
 /// does not answer.
 fn volume_flags(path: &Path) -> Option<winsafe::co::FILE_VOL> {
-    let absolute = std::path::absolute(path).ok()?;
-    let root = winsafe::GetVolumePathName(&absolute.to_string_lossy()).ok()?;
+    let located = on_its_volume(path)?;
+    let root = winsafe::GetVolumePathName(&located.to_string_lossy()).ok()?;
     let mut flags = winsafe::co::FILE_VOL::default();
     winsafe::GetVolumeInformation(Some(&root), None, None, None, Some(&mut flags), None).ok()?;
     Some(flags)
+}
+
+/// `path` with its folder resolved through every folder link, junction and
+/// mount point in it, or `None` when the path has no absolute form.
+///
+/// The volume call answers for the volume that holds a link, not for the
+/// volume the link leads to. The entry of the item itself lives in the
+/// volume of its folder, and the item need not exist, so only the folder is
+/// resolved. A folder that cannot be resolved is taken as written.
+fn on_its_volume(path: &Path) -> Option<std::path::PathBuf> {
+    let absolute = std::path::absolute(path).ok()?;
+    let resolved = match (absolute.parent(), absolute.file_name()) {
+        (Some(folder), Some(name)) => std::fs::canonicalize(folder)
+            .ok()
+            .map(|folder| folder.join(name)),
+        _ => None,
+    };
+    Some(resolved.unwrap_or(absolute))
 }
 
 /// The access list of the file or folder `path` as descriptor text.
@@ -538,6 +556,41 @@ mod tests {
         assert_eq!(super::entries_of("").unwrap(), Vec::<&str>::new());
         let not_ascii = "(A;;FA;;;S-1-5-21-1-2-3-1001)(A;;FR;;;\u{e9})";
         assert_eq!(super::entries_of(not_ascii).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn the_volume_question_is_asked_where_the_folder_of_a_path_leads() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let resolved = std::fs::canonicalize(&real).unwrap();
+        let junction = dir.path().join("junction");
+        let made = ca_io::host_command::host_command("cmd.exe")
+            .args(["/c", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&real)
+            .output()
+            .unwrap();
+        assert!(made.status.success(), "{made:?}");
+        // The item need not exist, and a folder that is gone is taken as
+        // written.
+        assert_eq!(
+            super::on_its_volume(&junction.join("new.txt")).unwrap(),
+            resolved.join("new.txt")
+        );
+        let gone = dir.path().join("gone").join("new.txt");
+        assert_eq!(super::on_its_volume(&gone).unwrap(), gone);
+        // A folder link needs a privilege that not every account has.
+        let link = dir.path().join("link");
+        if std::os::windows::fs::symlink_dir(&junction, &link).is_ok() {
+            assert_eq!(
+                super::on_its_volume(&link.join("new.txt")).unwrap(),
+                resolved.join("new.txt")
+            );
+        }
+        assert!(super::volume_flags(&junction.join("new.txt")).is_some());
+        assert!(!super::volume_keeps_no_lists(&junction.join("new.txt")));
+        std::fs::remove_dir(&junction).unwrap();
     }
 
     #[test]
