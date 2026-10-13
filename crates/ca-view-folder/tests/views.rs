@@ -648,7 +648,7 @@ fn explorer_selects_the_file_side_of_a_row_that_is_a_folder_on_the_other_side() 
     );
     let shown = explorer_command_of(&view).arguments;
     #[cfg(target_os = "windows")]
-    assert_eq!(shown, ["/select,".to_owned(), text(&file)]);
+    assert_eq!(shown, [format!("/select,\"{}\"", text(&file))]);
     #[cfg(target_os = "macos")]
     assert_eq!(shown, ["-R".to_owned(), text(&file)]);
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
@@ -660,17 +660,27 @@ fn explorer_selects_the_file_side_of_a_row_that_is_a_folder_on_the_other_side() 
         SessionView::explorer_target(&view),
         Some((folder.clone(), ca_ui::launch::Selection::Folders))
     );
-    assert_eq!(explorer_command_of(&view).arguments, [text(&folder)]);
+    let opened = if cfg!(target_os = "windows") {
+        format!("\"{}\"", text(&folder))
+    } else {
+        text(&folder)
+    };
+    assert_eq!(
+        explorer_command_of(&view).arguments,
+        std::slice::from_ref(&opened)
+    );
 
     // A file takes the place of the folder after the scan.
     std::fs::remove_dir(&folder).unwrap();
     std::fs::write(&folder, b"#!/bin/sh\n").unwrap();
     let shown = explorer_command_of(&view).arguments;
-    assert_ne!(shown, [text(&folder)]);
+    assert_ne!(shown, [opened]);
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     assert_eq!(shown, [text(&dir.path().join("right"))]);
-    #[cfg(any(target_os = "windows", target_os = "macos"))]
-    assert_eq!(shown.len(), 2);
+    #[cfg(target_os = "windows")]
+    assert_eq!(shown, [format!("/select,\"{}\"", text(&folder))]);
+    #[cfg(target_os = "macos")]
+    assert_eq!(shown, ["-R".to_owned(), text(&folder)]);
 }
 
 /// A pair of files under the folder `d` with one status each.

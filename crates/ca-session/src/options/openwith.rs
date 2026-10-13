@@ -186,6 +186,12 @@ pub struct LaunchCommand {
     pub arguments: Vec<String>,
     /// The folder the program starts in, where the entry names one.
     pub working_directory: Option<PathBuf>,
+    /// True when the builder of the command has put the quotation marks into
+    /// the arguments itself, for a Windows program that reads its command
+    /// line by rules of its own. Windows then passes the arguments as
+    /// written, with one space between them and no quotation mark added.
+    /// Every other platform passes each argument as it is.
+    pub arguments_as_written: bool,
 }
 
 impl OpenWithEntry {
@@ -206,6 +212,7 @@ impl OpenWithEntry {
             program,
             arguments,
             working_directory: self.working_directory(context),
+            arguments_as_written: false,
         }
     }
 

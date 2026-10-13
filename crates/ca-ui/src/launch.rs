@@ -100,8 +100,8 @@ pub struct SystemSpawner;
 impl Spawner for SystemSpawner {
     fn spawn(&self, command: &LaunchCommand) -> Result<(), String> {
         let mut process = ca_io::host_command::host_command(&command.program);
+        add_arguments(&mut process, command);
         process
-            .args(&command.arguments)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
@@ -117,6 +117,24 @@ impl Spawner for SystemSpawner {
             )
         })
     }
+}
+
+/// Give `process` the arguments of `command`.
+///
+/// The standard library puts quotation marks around an argument only when
+/// it holds a space or a tab. A program that splits its command line at
+/// another character then reads one argument as two, so a command whose
+/// builder quoted the arguments reaches Windows as written.
+fn add_arguments(process: &mut std::process::Command, command: &LaunchCommand) {
+    #[cfg(windows)]
+    if command.arguments_as_written {
+        use std::os::windows::process::CommandExt;
+        for argument in &command.arguments {
+            process.raw_arg(argument);
+        }
+        return;
+    }
+    process.args(&command.arguments);
 }
 
 /// The entries offered over `selection`, with the index each one sits at.
@@ -198,6 +216,7 @@ pub fn system_open_command(path: &std::path::Path) -> LaunchCommand {
         program,
         arguments,
         working_directory: path.parent().map(std::path::Path::to_path_buf),
+        arguments_as_written: false,
     }
 }
 
@@ -289,6 +308,7 @@ fn explorer_command_on(
         program,
         arguments,
         working_directory: None,
+        arguments_as_written: false,
     }
 }
 
@@ -325,15 +345,23 @@ fn mac_folder(_path: &std::path::Path) -> MacFolder {
     MacFolder::Plain
 }
 
+/// The Windows file manager splits its command line at a comma outside
+/// quotation marks and reads the first part as an item to open. The path
+/// therefore stands between quotation marks in both forms, and the command
+/// reaches the program as written. A Windows name holds no quotation mark;
+/// one in the text would end the quoted part, so it is taken out, and the
+/// text then names no item.
 fn windows_explorer_command(path: &std::path::Path, selection: Selection) -> LaunchCommand {
+    let quoted = format!("\"{}\"", path_argument(path).replace('"', ""));
     let arguments = match selection {
-        Selection::Files => vec!["/select,".to_owned(), path_argument(path)],
-        Selection::Folders => vec![path_argument(path)],
+        Selection::Files => vec![format!("/select,{quoted}")],
+        Selection::Folders => vec![quoted],
     };
     LaunchCommand {
         program: std::path::PathBuf::from("explorer.exe"),
         arguments,
         working_directory: None,
+        arguments_as_written: true,
     }
 }
 
@@ -477,7 +505,7 @@ mod tests {
         let file = std::path::Path::new("/tmp/a file's name.txt");
         let command = system_explorer_command(file, Selection::Files);
         #[cfg(target_os = "windows")]
-        assert_eq!(command.arguments, ["/select,", "/tmp/a file's name.txt"]);
+        assert_eq!(command.arguments, ["/select,\"/tmp/a file's name.txt\""]);
         #[cfg(target_os = "macos")]
         assert_eq!(command.arguments, ["-R", "/tmp/a file's name.txt"]);
         #[cfg(not(any(target_os = "windows", target_os = "macos")))]
@@ -487,12 +515,15 @@ mod tests {
         let comma_path = std::path::Path::new(r"C:\work tree\a,b.txt");
         let command = windows_explorer_command(comma_path, Selection::Files);
         assert_eq!(command.program, PathBuf::from("explorer.exe"));
-        assert_eq!(command.arguments, ["/select,", r"C:\work tree\a,b.txt"]);
+        assert_eq!(command.arguments, [r#"/select,"C:\work tree\a,b.txt""#]);
 
         let base = tempfile::tempdir().unwrap();
         let folder = base.path().join("a folder");
         std::fs::create_dir(&folder).unwrap();
         let command = system_explorer_command(&folder, Selection::Folders);
+        #[cfg(target_os = "windows")]
+        assert_eq!(command.arguments, [format!("\"{}\"", folder.display())]);
+        #[cfg(not(target_os = "windows"))]
         assert_eq!(command.arguments, [folder.display().to_string()]);
     }
 
@@ -516,19 +547,23 @@ mod tests {
 
         assert_eq!(
             arguments("windows", &file),
-            ["/select,".to_owned(), text(&file)]
+            [format!("/select,\"{}\"", text(&file))]
         );
         assert_eq!(arguments("macos", &file), ["-R".to_owned(), text(&file)]);
         assert_eq!(arguments("linux", &file), [text(base.path())]);
         // The parent of the path that is gone is the file.
         assert_eq!(
             arguments("windows", &gone),
-            ["/select,".to_owned(), text(&gone)]
+            [format!("/select,\"{}\"", text(&gone))]
         );
         assert_eq!(arguments("macos", &gone), ["-R".to_owned(), text(&gone)]);
         assert_eq!(arguments("linux", &gone), [text(base.path())]);
 
-        for os in ["windows", "macos", "linux"] {
+        assert_eq!(
+            arguments("windows", base.path()),
+            [format!("\"{}\"", text(base.path()))]
+        );
+        for os in ["macos", "linux"] {
             assert_eq!(arguments(os, base.path()), [text(base.path())], "{os}");
         }
     }
@@ -550,7 +585,7 @@ mod tests {
         assert_eq!(started.len(), 1);
         assert_eq!(started[0], system_explorer_command(&file, Selection::Files));
         #[cfg(target_os = "windows")]
-        assert_eq!(started[0].arguments[0], "/select,");
+        assert!(started[0].arguments[0].starts_with("/select,\""));
         #[cfg(target_os = "macos")]
         assert_eq!(started[0].arguments[0], "-R");
         #[cfg(not(any(target_os = "windows", target_os = "macos")))]
@@ -682,9 +717,104 @@ mod tests {
         assert!(matches!(settle(&mut job), LaunchMessage::Started { .. }));
         let started = recorder.started.lock().unwrap();
         assert_eq!(started.len(), 1);
+        let folder = base.path().display().to_string();
+        #[cfg(target_os = "windows")]
+        let folder = format!("\"{folder}\"");
         assert_eq!(
             started[0].arguments.last().map(String::as_str),
-            Some(base.path().display().to_string().as_str())
+            Some(folder.as_str())
+        );
+    }
+
+    #[test]
+    fn the_windows_file_manager_gets_each_path_between_quotation_marks_in_both_forms() {
+        for name in [
+            "tool.cmd,x",
+            "tool.cmd x",
+            "tool.cmd, x",
+            ",x",
+            "tool.cmd,",
+            "tool.cmd^x",
+            "tool.cmd%x",
+            "%windir%",
+            "tool.cmd&x",
+            "tool.cmd;x",
+            "tool.cmd=x",
+            "plain",
+        ] {
+            for path in [
+                format!(r"C:\work\{name}"),
+                format!(r"C:\work\{name}\inside.txt"),
+                format!(r"\\server\share\{name}"),
+                name.to_owned(),
+            ] {
+                let open = windows_explorer_command(path.as_ref(), Selection::Folders);
+                assert_eq!(open.program, PathBuf::from("explorer.exe"));
+                assert_eq!(open.arguments, [format!("\"{path}\"")]);
+                assert!(open.arguments_as_written, "{path}");
+                let select = windows_explorer_command(path.as_ref(), Selection::Files);
+                assert_eq!(select.arguments, [format!("/select,\"{path}\"")]);
+                assert!(select.arguments_as_written, "{path}");
+            }
+        }
+        // The command of every other platform and of every other builder
+        // leaves the quotation marks to the system.
+        for os in ["macos", "linux"] {
+            let command = explorer_command_on(
+                os,
+                "/work/a,b".as_ref(),
+                Selection::Folders,
+                |_| true,
+                |_| MacFolder::Plain,
+            );
+            assert_eq!(command.arguments, ["/work/a,b"]);
+            assert!(!command.arguments_as_written, "{os}");
+        }
+        assert!(!super::system_open_command("/work/a,b".as_ref()).arguments_as_written);
+        assert!(!entry().command(&context()).arguments_as_written);
+    }
+
+    #[test]
+    fn a_quotation_mark_in_the_text_of_a_path_ends_no_quoted_argument() {
+        for selection in [Selection::Folders, Selection::Files] {
+            let command = windows_explorer_command(r#"C:\work\a" "tool.cmd"#.as_ref(), selection);
+            let argument = command.arguments.last().unwrap();
+            let quoted = argument.strip_prefix("/select,").unwrap_or(argument);
+            assert_eq!(quoted, r#""C:\work\a tool.cmd""#);
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn a_command_with_its_own_quotation_marks_reaches_the_program_as_written() {
+        let line_of = |arguments: &[&str], as_written: bool| {
+            let command = LaunchCommand {
+                program: PathBuf::from("cmd.exe"),
+                arguments: ["/d", "/c", "echo"]
+                    .iter()
+                    .chain(arguments)
+                    .map(|argument| (*argument).to_owned())
+                    .collect(),
+                working_directory: None,
+                arguments_as_written: as_written,
+            };
+            let mut process = ca_io::host_command::host_command(&command.program);
+            super::add_arguments(&mut process, &command);
+            let output = process.output().unwrap();
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        };
+        assert_eq!(
+            line_of(&[r#""C:\work\tool.cmd,x""#], true),
+            r#""C:\work\tool.cmd,x""#
+        );
+        assert_eq!(
+            line_of(&[r#"/select,"C:\work\a b,c""#], true),
+            r#"/select,"C:\work\a b,c""#
+        );
+        // The standard quoting adds no quotation mark for a comma.
+        assert_eq!(
+            line_of(&[r"C:\work\tool.cmd,x"], false),
+            r"C:\work\tool.cmd,x"
         );
     }
 
