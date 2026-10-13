@@ -203,17 +203,26 @@ pub fn system_open_command(path: &std::path::Path) -> LaunchCommand {
 
 /// The command that shows `path` in the platform's file manager.
 ///
-/// Files are selected where the platform offers that operation. A folder is
-/// opened directly. On macOS a folder that the system takes for a package is
-/// shown from the inside without a request to open it, because that request
-/// starts a program. The path is always one process argument; it is never
-/// interpolated into a shell command.
+/// A folder is opened directly, and only a path that is a folder when this
+/// call runs is opened: a request to open a file starts the program that
+/// handles the file. Every other item is selected in its folder, or its
+/// folder is opened where the platform has no selection. On macOS a folder
+/// that the system takes for a package is shown from the inside without a
+/// request to open it, because that request starts a program. The path is
+/// always one process argument; it is never interpolated into a shell
+/// command.
 ///
-/// On macOS the command for a folder reads the folder, so a caller on the
-/// interface thread hands this call to a worker.
+/// The call reads the file system, so a caller on the interface thread hands
+/// it to a worker.
 #[must_use]
 pub fn system_explorer_command(path: &std::path::Path, selection: Selection) -> LaunchCommand {
-    explorer_command_on(std::env::consts::OS, path, selection, mac_folder)
+    explorer_command_on(
+        std::env::consts::OS,
+        path,
+        selection,
+        std::path::Path::is_dir,
+        mac_folder,
+    )
 }
 
 /// How macOS treats a folder that it is asked to open.
@@ -229,14 +238,22 @@ enum MacFolder {
     Package { inside: Option<std::path::PathBuf> },
 }
 
-/// [`system_explorer_command`] for the platform named `os`. `mac_folder`
-/// answers for a folder on macOS and is not called otherwise.
+/// [`system_explorer_command`] for the platform named `os`. `is_folder` says
+/// whether a path is a folder now, through its links. `mac_folder` answers
+/// for a folder on macOS and is not called otherwise.
 fn explorer_command_on(
     os: &str,
     path: &std::path::Path,
     selection: Selection,
+    is_folder: impl Fn(&std::path::Path) -> bool,
     mac_folder: impl FnOnce(&std::path::Path) -> MacFolder,
 ) -> LaunchCommand {
+    // The kind a view names can be the kind of the other side of its row, or
+    // of an item that is replaced after the scan. Only a folder is opened.
+    let selection = match selection {
+        Selection::Folders if is_folder(path) => Selection::Folders,
+        _ => Selection::Files,
+    };
     if os == "windows" {
         return windows_explorer_command(path, selection);
     }
@@ -253,10 +270,14 @@ fn explorer_command_on(
             MacFolder::Package { inside: None } => select(path),
         },
         ("macos", Selection::Files) => select(path),
+        // The parent of a path that is gone can be a file.
         (_, Selection::Files) => (
             std::path::PathBuf::from("xdg-open"),
             vec![path_argument(
-                path.parent().unwrap_or_else(|| std::path::Path::new(".")),
+                path.ancestors()
+                    .skip(1)
+                    .find(|above| is_folder(above))
+                    .unwrap_or_else(|| std::path::Path::new(".")),
             )],
         ),
         (_, Selection::Folders) => (
@@ -327,8 +348,8 @@ pub fn reveal(
     let description = path.display().to_string();
     Job::spawn_notifying(
         move |emitter, _| {
-            // The command for a folder on macOS reads the folder, so it is
-            // built on this worker.
+            // The command reads the file system, so it is built on this
+            // worker.
             let command = system_explorer_command(&path, selection);
             emitter.send(match spawner.spawn(&command) {
                 Ok(()) => LaunchMessage::Started { description },
@@ -468,12 +489,72 @@ mod tests {
         assert_eq!(command.program, PathBuf::from("explorer.exe"));
         assert_eq!(command.arguments, ["/select,", r"C:\work tree\a,b.txt"]);
 
-        let folder = std::path::Path::new("/tmp/a folder");
-        let command = system_explorer_command(folder, Selection::Folders);
+        let base = tempfile::tempdir().unwrap();
+        let folder = base.path().join("a folder");
+        std::fs::create_dir(&folder).unwrap();
+        let command = system_explorer_command(&folder, Selection::Folders);
+        assert_eq!(command.arguments, [folder.display().to_string()]);
+    }
+
+    #[test]
+    fn no_platform_is_asked_to_open_an_item_that_is_no_folder() {
+        let base = tempfile::tempdir().unwrap();
+        let file = base.path().join("tool.command");
+        std::fs::write(&file, b"#!/bin/sh\n").unwrap();
+        let gone = file.join("inside");
+        let text = |path: &std::path::Path| path.display().to_string();
+        let arguments = |os: &str, path: &std::path::Path| {
+            explorer_command_on(
+                os,
+                path,
+                Selection::Folders,
+                std::path::Path::is_dir,
+                |_| MacFolder::Plain,
+            )
+            .arguments
+        };
+
         assert_eq!(
-            command.arguments.last().map(String::as_str),
-            Some("/tmp/a folder")
+            arguments("windows", &file),
+            ["/select,".to_owned(), text(&file)]
         );
+        assert_eq!(arguments("macos", &file), ["-R".to_owned(), text(&file)]);
+        assert_eq!(arguments("linux", &file), [text(base.path())]);
+        // The parent of the path that is gone is the file.
+        assert_eq!(
+            arguments("windows", &gone),
+            ["/select,".to_owned(), text(&gone)]
+        );
+        assert_eq!(arguments("macos", &gone), ["-R".to_owned(), text(&gone)]);
+        assert_eq!(arguments("linux", &gone), [text(base.path())]);
+
+        for os in ["windows", "macos", "linux"] {
+            assert_eq!(arguments(os, base.path()), [text(base.path())], "{os}");
+        }
+    }
+
+    #[test]
+    fn showing_a_file_that_the_view_names_as_a_folder_selects_the_file() {
+        let recorder = Arc::new(Recorder::default());
+        let base = tempfile::tempdir().unwrap();
+        let file = base.path().join("note.txt");
+        std::fs::write(&file, b"text").unwrap();
+        let mut job = super::reveal(
+            &file,
+            Selection::Folders,
+            Arc::new(Arc::clone(&recorder)),
+            Arc::new(|| {}),
+        );
+        assert!(matches!(settle(&mut job), LaunchMessage::Started { .. }));
+        let started = recorder.started.lock().unwrap();
+        assert_eq!(started.len(), 1);
+        assert_eq!(started[0], system_explorer_command(&file, Selection::Files));
+        #[cfg(target_os = "windows")]
+        assert_eq!(started[0].arguments[0], "/select,");
+        #[cfg(target_os = "macos")]
+        assert_eq!(started[0].arguments[0], "-R");
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        assert_eq!(started[0].arguments, [base.path().display().to_string()]);
     }
 
     #[test]
@@ -487,7 +568,8 @@ mod tests {
         );
         for os in ["windows", "macos", "linux"] {
             for selection in [Selection::Files, Selection::Folders] {
-                let command = explorer_command_on(os, file, selection, |_| MacFolder::Plain);
+                let command =
+                    explorer_command_on(os, file, selection, |_| true, |_| MacFolder::Plain);
                 assert!(
                     command
                         .arguments
@@ -507,6 +589,7 @@ mod tests {
                 "macos",
                 std::path::Path::new(folder),
                 Selection::Folders,
+                |_| true,
                 |_| kind,
             );
             assert_eq!(command.program, PathBuf::from("/usr/bin/open"));
