@@ -798,19 +798,90 @@ fn input_allowance(model: &crate::model::MergeModel) -> HashMap<String, usize> {
     allowance
 }
 
+/// The copies of each token in `owned` that an edit made: a copy whose
+/// characters lie in a section other than the one whose inputs hold the
+/// token, or in more than one section.
+fn made_by_edits(view: &MergeView, owned: &Owned) -> HashMap<String, usize> {
+    let homes = token_owner(view);
+    let mut made = HashMap::new();
+    for (token, start, end) in token_spans(&owned.text) {
+        let home = homes.get(&token).map(|(section, _)| *section);
+        if single_owner(&owned.owners[start..end]) != home || home.is_none() {
+            *made.entry(token).or_insert(0) += 1;
+        }
+    }
+    made
+}
+
 /// After a reload or Swap Sides: a token the output shows more often than
 /// the text before it did, and more often than the inputs show it in the
-/// new merge.
-fn reload_duplicate(view: &MergeView, before_counts: &HashMap<String, usize>) -> Option<String> {
+/// new merge. A copy an edit made before, `made`, stays next to the copies
+/// of the inputs, so it counts on top of them.
+fn reload_duplicate(
+    view: &MergeView,
+    before_counts: &HashMap<String, usize>,
+    made: &HashMap<String, usize>,
+) -> Option<String> {
     let allowance = input_allowance(view.model());
     let mut shown: Vec<(String, usize)> = counts(&view.output_text()).into_iter().collect();
     shown.sort();
     shown.into_iter().find_map(|(token, count)| {
+        let made = made.get(&token).copied().unwrap_or(0);
+        let before = before_counts.get(&token).copied().unwrap_or(0);
         let allowed = allowance
             .get(&token)
             .copied()
             .unwrap_or(0)
-            .max(before_counts.get(&token).copied().unwrap_or(0));
+            .max(before.saturating_sub(made))
+            + made;
+        (count > allowed).then(|| format!("{token} x{count}, {allowed} allowed"))
+    })
+}
+
+/// After Take All Non-Conflicting: a token the output shows more often than
+/// its sections account for. A section accounts for the copies in its own
+/// lines and in the text it lends when those lines are the lines of the
+/// input its resolution or its waiting take selects, without the characters
+/// its lent records stand for. Any other section accounts for the copies it
+/// owned before the command, so a copy an edit of the user made is no
+/// duplicate. A copy no single section owned before the command counts once.
+fn take_all_duplicate(view: &MergeView, owned_before: &Owned) -> Option<String> {
+    let model = view.model();
+    let mut allowed: HashMap<String, usize> = HashMap::new();
+    for index in 0..model.sections().len() {
+        let section = &model.sections()[index];
+        let resolution = model.pending_take(index).unwrap_or(section.resolution);
+        let own = model.section_lines(index).concat();
+        let mut records: Vec<_> = section.lent_records().iter().collect();
+        records.sort_by_key(|entry| entry.seq);
+        let source: String = records
+            .iter()
+            .filter_map(|entry| entry.source.as_deref())
+            .collect();
+        let from_input = selected_input_lines(model, index, resolution)
+            .is_some_and(|lines| lines.concat().strip_prefix(source.as_str()) == Some(&own));
+        let here = if from_input {
+            let mut here = counts(&own);
+            for token in records.iter().flat_map(|entry| tokens(&entry.text)) {
+                *here.entry(token).or_insert(0) += 1;
+            }
+            here
+        } else {
+            kept_tokens(owned_before, &|owner| owner == index)
+        };
+        for (token, count) in here {
+            *allowed.entry(token).or_insert(0) += count;
+        }
+    }
+    let owned = kept_tokens(owned_before, &|owner| owner != NO_OWNER);
+    for (token, count) in counts(&owned_before.text) {
+        let shared = count.saturating_sub(owned.get(&token).copied().unwrap_or(0));
+        *allowed.entry(token).or_insert(0) += shared;
+    }
+    let mut shown: Vec<(String, usize)> = counts(&view.output_text()).into_iter().collect();
+    shown.sort();
+    shown.into_iter().find_map(|(token, count)| {
+        let allowed = allowed.get(&token).copied().unwrap_or(0);
         (count > allowed).then(|| format!("{token} x{count}, {allowed} allowed"))
     })
 }
@@ -1219,6 +1290,11 @@ fn run_case(
             let before = pane_text(&view);
             let before_counts = counts(&before);
             let owned_before = owned_text(&view);
+            let made_before = if matches!(op, Op::Reload | Op::Swap | Op::ReloadChanged(..)) {
+                made_by_edits(&view, &owned_before)
+            } else {
+                HashMap::new()
+            };
             let sections_before = view.model().sections().len();
             let pending: Vec<PendingTake> = (0..sections_before)
                 .filter_map(|index| Some((index, view.model().pending_take(index)?)))
@@ -1307,7 +1383,7 @@ fn run_case(
                 }
             }
             if matches!(op, Op::Reload | Op::Swap | Op::ReloadChanged(..)) {
-                if let Some(problem) = reload_duplicate(&view, &before_counts) {
+                if let Some(problem) = reload_duplicate(&view, &before_counts, &made_before) {
                     local.push((
                         "reload-duplicated-token".to_owned(),
                         format!(
@@ -1502,14 +1578,11 @@ fn run_case(
                         break;
                     }
                 }
-                for (token, count) in &after_counts {
-                    let had = before_counts.get(token).copied().unwrap_or(0);
-                    if had >= 1 && *count > had {
-                        local.push((
-                            "take-all-duplicated-token".to_owned(),
-                            format!("{token}; before {before:?} after {after:?}"),
-                        ));
-                    }
+                if let Some(problem) = take_all_duplicate(&view, &owned_before) {
+                    local.push((
+                        "take-all-duplicated-token".to_owned(),
+                        format!("{problem}; before {before:?} after {after:?}"),
+                    ));
                 }
             }
             let owners_now = token_owner(&view);
@@ -1902,12 +1975,63 @@ fn the_reload_duplicate_oracle_reports_a_line_shown_twice() {
     let (mut view, _dir) = open(TOKEN_INPUTS[0], Some(TOKEN_INPUTS[1]), TOKEN_INPUTS[2]);
     run_until_ready(&mut view);
     let before = counts(&view.output_text());
-    assert_eq!(reload_duplicate(&view, &before), None);
+    assert_eq!(reload_duplicate(&view, &before, &HashMap::new()), None);
     view.data
         .model
         .set_edited(2, vec!["[c]\n".to_owned(), "[c]\n".to_owned()]);
     assert_eq!(
-        reload_duplicate(&view, &before).as_deref(),
+        reload_duplicate(&view, &before, &HashMap::new()).as_deref(),
+        Some("[c] x2, 1 allowed")
+    );
+}
+
+/// Take All Non-Conflicting restores `[u1W]` to `[u1]` while a decided
+/// conflict holds a `[u1]` the user made of `[u14]`: two copies, each
+/// accounted for, and no finding.
+#[test]
+fn the_take_all_duplicate_oracle_accepts_a_token_an_edit_made() {
+    let (mut view, _dir) = open(
+        "[u1]\n[k]\n[l9]\n",
+        Some("[u1]\n[k]\n[u14]\n"),
+        "[u1]\n[k]\n[r9]\n",
+    );
+    run_until_ready(&mut view);
+    view.output_pane.place(Caret::new(0, 3), false);
+    view.output_pane.type_character('W');
+    view.absorb_output_edits();
+    view.output_pane.place(Caret::new(2, 3), false);
+    view.output_pane.delete();
+    view.absorb_output_edits();
+    assert_eq!(pane_text(&view), "[u1W]\n[k]\n[u1]\n");
+    let before = owned_text(&view);
+    view.run(Command::TakeAllNonConflicting);
+    assert_eq!(pane_text(&view), "[u1]\n[k]\n[u1]\n");
+    assert_eq!(take_all_duplicate(&view, &before), None);
+}
+
+/// A lender that shows its lines again while its holder still shows them
+/// is a finding: no section accounts for the second copy.
+#[test]
+fn the_take_all_duplicate_oracle_reports_a_line_shown_twice() {
+    let (mut view, _dir) = open(TOKEN_INPUTS[0], Some(TOKEN_INPUTS[1]), TOKEN_INPUTS[2]);
+    run_until_ready(&mut view);
+    for _ in 0..2 {
+        view.output_pane.place(Caret::new(1, 0), false);
+        view.output_pane
+            .move_caret(ca_ui::editor::Motion::LineEnd, false);
+        view.output_pane.delete();
+        view.absorb_output_edits();
+    }
+    let before = owned_text(&view);
+    view.run(Command::TakeAllNonConflicting);
+    assert_eq!(pane_text(&view), "[a]\n[b][c][d]\n[g]\n");
+    assert_eq!(take_all_duplicate(&view, &before), None);
+    view.data.model.replace_lines_keeping_resolution(
+        2,
+        vec!["[c]\n".to_owned(), "[d]\n".to_owned(), "[g]\n".to_owned()],
+    );
+    assert_eq!(
+        take_all_duplicate(&view, &before).as_deref(),
         Some("[c] x2, 1 allowed")
     );
 }
