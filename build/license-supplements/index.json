@@ -118,5 +118,13 @@
     "kind": "declaration",
     "file": "b8e89c393831c2161b6d390bd40422910ac34f02903ad39edd85ec38d4513fef.txt",
     "source": "https://raw.githubusercontent.com/r-efi/r-efi/7e1b0322d31d625f81a5656096330934f9cd835d/Cargo.toml"
+  },
+  {
+    "version": "0.2.4",
+    "name": "windows-permissions",
+    "sha256": "cbd9c52b990970d43f5d2fce51f680c2a8390ca0fe1f0f48ab2ffc907c91a837",
+    "kind": "declaration",
+    "file": "cbd9c52b990970d43f5d2fce51f680c2a8390ca0fe1f0f48ab2ffc907c91a837.txt",
+    "source": "https://raw.githubusercontent.com/danieldulaney/windows-permissions-rs/8740e4efbd88dd01046ad9c169894f3a52eb6e2c/Cargo.toml"
   }
 ]

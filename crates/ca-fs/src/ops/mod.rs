@@ -9,6 +9,8 @@
 //! caller-supplied error policy, recording each step to a journal before and
 //! after it runs so an interrupted batch can be reported and cleaned up.
 
+#[cfg(windows)]
+mod access_list;
 pub mod exec;
 pub mod fsops;
 pub mod plan;

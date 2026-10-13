@@ -7727,6 +7727,66 @@ USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 ## MIT License (MIT)
 
+Used by: `windows-permissions 0.2.4`
+
+```text
+License declaration: https://raw.githubusercontent.com/danieldulaney/windows-permissions-rs/8740e4efbd88dd01046ad9c169894f3a52eb6e2c/Cargo.toml
+
+[package]
+name = "windows-permissions"
+version = "0.2.4"
+authors = ["Daniel Dulaney <dan@dulaney.xyz>"]
+edition = "2018"
+description = "Safe Rust bindings to Windows permissions APIs"
+repository = "https://github.com/danieldulaney/windows-permissions-rs"
+readme = "README.md"
+keywords = ["windows", "security", "permissions"]
+categories = ["api-bindings", "authentication", "os::windows-apis"]
+license = "MIT"
+
+[package.metadata.docs.rs]
+targets = ["x86_64-pc-windows-msvc", "i686-pc-windows-msvc"]
+
+[dependencies]
+winapi = { version = "0.3.9", features = [
+    "std",
+    "aclapi",
+    "handleapi",
+    "sddl",
+    "securitybaseapi",
+    "winerror",
+    "winnt",
+    ]}
+bitflags = "1"
+
+[dev-dependencies]
+itertools = "0.8"
+tempfile = "3"
+
+
+MIT license terms (upstream supplies no copyright statement):
+
+MIT License
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
+associated documentation files (the "Software"), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the
+following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial
+portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
+LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO
+EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
+USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+```
+
+## MIT License (MIT)
+
 Used by: `objc2-app-kit 0.3.2`, `objc2-core-foundation 0.3.2`, `objc2-core-graphics 0.3.2`, `objc2-foundation 0.3.2`
 
 ```text

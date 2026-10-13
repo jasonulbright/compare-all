@@ -274,24 +274,14 @@ pub trait FileOps: Send + Sync {
         self.create_new(path)
     }
 
-    /// Give the file `target` the second name `name`, a name that no item may
-    /// hold, and say whether the file has that name now. An implementation
-    /// does this only where a copy of the file would take other access
-    /// settings than the file has.
+    /// [`FileOps::write_new`] for a copy of the file `model`. On the local disk
+    /// the copy and its temporary are never open to more users than `model`:
+    /// they have its permission bits, or its access list on Windows.
     ///
     /// # Errors
-    /// Returns [`io::ErrorKind::AlreadyExists`] when an item holds `name`.
-    fn second_name(&self, _target: &Path, _name: &Path) -> io::Result<bool> {
-        Ok(false)
-    }
-
-    /// [`FileOps::write_new`] for a copy of the file `model`. Where the file
-    /// system keeps access settings as permission bits, the copy and its
-    /// temporary are never open to more users than `model`.
-    ///
-    /// # Errors
-    /// Returns [`io::ErrorKind::AlreadyExists`] when an item holds `target`,
-    /// and propagates every other error.
+    /// Returns [`io::ErrorKind::AlreadyExists`] when an item holds `target`.
+    /// Returns an error and writes no copy when the copy cannot take the
+    /// access list of `model`. Propagates every other error.
     fn write_new_like(
         &self,
         target: &Path,
@@ -787,21 +777,36 @@ impl FileOps for RealFs {
     }
 
     #[cfg(windows)]
-    fn second_name(&self, target: &Path, name: &Path) -> io::Result<bool> {
-        let meta = std::fs::symlink_metadata(target)?;
-        if !meta.is_file() || windows_reparse_point(&meta) {
-            return Ok(false);
-        }
-        // A copy takes the inherited access list of its folder. A second
-        // name is the same file, so it keeps the list the file has, and it
-        // keeps the content when a rename or a replacement takes the first
-        // name away.
-        match std::fs::hard_link(target, name) {
-            Ok(()) => Ok(true),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Err(error),
-            // A volume with no links, or a name on another volume.
-            Err(_) => Ok(false),
-        }
+    fn write_new_like(
+        &self,
+        target: &Path,
+        reader: &mut dyn Read,
+        buffer_size: usize,
+        model: &Path,
+    ) -> io::Result<()> {
+        let refused = |error: io::Error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "{} cannot take the access list of {}, so nothing was replaced: {error}",
+                    target.display(),
+                    model.display()
+                ),
+            )
+        };
+        let Some(list) = super::access_list::AccessList::of(model).map_err(refused)? else {
+            return self.write_new(target, reader, buffer_size);
+        };
+        ca_io::replace_new_prepared(
+            target,
+            |written: &mut dyn Write| copy_all(reader, written, buffer_size),
+            || Ok(()),
+            0o666,
+            // A new file has the inherited list of its folder. The copy gets
+            // the list of the model while it is empty, and a rename keeps a
+            // list, so the copy is never open to more users than the model.
+            |_, temporary| list.apply_to(temporary).map_err(refused),
+        )
     }
 
     #[cfg(unix)]
