@@ -172,8 +172,11 @@ fn a_deletion_that_starts_inside_a_line_ending_like_the_removed_text_keeps_that_
     assert_eq!(view.output_text(), "[u1]\nR\nz\n");
 }
 
+/// s1 was taken from the right and its `R` joined to s0. The center then
+/// changes in s1: the reload drops the take with the text it took, s1 waits
+/// again with its new center line, and the old `R` leaves s0.
 #[test]
-fn a_reload_that_changed_a_waiting_lender_keeps_its_joined_text_through_take_all() {
+fn a_reload_that_changed_a_taken_lender_takes_its_joined_text_out_of_the_holder() {
     let (mut view, dir) = open("a\nb\nL\nz\n", Some("a\nb\nc\nz\n"), "a\nb\nR\nz\n");
     run_until_ready(&mut view);
     take_at(&mut view, 1, Command::TakeRight);
@@ -185,11 +188,11 @@ fn a_reload_that_changed_a_waiting_lender_keeps_its_joined_text_through_take_all
     view.run(Command::Reload);
     run_until_ready(&mut view);
     assert_output_lines_match_pane(&view);
-    assert_eq!(view.output_text(), "a\nbR\nC\nz\n");
+    assert_eq!(view.output_text(), "a\nb\nC\nz\n");
     assert_eq!(view.model().totals().conflicts_remaining, 1);
     view.run(Command::TakeAllNonConflicting);
     assert_output_lines_match_pane(&view);
-    assert_eq!(view.output_text(), "a\nb\nR\nC\nz\n");
+    assert_eq!(view.output_text(), "a\nb\nC\nz\n");
     assert_eq!(view.model().totals().conflicts_remaining, 1);
 }
 

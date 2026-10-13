@@ -737,8 +737,8 @@ fn lender_and_holder_takes_in_every_line_ending_restore_the_selected_input() {
 }
 
 /// Join, then change lines `c` and `d` of s2 to `x` and `y` in all three
-/// inputs and reload: s2 keeps its automatic resolution, its new text shows
-/// no line of the characters s1 holds, and it keeps the record of them.
+/// inputs and reload: the new text of s2 does not start with the characters
+/// s1 holds, so they leave s1 and s2 lends nothing.
 fn joined_then_lender_changed_on_disk() -> (MergeView, tempfile::TempDir) {
     let (mut view, dir) = joined(F1, 2);
     for (name, text) in [
@@ -755,12 +755,12 @@ fn joined_then_lender_changed_on_disk() -> (MergeView, tempfile::TempDir) {
 }
 
 #[test]
-fn a_take_of_a_lender_that_a_reload_left_on_its_side_restores_it_in_both_orders() {
+fn takes_after_a_reload_that_replaced_the_lent_lines_give_one_result_in_both_orders() {
     let mut texts = Vec::new();
     for lender_first in [true, false] {
         let (mut view, dir) = joined_then_lender_changed_on_disk();
-        assert_eq!(view.output_text(), "a\nbcd\nx\ny\ng\nh\ni\nX\nf\n");
-        assert!(!view.model().sections()[2].lent_records().is_empty());
+        assert_eq!(view.output_text(), "a\nb\nx\ny\ng\nh\ni\nX\nf\n");
+        assert!(view.model().sections()[2].lent_records().is_empty());
         assert_eq!(resolution(&view, 2), "Center");
         let order = if lender_first {
             [(2, Command::TakeCenter), (1, Command::TakeLeft)]
