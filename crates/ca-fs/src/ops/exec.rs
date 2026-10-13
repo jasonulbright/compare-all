@@ -1429,6 +1429,9 @@ fn write_backup(
     name: &Path,
     options: &OperationOptions,
 ) -> io::Result<()> {
+    if fs.second_name(target, name)? {
+        return Ok(());
+    }
     let mut reader = fs.open_read(target)?;
     fs.write_new_like(name, &mut *reader, options.buffer_size, target)
 }

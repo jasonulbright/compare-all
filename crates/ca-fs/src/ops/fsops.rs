@@ -267,6 +267,17 @@ pub trait FileOps: Send + Sync {
         self.create_new(path)
     }
 
+    /// Give the file `target` the second name `name`, a name that no item may
+    /// hold, and say whether the file has that name now. An implementation
+    /// does this only where a copy of the file would take other access
+    /// settings than the file has.
+    ///
+    /// # Errors
+    /// Returns [`io::ErrorKind::AlreadyExists`] when an item holds `name`.
+    fn second_name(&self, _target: &Path, _name: &Path) -> io::Result<bool> {
+        Ok(false)
+    }
+
     /// [`FileOps::write_new`] for a copy of the file `model`. Where the file
     /// system keeps access settings as permission bits, the copy and its
     /// temporary are never open to more users than `model`.
@@ -758,6 +769,24 @@ impl FileOps for RealFs {
             }
         };
         Ok(Box::new(file))
+    }
+
+    #[cfg(windows)]
+    fn second_name(&self, target: &Path, name: &Path) -> io::Result<bool> {
+        let meta = std::fs::symlink_metadata(target)?;
+        if !meta.is_file() || windows_reparse_point(&meta) {
+            return Ok(false);
+        }
+        // A copy takes the inherited access list of its folder. A second
+        // name is the same file, so it keeps the list the file has, and it
+        // keeps the content when a rename or a replacement takes the first
+        // name away.
+        match std::fs::hard_link(target, name) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Err(error),
+            // A volume with no links, or a name on another volume.
+            Err(_) => Ok(false),
+        }
     }
 
     #[cfg(unix)]
