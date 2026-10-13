@@ -826,14 +826,20 @@ pub(crate) fn skips_unreachable_name(
 
 /// Record `rel` as left alone when the new name `new_name` holds a folder
 /// separator or is a dot segment, and say whether it was. A rename changes the
-/// name only; such a name would move the item into another folder.
+/// name only; such a name would move the item into another folder. On Windows
+/// a colon does the same: the text before it names a drive, or a file whose
+/// stream the text after it names.
 fn skips_folder_name(plan: &mut OperationPlan, rel: &Path, new_name: &str) -> bool {
-    if !(new_name.contains(['/', '\\']) || new_name == "." || new_name == "..") {
+    let reason = if new_name.contains(['/', '\\']) || new_name == "." || new_name == ".." {
+        "names another folder"
+    } else if cfg!(windows) && new_name.contains(':') {
+        "holds a colon, which names a drive or a stream of another file"
+    } else {
         return false;
-    }
+    };
     plan.skipped.push(PlanSkip::noted(
         rel.to_path_buf(),
-        format!("the new name {new_name:?} names another folder"),
+        format!("the new name {new_name:?} {reason}"),
     ));
     true
 }
