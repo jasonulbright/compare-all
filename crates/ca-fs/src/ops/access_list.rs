@@ -18,6 +18,10 @@ use windows_permissions::{LocalBox, SecurityDescriptor};
 
 const READ_CONTROL: u32 = 0x0002_0000;
 const WRITE_DAC: u32 = 0x0004_0000;
+const DELETE: u32 = 0x0001_0000;
+const GENERIC_WRITE: u32 = 0x4000_0000;
+const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+const SHARE_ALL: u32 = 0x0000_0007;
 
 /// The text a descriptor has for a file with no access list at all, which
 /// every user can open.
@@ -59,34 +63,119 @@ impl AccessList {
         }))
     }
 
-    /// Give the file at `path` this list and nothing from its folder.
+    /// Create the file `path`, which no item may hold, with this list and
+    /// nothing from its folder. The file is returned open and empty.
+    ///
+    /// A new file has the list of its folder until its own list is set, and
+    /// a handle keeps the access it had when it was opened. The returned
+    /// handle is the only one that can read or write the file while it is
+    /// open: it shares the file for a rename or a removal only, and the list
+    /// is set through it before the file holds a byte. All bytes of the file
+    /// go in through this handle, so the list need not let this account
+    /// write the file.
     ///
     /// # Errors
-    /// Returns an error when the volume refuses the list, or when the file
-    /// does not report the same list afterwards. The file can then be open
-    /// to more users than the list allows.
-    pub(crate) fn apply_to(&self, path: &Path) -> io::Result<()> {
+    /// Returns [`io::ErrorKind::AlreadyExists`] when an item holds `path`.
+    /// Returns an error and leaves no file when the volume refuses the list,
+    /// when the file does not report the same list afterwards, or when this
+    /// account could not rename or remove a file with this list in the
+    /// folder. When the empty file cannot be removed, the error names it.
+    pub(crate) fn create(&self, path: &Path) -> io::Result<File> {
+        let mut file = File::options()
+            .write(true)
+            .create_new(true)
+            .access_mode(GENERIC_WRITE | READ_CONTROL | WRITE_DAC)
+            .share_mode(FILE_SHARE_DELETE)
+            .open(path)?;
+        match self.apply_to(&mut file).and_then(|()| removable(path)) {
+            Ok(()) => Ok(file),
+            Err(error) => Err(discard(file, path, &error)),
+        }
+    }
+
+    /// Give the open file `file` this list and nothing from its folder.
+    fn apply_to(&self, file: &mut File) -> io::Result<()> {
+        let not_kept = |cause: &dyn std::fmt::Display| {
+            io::Error::other(format!("the volume did not keep the access list ({cause})"))
+        };
         let descriptor: LocalBox<SecurityDescriptor> = format!("D:P{}", self.entries).parse()?;
         let list = descriptor
             .dacl()
             .ok_or_else(|| io::Error::other("the access list has no entries to apply"))?;
-        let mut file = File::options()
-            .access_mode(READ_CONTROL | WRITE_DAC)
-            .open(path)?;
         SetSecurityInfo(
-            &mut file,
+            file,
             SeObjectType::SE_FILE_OBJECT,
             SecurityInformation::Dacl | SecurityInformation::ProtectedDacl,
             None,
             None,
             Some(list),
             None,
-        )?;
-        if Self::parse(&list_text(&file)?)?.as_ref() == Some(self) {
+        )
+        .map_err(|error| not_kept(&error))?;
+        let kept = list_text(file).map_err(|error| not_kept(&error))?;
+        if Self::parse(&kept)?.as_ref() == Some(self) {
             Ok(())
         } else {
-            Err(io::Error::other("the volume did not keep the access list"))
+            Err(not_kept(&"it reports another list"))
         }
+    }
+}
+
+/// Fails when this account may not rename or remove the file at `path`,
+/// which another handle holds open and shares for that.
+///
+/// The right comes from the list of the file or from the list of its
+/// folder. A file without it cannot take its final name and stays under its
+/// temporary name.
+fn removable(path: &Path) -> io::Result<()> {
+    match File::options()
+        .access_mode(DELETE)
+        .share_mode(SHARE_ALL)
+        .open(path)
+    {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "the access list gives this account no right to rename or delete the backup, and \
+             the backup folder gives no right to delete its files; choose a backup folder where \
+             this account can delete files, or turn the backup off",
+        )),
+        Err(error) => Err(error),
+    }
+}
+
+/// Remove the empty file `file` at `path` after `error`, and return the
+/// error to report.
+///
+/// The list of the file can deny its removal, so the file takes the list of
+/// its folder first. It holds no byte.
+fn discard(mut file: File, path: &Path, error: &io::Error) -> io::Error {
+    if let Ok(inherited) = "D:".parse::<LocalBox<SecurityDescriptor>>() {
+        let _ = SetSecurityInfo(
+            &mut file,
+            SeObjectType::SE_FILE_OBJECT,
+            SecurityInformation::Dacl | SecurityInformation::UnprotectedDacl,
+            None,
+            None,
+            inherited.dacl(),
+            None,
+        );
+    }
+    drop(file);
+    // The kind for a taken name asks the caller for another name.
+    let kind = match error.kind() {
+        io::ErrorKind::AlreadyExists => io::ErrorKind::Other,
+        kind => kind,
+    };
+    match std::fs::remove_file(path) {
+        Ok(()) => io::Error::new(kind, error.to_string()),
+        Err(removal) => io::Error::new(
+            kind,
+            format!(
+                "{error}; the empty temporary file {} could not be removed: {removal}",
+                path.display()
+            ),
+        ),
     }
 }
 
@@ -199,7 +288,7 @@ fn without_repeats(entries: &str) -> String {
 /// True when the volume that holds `path` reports that it keeps no access
 /// lists, as FAT and exFAT do. A volume that does not answer counts as one
 /// that keeps them.
-fn volume_keeps_no_lists(path: &Path) -> bool {
+pub(crate) fn volume_keeps_no_lists(path: &Path) -> bool {
     volume_flags(path).is_some_and(|flags| !flags.has(winsafe::co::FILE_VOL::PERSISTENT_ACLS))
 }
 

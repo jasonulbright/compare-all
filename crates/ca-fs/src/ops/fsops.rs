@@ -718,6 +718,26 @@ fn replace_or_rename(
     ))
 }
 
+/// `error` of a write whose temporary was `temporary`. When the temporary is
+/// still there and cannot be removed, the error names it: the access list
+/// of a file can deny its removal to the account that wrote it.
+#[cfg(windows)]
+fn naming_a_leftover(error: io::Error, temporary: &Path) -> io::Error {
+    if std::fs::symlink_metadata(temporary).is_err() {
+        return error;
+    }
+    match std::fs::remove_file(temporary) {
+        Ok(()) => error,
+        Err(removal) => io::Error::new(
+            error.kind(),
+            format!(
+                "{error}; the temporary file {} could not be removed: {removal}",
+                temporary.display()
+            ),
+        ),
+    }
+}
+
 /// [`FileOps`] backed by the real file system.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RealFs;
@@ -845,16 +865,24 @@ impl FileOps for RealFs {
         let Some(list) = super::access_list::AccessList::of(model).map_err(refused)? else {
             return self.write_new(target, reader, buffer_size);
         };
-        ca_io::replace_new_prepared(
+        let mut temporary = None;
+        let written = ca_io::replace_new_created(
             target,
             |written: &mut dyn Write| copy_all(reader, written, buffer_size),
             || Ok(()),
-            0o666,
-            // A new file has the inherited list of its folder. The copy gets
-            // the list of the model while it is empty, and a rename keeps a
-            // list, so the copy is never open to more users than the model.
-            |_, temporary| list.apply_to(temporary).map_err(refused),
-        )
+            // The copy has the list of the model from before its first byte,
+            // and a rename keeps a list, so the copy is never open to more
+            // users than the model.
+            |path| {
+                let file = list.create(path).map_err(refused)?;
+                temporary = Some(path.to_path_buf());
+                Ok(file)
+            },
+        );
+        match (written, temporary) {
+            (Err(error), Some(temporary)) => Err(naming_a_leftover(error, &temporary)),
+            (written, _) => written,
+        }
     }
 
     #[cfg(unix)]

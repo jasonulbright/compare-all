@@ -1212,6 +1212,199 @@ fn the_backup_of_a_file_with_an_entry_that_its_folder_also_gives_is_written() {
     }
 }
 
+/// A reader that, at each block, tries to open every temporary of `folder`
+/// for reading and reads its access list.
+#[cfg(windows)]
+struct TemporaryProbe {
+    inner: std::fs::File,
+    folder: PathBuf,
+    /// The error code of the open for reading, and the list.
+    seen: Vec<(Option<i32>, String)>,
+}
+
+#[cfg(windows)]
+impl Read for TemporaryProbe {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        for name in temporaries_in(&self.folder) {
+            let path = self.folder.join(name);
+            let read = std::fs::File::open(&path)
+                .err()
+                .and_then(|error| error.raw_os_error());
+            self.seen
+                .push((read, crate::ops::access_list::text_for_test(&path)));
+        }
+        self.inner.read(buffer)
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn the_backup_temporary_has_its_final_list_and_no_reader_while_it_is_written() {
+    use crate::ops::access_list::{set_for_test, text_for_test};
+    const SHARING_VIOLATION: i32 = 32;
+    let account = current_account();
+    let dir = tempfile::tempdir().unwrap();
+    let model = dir.path().join("secret.txt");
+    std::fs::write(&model, vec![b's'; 3 * 4096]).unwrap();
+    set_for_test(&model, Some(&format!("D:P(A;;FA;;;{account})")));
+    let list = text_for_test(&model);
+    let backup = dir.path().join("secret.txt.bak");
+
+    let mut reader = TemporaryProbe {
+        inner: std::fs::File::open(&model).unwrap(),
+        folder: dir.path().to_path_buf(),
+        seen: Vec::new(),
+    };
+    RealFs
+        .write_new_like(&backup, &mut reader, 4096, &model)
+        .unwrap();
+
+    assert!(reader.seen.len() >= 3, "{:?}", reader.seen);
+    for (read, seen_list) in &reader.seen {
+        assert_eq!(*read, Some(SHARING_VIOLATION), "a reader opened the file");
+        assert_eq!(seen_list, &list);
+    }
+    assert_eq!(std::fs::read(&backup).unwrap(), vec![b's'; 3 * 4096]);
+    assert_eq!(text_for_test(&backup), list);
+    assert_eq!(temporaries_in(dir.path()), Vec::<String>::new());
+}
+
+/// A second thread opens each backup temporary as soon as the folder shows
+/// it. A handle keeps the access it had when it was opened, so a handle
+/// taken while the file has the list of its folder reads the saved content
+/// later.
+#[cfg(windows)]
+#[test]
+fn no_handle_reads_a_backup_temporary_that_has_the_list_of_its_folder() {
+    use crate::ops::access_list::set_for_test;
+    use std::sync::atomic::AtomicBool;
+    use windows_permissions::constants::{SeObjectType, SecurityInformation};
+    use windows_permissions::wrappers::{
+        ConvertSecurityDescriptorToStringSecurityDescriptor, GetSecurityInfo,
+    };
+    let account = current_account();
+    let mut opened = 0usize;
+    for _ in 0..40 {
+        let dir = tempfile::tempdir().unwrap();
+        let model = dir.path().join("secret.txt");
+        std::fs::write(&model, vec![b's'; 64 * 1024]).unwrap();
+        set_for_test(&model, Some(&format!("D:P(A;;FA;;;{account})")));
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let watcher = {
+            let (stop, folder) = (std::sync::Arc::clone(&stop), dir.path().to_path_buf());
+            std::thread::spawn(move || {
+                let mut lists = Vec::new();
+                while !stop.load(Ordering::Relaxed) && lists.is_empty() {
+                    for name in temporaries_in(&folder) {
+                        let Ok(file) = std::fs::File::open(folder.join(name)) else {
+                            continue;
+                        };
+                        let list = GetSecurityInfo(
+                            &file,
+                            SeObjectType::SE_FILE_OBJECT,
+                            SecurityInformation::Dacl,
+                        )
+                        .and_then(|descriptor| {
+                            ConvertSecurityDescriptorToStringSecurityDescriptor(
+                                &descriptor,
+                                SecurityInformation::Dacl,
+                            )
+                        })
+                        .map(|text| text.to_string_lossy().into_owned());
+                        lists.push(list);
+                    }
+                }
+                lists
+            })
+        };
+        let mut reader = std::fs::File::open(&model).unwrap();
+        let written = RealFs.write_new_like(
+            &dir.path().join("secret.txt.bak"),
+            &mut reader,
+            4096,
+            &model,
+        );
+        stop.store(true, Ordering::Relaxed);
+        let lists = watcher.join().unwrap();
+        written.unwrap();
+        for list in lists {
+            opened += 1;
+            assert_eq!(list.unwrap(), format!("D:PAI(A;;FA;;;{account})"));
+        }
+    }
+    println!("handles that read a closed temporary with its final list: {opened}");
+}
+
+#[cfg(windows)]
+#[test]
+fn the_backup_of_a_file_that_the_account_can_only_read_is_written() {
+    use crate::ops::access_list::{set_for_test, text_for_test};
+    let account = current_account();
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("read only for me.txt");
+    std::fs::write(&target, b"old").unwrap();
+    set_for_test(
+        &target,
+        Some(&format!("D:P(A;;FR;;;{account})(A;;FA;;;SY)")),
+    );
+    let list = text_for_test(&target);
+
+    let outcome = replace_with_a_backup(dir.path(), "read only for me.txt");
+
+    assert!(outcome.is_done(), "{outcome:?}");
+    assert_eq!(std::fs::read(&target).unwrap(), b"new");
+    let backup = dir.path().join("read only for me.txt.bak");
+    assert_eq!(std::fs::read(&backup).unwrap(), b"old");
+    assert_eq!(text_for_test(&backup), list);
+    assert_eq!(text_for_test(&target), list);
+    assert_eq!(temporaries_in(dir.path()), Vec::<String>::new());
+}
+
+#[cfg(windows)]
+#[test]
+fn a_backup_that_the_account_could_not_rename_is_refused_and_leaves_no_temporary() {
+    use crate::ops::access_list::set_for_test;
+    let account = current_account();
+    let dir = tempfile::tempdir().unwrap();
+    // The folder lets the account change its files and delete none of them
+    // by the right of the folder.
+    let folder = dir.path().join("no delete of items");
+    std::fs::create_dir(&folder).unwrap();
+    set_for_test(
+        &folder,
+        Some(&format!("D:P(A;OICI;0x1301bf;;;{account})(A;OICI;FA;;;SY)")),
+    );
+    for (name, rights) in [("read.txt", "FR"), ("no delete.txt", "0x1201bf")] {
+        let target = folder.join(name);
+        std::fs::write(&target, b"old").unwrap();
+        set_for_test(
+            &target,
+            Some(&format!("D:P(A;;{rights};;;{account})(A;;FA;;;SY)")),
+        );
+
+        let outcome = replace_with_a_backup(&folder, name);
+
+        let StepOutcome::Failed { message } = &outcome else {
+            panic!("{name}: {outcome:?}");
+        };
+        let backup = folder.join(format!("{name}.bak"));
+        for part in [
+            backup.display().to_string(),
+            target.display().to_string(),
+            "no right to rename or delete the backup".to_owned(),
+            "turn the backup off".to_owned(),
+        ] {
+            assert!(message.contains(&part), "{part} is not in: {message}");
+        }
+        assert!(!message.contains("could not be removed"), "{message}");
+        assert_eq!(temporaries_in(&folder), Vec::<String>::new(), "{name}");
+        assert!(!backup.exists());
+        assert_eq!(std::fs::read(&target).unwrap(), b"old");
+    }
+    // The clean-up of the test needs the right to delete.
+    set_for_test(&folder, Some(&format!("D:P(A;OICI;FA;;;{account})")));
+}
+
 /// A folder for one test on the share that `COMPARE_ALL_WSL_SHARE` names: a
 /// folder under `\\wsl.localhost\`, a volume with no replacement call and no
 /// access lists. `None` when the variable names no folder.

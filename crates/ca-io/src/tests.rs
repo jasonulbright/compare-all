@@ -200,6 +200,7 @@ fn finalization_failure_does_not_commit_or_leave_temporary_files() {
             |_, _| Ok(()),
             false,
             None,
+            None,
         );
         assert!(result.is_err());
         assert_eq!(fs::read(&target).unwrap(), b"original");
@@ -893,4 +894,80 @@ fn a_log_or_a_removal_refuses_a_folder_and_a_read_only_file() {
         remove_file(&locked).unwrap_err().kind(),
         io::ErrorKind::NotFound
     );
+}
+
+#[cfg(windows)]
+#[test]
+fn a_file_the_caller_creates_is_renamed_closed_to_a_free_name_only() {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("output");
+    let create = |path: &Path| {
+        fs::File::options()
+            .write(true)
+            .create_new(true)
+            .share_mode(FILE_SHARE_DELETE)
+            .open(path)
+    };
+
+    // The handle of the caller lets no other handle read while the bytes go
+    // in, and the commit works with that handle.
+    let mut read_while_written = None;
+    replace_new_created(
+        &target,
+        |writer| {
+            writer.write_all(b"complete")?;
+            let temporary = names(dir.path()).remove(0);
+            read_while_written = Some(fs::read(dir.path().join(temporary)).is_ok());
+            io::Result::Ok(())
+        },
+        || Ok(()),
+        create,
+    )
+    .unwrap();
+    assert_eq!(read_while_written, Some(false));
+    assert_eq!(fs::read(&target).unwrap(), b"complete");
+    assert_eq!(names(dir.path()), ["output"]);
+
+    // A taken name is refused at the start, and when it is taken after the
+    // last check.
+    let taken = replace_new_created(
+        &target,
+        |writer| writer.write_all(b"second"),
+        || io::Result::Ok(()),
+        create,
+    )
+    .unwrap_err();
+    assert_eq!(taken.kind(), io::ErrorKind::AlreadyExists);
+    let late = dir.path().join("late");
+    let taken = replace_new_created(
+        &late,
+        |writer| writer.write_all(b"second"),
+        || fs::write(&late, b"another writer"),
+        create,
+    )
+    .unwrap_err();
+    assert_eq!(taken.kind(), io::ErrorKind::AlreadyExists, "{taken}");
+    assert_eq!(fs::read(&late).unwrap(), b"another writer");
+    assert_eq!(fs::read(&target).unwrap(), b"complete");
+
+    // An error of the caller is returned, and a failed write removes the
+    // temporary.
+    let refused = replace_new_created(
+        &dir.path().join("refused"),
+        |writer| writer.write_all(b"x"),
+        || io::Result::Ok(()),
+        |_| Err(io::Error::other("no file for this caller")),
+    )
+    .unwrap_err();
+    assert_eq!(refused.to_string(), "no file for this caller");
+    replace_new_created(
+        &dir.path().join("failed"),
+        |_| io::Result::<()>::Err(io::Error::other("the source ended")),
+        || io::Result::Ok(()),
+        create,
+    )
+    .unwrap_err();
+    assert_eq!(names(dir.path()), ["late", "output"]);
 }
