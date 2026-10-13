@@ -392,6 +392,19 @@ pub(crate) fn text_for_test(path: &Path) -> String {
     list_text(&item).unwrap()
 }
 
+/// The descriptor text `text` as Windows writes it. Windows writes a
+/// well-known account by a short name where the text can name it by its
+/// identifier.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+pub(crate) fn as_written_for_test(text: &str) -> String {
+    let descriptor: LocalBox<SecurityDescriptor> = text.parse().unwrap();
+    ConvertSecurityDescriptorToStringSecurityDescriptor(&descriptor, SecurityInformation::Dacl)
+        .unwrap()
+        .into_string()
+        .unwrap()
+}
+
 /// Give the file or folder `path` the list of the descriptor text `text`,
 /// or no list at all for `None`. A text that starts with `D:P` adds nothing
 /// from the folder of `path`.
