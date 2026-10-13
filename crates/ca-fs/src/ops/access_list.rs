@@ -100,7 +100,11 @@ impl Reported {
                 self.size.entries
             )));
         }
-        let again: LocalBox<SecurityDescriptor> = self.text.parse()?;
+        let again: LocalBox<SecurityDescriptor> = self.text.parse().map_err(|error| {
+            io::Error::other(format!(
+                "Windows cannot read the text of the access list again ({error}); {TEXT_ADVICE}"
+            ))
+        })?;
         let again = ListSize::of(&again)?;
         if again.entries != self.size.entries
             || (self.text.contains('"') && again.bytes != self.size.bytes)
@@ -322,19 +326,24 @@ fn names_no_list(mut flags: &str) -> io::Result<bool> {
 /// What the open file `file` reports of its access list.
 ///
 /// # Errors
-/// Returns the error of the read.
+/// Returns the error of the read. Windows has no text for a list with an
+/// entry of a type that it does not know; the error then says what a user
+/// can do.
 fn reported(file: &File) -> io::Result<Reported> {
     let descriptor = GetSecurityInfo(
         file,
         SeObjectType::SE_FILE_OBJECT,
         SecurityInformation::Dacl,
     )?;
-    let text = ConvertSecurityDescriptorToStringSecurityDescriptor(
-        &descriptor,
-        SecurityInformation::Dacl,
-    )?
-    .into_string()
-    .map_err(|_| io::Error::other("the access list text is not Unicode"))?;
+    let text =
+        ConvertSecurityDescriptorToStringSecurityDescriptor(&descriptor, SecurityInformation::Dacl)
+            .map_err(|error| {
+                io::Error::other(format!(
+                    "Windows cannot write the access list as text ({error}); {TEXT_ADVICE}"
+                ))
+            })?
+            .into_string()
+            .map_err(|_| io::Error::other("the access list text is not Unicode"))?;
     // The list accessor of the descriptor panics for a file with no list at
     // all, so such a descriptor is not measured.
     let no_list = text
