@@ -1092,6 +1092,53 @@ fn a_step_that_replaces_nothing_leaves_the_target_under_one_name() {
     }
 }
 
+/// The outcome of a copy of `new` over the file `name` of `folder`, with a
+/// backup beside the file.
+#[cfg(windows)]
+fn replace_with_a_backup(folder: &Path, name: &str) -> StepOutcome {
+    let source = folder.join(format!("{name}.source"));
+    std::fs::write(&source, b"new").unwrap();
+    let backed_up = OperationOptions {
+        overwrite: true,
+        backup: Some(BackupOptions::default()),
+        ..options()
+    };
+    replace_by_copy_with(folder, &source, &folder.join(name), backed_up)
+}
+
+/// The names in `folder` that the application gives its temporary files.
+#[cfg(windows)]
+fn temporaries_in(folder: &Path) -> Vec<String> {
+    std::fs::read_dir(folder)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with(".compare-all-"))
+        .collect()
+}
+
+#[cfg(windows)]
+#[test]
+fn the_backup_of_a_file_with_no_access_list_at_all_is_an_ordinary_copy() {
+    use crate::ops::access_list::{set_for_test, text_for_test};
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("open.txt");
+    std::fs::write(&target, b"old").unwrap();
+    set_for_test(&target, None);
+    assert!(text_for_test(&target).ends_with("NO_ACCESS_CONTROL"));
+
+    let outcome = replace_with_a_backup(dir.path(), "open.txt");
+
+    assert!(outcome.is_done(), "{outcome:?}");
+    assert_eq!(std::fs::read(&target).unwrap(), b"new");
+    let backup = dir.path().join("open.txt.bak");
+    assert_eq!(std::fs::read(&backup).unwrap(), b"old");
+    // An ordinary copy has the entries of its folder and no other.
+    let list = text_for_test(&backup);
+    assert!(list.contains("(A;ID;"), "{list}");
+    assert!(!list.contains("(A;;"), "{list}");
+    assert_eq!(temporaries_in(dir.path()), Vec::<String>::new());
+}
+
 /// A folder for one test on the share that `COMPARE_ALL_WSL_SHARE` names: a
 /// folder under `\\wsl.localhost\`, a volume with no replacement call and no
 /// access lists. `None` when the variable names no folder.
