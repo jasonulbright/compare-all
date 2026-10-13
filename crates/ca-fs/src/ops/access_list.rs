@@ -50,10 +50,10 @@ impl AccessList {
         let list = text
             .strip_prefix("D:")
             .ok_or_else(|| io::Error::other("the file reports no access list text"))?;
-        if list.starts_with(NO_LIST) {
+        let (flags, entries) = list.split_at(list.find('(').unwrap_or(list.len()));
+        if names_no_list(flags)? {
             return Ok(None);
         }
-        let entries = list.find('(').map_or("", |start| &list[start..]);
         Ok(Some(Self {
             entries: without_inherited_marks(entries),
         }))
@@ -88,6 +88,30 @@ impl AccessList {
             Err(io::Error::other("the volume did not keep the access list"))
         }
     }
+}
+
+/// True when `flags`, the text between `D:` and the first entry of a list,
+/// holds the mark of a file with no list.
+///
+/// The flags follow one another with no separator, and the mark stands
+/// after the other flags of the file (`PAINO_ACCESS_CONTROL`), so its place
+/// in the text is not fixed.
+///
+/// # Errors
+/// Returns an error for a flag that is not known. No list is assumed then.
+fn names_no_list(mut flags: &str) -> io::Result<bool> {
+    let mut no_list = false;
+    while !flags.is_empty() {
+        let flag = [NO_LIST, "AR", "AI", "P"]
+            .into_iter()
+            .find(|flag| flags.starts_with(flag))
+            .ok_or_else(|| {
+                io::Error::other("the file reports an access list flag with no known meaning")
+            })?;
+        no_list |= flag == NO_LIST;
+        flags = &flags[flag.len()..];
+    }
+    Ok(no_list)
 }
 
 /// The access list of the open file `file` as descriptor text.
@@ -169,10 +193,53 @@ fn volume_flags(path: &Path) -> Option<winsafe::co::FILE_VOL> {
     Some(flags)
 }
 
+/// The access list of the file or folder `path` as descriptor text.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+pub(crate) fn text_for_test(path: &Path) -> String {
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    let item = File::options()
+        .access_mode(READ_CONTROL)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .unwrap();
+    list_text(&item).unwrap()
+}
+
+/// Give the file or folder `path` the list of the descriptor text `text`,
+/// or no list at all for `None`. A text that starts with `D:P` adds nothing
+/// from the folder of `path`.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+pub(crate) fn set_for_test(path: &Path, text: Option<&str>) {
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    let mut item = File::options()
+        .access_mode(READ_CONTROL | WRITE_DAC)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .unwrap();
+    let descriptor: Option<LocalBox<SecurityDescriptor>> = text.map(|text| text.parse().unwrap());
+    let inheritance = if text.is_some_and(|text| text.starts_with("D:P")) {
+        SecurityInformation::ProtectedDacl
+    } else {
+        SecurityInformation::UnprotectedDacl
+    };
+    SetSecurityInfo(
+        &mut item,
+        SeObjectType::SE_FILE_OBJECT,
+        SecurityInformation::Dacl | inheritance,
+        None,
+        None,
+        descriptor.as_ref().and_then(|descriptor| descriptor.dacl()),
+        None,
+    )
+    .unwrap();
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::{without_inherited_marks, AccessList};
+    use super::{set_for_test, text_for_test, without_inherited_marks, AccessList};
 
     #[test]
     fn the_inherited_mark_is_the_only_text_taken_out_of_an_entry() {
@@ -192,12 +259,35 @@ mod tests {
 
     #[test]
     fn a_file_with_no_list_needs_no_copy_of_one_and_an_empty_list_is_kept() {
-        assert_eq!(AccessList::parse("D:NO_ACCESS_CONTROL").unwrap(), None);
+        for no_list in [
+            "D:NO_ACCESS_CONTROL",
+            "D:PAINO_ACCESS_CONTROL",
+            "D:AINO_ACCESS_CONTROL",
+            "D:PARAINO_ACCESS_CONTROL",
+            "D:NO_ACCESS_CONTROLPAI",
+        ] {
+            assert_eq!(AccessList::parse(no_list).unwrap(), None, "{no_list}");
+        }
+        assert!(AccessList::parse("D:PX(A;;FA;;;SY)").is_err());
+        let flagged = AccessList::parse("D:PARAI(A;;FA;;;SY)").unwrap().unwrap();
+        assert_eq!(flagged.entries, "(A;;FA;;;SY)");
         let empty = AccessList::parse("D:P").unwrap().unwrap();
         assert_eq!(empty.entries, "");
         let inherited = AccessList::parse("D:AI(A;ID;FA;;;SY)").unwrap().unwrap();
         let protected = AccessList::parse("D:PAI(A;;FA;;;SY)").unwrap().unwrap();
         assert_eq!(inherited, protected);
         assert!(AccessList::parse("O:SY").is_err());
+    }
+
+    #[test]
+    fn a_real_file_with_no_list_at_all_reports_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("open to all.txt");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(AccessList::of(&file).unwrap().is_some());
+        set_for_test(&file, None);
+        let text = text_for_test(&file);
+        assert!(text.ends_with("NO_ACCESS_CONTROL"), "{text}");
+        assert_eq!(AccessList::of(&file).unwrap(), None);
     }
 }
