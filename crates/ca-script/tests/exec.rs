@@ -1050,6 +1050,37 @@ fn a_password_that_holds_a_space_a_tab_or_a_slash_reaches_neither_the_log_nor_th
 }
 
 #[test]
+fn a_password_after_text_in_brackets_that_is_no_address_reaches_neither_the_log_nor_the_error() {
+    for (location, logged) in [
+        ("ftp://[alice:hun/ter2@127.0.0.1:1/pub", "ftp://[alice:***@"),
+        (
+            "ftp://[alice]:123/hunter2@127.0.0.1:1/pub",
+            "ftp://[alice]:***@",
+        ),
+    ] {
+        let fixture = Fixture::new();
+        let target = fixture.root().join("run.log");
+        let mut session = fixture.session();
+        session.log.set_fixed_time(Some(0));
+        let source = format!(
+            "log verbose \"{}\"\nload \"{location}\" \"{}\"\n",
+            target.display(),
+            fixture.right().display()
+        );
+        let error = run_script(&source, &Substitution::none(), &mut session).unwrap_err();
+        let text = std::fs::read_to_string(&target).expect("log");
+        assert!(text.contains(logged), "{text}");
+        for part in ["hun", "ter2", "123/"] {
+            assert!(!text.contains(part), "{part:?} in the log: {text}");
+            assert!(
+                !error.to_string().contains(part),
+                "{part:?} in the error: {error}"
+            );
+        }
+    }
+}
+
+#[test]
 fn a_location_with_no_password_is_logged_as_written() {
     let fixture = Fixture::new();
     let target = fixture.root().join("run.log");

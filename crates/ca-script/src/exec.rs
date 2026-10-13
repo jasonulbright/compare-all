@@ -229,26 +229,27 @@ fn text_without_url_passwords(text: &str) -> String {
 /// only after a colon. With no `@` there, a colon in the authority and a
 /// later `@` can be a password that holds a `/`: a name with a port number
 /// and a path with an `@` have the same form, so that text is hidden too.
-/// A numeric or bracketed address with a decimal port after the colon is no
-/// user name. A bracketed text with other text after the colon is one. The
-/// password ends at the last `@` of the URL, because a password can hold an
-/// unescaped `/` or `@`.
+/// Two forms are a host and a port for the location reader and stay as
+/// written: a numeric address with a decimal port, and an address in
+/// brackets that holds a colon, alone or with a decimal port. Text in
+/// brackets with no colon in it is no address, and a `[` with no `]` starts
+/// none. The password ends at the last `@` of the URL, because a password
+/// can hold an unescaped `/` or `@`.
 fn password_span(url: &str) -> Option<(usize, usize)> {
     let authority = &url[..url.find('/').unwrap_or(url.len())];
     let at = url.rfind('@')?;
     if let Some(user_end) = authority.rfind('@') {
         return Some((authority[..user_end].find(':')?, at));
     }
-    // The colons inside the brackets of an address separate no password.
-    // `closing` is the place of the closing bracket.
-    let closing = match authority.strip_prefix('[') {
-        Some(bracketed) => Some(bracketed.find(']')? + 1),
-        None => None,
-    };
-    let colon = closing.unwrap_or(0) + authority[closing.unwrap_or(0)..].find(':')?;
+    // The colons between a leading `[` and its `]` separate no password.
+    let bracketed = authority
+        .strip_prefix('[')
+        .and_then(|rest| rest.find(']').map(|closing| &rest[..closing]));
+    let after_brackets = bracketed.map_or(0, |text| text.len() + 2);
+    let colon = after_brackets + authority[after_brackets..].find(':')?;
     let port = &authority[colon + 1..];
-    let numeric_host = match closing {
-        Some(closing) => colon == closing + 1,
+    let numeric_host = match bracketed {
+        Some(address) => colon == after_brackets && address.contains(':'),
         None => authority[..colon].parse::<std::net::Ipv4Addr>().is_ok(),
     };
     if numeric_host && !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) {
@@ -1465,10 +1466,60 @@ mod tests {
             "load ftp://[::1]/pub/a@b right",
             "load ftp://[::1]:21/pub/a@b right",
             "load ftp://[fe80::1%eth0]:2121/a@b right",
-            "load ftp://[::1/pub/a@b right",
         ] {
             assert_eq!(command_without_url_passwords(line), line);
         }
+    }
+
+    #[test]
+    fn text_in_brackets_that_is_no_address_hides_the_password_after_it() {
+        for (line, logged) in [
+            // An opening bracket with no closing bracket.
+            (
+                "load ftp://[alice:se/cret@h:1/pub right",
+                "load ftp://[alice:***@h:1/pub right",
+            ),
+            ("load ftp://[::1/pub/a@b right", "load ftp://[:***@b right"),
+            // Text in brackets with no colon in it, then a decimal number.
+            (
+                "load ftp://[alice]:123/cret@h/pub right",
+                "load ftp://[alice]:***@h/pub right",
+            ),
+            (
+                "load ftp://[]:123/cret@h/pub right",
+                "load ftp://[]:***@h/pub right",
+            ),
+            // Characters outside ASCII beside the places that are cut.
+            (
+                "load \"ftp://[\u{e9}]:1/\u{e9}@h/pub\" right",
+                "load \"ftp://[\u{e9}]:***@h/pub\" right",
+            ),
+            (
+                "load \"ftp://[\u{e9}:\u{e9}/x@h/pub\" right",
+                "load \"ftp://[\u{e9}:***@h/pub\" right",
+            ),
+        ] {
+            assert_eq!(command_without_url_passwords(line), logged);
+            let argument = line["load ".len()..].trim_end_matches(" right");
+            assert_eq!(
+                error_without_url_passwords(&format!("no profile matches {argument}"), line),
+                format!(
+                    "no profile matches {}",
+                    logged["load ".len()..].trim_end_matches(" right")
+                )
+            );
+        }
+        // Two locations on one line are hidden one by one.
+        assert_eq!(
+            command_without_url_passwords(
+                "load ftp://[alice:se/cret@h:1/left ftp://[bob]:123/cret@h/right"
+            ),
+            "load ftp://[alice:***@h:1/left ftp://[bob]:***@h/right"
+        );
+        assert_eq!(
+            command_without_url_passwords("load ftp://[alice]:123/cret@h/left ftp://bob@h/a@b"),
+            "load ftp://[alice]:***@h/left ftp://bob@h/a@b"
+        );
     }
 
     #[test]
