@@ -274,6 +274,50 @@ fn a_name_that_ends_in_a_dot_or_a_space_is_refused_and_the_shorter_name_kept() {
     assert_eq!(fs::read(&target).unwrap(), b"original");
 }
 
+/// A Windows path reads a colon in a name as the start of a stream name, and
+/// drops a dot or a space at the end of a folder name.
+#[cfg(windows)]
+#[test]
+fn a_stream_name_or_a_trimmed_folder_name_is_refused_before_any_change_on_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let sub = dir.path().join("sub");
+    fs::create_dir(&sub).unwrap();
+    fs::write(dir.path().join("a.txt"), b"original").unwrap();
+    fs::write(sub.join("a.txt"), b"original").unwrap();
+    for spelling in [
+        "a.txt::$DATA",
+        "a.txt:extra",
+        "a.txt:extra:$DATA",
+        r"sub.\a.txt",
+        r"sub \a.txt",
+        r"sub.\new.txt",
+    ] {
+        let refused = dir.path().join(spelling);
+        let error = write_atomic(&refused, b"via the other spelling").unwrap_err();
+        assert_eq!(
+            error.kind(),
+            io::ErrorKind::InvalidInput,
+            "{spelling}: {error}"
+        );
+        let error = remove_file(&refused).unwrap_err();
+        assert_eq!(
+            error.kind(),
+            io::ErrorKind::InvalidInput,
+            "{spelling}: {error}"
+        );
+        let error = open_log(&refused, true).unwrap_err();
+        assert_eq!(
+            error.kind(),
+            io::ErrorKind::InvalidInput,
+            "{spelling}: {error}"
+        );
+        assert_eq!(names(dir.path()), ["a.txt", "sub"], "{spelling}");
+        assert_eq!(names(&sub), ["a.txt"], "{spelling}");
+        assert_eq!(fs::read(dir.path().join("a.txt")).unwrap(), b"original");
+        assert_eq!(fs::read(sub.join("a.txt")).unwrap(), b"original");
+    }
+}
+
 #[test]
 fn a_refusal_names_the_kind_of_item_and_the_operation() {
     let dir = tempfile::tempdir().unwrap();
