@@ -625,6 +625,33 @@ impl MergeModel {
             })
     }
 
+    /// Whether the text still lent by `index` contains the characters its
+    /// records say it stands for, in order. A take restore can survive a
+    /// separator edit only while those characters remain in the holder.
+    fn still_holds_lent_source(&self, index: usize) -> bool {
+        let Some(section) = self.sections.get(index) else {
+            return false;
+        };
+        if section.lent.is_empty() {
+            return false;
+        }
+        let mut records: Vec<&super::Lent> = section.lent.iter().collect();
+        records.sort_by_key(|record| record.seq);
+        let source: Vec<char> = records
+            .iter()
+            .filter_map(|record| record.source.as_deref())
+            .flat_map(str::chars)
+            .filter(|character| !matches!(character, '\r' | '\n'))
+            .collect();
+        let mut held = records
+            .iter()
+            .flat_map(|record| record.text.chars())
+            .filter(|character| !matches!(character, '\r' | '\n'));
+        source
+            .into_iter()
+            .all(|character| held.find(|candidate| *candidate == character).is_some())
+    }
+
     /// Restore the state `index` kept for when its lent text is back.
     /// Rebuild its output because edits to the holder may have changed line
     /// boundaries while the text was away. Only `lent` shows what is still
@@ -670,7 +697,7 @@ impl MergeModel {
                 .collect();
             giving.sort_unstable();
             for (_, lender, seq) in giving.into_iter().rev() {
-                if let Some(given) = self.give_back(lender, seq) {
+                if let Some(given) = self.give_back(lender, seq, true) {
                     returned.push(given);
                 }
             }
@@ -877,7 +904,12 @@ impl MergeModel {
     /// as lent text again, or in front of the lender's own text. The
     /// lender's characters keep their order. Returns the section and the
     /// lines that received the text.
-    fn give_back(&mut self, lender: usize, seq: u64) -> Option<(usize, Range<u32>)> {
+    fn give_back(
+        &mut self,
+        lender: usize,
+        seq: u64,
+        apply_restore: bool,
+    ) -> Option<(usize, Range<u32>)> {
         let record = self.lent_record(lender, seq)?.clone();
         let next = self
             .record_at(&record)
@@ -885,7 +917,7 @@ impl MergeModel {
         let entry = self.remove_lent(lender, seq, false)?;
         match next {
             Some(next) => self.lend_before(lender, entry, &next),
-            None => self.return_to_lender(lender, entry),
+            None => self.return_to_lender(lender, entry, apply_restore),
         }
     }
 
@@ -926,7 +958,7 @@ impl MergeModel {
     }
 
     /// Put the text of `entry`, a record of `lender` no line holds now, in
-    /// front of the lender's own text, then apply the lender's restore.
+    /// front of the lender's own text, then optionally apply the lender's restore.
     ///
     /// The restore applies once the lender's last record is back. A restore
     /// a take recorded rebuilds the lender from the selected input whatever
@@ -936,9 +968,12 @@ impl MergeModel {
         &mut self,
         lender: usize,
         entry: super::Lent,
+        apply_restore: bool,
     ) -> Option<(usize, Range<u32>)> {
         let placed = self.place_returned(lender, entry)?;
-        self.apply_restore(lender);
+        if apply_restore {
+            self.apply_restore(lender);
+        }
         Some(placed)
     }
 
@@ -993,7 +1028,7 @@ impl MergeModel {
         records
             .into_iter()
             .rev()
-            .filter_map(|(_, lender, seq)| self.give_back(lender, seq))
+            .filter_map(|(_, lender, seq)| self.give_back(lender, seq, true))
             .collect()
     }
 
@@ -1030,16 +1065,19 @@ impl MergeModel {
         // Last in output order first. The holder shows the text until its
         // line is cut, so each text leaves that line once the lender has it.
         for (_, record) in giving.into_iter().rev() {
-            if let Some(given) = self.give_back(lender, record.seq) {
+            if let Some(given) = self.give_back(lender, record.seq, false) {
                 returned.push(given);
                 self.strip_record(&record, None);
             }
         }
-        // A restore a take recorded has rebuilt the lender from its input.
+        // Apply a restore only after all returned text has been put back in
+        // its original line shape.
         if from_take || !self.sections[lender].lent.is_empty() {
+            self.apply_restore(lender);
             return returned;
         }
         let Some(range) = self.output_range(lender) else {
+            self.apply_restore(lender);
             return returned;
         };
         let front = (range.end - range.start).saturating_sub(own);
@@ -1057,10 +1095,12 @@ impl MergeModel {
             || bare(&shown) != bare(&source)
             || (own > 0 && !source.ends_with(['\r', '\n']))
         {
+            self.apply_restore(lender);
             return returned;
         }
         let lines = super::split(&source);
         let Ok(count) = u32::try_from(lines.len()) else {
+            self.apply_restore(lender);
             return returned;
         };
         let conflict = self.sections[lender].conflict;
@@ -1069,6 +1109,7 @@ impl MergeModel {
             self.refresh_section_totals(lender);
             returned.push((lender, 0..count));
         }
+        self.apply_restore(lender);
         returned
     }
 
@@ -1114,7 +1155,7 @@ impl MergeModel {
         // the lender's later characters already in their place.
         giving.sort_unstable();
         for (_, lender, seq) in giving.into_iter().rev() {
-            if let Some(given) = self.give_back(lender, seq) {
+            if let Some(given) = self.give_back(lender, seq, true) {
                 returned.push(given);
             }
         }
@@ -1500,12 +1541,15 @@ impl MergeModel {
             let Some(previous) = before.get(&index) else {
                 continue;
             };
-            // An edit that leaves the characters of a section the same, line
-            // breaks left out, changes no character of it, so the restore of
-            // an explicit take still applies once its text is back.
-            let keeps_take =
-                self.sections[index].restore_from_take && same_characters.contains(&index);
-            if (modified.contains(&index) && !keeps_take) || lost.contains(&index) {
+            // A separator edit does not invalidate a restore while the
+            // section still shows the characters of its input. A take restore
+            // also needs its source characters to remain in the holder; once
+            // they are gone, applying it would put text back that the pane
+            // removed.
+            let keeps_restore = self.sections[index].restore.is_some()
+                && same_characters.contains(&index)
+                && (!self.sections[index].restore_from_take || self.still_holds_lent_source(index));
+            if (modified.contains(&index) && !keeps_restore) || lost.contains(&index) {
                 if self.sections[index].restore.is_some() {
                     self.touch(index);
                     self.sections[index].restore = None;
