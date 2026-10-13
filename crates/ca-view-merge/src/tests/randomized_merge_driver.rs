@@ -1154,9 +1154,7 @@ fn run_case(
             }
             if DUMP.with(std::cell::Cell::get) {
                 println!(
-                    "OP {op:?}
-   text {:?}
-   sections {:?}",
+                    "OP {op:?}\n   text {:?}\n   sections {:?}",
                     pane_text(&view),
                     summary(&view)
                 );
