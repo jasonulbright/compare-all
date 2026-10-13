@@ -4399,7 +4399,8 @@ fn each_backup_keeps_the_one_before_it() {
         std::fs::write(right.path().join("a.txt"), previous).unwrap();
         let root = compared(left.path(), right.path());
         let plan = plan_copy(&selection(&root, &["a.txt"]), Side::Left, bases, &opts);
-        assert!(run(&plan).is_clean());
+        let report = run(&plan);
+        assert!(report.is_clean(), "{report:?}");
     }
 
     assert_eq!(
