@@ -1147,17 +1147,22 @@ impl MergeModel {
         OUTPUT_TEXT_CALLS.with(std::cell::Cell::get)
     }
 
-    /// The resolution and lines a take recorded for section `index` to take
-    /// again once its lent text is back.
+    /// The resolution a take recorded for section `index` to take again
+    /// once its lent text is back.
     #[cfg(test)]
-    pub(crate) fn pending_take(&self, index: usize) -> Option<(Resolution, Vec<String>)> {
+    pub(crate) fn pending_take(&self, index: usize) -> Option<Resolution> {
         let section = self.sections.get(index)?;
         if !section.restore_from_take {
             return None;
         }
-        let mut state = section.clone();
-        state.resolution = section.restore.as_deref()?.resolution;
-        Some((state.resolution, self.contribution(index, &state)))
+        Some(section.restore.as_deref()?.resolution)
+    }
+
+    /// Replace the output lines of section `index` and keep its resolution:
+    /// a wrong result for the tests of the test oracles to find.
+    #[cfg(test)]
+    pub(crate) fn replace_lines_keeping_resolution(&mut self, index: usize, lines: Vec<String>) {
+        self.replace_section_lines(index, lines);
     }
 
     /// The output lines of section `index`, without the separators a

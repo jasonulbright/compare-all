@@ -47,6 +47,7 @@ const ASSERTED: &[&str] = &[
     "take-restore-duplicated-token",
     "take-order-replay-differs",
     "edit-kept-take-restore",
+    "reload-duplicated-token",
 ];
 
 /// Every token with its byte range in `text`.
@@ -764,9 +765,85 @@ fn summary(view: &MergeView) -> Vec<String> {
         .collect()
 }
 
-/// A section whose take waits for its lent text, with the resolution and
-/// lines that take recorded.
-type PendingTake = (usize, Resolution, Vec<String>);
+/// How often the inputs show each token in the new merge: per section, the
+/// copies of the sides its resolution takes, both sides for a take of both,
+/// and the most of any one side for an edited or unresolved section.
+fn input_allowance(model: &crate::model::MergeModel) -> HashMap<String, usize> {
+    let mut allowance: HashMap<String, usize> = HashMap::new();
+    for index in 0..model.sections().len() {
+        let side = |resolution| {
+            selected_input_lines(model, index, resolution)
+                .map(|lines| counts(&lines.concat()))
+                .unwrap_or_default()
+        };
+        let resolution = model.sections()[index].resolution;
+        let here = match resolution {
+            Resolution::Edited | Resolution::Unresolved => {
+                let mut most: HashMap<String, usize> = HashMap::new();
+                for one in [Resolution::Left, Resolution::Center, Resolution::Right] {
+                    for (token, count) in side(one) {
+                        let entry = most.entry(token).or_insert(0);
+                        *entry = (*entry).max(count);
+                    }
+                }
+                most
+            }
+            taken => side(taken),
+        };
+        for (token, count) in here {
+            *allowance.entry(token).or_insert(0) += count;
+        }
+    }
+    allowance
+}
+
+/// After a reload or Swap Sides: a token the output shows more often than
+/// the text before it did, and more often than the inputs show it in the
+/// new merge.
+fn reload_duplicate(view: &MergeView, before_counts: &HashMap<String, usize>) -> Option<String> {
+    let allowance = input_allowance(view.model());
+    let mut shown: Vec<(String, usize)> = counts(&view.output_text()).into_iter().collect();
+    shown.sort();
+    shown.into_iter().find_map(|(token, count)| {
+        let allowed = allowance
+            .get(&token)
+            .copied()
+            .unwrap_or(0)
+            .max(before_counts.get(&token).copied().unwrap_or(0));
+        (count > allowed).then(|| format!("{token} x{count}, {allowed} allowed"))
+    })
+}
+
+/// A section whose take waits for its lent text, with the resolution that
+/// take recorded.
+type PendingTake = (usize, Resolution);
+
+/// The lines of the input that `resolution` selects for section `index`,
+/// read from the inputs and the section's ranges.
+fn selected_input_lines(
+    model: &crate::model::MergeModel,
+    index: usize,
+    resolution: Resolution,
+) -> Option<Vec<String>> {
+    let inputs = model.inputs();
+    let section = model.sections().get(index)?;
+    let side = |lines: &Vec<String>, range: &std::ops::Range<u32>| {
+        lines
+            .get(range.start as usize..range.end as usize)
+            .map(<[String]>::to_vec)
+    };
+    let left = side(&inputs.left, &section.left);
+    let center = side(&inputs.center, &section.center);
+    let right = side(&inputs.right, &section.right);
+    match resolution {
+        Resolution::Left => left,
+        Resolution::Center => center,
+        Resolution::Right => right,
+        Resolution::LeftThenRight => Some([left?, right?].concat()),
+        Resolution::RightThenLeft => Some([right?, left?].concat()),
+        Resolution::Edited | Resolution::Unresolved => None,
+    }
+}
 
 /// Token counts of the input lines of every section but `skip`, on all
 /// three sides.
@@ -797,8 +874,9 @@ fn input_tokens_outside(model: &crate::model::MergeModel, skip: usize) -> HashMa
 
 /// The sections whose pending take a take restored, and the problems of
 /// those restores. `pending` holds, from before the take, each section that
-/// waited for its lent text with the resolution and lines its take
-/// recorded. A restored section holds exactly those lines. Every token of
+/// waited for its lent text with the resolution its take recorded. A
+/// restored section holds exactly the lines of the input that resolution
+/// selects, read from the inputs themselves. Every token of
 /// them appears outside the section no more often than sections other than
 /// it showed that token before the take, plus the copies the inputs of
 /// other sections hold: a holder that keeps the lent text next to the
@@ -815,7 +893,7 @@ fn restore_problems(
     let before_counts = counts(&owned_before.text);
     let mut restored = HashSet::new();
     let mut problems = Vec::new();
-    for (index, resolution, lines) in pending {
+    for (index, resolution) in pending {
         let Some(section) = model.sections().get(*index) else {
             continue;
         };
@@ -823,7 +901,8 @@ fn restore_problems(
             continue;
         }
         let now = model.section_lines(*index);
-        if now != *lines {
+        let lines = selected_input_lines(model, *index, *resolution);
+        if lines.as_ref() != Some(&now) {
             problems.push((
                 "take-restore-differs-from-selected-input".to_owned(),
                 format!("after {op}: s{index} {now:?} expected {lines:?}; text {after:?}"),
@@ -1021,10 +1100,7 @@ fn run_case(
             let owned_before = owned_text(&view);
             let sections_before = view.model().sections().len();
             let pending: Vec<PendingTake> = (0..sections_before)
-                .filter_map(|index| {
-                    let (resolution, lines) = view.model().pending_take(index)?;
-                    Some((index, resolution, lines))
-                })
+                .filter_map(|index| Some((index, view.model().pending_take(index)?)))
                 .collect();
             let taken: Option<HashSet<usize>> = match &op {
                 Op::Take(section, _, selection) => {
@@ -1078,7 +1154,9 @@ fn run_case(
             }
             if DUMP.with(std::cell::Cell::get) {
                 println!(
-                    "OP {op:?}\n   text {:?}\n   sections {:?}",
+                    "OP {op:?}
+   text {:?}
+   sections {:?}",
                     pane_text(&view),
                     summary(&view)
                 );
@@ -1105,6 +1183,17 @@ fn run_case(
                     local.push((
                         class.to_owned(),
                         format!("before {before:?} after {after:?}"),
+                    ));
+                }
+            }
+            if matches!(op, Op::Reload | Op::Swap | Op::ReloadChanged(..)) {
+                if let Some(problem) = reload_duplicate(&view, &before_counts) {
+                    local.push((
+                        "reload-duplicated-token".to_owned(),
+                        format!(
+                            "after {}: {problem}; before {before:?} after {after:?}",
+                            op_name(&op)
+                        ),
                     ));
                 }
             }
@@ -1166,7 +1255,7 @@ fn run_case(
             {
                 let old = section_chars(&owned_before, sections_before);
                 let new = section_chars(&owned_after, sections_before);
-                if let Some((index, _, _)) = pending.iter().find(|(index, _, _)| {
+                if let Some((index, _)) = pending.iter().find(|(index, _)| {
                     old[*index] != new[*index] && view.model().pending_take(*index).is_some()
                 }) {
                     local.push((
@@ -1614,18 +1703,16 @@ fn lender_taken_while_lent() -> (MergeView, tempfile::TempDir, Vec<PendingTake>,
     view.current = 2;
     view.run(Command::TakeCenter);
     let pending: Vec<PendingTake> = (0..view.model().sections().len())
-        .filter_map(|index| {
-            let (resolution, lines) = view.model().pending_take(index)?;
-            Some((index, resolution, lines))
-        })
+        .filter_map(|index| Some((index, view.model().pending_take(index)?)))
         .collect();
+    assert_eq!(pending, vec![(2, Resolution::Center)]);
     assert_eq!(
-        pending,
-        vec![(
-            2,
-            Resolution::Center,
-            vec!["[c]\n".to_owned(), "[d]\n".to_owned(), "[g]\n".to_owned()]
-        )]
+        selected_input_lines(view.model(), 2, Resolution::Center),
+        Some(vec![
+            "[c]\n".to_owned(),
+            "[d]\n".to_owned(),
+            "[g]\n".to_owned()
+        ])
     );
     let owned = owned_text(&view);
     view.current = 1;
@@ -1657,11 +1744,15 @@ fn a_take_restore_that_leaves_the_lent_text_in_the_holder_is_a_finding() {
     assert_eq!(classes, ["take-restore-duplicated-token"], "{problems:?}");
 }
 
-/// A restore that misses a line of the selected input is not exempt.
+/// A restore that misses a line of the selected input, with the resolution
+/// the take recorded, is not exempt.
 #[test]
 fn a_take_restore_without_a_line_of_the_selected_input_is_a_finding() {
-    let (view, _dir, mut pending, owned) = lender_taken_while_lent();
-    pending[0].2.insert(1, "[x]\n".to_owned());
+    let (mut view, _dir, pending, owned) = lender_taken_while_lent();
+    view.data
+        .model
+        .replace_lines_keeping_resolution(2, vec!["[c]\n".to_owned(), "[g]\n".to_owned()]);
+    assert_eq!(view.model().sections()[2].resolution, Resolution::Center);
     let (restored, problems) = restore_problems(&view, "Take", &pending, &owned);
     assert!(restored.is_empty());
     let classes: Vec<&str> = problems.iter().map(|(class, _)| class.as_str()).collect();
@@ -1669,5 +1760,23 @@ fn a_take_restore_without_a_line_of_the_selected_input_is_a_finding() {
         classes,
         ["take-restore-differs-from-selected-input"],
         "{problems:?}"
+    );
+}
+
+/// A line that shows twice after a reload, while the text before showed it
+/// once and every input holds it once, is a finding; the same text before
+/// and after is not.
+#[test]
+fn the_reload_duplicate_oracle_reports_a_line_shown_twice() {
+    let (mut view, _dir) = open(TOKEN_INPUTS[0], Some(TOKEN_INPUTS[1]), TOKEN_INPUTS[2]);
+    run_until_ready(&mut view);
+    let before = counts(&view.output_text());
+    assert_eq!(reload_duplicate(&view, &before), None);
+    view.data
+        .model
+        .set_edited(2, vec!["[c]\n".to_owned(), "[c]\n".to_owned()]);
+    assert_eq!(
+        reload_duplicate(&view, &before).as_deref(),
+        Some("[c] x2, 1 allowed")
     );
 }
