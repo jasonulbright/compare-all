@@ -244,7 +244,6 @@ fn read_only_targets_are_not_replaced() {
     assert_eq!(names(dir.path()), ["output"]);
 }
 
-/// A Windows path drops a dot or a space at the end of its last name.
 #[cfg(unix)]
 #[test]
 fn replaced_content_drops_the_set_user_and_group_id_bits() {
@@ -258,6 +257,7 @@ fn replaced_content_drops_the_set_user_and_group_id_bits() {
     assert_eq!(mode, 0o755, "{mode:o}");
 }
 
+/// A Windows path drops a dot or a space at the end of its last name.
 #[cfg(windows)]
 #[test]
 fn a_name_that_ends_in_a_dot_or_a_space_is_refused_and_the_shorter_name_kept() {
