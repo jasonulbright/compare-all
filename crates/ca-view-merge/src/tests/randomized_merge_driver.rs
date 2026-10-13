@@ -13,6 +13,8 @@ const CLAMP_COUNTERS: [&std::thread::LocalKey<std::cell::Cell<usize>>; 3] = [
     &crate::model::REPLAY_END_CLAMPS,
 ];
 const MAX_OPS: usize = 24;
+/// Cases per seed and mode of the two way runs.
+const TWO_WAY_CASES: usize = 150;
 
 const ASSERTED: &[&str] = &[
     "panic",
@@ -463,6 +465,20 @@ fn pick_op(r: &mut Seeded, view: &MergeView, frames: bool) -> Op {
     }
 }
 
+/// `command`, or in a two way merge, which has no center input, the take
+/// of both sides in place of a take from the center and the right line in
+/// place of the center line.
+fn usable(view: &MergeView, command: Command) -> Command {
+    if !view.paths().is_two_way() {
+        return command;
+    }
+    match command {
+        Command::TakeCenter => Command::TakeRightThenLeft,
+        Command::TakeCenterLine => Command::TakeRightLine,
+        other => other,
+    }
+}
+
 fn pane_text(view: &MergeView) -> String {
     view.output_pane.buffer().text()
 }
@@ -643,12 +659,12 @@ fn apply(
                 view.output_pane.place(*a, false);
                 view.output_pane.place(*b, true);
             }
-            view.run(*command);
+            view.run(usable(view, *command));
             stats.takes += 1;
         }
         Op::TakeLine(row, command) => {
             view.row = (*row).min(view.model().rows().len().saturating_sub(1));
-            view.run(*command);
+            view.run(usable(view, *command));
             stats.line_takes += 1;
         }
         Op::TakeAll => {
@@ -909,7 +925,7 @@ pub(super) fn line_take(view: &MergeView, row: usize, command: Command) -> Optio
     let model = view.model();
     let section = model.section_of_row(row)?;
     let step = row.checked_sub(model.row_of_section(section)?)?;
-    let pane = match command {
+    let pane = match usable(view, command) {
         Command::TakeLeftLine => crate::model::Pane::Left,
         Command::TakeCenterLine => crate::model::Pane::Center,
         _ => crate::model::Pane::Right,
@@ -1193,16 +1209,17 @@ fn without_folder(saved: &[u8], dir: &tempfile::TempDir) -> Vec<u8> {
     out
 }
 
-/// Run `ops` again on a fresh view of `inputs`, then `takes` in order. The
+/// Run `ops` again on a fresh view of `inputs`, the left input, the ancestor
+/// of a three way merge and the right input, then `takes` in order. The
 /// later of the two sections is the lender.
 fn replay_with_takes(
-    inputs: [&str; 3],
+    inputs: (&str, Option<&str>, &str),
     ops: &[Op],
     paste: usize,
     takes: [(usize, Command); 2],
 ) -> TakeOrderReplay {
     PASTE.with(|p| p.set(paste));
-    let (mut view, dir) = open(inputs[0], Some(inputs[1]), inputs[2]);
+    let (mut view, dir) = open(inputs.0, inputs.1, inputs.2);
     run_until_ready(&mut view);
     let mut stats = Stats::default();
     for op in ops {
@@ -1214,7 +1231,7 @@ fn replay_with_takes(
         view.output_pane.clear_selection();
         view.focus = crate::Pane::Output;
         view.current = section;
-        view.run(command);
+        view.run(usable(&view, command));
     }
     let text = pane_text(&view);
     let model = view.model();
@@ -1263,12 +1280,14 @@ fn run_case(
     seed: u64,
     case: usize,
     frames: bool,
+    two_way: bool,
     gen: &mut Gen,
     stats: &mut Stats,
     findings: &mut BTreeMap<String, Vec<(usize, String)>>,
 ) {
     let (left, center, right) = gen.inputs();
-    let (mut view, dir) = open(&left, Some(&center), &right);
+    let ancestor = (!two_way).then_some(center.as_str());
+    let (mut view, dir) = open(&left, ancestor, &right);
     run_until_ready(&mut view);
     let len = 2 + gen.0.pick(MAX_OPS - 1);
     let mut ops: Vec<Op> = Vec::new();
@@ -1620,7 +1639,7 @@ fn run_case(
                     [Command::TakeCenter, Command::TakeRight, Command::TakeLeft][case % 3],
                 ),
             ];
-            let inputs = [left.as_str(), center.as_str(), right.as_str()];
+            let inputs = (left.as_str(), ancestor, right.as_str());
             let paste_end = PASTE.with(std::cell::Cell::get);
             let lender_first = replay_with_takes(inputs, &ops, paste_start, takes);
             let holder_first = replay_with_takes(inputs, &ops, paste_start, [takes[1], takes[0]]);
@@ -1725,7 +1744,7 @@ fn run_case(
         }
         let bottom = pane_text(&view);
         if !reset && !flags_changed && bottom == initial {
-            let (mut fresh, _fresh_dir) = open(&left, Some(&center), &right);
+            let (mut fresh, _fresh_dir) = open(&left, ancestor, &right);
             run_until_ready(&mut fresh);
             if summary(&fresh) != summary(&view) {
                 local.push((
@@ -1765,9 +1784,11 @@ fn run_case(
     for counter in CLAMP_COUNTERS {
         stats.clamps += counter.with(std::cell::Cell::get);
     }
-    let context = format!(
-        "seed {seed:#x} case {case} inputs L={left:?} C={center:?} R={right:?} ops={ops:?}"
-    );
+    let context = if two_way {
+        format!("seed {seed:#x} case {case} two way inputs L={left:?} R={right:?} ops={ops:?}")
+    } else {
+        format!("seed {seed:#x} case {case} inputs L={left:?} C={center:?} R={right:?} ops={ops:?}")
+    };
     let weight = ops.len();
     match result {
         Ok(local) => {
@@ -1796,19 +1817,28 @@ fn run_case(
     }
 }
 
-fn run(frames: bool) {
+fn run(frames: bool, two_way: bool, cases: usize) {
+    let seeds = SEEDS.to_vec();
     let mut stats = Stats::default();
     let mut findings: BTreeMap<String, Vec<(usize, String)>> = BTreeMap::new();
     let mut empty = 0;
-    for seed in SEEDS {
+    for &seed in &seeds {
         let mut gen = Gen(Seeded(seed), 0);
-        for case in 0..CASES {
-            run_case(seed, case, frames, &mut gen, &mut stats, &mut findings);
+        for case in 0..cases {
+            run_case(
+                seed,
+                case,
+                frames,
+                two_way,
+                &mut gen,
+                &mut stats,
+                &mut findings,
+            );
         }
         empty += gen.1;
     }
     stats.empty_inputs = empty;
-    println!("STATS frames={frames} {stats:?}");
+    println!("STATS frames={frames} two_way={two_way} {stats:?}");
     for (class, list) in &findings {
         let asserted = if ASSERTED.contains(&class.as_str()) {
             "asserted"
@@ -1816,10 +1846,15 @@ fn run(frames: bool) {
             "reported"
         };
         println!("CLASS {class} ({asserted}): {} case(s)", list.len());
-        for set in ["seed 0x1", "seed 0x3", "seed 0x6", "seed 0x7", "seed 0x9"] {
+        let mut sets: Vec<String> = seeds
+            .iter()
+            .map(|seed| format!("seed {:#x}", seed >> 12))
+            .collect();
+        sets.dedup();
+        for set in &sets {
             let in_set = list
                 .iter()
-                .filter(|(_, text)| text.starts_with(set))
+                .filter(|(_, text)| text.starts_with(set.as_str()))
                 .count();
             println!("  SET {set}: {in_set} case(s)");
         }
@@ -1834,7 +1869,7 @@ fn run(frames: bool) {
         .filter(|(class, _)| ASSERTED.contains(&class.as_str()))
         .map(|(class, list)| (class, list.len()))
         .collect();
-    assert_eq!(stats.cases, SEEDS.len() * CASES);
+    assert_eq!(stats.cases, seeds.len() * cases);
     assert_eq!(
         (stats.panics, stats.resyncs, stats.reabsorbs, stats.clamps),
         (0, 0, 0, 0)
@@ -1847,21 +1882,39 @@ fn run(frames: bool) {
 
 #[test]
 fn randomized_merge_edits_with_one_edit_per_fold_keep_every_section() {
-    run(false);
+    run(false, false, CASES);
 }
 
 #[test]
 fn randomized_merge_edits_with_several_edits_per_fold_keep_every_section() {
-    run(true);
+    run(true, false, CASES);
 }
 
-fn replay(seed: u64, target: usize, frames: bool) {
+#[test]
+fn randomized_two_way_merge_edits_with_one_edit_per_fold_keep_every_section() {
+    run(false, true, TWO_WAY_CASES);
+}
+
+#[test]
+fn randomized_two_way_merge_edits_with_several_edits_per_fold_keep_every_section() {
+    run(true, true, TWO_WAY_CASES);
+}
+
+fn replay(seed: u64, target: usize, frames: bool, two_way: bool) {
     let mut stats = Stats::default();
     let mut findings: BTreeMap<String, Vec<(usize, String)>> = BTreeMap::new();
     let mut gen = Gen(Seeded(seed), 0);
     for case in 0..=target {
         DUMP.with(|d| d.set(case == target));
-        run_case(seed, case, frames, &mut gen, &mut stats, &mut findings);
+        run_case(
+            seed,
+            case,
+            frames,
+            two_way,
+            &mut gen,
+            &mut stats,
+            &mut findings,
+        );
     }
     DUMP.with(|d| d.set(false));
     for (class, list) in &findings {
@@ -1881,7 +1934,7 @@ fn replay(seed: u64, target: usize, frames: bool) {
 
 #[test]
 fn replay_one_randomized_merge_case() {
-    replay(0x1007, 31, false);
+    replay(0x1007, 31, false, false);
 }
 
 const TOKEN_INPUTS: [&str; 3] = [
