@@ -596,6 +596,83 @@ fn explorer_is_disabled_when_the_selected_side_has_no_item() {
     assert_eq!(SessionView::explorer_target(&view), None);
 }
 
+/// A spawner that keeps the commands it is asked to start.
+#[derive(Default, Clone)]
+struct StartedCommands(std::sync::Arc<std::sync::Mutex<Vec<ca_session::options::LaunchCommand>>>);
+
+impl ca_ui::launch::Spawner for StartedCommands {
+    fn spawn(&self, command: &ca_session::options::LaunchCommand) -> Result<(), String> {
+        self.0.lock().unwrap().push(command.clone());
+        Ok(())
+    }
+}
+
+/// The command the file manager gets for the item under the cursor.
+fn explorer_command_of(view: &FolderView) -> ca_session::options::LaunchCommand {
+    let (path, selection) = SessionView::explorer_target(view).unwrap();
+    let started = StartedCommands::default();
+    let mut job = ca_ui::launch::reveal(
+        &path,
+        selection,
+        std::sync::Arc::new(started.clone()),
+        std::sync::Arc::new(|| {}),
+    );
+    assert!(ca_ui::testing::wait_until(Duration::from_secs(10), || {
+        !job.drain().is_empty()
+    }));
+    let command = started.0.lock().unwrap().remove(0);
+    command
+}
+
+/// One name is a file on the left and a folder on the right. The row counts
+/// as a folder on both sides, and a request to open the file starts its
+/// program.
+#[test]
+fn explorer_selects_the_file_side_of_a_row_that_is_a_folder_on_the_other_side() {
+    ca_ui::testing::isolate_settings();
+    let dir = fixture();
+    let file = dir.path().join("left").join("tool.command");
+    let folder = dir.path().join("right").join("tool.command");
+    std::fs::write(&file, b"#!/bin/sh\n").unwrap();
+    std::fs::create_dir(&folder).unwrap();
+    let mut view = view_over(dir.path());
+    assert!(tick_until(&mut view, SessionView::is_ready));
+    let text = |path: &Path| path.display().to_string();
+
+    view.selection_mut()
+        .set_cursor(ca_fs::Side::Left, PathBuf::from("tool.command"));
+    assert_eq!(
+        SessionView::explorer_target(&view),
+        Some((file.clone(), ca_ui::launch::Selection::Folders)),
+        "the row no longer counts as a folder"
+    );
+    let shown = explorer_command_of(&view).arguments;
+    #[cfg(target_os = "windows")]
+    assert_eq!(shown, ["/select,".to_owned(), text(&file)]);
+    #[cfg(target_os = "macos")]
+    assert_eq!(shown, ["-R".to_owned(), text(&file)]);
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    assert_eq!(shown, [text(&dir.path().join("left"))]);
+
+    view.selection_mut()
+        .set_cursor(ca_fs::Side::Right, PathBuf::from("tool.command"));
+    assert_eq!(
+        SessionView::explorer_target(&view),
+        Some((folder.clone(), ca_ui::launch::Selection::Folders))
+    );
+    assert_eq!(explorer_command_of(&view).arguments, [text(&folder)]);
+
+    // A file takes the place of the folder after the scan.
+    std::fs::remove_dir(&folder).unwrap();
+    std::fs::write(&folder, b"#!/bin/sh\n").unwrap();
+    let shown = explorer_command_of(&view).arguments;
+    assert_ne!(shown, [text(&folder)]);
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    assert_eq!(shown, [text(&dir.path().join("right"))]);
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    assert_eq!(shown.len(), 2);
+}
+
 /// A pair of files under the folder `d` with one status each.
 fn file_pair(rel: &str, status: ca_fs::NodeStatus) -> ca_fs::Node {
     let mut node = folder_node(rel, false, Vec::new());
