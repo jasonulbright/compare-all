@@ -263,6 +263,9 @@ fn check_encoded_header(cursor: &mut HeaderCursor<'_>, len: u64) -> VfsResult<()
 /// declares.
 fn skip_block(cursor: &mut HeaderCursor<'_>) -> VfsResult<u64> {
     let coders = cursor.count()?;
+    if coders > MAX_BLOCK_CODERS {
+        return Err(coder_chain_limit());
+    }
     let (mut inputs, mut outputs) = (0u64, 0u64);
     for _ in 0..coders {
         let flags = cursor.byte()?;
@@ -283,7 +286,7 @@ fn skip_block(cursor: &mut HeaderCursor<'_>) -> VfsResult<u64> {
         } else {
             &[]
         };
-        check_coder(method, properties)?;
+        claim_memory(&mut 0, method, properties)?;
     }
     let pairs = outputs.checked_sub(1).ok_or_else(malformed)?;
     for _ in 0..pairs {
@@ -333,25 +336,42 @@ fn coder_memory(method: &[u8], properties: &[u8]) -> Option<u64> {
     }
 }
 
-/// Refuse a coder whose decoder would claim more than [`CODER_MEMORY_LIMIT`].
-///
-/// The decoder library allocates whatever dictionary a coder names, so the
-/// check runs on the raw properties before the library sees them.
-fn check_coder(method: &[u8], properties: &[u8]) -> VfsResult<()> {
-    match coder_memory(method, properties) {
-        Some(memory) if memory > CODER_MEMORY_LIMIT => Err(VfsError::LimitExceeded {
-            kind: LimitKind::DecoderMemory,
-            limit: CODER_MEMORY_LIMIT,
-        }),
-        _ => Ok(()),
+/// Most coders one block may chain. The decoder nests one reader per coder
+/// and every read goes down through all of them, so a longer chain can use up
+/// the stack of the thread that reads.
+const MAX_BLOCK_CODERS: u64 = 32;
+
+fn coder_chain_limit() -> VfsError {
+    VfsError::LimitExceeded {
+        kind: LimitKind::CoderChain,
+        limit: MAX_BLOCK_CODERS,
     }
 }
 
-/// [`check_coder`] for every coder of every block of a parsed container.
+/// Add the memory one more coder of a block names to `claimed`, and refuse
+/// the block when its coders together name more than [`CODER_MEMORY_LIMIT`].
+///
+/// The decoder library allocates whatever dictionary a coder names, so the
+/// check runs on the raw properties before the library sees them.
+fn claim_memory(claimed: &mut u64, method: &[u8], properties: &[u8]) -> VfsResult<()> {
+    *claimed = claimed.saturating_add(coder_memory(method, properties).unwrap_or(0));
+    if *claimed > CODER_MEMORY_LIMIT {
+        return Err(VfsError::LimitExceeded {
+            kind: LimitKind::DecoderMemory,
+            limit: CODER_MEMORY_LIMIT,
+        });
+    }
+    Ok(())
+}
+
+/// The coder count and memory checks for every block of a parsed container.
 fn check_blocks(archive: &sevenz_rust2::Archive) -> VfsResult<()> {
     for block in &archive.blocks {
+        if block.coders.len() as u64 > MAX_BLOCK_CODERS {
+            return Err(coder_chain_limit());
+        }
         for coder in &block.coders {
-            check_coder(coder.encoder_method_id(), coder.properties())?;
+            claim_memory(&mut 0, coder.encoder_method_id(), coder.properties())?;
         }
     }
     Ok(())
@@ -665,10 +685,16 @@ fn map_sevenz(error: SevenZError, path: &VfsPath) -> VfsError {
 
 #[cfg(test)]
 mod tests {
-    use super::{check_coder, METHOD_LZMA, METHOD_LZMA2, METHOD_PPMD};
+    use super::{
+        claim_memory, skip_block, HeaderCursor, MAX_BLOCK_CODERS, METHOD_LZMA, METHOD_LZMA2,
+        METHOD_PPMD,
+    };
+    use crate::error::{LimitKind, VfsError};
 
     #[test]
     fn a_coder_is_refused_only_above_the_memory_ceiling() {
+        let check_coder =
+            |method: &[u8], properties: &[u8]| claim_memory(&mut 0, method, properties);
         // LZMA2 property 32 names 256 MiB, 33 names 384 MiB, 40 names 4 GiB.
         assert!(check_coder(METHOD_LZMA2, &[24]).is_ok());
         assert!(check_coder(METHOD_LZMA2, &[32]).is_ok());
@@ -684,5 +710,38 @@ mod tests {
         assert!(check_coder(METHOD_PPMD, &field(192 << 20)).is_ok());
         assert!(check_coder(METHOD_PPMD, &field(1 << 30)).is_err());
         assert!(check_coder(&[0x00], &[]).is_ok());
+    }
+
+    /// The header bytes of one block that chains `coders` Delta coders.
+    fn delta_block(coders: u8) -> Vec<u8> {
+        let mut bytes = vec![coders];
+        for _ in 0..coders {
+            bytes.extend_from_slice(&[0x01, 0x03]);
+        }
+        for pair in 1..coders {
+            bytes.extend_from_slice(&[pair, pair - 1]);
+        }
+        bytes
+    }
+
+    #[test]
+    fn a_header_block_is_refused_only_above_the_coder_ceiling() {
+        let most = u8::try_from(MAX_BLOCK_CODERS).unwrap_or(u8::MAX);
+        let block = delta_block(most);
+        let outputs = skip_block(&mut HeaderCursor { bytes: &block });
+        assert!(matches!(outputs, Ok(count) if count == MAX_BLOCK_CODERS));
+
+        let block = delta_block(most + 1);
+        let refused = skip_block(&mut HeaderCursor { bytes: &block });
+        assert!(
+            matches!(
+                refused,
+                Err(VfsError::LimitExceeded {
+                    kind: LimitKind::CoderChain,
+                    limit: MAX_BLOCK_CODERS,
+                })
+            ),
+            "{refused:?}"
+        );
     }
 }
