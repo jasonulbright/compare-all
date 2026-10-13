@@ -759,6 +759,157 @@ fn windows_failed_replace_recovery_covers_documented_error_states() {
 }
 
 #[cfg(windows)]
+#[test]
+fn error_1175_leaves_both_files_under_their_names_and_the_next_call_replaces() {
+    use std::os::windows::fs::OpenOptionsExt;
+    const READ_CONTROL: u32 = 0x0002_0000;
+    const SHARE_ALL: u32 = 7;
+
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("output");
+    let replacement = dir.path().join("new");
+    let reserved = dir.path().join("reserved");
+    fs::write(&target, b"original").unwrap();
+    fs::write(&replacement, b"replacement").unwrap();
+    fs::write(&reserved, b"").unwrap();
+    let held = fs::OpenOptions::new()
+        .access_mode(READ_CONTROL)
+        .share_mode(SHARE_ALL)
+        .open(&reserved)
+        .unwrap();
+
+    let code = winsafe::ReplaceFile(
+        &windows_path(&target).unwrap(),
+        &windows_path(&replacement).unwrap(),
+        Some(&windows_path(&reserved).unwrap()),
+        winsafe::co::REPLACEFILE::default(),
+    )
+    .unwrap_err();
+
+    assert_eq!(code, winsafe::co::ERROR::UNABLE_TO_REMOVE_REPLACED);
+    assert!(unable_to_remove_replaced(&io::Error::from_raw_os_error(
+        code.raw().cast_signed()
+    )));
+    assert_eq!(fs::read(&target).unwrap(), b"original");
+    assert_eq!(fs::read(&replacement).unwrap(), b"replacement");
+    assert_eq!(fs::metadata(&reserved).unwrap().len(), 0);
+    assert_eq!(names(dir.path()), ["new", "output", "reserved"]);
+
+    // The other handle is still open: the next call reserves another name.
+    replace_existing_file(&target, &replacement).unwrap();
+    assert_eq!(fs::read(&target).unwrap(), b"replacement");
+    assert_eq!(names(dir.path()), ["output", "reserved"]);
+    drop(held);
+}
+
+#[cfg(windows)]
+#[test]
+fn error_1175_of_the_replacement_call_is_tried_again_within_the_bound() {
+    let unremoved = || io::Error::from_raw_os_error(1175);
+    let mut calls = 0;
+    let done = retrying_unremoved(|| {
+        calls += 1;
+        if calls < 8 {
+            Err(unremoved())
+        } else {
+            Ok(calls)
+        }
+    });
+    assert_eq!(done.unwrap(), 8);
+
+    let mut calls = 0;
+    let error = retrying_unremoved(|| -> io::Result<()> {
+        calls += 1;
+        Err(unremoved())
+    })
+    .unwrap_err();
+    assert_eq!((calls, error.raw_os_error()), (8, Some(1175)));
+
+    // The other documented states of the call move a file, and every other
+    // error keeps its single attempt here.
+    for other in [5, 32, 33, 87, 1176, 1177] {
+        let mut calls = 0;
+        let error = retrying_unremoved(|| -> io::Result<()> {
+            calls += 1;
+            Err(io::Error::from_raw_os_error(other))
+        })
+        .unwrap_err();
+        assert_eq!((calls, error.raw_os_error()), (1, Some(other)));
+        assert!(!unable_to_remove_replaced(&error));
+    }
+}
+
+/// Runs `replace` while a second thread opens each reserved backup name of
+/// `folder` as soon as the folder shows it, and holds it for a short time.
+/// Returns how many names the thread held.
+#[cfg(windows)]
+fn while_reserved_names_are_held(folder: &Path, replace: impl FnOnce()) -> usize {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    const READ_CONTROL: u32 = 0x0002_0000;
+    const SHARE_ALL: u32 = 7;
+
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let watcher = {
+        let (stop, folder) = (std::sync::Arc::clone(&stop), folder.to_path_buf());
+        std::thread::spawn(move || {
+            let mut held = 0;
+            while !stop.load(Ordering::Relaxed) && held < 3 {
+                let Ok(entries) = fs::read_dir(&folder) else {
+                    continue;
+                };
+                for entry in entries.flatten() {
+                    let reserved = entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".compare-all-backup-");
+                    let handle = reserved.then(|| {
+                        fs::OpenOptions::new()
+                            .access_mode(READ_CONTROL)
+                            .share_mode(SHARE_ALL)
+                            .open(entry.path())
+                    });
+                    if let Some(Ok(handle)) = handle {
+                        held += 1;
+                        std::thread::sleep(Duration::from_millis(15));
+                        drop(handle);
+                    }
+                }
+            }
+            held
+        })
+    };
+    replace();
+    stop.store(true, Ordering::Relaxed);
+    watcher.join().unwrap()
+}
+
+#[cfg(windows)]
+#[test]
+fn a_handle_of_another_program_on_the_reserved_backup_name_does_not_fail_the_replacement() {
+    let mut held = 0;
+    for round in 0..40 {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("output");
+        fs::write(&target, b"original").unwrap();
+        if round % 2 == 0 {
+            held += while_reserved_names_are_held(dir.path(), || {
+                write_atomic(&target, b"replacement").unwrap();
+            });
+        } else {
+            let replacement = dir.path().join("new");
+            fs::write(&replacement, b"replacement").unwrap();
+            held += while_reserved_names_are_held(dir.path(), || {
+                replace_existing_file(&target, &replacement).unwrap();
+            });
+        }
+        assert_eq!(fs::read(&target).unwrap(), b"replacement");
+        assert_eq!(names(dir.path()), ["output"]);
+    }
+    println!("reserved backup names that the second thread held: {held}");
+}
+
+#[cfg(windows)]
 fn deny_replacement(path: &Path) -> File {
     use std::os::windows::fs::OpenOptionsExt;
     fs::OpenOptions::new()
