@@ -190,7 +190,7 @@ fn replace_impl<T, E: From<io::Error>>(
     require_absent: bool,
     mut has_conflict: Option<&mut dyn FnMut(&Path) -> bool>,
 ) -> Result<(T, Option<PathBuf>), E> {
-    refuse_trimmed_name(path)?;
+    refuse_other_spelling(path)?;
     #[cfg(windows)]
     let extended_path = windows_extended_path(path)?;
     #[cfg(windows)]
@@ -384,23 +384,30 @@ fn replacement_permissions(target: &fs::Permissions, _new_file_mode: u32) -> fs:
     target.clone()
 }
 
-/// Refuse a path whose last name ends in a dot or a space: a Windows path
-/// drops that character and then names another file.
-fn refuse_trimmed_name(path: &Path) -> io::Result<()> {
-    let trimmed = cfg!(windows)
-        && path
-            .file_name()
-            .is_some_and(|name| name.to_string_lossy().ends_with(['.', ' ']));
-    if trimmed {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "{} ends in a dot or a space, which a Windows path drops",
-                path.display()
-            ),
-        ));
+/// Refuse a path that Windows reads as the name of another file: a folder or
+/// file name that ends in a dot or a space loses that character, and a colon
+/// in a name starts the name of a stream of the file before the colon.
+fn refuse_other_spelling(path: &Path) -> io::Result<()> {
+    if !cfg!(windows) {
+        return Ok(());
     }
-    Ok(())
+    let names = || {
+        path.components().filter_map(|component| match component {
+            std::path::Component::Normal(name) => Some(name.to_string_lossy()),
+            _ => None,
+        })
+    };
+    let reason = if names().any(|name| name.ends_with(['.', ' '])) {
+        "holds a name that ends in a dot or a space, which a Windows path drops"
+    } else if names().any(|name| name.contains(':')) {
+        "holds a colon, which names a stream of another file"
+    } else {
+        return Ok(());
+    };
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("{} {reason}", path.display()),
+    ))
 }
 
 fn target_permissions(
@@ -408,7 +415,7 @@ fn target_permissions(
     require_absent: bool,
     operation: &str,
 ) -> io::Result<Option<fs::Permissions>> {
-    refuse_trimmed_name(path)?;
+    refuse_other_spelling(path)?;
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
             if require_absent {
