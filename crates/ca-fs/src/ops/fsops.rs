@@ -1107,7 +1107,15 @@ fn set_attributes_impl(path: &Path, change: &AttributeChange) -> io::Result<()> 
     if let Some(mode) = change.unix_mode {
         permissions.set_mode(mode);
     } else if let Some(read_only) = change.read_only {
-        permissions.set_readonly(read_only);
+        // Clearing the state gives the write bit to the owner alone. The
+        // standard call gives it to the group and to others too, whatever
+        // the umask, and a file that replaces this one keeps these bits.
+        let mode = permissions.mode();
+        permissions.set_mode(if read_only {
+            mode & !0o222
+        } else {
+            mode | 0o200
+        });
     }
     std::fs::set_permissions(path, permissions)
 }
