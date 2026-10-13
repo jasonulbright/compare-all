@@ -54,6 +54,7 @@ pub fn write_atomic_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
         |_, _| Ok(()),
         false,
         None,
+        None,
     )
     .map(|(value, _)| value)
 }
@@ -127,6 +128,7 @@ pub fn replace_checked<T, E: From<io::Error>>(
         |_, _| Ok(()),
         false,
         None,
+        None,
     )
     .map(|(value, _)| value)
 }
@@ -155,6 +157,7 @@ pub fn replace_checked_preserving_conflict<T, E: From<io::Error>>(
         0o666,
         |_, _| Ok(()),
         false,
+        None,
         Some(&mut has_conflict),
     )
 }
@@ -180,6 +183,7 @@ pub fn replace_new_checked<T, E: From<io::Error>>(
         0o666,
         |_, _| Ok(()),
         true,
+        None,
         None,
     )
     .map(|(value, _)| value)
@@ -217,8 +221,113 @@ pub fn replace_new_prepared<T, E: From<io::Error>>(
         prepare,
         true,
         None,
+        None,
     )
     .map(|(value, _)| value)
+}
+
+/// Like [`replace_new_checked`], for a file that the caller creates with the
+/// access it must have.
+///
+/// `create` gets a free name beside `path`. It creates the file there and
+/// returns it open and empty, or fails with
+/// [`io::ErrorKind::AlreadyExists`] when an item holds the name. The bytes
+/// go in through that handle. The file is closed and then renamed to `path`,
+/// and no other call changes it by path, so the commit needs no right on the
+/// file but the right to rename it, and the file has the access that `create`
+/// gave it under both names.
+///
+/// # Errors
+/// Returns [`io::ErrorKind::AlreadyExists`] if another writer creates the
+/// target before commit, or the error of `create`, of the write or of the
+/// rename. A failure after `create` removes the temporary when the access of
+/// the file allows that.
+#[cfg(windows)]
+pub fn replace_new_created<T, E: From<io::Error>>(
+    path: &Path,
+    produce: impl FnOnce(&mut dyn Write) -> Result<T, E>,
+    check: impl FnMut() -> Result<(), E>,
+    mut create: impl FnMut(&Path) -> io::Result<File>,
+) -> Result<T, E> {
+    replace_impl(
+        path,
+        produce,
+        check,
+        |file| {
+            file.flush()?;
+            file.sync_all()
+        },
+        0o666,
+        |_, _| Ok(()),
+        true,
+        Some(&mut create),
+        None,
+    )
+    .map(|(value, _)| value)
+}
+
+/// Give the closed temporary `closed` the name `path`, which no item may
+/// hold. `check` runs immediately before each attempt. A failure removes the
+/// temporary when the access of the file allows that.
+#[cfg(windows)]
+fn commit_closed_to_free_name<E: From<io::Error>>(
+    mut closed: tempfile::TempPath,
+    path: &Path,
+    mut check: impl FnMut() -> Result<(), E>,
+) -> Result<(), E> {
+    let from = windows_path(&closed)?;
+    let to = windows_path(path)?;
+    let mut backoff = Duration::from_millis(5);
+    let mut attempt = 0;
+    loop {
+        let guard = COMMIT_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        check()?;
+        // Without REPLACE_EXISTING the call fails when an item holds `to`.
+        let outcome = winsafe::MoveFileEx(&from, Some(&to), winsafe::co::MOVEFILE::default())
+            .map_err(|code| io::Error::from_raw_os_error(code.raw().cast_signed()));
+        drop(guard);
+        match outcome {
+            Ok(()) => {
+                closed.disable_cleanup(true);
+                return Ok(());
+            }
+            Err(error) if retryable(&error) && attempt < 7 => {
+                std::thread::sleep(backoff);
+                backoff = (backoff * 2).min(Duration::from_millis(200));
+                attempt += 1;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+/// Creates the temporary of a replacement at a free name and returns it open.
+type CreateTemporary<'a> = &'a mut dyn FnMut(&Path) -> io::Result<File>;
+
+/// The temporary of a replacement in the folder `parent`. Unix gives a new
+/// output the permission bits `new_file_mode`, less the bits the process
+/// umask withholds. `create` creates the file in place of the default call.
+fn new_temporary(
+    parent: &Path,
+    new_file_mode: Option<u32>,
+    create: Option<CreateTemporary<'_>>,
+) -> io::Result<tempfile::NamedTempFile> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(".compare-all-");
+    #[cfg(unix)]
+    if let Some(mode) = new_file_mode {
+        use std::os::unix::fs::PermissionsExt;
+        // Match File::create for a new general output: mode 0666 under umask.
+        builder.permissions(fs::Permissions::from_mode(mode));
+    }
+    #[cfg(not(unix))]
+    let _ = new_file_mode;
+    match create {
+        Some(create) => builder.make_in(parent, create),
+        None => builder.tempfile_in(parent),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -230,6 +339,7 @@ fn replace_impl<T, E: From<io::Error>>(
     new_file_mode: u32,
     prepare: impl FnOnce(&File, &Path) -> io::Result<()>,
     require_absent: bool,
+    create: Option<CreateTemporary<'_>>,
     mut has_conflict: Option<&mut dyn FnMut(&Path) -> bool>,
 ) -> Result<(T, Option<PathBuf>), E> {
     refuse_other_spelling(path)?;
@@ -242,17 +352,10 @@ fn replace_impl<T, E: From<io::Error>>(
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let mut builder = tempfile::Builder::new();
-    builder.prefix(".compare-all-");
-    #[cfg(unix)]
-    if permissions.is_none() {
-        use std::os::unix::fs::PermissionsExt;
-        // Match File::create for a new general output: mode 0666 under umask.
-        builder.permissions(fs::Permissions::from_mode(new_file_mode));
-    }
-    #[cfg(not(unix))]
-    let _ = new_file_mode;
-    let mut temporary = builder.tempfile_in(parent)?;
+    #[cfg(windows)]
+    let created_by_caller = create.is_some();
+    let mode = permissions.is_none().then_some(new_file_mode);
+    let mut temporary = new_temporary(parent, mode, create)?;
     prepare(temporary.as_file(), temporary.path())?;
     let result = produce(temporary.as_file_mut())?;
     if let Some(permissions) = &permissions {
@@ -292,6 +395,16 @@ fn replace_impl<T, E: From<io::Error>>(
                 Err(error) => return Err(error.into()),
             }
         }
+    }
+    #[cfg(windows)]
+    if created_by_caller {
+        // The commit of an open temporary sets its attributes by path, which
+        // needs a right that the access of the file may not give. The file
+        // of the caller has no attribute to clear, so the closed file is
+        // renamed and nothing else changes it.
+        commit_closed_to_free_name(temporary.into_temp_path(), path, &mut check)?;
+        sync_directory(parent);
+        return Ok((result, None));
     }
     loop {
         let guard = COMMIT_LOCK
