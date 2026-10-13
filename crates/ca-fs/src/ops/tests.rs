@@ -1373,8 +1373,11 @@ fn set_stored_entries(path: &Path, second: &str) {
 #[test]
 fn a_list_whose_text_does_not_stand_for_it_with_certainty_gets_no_backup() {
     use crate::ops::access_list::{set_for_test, text_for_test};
+    let account = current_account();
     let dir = tempfile::tempdir().unwrap();
     let uncertain = "the access list text cannot be read with certainty";
+    let unknown_type = "[Security.AccessControl.GenericAce]::CreateFromBinaryForm(\
+                        [byte[]](0x7f, 0, 12, 0, 1, 2, 3, 4, 5, 6, 7, 8), 0)";
     for (name, list, causes) in [
         (
             "more entries in the text.txt",
@@ -1386,11 +1389,26 @@ fn a_list_whose_text_does_not_stand_for_it_with_certainty_gets_no_backup() {
             Err(r#"Conditional 'a" || @USER.t != "b'"#),
             [uncertain, "a list of another size"],
         ),
+        (
+            "no text.txt",
+            Err(unknown_type),
+            ["Windows cannot write the access list as text", "1336"],
+        ),
+        (
+            "text that is not read again.txt",
+            Ok(format!(
+                "D:P(A;;FA;;;{account})(XA;;FR;;;WD;(Exists!= @User.x))"
+            )),
+            [
+                "Windows cannot read the text of the access list again",
+                "1336",
+            ],
+        ),
     ] {
         let target = dir.path().join(name);
         std::fs::write(&target, b"old").unwrap();
         match &list {
-            Ok::<String, _>(text) => set_for_test(&target, Some(text)),
+            Ok(text) => set_for_test(&target, Some(text)),
             Err(second) => set_stored_entries(&target, second),
         }
         // A list with no text form has no text to compare.
