@@ -453,7 +453,13 @@ fn show_on(
     let shown = path.display();
     match std::fs::symlink_metadata(path) {
         Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+        // Linux and macOS give the second kind for a path under a file.
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
             return LaunchMessage::Failed {
                 reason: format!("{shown} no longer exists."),
             };
