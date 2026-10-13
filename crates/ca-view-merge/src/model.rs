@@ -40,6 +40,7 @@ thread_local! {
     static TAKE_LINE_ITEMS_READ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static SECTION_OFFSET_CELLS_UPDATED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static SEQUENCE_NODES_VISITED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static RELOAD_LINES_COPIED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 const MERGE_SEQUENCE_CHUNK_SIZE: usize = 1024;
@@ -2160,12 +2161,28 @@ impl MergeModel {
         let Some(source) = entry.source.as_deref() else {
             return false;
         };
-        let section = self.sections[index].clone();
+        // The check reads the lines in place. Each record of a changed
+        // region asks it, and a copy of the lines per record costs the
+        // region's size times the number of records.
+        let live = &self.sections[index];
+        let starts = if matches!(live.resolution, Resolution::Edited) {
+            ownership::starts_with(&live.edited, source)
+        } else {
+            self.selection_of(live).is_some_and(|(first, second)| {
+                ownership::starts_with(first.iter().chain(second), source)
+            })
+        };
+        if !starts {
+            return false;
+        }
+        let section = live.clone();
         let mut text = if matches!(section.resolution, Resolution::Edited) {
             section.edited.clone()
         } else {
             self.contribution(index, &section)
         };
+        #[cfg(test)]
+        RELOAD_LINES_COPIED.with(|copied| copied.set(copied.get() + text.len()));
         if !ownership::remove_prefix(&mut text, source) {
             return false;
         }

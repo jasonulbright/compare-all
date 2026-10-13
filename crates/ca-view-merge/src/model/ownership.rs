@@ -115,6 +115,21 @@ fn is_terminator_only(text: &str) -> bool {
     !text.is_empty() && text.chars().all(|c| c == '\r' || c == '\n')
 }
 
+/// Whether the text `lines` hold starts with `prefix`.
+pub(super) fn starts_with<'a>(lines: impl IntoIterator<Item = &'a String>, prefix: &str) -> bool {
+    let mut rest = prefix;
+    for line in lines {
+        if rest.is_empty() {
+            break;
+        }
+        match rest.strip_prefix(line.as_str()) {
+            Some(after) => rest = after,
+            None => return line.starts_with(rest),
+        }
+    }
+    rest.is_empty()
+}
+
 /// Remove `prefix` from the start of the text `lines` hold. Returns false,
 /// leaving `lines` alone, when the text does not start with it.
 pub(super) fn remove_prefix(lines: &mut Vec<String>, prefix: &str) -> bool {
@@ -571,7 +586,7 @@ impl MergeModel {
 
     /// The input lines the resolution of `state` selects, as up to two runs
     /// of lines. Nothing for an edited section.
-    fn selection_of(&self, state: &Section) -> Option<(&[String], &[String])> {
+    pub(super) fn selection_of(&self, state: &Section) -> Option<(&[String], &[String])> {
         fn part<'a>(lines: &'a [String], range: &Range<u32>) -> Option<&'a [String]> {
             lines.get(range.start as usize..range.end as usize)
         }
