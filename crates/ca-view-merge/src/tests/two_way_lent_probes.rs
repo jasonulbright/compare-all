@@ -57,11 +57,14 @@ fn reload(view: &mut MergeView) {
     assert_eq!(view.model().lent_record_problems(), Vec::<String>::new());
 }
 
+/// An edit of the joined line, with its name.
+type Edit<'a> = (&'a str, &'a dyn Fn(&mut MergeView));
+
 /// Every edit before the takes, then the lender take and the holder take
 /// in both orders: one text, the lender a left section with its left lines.
 #[test]
 fn a_two_way_lender_take_and_holder_take_give_one_result_in_both_orders() {
-    let edits: [(&str, &dyn Fn(&mut MergeView)); 4] = [
+    let edits: [Edit; 4] = [
         ("none", &|_| {}),
         ("type", &|view| {
             at(view, 1, 2);
