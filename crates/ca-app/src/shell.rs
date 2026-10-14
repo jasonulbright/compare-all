@@ -740,7 +740,7 @@ const fn menus_for(view: MenuView) -> &'static [(&'static str, &'static [Entry])
 /// Why an editing command is disabled.
 const EDITABLE: &str = "The active view has no editable pane";
 /// Why a command that needs a finished comparison is disabled.
-const COMPARED: &str = "Available once a comparison finishes";
+const COMPARED: &str = "Available once the comparison finishes";
 /// Why Compare Parent Folders is disabled.
 const PARENT_FOLDERS: &str = "Both sides must be local files with existing parent folders";
 /// Why file-kind switching is disabled.

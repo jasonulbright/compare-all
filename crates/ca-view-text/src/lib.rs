@@ -87,6 +87,8 @@ const LOCKED: &str = "This view is read-only";
 const LEFT_READ_ONLY: &str = "The left pane is read-only";
 /// Reason shown on a copy into the right pane while that pane takes no edit.
 const RIGHT_READ_ONLY: &str = "The right pane is read-only";
+/// Why an edit waits when editing is turned off for the session.
+const EDITING_OFF: &str = "Editing is turned off for this session";
 /// Reason shown on a control that maps rows to lines while the comparison of
 /// an edit is still due.
 const EDIT_NOT_COMPARED: &str = "Available once the edit is compared";
@@ -102,9 +104,9 @@ const WAIT_FOR_COMPARISON_AGAIN: &str =
 /// What the message panel says when such a command arrives during a load.
 const WAIT_FOR_LOAD: &str = "The comparison is not finished. Try again when it is.";
 /// Reason shown on a control that needs a comparison after one failed.
-const FAILED: &str = "The comparison failed. Use Reload to compare again";
+const FAILED: &str = "The comparison failed. Use Reload Files to compare again";
 /// Reason shown on a control that needs a comparison after one was stopped.
-const STOPPED: &str = "The comparison was stopped. Use Reload to compare again";
+const STOPPED: &str = "The comparison was stopped. Use Reload Files to compare again";
 /// Reason shown when a comparison failed in a view that cannot reload.
 const FAILED_LOCKED: &str = "The comparison failed";
 /// Reason shown when a comparison was stopped in a view that cannot reload.
@@ -129,6 +131,10 @@ const fn command_is_disabled_while_locked(command: Command) -> bool {
             | Command::SaveFileAs
             | Command::SaveBoth
             | Command::CopyToOtherSide
+            | Command::CopyToRight
+            | Command::CopyToLeft
+            | Command::CopyLineToRight
+            | Command::CopyLineToLeft
             | Command::ToggleOverwrite
             | Command::OpenFile
     )
@@ -2059,7 +2065,7 @@ impl TextView {
             }
             SaveOutcome::NotWritable => {
                 self.pane_mut(side).set_read_only(true);
-                self.message = Some("The file cannot be written, so the pane is read only.".into());
+                self.message = Some("The file cannot be written, so the pane is read-only.".into());
                 self.saving = None;
                 self.save_both_pending = false;
                 self.forget_reread();
@@ -2376,8 +2382,8 @@ impl TextView {
                 "copy",
                 Command::CopyToOtherSide,
                 "Copy",
-                rows && !self.locked,
-                if self.locked { LOCKED } else { rows_reason },
+                self.accepts(Command::CopyToOtherSide),
+                self.refusal(Command::CopyToOtherSide).unwrap_or(""),
             ),
             toolbar::Item::command(
                 "next-section",
@@ -2394,7 +2400,13 @@ impl TextView {
                 rows_reason,
             ),
             toolbar::Item::command("swap", Command::SwapSides, "Swap", !self.locked, LOCKED),
-            toolbar::Item::command("reload", Command::Reload, "Reload", !self.locked, LOCKED),
+            toolbar::Item::command(
+                "reload",
+                Command::Reload,
+                "Reload Files",
+                !self.locked,
+                LOCKED,
+            ),
             toolbar::Item::separator("separator-3"),
             toolbar::Item::command(
                 "report",
@@ -2760,8 +2772,12 @@ impl TextView {
             return None;
         }
         let mut copy = None;
-        let enabled = ui.is_enabled() && self.rows_current();
         for arrow in &self.arrows {
+            let command = match arrow.side {
+                Side::Left => Command::CopyLineToRight,
+                Side::Right => Command::CopyLineToLeft,
+            };
+            let enabled = ui.is_enabled() && self.accepts(command);
             let response = ui.interact(
                 arrow.rect,
                 self.id
@@ -2797,7 +2813,7 @@ impl TextView {
             );
             let clicked = enabled && response.clicked();
             if ui.is_enabled() && !enabled {
-                let reason = self.rows_reason();
+                let reason = self.refusal(command).unwrap_or(self.rows_reason());
                 widgets::describe_refusal(&response, reason);
                 let _ = response.on_hover_text(reason);
             }
@@ -4937,6 +4953,33 @@ impl SessionView for TextView {
     }
 
     fn refusal(&self, command: Command) -> Option<&'static str> {
+        if self.locked && command_is_disabled_while_locked(command) && !self.accepts(command) {
+            return Some(LOCKED);
+        }
+        if !self.accepts(command)
+            && matches!(
+                command,
+                Command::Cut
+                    | Command::Paste
+                    | Command::IncreaseIndent
+                    | Command::DecreaseIndent
+                    | Command::ToggleOverwrite
+            )
+        {
+            if self.editing_off() {
+                return Some(EDITING_OFF);
+            }
+            if self.active_pane().is_read_only() {
+                return Some(match self.active {
+                    Side::Left => LEFT_READ_ONLY,
+                    Side::Right => RIGHT_READ_ONLY,
+                });
+            }
+            return Some(self.not_compared_reason());
+        }
+        if command == Command::Copy && !self.accepts(command) {
+            return Some(self.not_compared_reason());
+        }
         let target = match command {
             Command::NextDifference
             | Command::PreviousDifference
@@ -4948,6 +4991,9 @@ impl SessionView for TextView {
             Command::CopyToOtherSide => Some(self.active.other()),
             _ => return None,
         };
+        if target.is_some() && self.editing_off() {
+            return Some(EDITING_OFF);
+        }
         if let Some(side) = target.filter(|side| self.pane(*side).is_read_only()) {
             return Some(match (self.locked, side) {
                 (true, _) => LOCKED,

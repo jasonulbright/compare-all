@@ -91,6 +91,24 @@ const PREVIEW_HEIGHT: f32 = 220.0;
 const NOT_BUILT: &str = "Not available in this build";
 /// Why a copy has nothing to act on.
 const NOTHING_TO_COPY: &str = "Select the items to copy first";
+/// Why no copy can happen when there are no comparison rows.
+const NO_ITEMS_TO_COPY: &str = "There is nothing to copy";
+/// Why no copy can happen when filters hide all comparison rows.
+const FILTER_HIDES_ITEMS: &str = "The current filters hide every item";
+/// Why a folder operation waits for its scan.
+const SCAN_NOT_READY: &str = "Available once the folder scan finishes";
+/// Why a copy or operation waits after the scan failed.
+const SCAN_FAILED: &str = "The folder scan failed. Use Refresh to try again";
+/// Why a copy or operation waits after the scan was stopped.
+const SCAN_STOPPED: &str = "The folder scan was stopped. Use Refresh to try again";
+/// Why an operation needs selected rows.
+const NOTHING_SELECTED_FOR_ACTION: &str = "Select the items to act on first";
+/// Why an action has no rows when the folder contains none.
+const NO_ITEMS_TO_ACT_ON: &str = "There are no items to act on";
+/// Why the synchronization preview has no operations.
+const NOTHING_TO_SYNCHRONIZE: &str = "Nothing is waiting to be reconciled";
+/// Why a synchronization preview could not be built.
+const SYNC_PREVIEW_FAILED: &str = "The synchronization preview could not be built";
 /// Why a copy waits while a file operation is planned, asks, runs or shows
 /// its result.
 const OPERATION_OPEN: &str = "Available once the open file operation is closed";
@@ -775,6 +793,79 @@ impl FolderView {
     #[must_use]
     pub fn sync_pending(&self) -> usize {
         self.sync.pending()
+    }
+
+    fn sync_refusal_reason(&self) -> &'static str {
+        if self.status.is_running() {
+            return SCAN_NOT_READY;
+        }
+        if matches!(self.status, Status::Failed(_)) {
+            return SCAN_FAILED;
+        }
+        if matches!(self.status, Status::Cancelled) {
+            return SCAN_STOPPED;
+        }
+        if self.stage.blocks_input() {
+            return OPERATION_OPEN;
+        }
+        if let Some(reason) = self.archive_refusal() {
+            return reason;
+        }
+        if self.preview_job.is_some() {
+            return "Available once the synchronization preview finishes";
+        }
+        if self.sync.refusal.is_some() {
+            return SYNC_PREVIEW_FAILED;
+        }
+        NOTHING_TO_SYNCHRONIZE
+    }
+
+    fn no_selection_reason(&self) -> &'static str {
+        if !self.rows.is_empty() {
+            NOTHING_TO_COPY
+        } else if self.arena.is_empty() {
+            NO_ITEMS_TO_COPY
+        } else {
+            FILTER_HIDES_ITEMS
+        }
+    }
+
+    fn no_action_selection_reason(&self) -> &'static str {
+        if !self.rows.is_empty() {
+            NOTHING_SELECTED_FOR_ACTION
+        } else if self.arena.is_empty() {
+            NO_ITEMS_TO_ACT_ON
+        } else {
+            FILTER_HIDES_ITEMS
+        }
+    }
+
+    fn unavailable_operation_reason(
+        &self,
+        needs_selection: bool,
+        copy_action: bool,
+    ) -> &'static str {
+        if self.stage.blocks_input() {
+            return OPERATION_OPEN;
+        }
+        match self.status {
+            Status::Running(_) => SCAN_NOT_READY,
+            Status::Failed(_) => SCAN_FAILED,
+            Status::Cancelled => SCAN_STOPPED,
+            Status::Ready => {
+                if let Some(reason) = self.archive_refusal() {
+                    return reason;
+                }
+                if needs_selection && self.selection.is_empty() {
+                    return if copy_action {
+                        self.no_selection_reason()
+                    } else {
+                        self.no_action_selection_reason()
+                    };
+                }
+                NOTHING_SELECTED_FOR_ACTION
+            }
+        }
     }
 
     /// The unfinished batches the journal directory reported.
@@ -1806,8 +1897,6 @@ impl FolderView {
     pub fn toolbar_items(&self) -> Vec<toolbar::Item> {
         let running = self.status.is_running() || self.stage.is_busy();
         let has_tree = self.compared_tree.is_some();
-        let has_selection = !self.selection.is_empty();
-        let idle = matches!(self.stage, Stage::Idle);
         vec![
             toolbar::Item::widget("home", 70.0),
             toolbar::Item::widget("sessions", 90.0),
@@ -1824,12 +1913,8 @@ impl FolderView {
                 "copy",
                 Command::CopyToOtherSide,
                 "Copy",
-                idle && has_selection,
-                if idle {
-                    NOTHING_TO_COPY
-                } else {
-                    OPERATION_OPEN
-                },
+                self.accepts(Command::CopyToOtherSide),
+                self.refusal(Command::CopyToOtherSide).unwrap_or(""),
             ),
             toolbar::Item::widget("expand", 80.0),
             toolbar::Item::widget("collapse", 90.0),
@@ -2172,8 +2257,13 @@ impl FolderView {
                 widgets::toolbar_button(
                     ui,
                     "Sync Now",
-                    pending > 0 && matches!(self.stage, Stage::Idle),
-                    "Build a preview with something in it first",
+                    self.status == Status::Ready
+                        && matches!(self.stage, Stage::Idle)
+                        && self.preview_job.is_none()
+                        && self.archive_refusal().is_none()
+                        && self.sync.refusal.is_none()
+                        && pending > 0,
+                    self.sync_refusal_reason(),
                 )
             }) {
                 start = true;
@@ -3347,14 +3437,23 @@ impl SessionView for FolderSyncView {
     fn accepts(&self, command: Command) -> bool {
         match command {
             Command::Synchronize => {
-                self.view.sync_refusal().is_none() && self.view.sync_pending() > 0
+                self.view.status == Status::Ready
+                    && matches!(self.view.stage, Stage::Idle)
+                    && self.view.preview_job.is_none()
+                    && self.view.archive_refusal().is_none()
+                    && self.view.sync_refusal().is_none()
+                    && self.view.sync_pending() > 0
             }
             other => self.view.accepts(other),
         }
     }
 
     fn refusal(&self, command: Command) -> Option<&'static str> {
-        self.view.refusal(command)
+        if command == Command::Synchronize && !self.accepts(command) {
+            Some(self.view.sync_refusal_reason())
+        } else {
+            self.view.refusal(command)
+        }
     }
 
     fn run(&mut self, command: Command) {
@@ -3528,12 +3627,16 @@ impl SessionView for FolderView {
 
     fn refusal(&self, command: Command) -> Option<&'static str> {
         match command {
-            Command::CopyToRight | Command::CopyToLeft if !self.accepts(command) => {
-                Some(if matches!(self.stage, Stage::Idle) {
-                    NOTHING_TO_COPY
-                } else {
-                    OPERATION_OPEN
-                })
+            Command::CopyToRight | Command::CopyToLeft | Command::CopyToOtherSide
+                if !self.accepts(command) =>
+            {
+                Some(self.unavailable_operation_reason(true, true))
+            }
+            command if operation_of(command).is_some() && !self.accepts(command) => {
+                Some(self.unavailable_operation_reason(
+                    operation_of(command).is_some_and(operations::Operation::needs_selection),
+                    false,
+                ))
             }
             _ => None,
         }
@@ -3544,7 +3647,8 @@ impl SessionView for FolderView {
         match command {
             Command::ExpandAll | Command::CollapseAll => !self.arena.is_empty(),
             Command::CompareContents | Command::CompareReport => self.compared_tree.is_some(),
-            Command::SwapSides | Command::Reload => self.status == Status::Ready && idle,
+            Command::SwapSides => self.status == Status::Ready && idle,
+            Command::Reload => !self.status.is_running() && idle,
             Command::Cancel => self.status.is_running() || self.stage.is_busy(),
             Command::ClearSelection => !self.selection.is_empty(),
             Command::CopyToRight | Command::CopyToLeft => idle && !self.selection.is_empty(),
@@ -3949,10 +4053,10 @@ mod stale_results {
     use super::FolderView;
     use crate::opjobs::{PreviewMessage, RescanMessage};
     use crate::tree::Arena;
-    use ca_fs::Node;
+    use ca_fs::{Node, NodeStatus};
     use ca_ui::view::SessionView;
     use ca_ui::worker::{Job, Terminal};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{mpsc, Arc};
     use std::time::{Duration, Instant};
@@ -3990,6 +4094,50 @@ mod stale_results {
         );
         assert!(poll_until(&mut view, FolderView::is_ready));
         view
+    }
+
+    fn sync_view(dir: &Path) -> FolderView {
+        let mut view = ready_view(dir);
+        view.mode = super::Mode::Sync;
+        view.sync.preview = Some(ca_fs::SyncPreview {
+            rows: vec![ca_fs::PreviewRow {
+                rel: PathBuf::from("thing.txt"),
+                name: "thing.txt".to_owned(),
+                is_dir: false,
+                status: NodeStatus::LeftOrphan,
+                action: ca_fs::SyncAction::CopyLeftToRight,
+            }],
+            overrides: std::collections::BTreeMap::default(),
+        });
+        view.sync.stale = false;
+        view
+    }
+
+    fn click_accessible(
+        view: &mut impl ca_ui::view::SessionView,
+        label: &str,
+    ) -> ca_ui::testing::probe::Control {
+        let mut probe = ca_ui::testing::probe::Probe::new(2_800.0, 900.0);
+        let held = ca_ui::testing::context();
+        let mut draw = |ctx: &egui::Context| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                view.ui(ui, &held);
+            });
+        };
+        probe.idle(&mut draw);
+        probe.idle(&mut draw);
+        let control = probe
+            .find_all(label)
+            .into_iter()
+            .max_by(|left, right| {
+                left.rect
+                    .top()
+                    .partial_cmp(&right.rect.top())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .expect("the requested accessible control is present");
+        probe.press_at(control.rect.center(), &mut draw);
+        control
     }
 
     /// A compared tree that holds `stale.txt`, which no scan of the view's
@@ -4037,7 +4185,8 @@ mod stale_results {
     #[test]
     fn a_refused_folder_copy_asks_for_a_selection_or_for_the_open_operation_to_close() {
         use crate::{
-            toolbar, Command, FolderSyncView, OperationPlan, Stage, NOTHING_TO_COPY, OPERATION_OPEN,
+            toolbar, Command, FolderSyncView, OperationPlan, Stage, Status, FILTER_HIDES_ITEMS,
+            NOTHING_SELECTED_FOR_ACTION, NOTHING_TO_COPY, OPERATION_OPEN, SCAN_NOT_READY,
         };
         use ca_ui::view::SessionView;
 
@@ -4055,11 +4204,32 @@ mod stale_results {
         };
         let dir = tempfile::tempdir().unwrap();
         let mut view = ready_view(dir.path());
+        view.status = Status::Failed("scan failed".to_owned());
+        assert!(view.accepts(Command::Reload));
+        view.status = Status::Cancelled;
+        assert!(view.accepts(Command::Reload));
+        view.status = Status::Ready;
         for command in [Command::CopyToRight, Command::CopyToLeft] {
             assert!(!view.accepts(command));
             assert_eq!(view.refusal(command), Some(NOTHING_TO_COPY), "{command:?}");
         }
         assert_eq!(copy_reason(&view), Some(NOTHING_TO_COPY));
+        assert_eq!(
+            view.refusal(Command::Delete),
+            Some(NOTHING_SELECTED_FOR_ACTION)
+        );
+
+        view.status = Status::Running("Scanning");
+        assert_eq!(view.refusal(Command::Delete), Some(SCAN_NOT_READY));
+        view.status = Status::Ready;
+
+        let mut hidden = ready_view(dir.path());
+        assert!(!hidden.arena.is_empty());
+        hidden.rows.clear();
+        assert_eq!(
+            hidden.refusal(Command::CopyToRight),
+            Some(FILTER_HIDES_ITEMS)
+        );
 
         view.run(Command::SelectAll);
         for command in [Command::CopyToRight, Command::CopyToLeft] {
@@ -4076,9 +4246,148 @@ mod stale_results {
             assert!(!view.accepts(command));
             assert_eq!(view.refusal(command), Some(OPERATION_OPEN), "{command:?}");
         }
+        assert_eq!(view.refusal(Command::Delete), Some(OPERATION_OPEN));
         assert_eq!(copy_reason(&view), Some(OPERATION_OPEN));
         let sync = FolderSyncView::from(view);
         assert_eq!(sync.refusal(Command::CopyToRight), Some(OPERATION_OPEN));
+    }
+
+    #[test]
+    fn folder_copy_is_refused_during_scan_and_refresh_clicks_recover_failed_scans() {
+        use crate::{Command, Status, SCAN_NOT_READY};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut scanning = ready_view(dir.path());
+        scanning.run(Command::SelectAll);
+        assert!(!scanning.selection().is_empty());
+        scanning.status = Status::Running("Scanning");
+        let copy = click_accessible(&mut scanning, "Copy");
+        assert!(!copy.enabled);
+        assert_eq!(copy.description.as_deref(), Some(SCAN_NOT_READY));
+        assert_eq!(scanning.status, Status::Running("Scanning"));
+
+        for status in [Status::Failed("scan failed".to_owned()), Status::Cancelled] {
+            let mut view = ready_view(dir.path());
+            view.status = status;
+            assert!(view.accepts(Command::Reload));
+            let generation = view.comparisons.current();
+            let refresh = click_accessible(&mut view, "Refresh");
+            assert!(refresh.enabled);
+            assert_ne!(view.comparisons.current(), generation);
+        }
+    }
+
+    #[test]
+    fn sync_now_accessible_clicks_are_disabled_for_every_refusal_state() {
+        use crate::{
+            FolderSyncView, OperationPlan, Stage, Status, ARCHIVE_SIDE_REFUSAL, OPERATION_OPEN,
+            SCAN_NOT_READY, SYNC_PREVIEW_FAILED,
+        };
+
+        const EMPTY_ZIP: &[u8] = &[
+            0x50, 0x4b, 0x05, 0x06, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let mut scanning = sync_view(dir.path());
+        scanning.status = Status::Running("Scanning");
+        let mut scanning = FolderSyncView::from(scanning);
+        assert!(!scanning.accepts(ca_ui::command::Command::Synchronize));
+        assert!(!click_accessible(&mut scanning, "Sync Now").enabled);
+        assert_eq!(scanning.view.status, Status::Running("Scanning"));
+        assert_eq!(
+            scanning.refusal(ca_ui::command::Command::Synchronize),
+            Some(SCAN_NOT_READY)
+        );
+        let mut archive_view = sync_view(dir.path());
+        let archive_path = dir.path().join("right.zip");
+        std::fs::write(&archive_path, EMPTY_ZIP).unwrap();
+        archive_view.sides = Some(crate::jobs::Sides {
+            left: ca_fs::Source::local(dir.path().join("left")),
+            right: ca_fs::Source::archive(&archive_path, ca_vfs::ArchiveOptions::default())
+                .unwrap(),
+        });
+        let mut archive = FolderSyncView::from(archive_view);
+        assert!(!click_accessible(&mut archive, "Sync Now").enabled);
+        assert_eq!(
+            archive.refusal(ca_ui::command::Command::Synchronize),
+            Some(ARCHIVE_SIDE_REFUSAL)
+        );
+
+        let mut pending = sync_view(dir.path());
+        let (open, gate) = mpsc::channel();
+        let sent = Arc::new(AtomicBool::new(false));
+        pending.preview_job = Some(gated(
+            PreviewMessage::Failed("preview failed".to_owned()),
+            gate,
+            Arc::clone(&sent),
+        ));
+        let mut pending = FolderSyncView::from(pending);
+        assert!(!click_accessible(&mut pending, "Sync Now").enabled);
+        assert_eq!(
+            pending.refusal(ca_ui::command::Command::Synchronize),
+            Some("Available once the synchronization preview finishes")
+        );
+        release(pending.view_mut(), &open, &sent);
+
+        let mut refused = sync_view(dir.path());
+        refused.sync.refusal = Some("preview failed".to_owned());
+        let mut refused = FolderSyncView::from(refused);
+        assert!(!click_accessible(&mut refused, "Sync Now").enabled);
+        assert_eq!(
+            refused.refusal(ca_ui::command::Command::Synchronize),
+            Some(SYNC_PREVIEW_FAILED)
+        );
+
+        let mut operation = sync_view(dir.path());
+        operation.stage = Stage::Running(Box::new(OperationPlan::new(
+            ca_fs::OperationKind::Copy,
+            Vec::new(),
+            ca_fs::OperationOptions::default(),
+        )));
+        let mut operation = FolderSyncView::from(operation);
+        assert!(!click_accessible(&mut operation, "Sync Now").enabled);
+        assert_eq!(
+            operation.refusal(ca_ui::command::Command::Synchronize),
+            Some(OPERATION_OPEN)
+        );
+        assert!(matches!(operation.view.stage, Stage::Running(_)));
+    }
+
+    #[test]
+    fn an_archive_sync_refusal_disables_the_start_action() {
+        use crate::{Command, FolderSyncView};
+        use ca_ui::view::SessionView;
+
+        const EMPTY_ZIP: &[u8] = &[
+            0x50, 0x4b, 0x05, 0x06, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let mut view = ready_view(dir.path());
+        let archive_path = dir.path().join("right.zip");
+        std::fs::write(&archive_path, EMPTY_ZIP).unwrap();
+        let archive =
+            ca_fs::Source::archive(&archive_path, ca_vfs::ArchiveOptions::default()).unwrap();
+        view.sides = Some(crate::jobs::Sides {
+            left: ca_fs::Source::local(dir.path().join("left")),
+            right: archive,
+        });
+        view.sync.preview = Some(ca_fs::SyncPreview {
+            rows: vec![ca_fs::PreviewRow {
+                rel: PathBuf::from("thing.txt"),
+                name: "thing.txt".to_owned(),
+                is_dir: false,
+                status: NodeStatus::LeftOrphan,
+                action: ca_fs::SyncAction::CopyLeftToRight,
+            }],
+            overrides: std::collections::BTreeMap::default(),
+        });
+
+        let sync = FolderSyncView::from(view);
+        assert!(!sync.accepts(Command::Synchronize));
+        assert_eq!(
+            sync.refusal(Command::Synchronize),
+            Some(super::ARCHIVE_SIDE_REFUSAL)
+        );
     }
 
     #[test]

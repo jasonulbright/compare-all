@@ -59,7 +59,7 @@ const COMMANDS: &[Expected] = &[
     ),
     ("center-pane", "Center Pane", Command::ToggleCenterPane),
     ("save", "Save", Command::SaveFile),
-    ("reload", "Reload", Command::Reload),
+    ("reload", "Reload Files", Command::Reload),
     ("report", "Report", Command::CompareReport),
     ("minor", "Minor", Command::ToggleIgnoreUnimportant),
 ];

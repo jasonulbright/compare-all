@@ -63,6 +63,8 @@ const DETAILS_HEIGHT: f32 = 58.0;
 const HEX_HEIGHT: f32 = 150.0;
 /// Room the status bar takes.
 const STATUS_HEIGHT: f32 = 26.0;
+/// Why a toolbar command needs a finished comparison.
+const NOT_COMPARED: &str = "Available once the comparison finishes";
 
 /// Every command a record view answers for.
 const HANDLED: &[Command] = &[
@@ -958,35 +960,29 @@ impl RecordsView {
                 Command::PreviousDifference,
                 "Previous",
                 ready,
-                "No comparison yet",
+                NOT_COMPARED,
             ),
             toolbar::Item::command(
                 "next-difference",
                 Command::NextDifference,
                 "Next",
                 ready,
-                "No comparison yet",
+                NOT_COMPARED,
             ),
             toolbar::Item::separator("separator-2"),
-            toolbar::Item::command(
-                "expand",
-                Command::ExpandAll,
-                "Expand",
-                ready,
-                "No comparison yet",
-            ),
+            toolbar::Item::command("expand", Command::ExpandAll, "Expand", ready, NOT_COMPARED),
             toolbar::Item::command(
                 "collapse",
                 Command::CollapseAll,
                 "Collapse",
                 ready,
-                "No comparison yet",
+                NOT_COMPARED,
             ),
             toolbar::Item::separator("separator-3"),
             toolbar::Item::command(
                 "reload",
                 Command::Reload,
-                "Reload",
+                "Reload Files",
                 !running,
                 "Work is running",
             ),
@@ -1016,7 +1012,7 @@ impl RecordsView {
                 Command::CompareReport,
                 "Report",
                 ready,
-                "No comparison yet",
+                NOT_COMPARED,
             ),
             toolbar::Item::separator("separator-4"),
             toolbar::Item::widget("strip", 110.0),

@@ -51,9 +51,11 @@ const COMBO_WIDTH: f32 = 116.0;
 /// Why a toolbar button refuses while the comparison is still running.
 const NOT_READY: &str = "Available once the comparison finishes";
 /// Reason shown on a copy after the comparison failed.
-const FAILED: &str = "The comparison failed. Use Reload to compare again";
+const FAILED: &str = "The comparison failed. Use Reload Files to compare again";
 /// Reason shown on a copy after the comparison was stopped.
-const STOPPED: &str = "The comparison was stopped. Use Reload to compare again";
+const STOPPED: &str = "The comparison was stopped. Use Reload Files to compare again";
+/// Why a byte copy is refused while editing is turned off for the session.
+const EDITING_OFF: &str = "Editing is turned off for this session";
 /// Reason shown on a copy into the left pane while that pane takes no edit.
 const LEFT_READ_ONLY: &str = "The left pane is read-only";
 /// Reason shown on a copy into the right pane while that pane takes no edit.
@@ -1517,15 +1519,15 @@ impl HexView {
                 "copy-left",
                 Command::CopyToLeft,
                 Command::CopyToLeft.label(),
-                ready,
-                "Nothing to copy yet",
+                self.accepts(Command::CopyToLeft),
+                self.refusal(Command::CopyToLeft).unwrap_or(""),
             ),
             toolbar::Item::command(
                 "copy-right",
                 Command::CopyToRight,
                 Command::CopyToRight.label(),
-                ready,
-                "Nothing to copy yet",
+                self.accepts(Command::CopyToRight),
+                self.refusal(Command::CopyToRight).unwrap_or(""),
             ),
             toolbar::Item::separator("separator-5"),
             toolbar::Item::command(
@@ -1538,7 +1540,13 @@ impl HexView {
             toolbar::Item::command("reload", Command::Reload, Command::Reload.label(), true, ""),
             toolbar::Item::widget("text-compare", 120.0),
             toolbar::Item::widget("parent-folders", 130.0),
-            toolbar::Item::command("report", Command::CompareReport, "Report", ready, NOT_READY),
+            toolbar::Item::command(
+                "report",
+                Command::CompareReport,
+                "Report",
+                ready,
+                self.refusal(Command::CompareReport).unwrap_or(""),
+            ),
             toolbar::Item::separator("separator-6"),
             toolbar::Item::widget("font", 140.0),
         ]
@@ -2893,19 +2901,20 @@ impl SessionView for HexView {
     }
 
     fn refusal(&self, command: Command) -> Option<&'static str> {
-        let (target, read_only) = match command {
-            Command::CopyToRight => (&self.right_bytes, RIGHT_READ_ONLY),
-            Command::CopyToLeft => (&self.left_bytes, LEFT_READ_ONLY),
+        let target_reason = match command {
+            Command::CopyToRight => Some((&self.right_bytes, RIGHT_READ_ONLY)),
+            Command::CopyToLeft => Some((&self.left_bytes, LEFT_READ_ONLY)),
+            Command::CompareReport => None,
             _ => return None,
         };
-        if target.is_read_only() {
-            return Some(read_only);
-        }
         match self.status {
-            Status::Ready => None,
             Status::Running(_) => Some(NOT_READY),
             Status::Failed(_) => Some(FAILED),
             Status::Cancelled => Some(STOPPED),
+            Status::Ready if self.editing_off() && target_reason.is_some() => Some(EDITING_OFF),
+            Status::Ready => target_reason
+                .filter(|(target, _)| target.is_read_only())
+                .map(|(_, reason)| reason),
         }
     }
 
@@ -3365,6 +3374,8 @@ mod tests {
 
     #[test]
     fn a_refused_byte_copy_names_the_read_only_pane_or_what_the_comparison_waits_for() {
+        use ca_ui::toolbar::Item;
+
         let dir = tempfile::tempdir().unwrap();
         let left = dir.path().join("left.bin");
         let right = dir.path().join("right.bin");
@@ -3372,6 +3383,23 @@ mod tests {
         std::fs::write(&right, [1u8, 2, 4]).unwrap();
         let mut view = HexView::new(left, right, &context(), 10);
         assert_eq!(view.refusal(Command::CopyToRight), Some(super::NOT_READY));
+        let toolbar_reason = |view: &HexView, command| {
+            view.toolbar_items()
+                .into_iter()
+                .find_map(|item| match item {
+                    Item::Command {
+                        command: found,
+                        enabled,
+                        reason,
+                        ..
+                    } if found == command => Some((enabled, reason)),
+                    _ => None,
+                })
+        };
+        assert_eq!(
+            toolbar_reason(&view, Command::CopyToRight),
+            Some((false, super::NOT_READY))
+        );
         let deadline = Instant::now() + Duration::from_secs(30);
         while Instant::now() < deadline && view.status != super::Status::Ready {
             view.tick();
@@ -3387,6 +3415,10 @@ mod tests {
         assert_eq!(
             view.refusal(Command::CopyToRight),
             Some(super::RIGHT_READ_ONLY)
+        );
+        assert_eq!(
+            toolbar_reason(&view, Command::CopyToRight),
+            Some((false, super::RIGHT_READ_ONLY))
         );
         assert!(view.accepts(Command::CopyToLeft));
         assert_eq!(view.refusal(Command::CopyToLeft), None);
@@ -3407,7 +3439,73 @@ mod tests {
             view.status = status;
             assert!(view.accepts(Command::Reload));
             assert_eq!(view.refusal(Command::CopyToLeft), Some(expected));
+            assert_eq!(
+                toolbar_reason(&view, Command::CopyToLeft),
+                Some((false, expected))
+            );
+            assert_eq!(view.refusal(Command::CompareReport), Some(expected));
+            assert_eq!(
+                toolbar_reason(&view, Command::CompareReport),
+                Some((false, expected))
+            );
         }
+    }
+
+    #[test]
+    fn disabled_hex_copy_controls_refuse_accessible_clicks() {
+        use ca_ui::testing::probe::Probe;
+
+        let dir = tempfile::tempdir().unwrap();
+        let left = dir.path().join("left.bin");
+        let right = dir.path().join("right.bin");
+        std::fs::write(&left, [1u8, 2, 3]).unwrap();
+        std::fs::write(&right, [1u8, 2, 4]).unwrap();
+        let mut view = HexView::new(left, right, &context(), 11);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !view.is_ready() && Instant::now() < deadline {
+            view.tick();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(view.is_ready());
+
+        let left_before = view.left_bytes.bytes().to_vec();
+        let right_before = view.right_bytes.bytes().to_vec();
+        view.right_bytes.set_read_only(true);
+        let mut probe = Probe::new(2_600.0, 900.0);
+        let held = context();
+        {
+            let mut draw = |ctx: &egui::Context| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    view.ui(ui, &held);
+                });
+            };
+            probe.idle(&mut draw);
+            probe.idle(&mut draw);
+            let copy = probe.click("Copy to Right", &mut draw).unwrap();
+            assert!(!copy.enabled);
+        }
+        assert_eq!(view.left_bytes.bytes(), left_before);
+        assert_eq!(view.right_bytes.bytes(), right_before);
+
+        let mut settings = view.session_settings();
+        settings.specs.disable_editing = true;
+        view.apply_session_settings(&settings);
+        let mut probe = Probe::new(2_600.0, 900.0);
+        {
+            let mut draw = |ctx: &egui::Context| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    view.ui(ui, &held);
+                });
+            };
+            probe.idle(&mut draw);
+            probe.idle(&mut draw);
+            for label in ["Copy to Left", "Copy to Right"] {
+                let copy = probe.click(label, &mut draw).unwrap();
+                assert!(!copy.enabled, "{label}");
+            }
+        }
+        assert_eq!(view.left_bytes.bytes(), left_before);
+        assert_eq!(view.right_bytes.bytes(), right_before);
     }
 
     #[test]

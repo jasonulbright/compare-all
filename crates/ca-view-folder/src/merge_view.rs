@@ -48,6 +48,15 @@ const NO_OUTPUT: &str = "Name an output folder in the session settings first";
 const ARCHIVE_OUTPUT: &str =
     "The output is an archive. A merge writes into a local folder only. Name a folder as the output.";
 const NOT_READY: &str = "Available once the comparison finishes";
+const FAILED_RELOAD: &str = "The comparison failed. Use Reload Files to compare again";
+const OPERATION_BUSY: &str = "Available once the current operation finishes";
+const OPERATION_PROMPT: &str = "Respond to the open operation prompt first";
+const OPERATION_COMPLETE: &str = "Close the completed operation first";
+const OPERATION_OPEN: &str = "Close the open operation first";
+const NO_CENTER: &str = "This merge has no center folder";
+const NO_CONFLICTS: &str = "No visible conflicts are available";
+const NO_TARGET: &str = "Select an item to act on first";
+const NO_COPY_TARGET: &str = "Select an item to copy first";
 /// What the view says when a merge has nothing to write and the output holds
 /// the merge result of every row.
 const FINISHED: &str = "The output already holds the merge result.";
@@ -1687,6 +1696,47 @@ impl FolderMergeView {
         self.status == Status::Ready && self.tree.is_some()
     }
 
+    fn comparison_unavailable_reason(&self) -> &'static str {
+        if matches!(self.status, Status::Failed(_)) {
+            FAILED_RELOAD
+        } else {
+            NOT_READY
+        }
+    }
+
+    fn operation_unavailable_reason(&self) -> &'static str {
+        match &self.stage {
+            Stage::Planning | Stage::Running(_) => OPERATION_BUSY,
+            Stage::Confirming(_) => OPERATION_PROMPT,
+            Stage::Summary(_, _) => OPERATION_COMPLETE,
+            Stage::Idle if self.plan_job.is_some() || self.exec_job.is_some() => OPERATION_BUSY,
+            Stage::Idle => OPERATION_OPEN,
+        }
+    }
+
+    fn toolbar_disabled_reason(&self, command: Command) -> &'static str {
+        if self.accepts(command) {
+            return "";
+        }
+        if !self.idle() {
+            return self.operation_unavailable_reason();
+        }
+        if !self.ready() {
+            return self.comparison_unavailable_reason();
+        }
+        match command {
+            Command::PreviousConflict | Command::NextConflict => NO_CONFLICTS,
+            Command::TakeCenter if !self.has_center() => NO_CENTER,
+            Command::TakeLeft | Command::TakeCenter | Command::TakeRight => NO_TARGET,
+            Command::MergeFolders | Command::CopyToOutput if self.output_folder().is_none() => {
+                NO_OUTPUT
+            }
+            Command::CopyToOutput => NO_COPY_TARGET,
+            Command::OpenTextMerge => self.text_merge_disabled_reason(),
+            _ => NOT_READY,
+        }
+    }
+
     fn has_center(&self) -> bool {
         self.folders.center.is_some()
     }
@@ -1844,7 +1894,6 @@ impl FolderMergeView {
     #[allow(clippy::too_many_lines)]
     pub fn toolbar_items(&self) -> Vec<toolbar::Item> {
         let ready = self.ready();
-        let idle = ready && self.idle();
         vec![
             toolbar::Item::widget("filter", FILTER_COMBO_WIDTH),
             toolbar::Item::separator("separator-1"),
@@ -1853,14 +1902,14 @@ impl FolderMergeView {
                 Command::PreviousConflict,
                 "Prev Conflict",
                 self.accepts(Command::PreviousConflict),
-                NOT_READY,
+                self.toolbar_disabled_reason(Command::PreviousConflict),
             ),
             toolbar::Item::command(
                 "next-conflict",
                 Command::NextConflict,
                 "Next Conflict",
                 self.accepts(Command::NextConflict),
-                NOT_READY,
+                self.toolbar_disabled_reason(Command::NextConflict),
             ),
             toolbar::Item::separator("separator-2"),
             toolbar::Item::command(
@@ -1868,21 +1917,21 @@ impl FolderMergeView {
                 Command::TakeLeft,
                 "Take Left",
                 self.accepts(Command::TakeLeft),
-                NOT_READY,
+                self.toolbar_disabled_reason(Command::TakeLeft),
             ),
             toolbar::Item::command(
                 "take-center",
                 Command::TakeCenter,
                 "Take Center",
                 self.accepts(Command::TakeCenter),
-                NOT_READY,
+                self.toolbar_disabled_reason(Command::TakeCenter),
             ),
             toolbar::Item::command(
                 "take-right",
                 Command::TakeRight,
                 "Take Right",
                 self.accepts(Command::TakeRight),
-                NOT_READY,
+                self.toolbar_disabled_reason(Command::TakeRight),
             ),
             toolbar::Item::separator("separator-3"),
             toolbar::Item::command(
@@ -1890,21 +1939,21 @@ impl FolderMergeView {
                 Command::MergeFolders,
                 "Merge",
                 self.accepts(Command::MergeFolders),
-                NO_OUTPUT,
+                self.toolbar_disabled_reason(Command::MergeFolders),
             ),
             toolbar::Item::command(
                 "copy-to-output",
                 Command::CopyToOutput,
                 "Copy to Output",
                 self.accepts(Command::CopyToOutput),
-                NO_OUTPUT,
+                self.toolbar_disabled_reason(Command::CopyToOutput),
             ),
             toolbar::Item::command(
                 "text-merge",
                 Command::OpenTextMerge,
                 "Text Merge",
                 self.accepts(Command::OpenTextMerge),
-                self.text_merge_disabled_reason(),
+                self.toolbar_disabled_reason(Command::OpenTextMerge),
             ),
             toolbar::Item::separator("separator-4"),
             toolbar::Item::toggle(
@@ -1913,6 +1962,7 @@ impl FolderMergeView {
                 "Center Pane",
                 self.has_center(),
                 self.show_center,
+                NO_CENTER,
             ),
             toolbar::Item::toggle(
                 "ignore-same",
@@ -1920,10 +1970,29 @@ impl FolderMergeView {
                 "Ignore Same",
                 ready,
                 self.ignore_same,
+                self.toolbar_disabled_reason(Command::ToggleIgnoreSameChanges),
             ),
-            toolbar::Item::command("swap", Command::SwapSides, "Swap", idle, NOT_READY),
-            toolbar::Item::command("reload", Command::Reload, "Reload", idle, NOT_READY),
-            toolbar::Item::command("report", Command::CompareReport, "Report", ready, NOT_READY),
+            toolbar::Item::command(
+                "swap",
+                Command::SwapSides,
+                "Swap",
+                self.accepts(Command::SwapSides),
+                self.toolbar_disabled_reason(Command::SwapSides),
+            ),
+            toolbar::Item::command(
+                "reload",
+                Command::Reload,
+                "Reload",
+                self.accepts(Command::Reload),
+                self.toolbar_disabled_reason(Command::Reload),
+            ),
+            toolbar::Item::command(
+                "report",
+                Command::CompareReport,
+                "Report",
+                ready,
+                self.toolbar_disabled_reason(Command::CompareReport),
+            ),
         ]
     }
 
@@ -2802,6 +2871,154 @@ mod tests {
     };
     use ca_session::settings::folder::MergeTarget;
     use ca_ui::theme::folder_merge::FolderMergeClass;
+    use ca_ui::view::SessionView;
+
+    fn toolbar_item_enabled(
+        items: &[ca_ui::toolbar::Item],
+        command: ca_ui::command::Command,
+    ) -> bool {
+        items
+            .iter()
+            .find_map(|item| match item {
+                ca_ui::toolbar::Item::Command {
+                    command: found,
+                    enabled,
+                    ..
+                } if *found == command => Some(*enabled),
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn failed_comparison_reasons_name_reload_files_on_the_merge_toolbar() {
+        let dir = tempfile::tempdir().unwrap();
+        let left = dir.path().join("left");
+        let right = dir.path().join("right");
+        std::fs::create_dir_all(&left).unwrap();
+        std::fs::create_dir_all(&right).unwrap();
+        let request =
+            ca_ui::view::OpenRequest::new(ca_session::SessionKind::FolderMerge, left, right);
+        let mut view = super::FolderMergeView::with_journal_directory(
+            &request,
+            &ca_ui::testing::context(),
+            1,
+            dir.path().join("journals"),
+        );
+        view.status = super::Status::Running("Scanning");
+        let items = view.toolbar_items();
+        for command in [
+            ca_ui::command::Command::SwapSides,
+            ca_ui::command::Command::Reload,
+        ] {
+            assert_eq!(toolbar_item_enabled(&items, command), view.accepts(command));
+            assert!(!toolbar_item_enabled(&items, command));
+        }
+
+        view.status = super::Status::Failed("unreadable".to_owned());
+        let items = view.toolbar_items();
+        assert!(toolbar_item_enabled(
+            &items,
+            ca_ui::command::Command::Reload
+        ));
+        assert!(!toolbar_item_enabled(
+            &items,
+            ca_ui::command::Command::CompareReport
+        ));
+
+        for command in [
+            ca_ui::command::Command::CompareReport,
+            ca_ui::command::Command::ToggleIgnoreSameChanges,
+        ] {
+            assert_eq!(view.toolbar_disabled_reason(command), super::FAILED_RELOAD);
+        }
+        assert_eq!(
+            view.toolbar_disabled_reason(ca_ui::command::Command::Reload),
+            ""
+        );
+
+        view.stage = super::Stage::Summary(
+            Box::new(OperationPlan::new(
+                OperationKind::Merge,
+                Vec::new(),
+                OperationOptions::default(),
+            )),
+            Box::default(),
+        );
+        assert!(!view.accepts(ca_ui::command::Command::Reload));
+        assert_eq!(
+            view.toolbar_disabled_reason(ca_ui::command::Command::Reload),
+            super::OPERATION_COMPLETE
+        );
+    }
+
+    fn click_accessible(
+        view: &mut super::FolderMergeView,
+        label: &str,
+    ) -> ca_ui::testing::probe::Control {
+        let mut probe = ca_ui::testing::probe::Probe::new(3_000.0, 900.0);
+        let held = ca_ui::testing::context();
+        let mut draw = |ctx: &egui::Context| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                view.ui(ui, &held);
+            });
+        };
+        probe.idle(&mut draw);
+        probe.idle(&mut draw);
+        probe.click(label, &mut draw).unwrap()
+    }
+
+    fn assert_comparison_restarted(view: &super::FolderMergeView, command: &str) {
+        let running =
+            matches!(view.status, super::Status::Running(_)) && view.compare_job.is_some();
+        let ready = matches!(view.status, super::Status::Ready) && view.tree.is_some();
+        assert!(running || ready, "{command} did not start a comparison");
+    }
+
+    #[test]
+    fn failed_and_running_folder_merges_gate_swap_and_reload_accessible_clicks() {
+        let dir = tempfile::tempdir().unwrap();
+        let left = dir.path().join("left");
+        let right = dir.path().join("right");
+        std::fs::create_dir_all(&left).unwrap();
+        std::fs::create_dir_all(&right).unwrap();
+        let request =
+            ca_ui::view::OpenRequest::new(ca_session::SessionKind::FolderMerge, left, right);
+        let mut view = super::FolderMergeView::with_journal_directory(
+            &request,
+            &ca_ui::testing::context(),
+            2,
+            dir.path().join("journals"),
+        );
+
+        view.status = super::Status::Running("Scanning");
+        view.compare_job = None;
+        let paths = view.folders.clone();
+        for label in ["Swap", "Reload"] {
+            let control = click_accessible(&mut view, label);
+            assert!(!control.enabled, "{label} while scanning");
+        }
+        assert_eq!(view.folders, paths);
+        assert!(
+            view.compare_job.is_none(),
+            "the refused reload did not restart"
+        );
+        assert!(matches!(view.status, super::Status::Running(_)));
+
+        view.status = super::Status::Failed("unreadable".to_owned());
+        let before_swap = view.folders.clone();
+        let swap = click_accessible(&mut view, "Swap");
+        assert!(swap.enabled);
+        assert_eq!(view.folders.left, before_swap.right);
+        assert_eq!(view.folders.right, before_swap.left);
+        assert_comparison_restarted(&view, "Swap");
+
+        view.compare_job = None;
+        view.status = super::Status::Failed("unreadable".to_owned());
+        let reload = click_accessible(&mut view, "Reload");
+        assert!(reload.enabled);
+        assert_comparison_restarted(&view, "Reload");
+    }
 
     #[test]
     fn the_merge_reads_the_stored_archive_masks() {

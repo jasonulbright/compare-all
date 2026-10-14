@@ -97,6 +97,32 @@ fn a_disabled_command_of_a_declared_toolbar_shows_its_reason() {
 }
 
 #[test]
+fn a_disabled_toolbar_toggle_shows_its_reason() {
+    let items = [Item::toggle(
+        "center-pane",
+        Command::ToggleCenterPane,
+        "Center Pane",
+        false,
+        false,
+        REASON,
+    )];
+    let mut draw = |ctx: &egui::Context| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let _ = toolbar::show(
+                ui,
+                egui::Id::new("bar"),
+                &items,
+                &Layout::built_in(),
+                |_, _| {},
+            );
+        });
+    };
+    let (painted, description) = rest_on("Center Pane", false, &mut draw);
+    assert!(shows(&painted, REASON), "painted {painted:?}");
+    assert_eq!(description.as_deref(), Some(REASON));
+}
+
+#[test]
 fn a_line_this_build_does_not_offer_says_so_on_hover() {
     const PENDING: &str = "Not available in this build";
     let mut draw = |ctx: &egui::Context| {
