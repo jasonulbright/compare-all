@@ -59,6 +59,16 @@ fn fixture() -> tempfile::TempDir {
     directory
 }
 
+/// Escape text inserted into the test server's XML listing.
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
 /// Every key in the bucket, as `key` and its real path.
 fn keys(root: &std::path::Path) -> Vec<(String, PathBuf)> {
     let mut out = Vec::new();
@@ -232,9 +242,10 @@ fn listing(root: &std::path::Path, request: &Request) -> Reply {
                 .map_or(0, ca_vfs::remote::timestamp::unix_seconds),
         );
         body.push_str(&format!(
-            "<Contents><Key>{key}</Key><Size>{}</Size>\
+            "<Contents><Key>{}</Key><Size>{}</Size>\
              <LastModified>{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.000Z</LastModified>\
              <ETag>&quot;none&quot;</ETag></Contents>",
+            xml_escape(&key),
             metadata.len(),
             stamp.0,
             stamp.1,
@@ -246,7 +257,8 @@ fn listing(root: &std::path::Path, request: &Request) -> Reply {
     }
     for folder in folders {
         body.push_str(&format!(
-            "<CommonPrefixes><Prefix>{folder}</Prefix></CommonPrefixes>"
+            "<CommonPrefixes><Prefix>{}</Prefix></CommonPrefixes>",
+            xml_escape(&folder)
         ));
     }
     body.push_str("<IsTruncated>false</IsTruncated></ListBucketResult>");
@@ -394,6 +406,35 @@ fn rename_is_a_copy_then_a_delete_and_delete_removes_a_prefix() {
 
     fs.delete(&VfsPath::parse("sub").unwrap(), &cancel).unwrap();
     assert!(!directory.path().join("sub").join("inner.bin").exists());
+}
+
+#[test]
+fn deleting_a_prefix_with_an_escaped_ampersand_does_not_delete_a_root_key() {
+    let directory = fixture();
+    std::fs::create_dir(directory.path().join("photos")).unwrap();
+    std::fs::write(directory.path().join("photos/tom&jerry.jpg"), b"photo").unwrap();
+    std::fs::write(directory.path().join("photos/tom & jerry.jpg"), b"spaced").unwrap();
+    std::fs::write(directory.path().join("jerry.jpg"), b"unrelated").unwrap();
+    let server = HttpTestServer::start(
+        handler(directory.path().to_path_buf(), Behaviour::default()),
+        None,
+    );
+    let fs = S3Fs::connect(
+        &profile(&server, "http://127.0.0.1"),
+        &context(),
+        &Cancel::new(),
+    )
+    .unwrap();
+
+    fs.delete(&VfsPath::parse("photos").unwrap(), &Cancel::new())
+        .unwrap();
+
+    assert!(!directory.path().join("photos/tom&jerry.jpg").exists());
+    assert!(!directory.path().join("photos/tom & jerry.jpg").exists());
+    assert_eq!(
+        std::fs::read(directory.path().join("jerry.jpg")).unwrap(),
+        b"unrelated"
+    );
 }
 
 #[test]

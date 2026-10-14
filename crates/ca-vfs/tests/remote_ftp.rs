@@ -117,6 +117,30 @@ fn a_nested_listing_reaches_the_whole_tree() {
 }
 
 #[test]
+fn an_incomplete_download_with_a_failed_final_reply_is_an_error() {
+    let options = Options {
+        truncate_downloads: Some(4),
+        ..Options::default()
+    };
+    let (directory, _server, fs) = connected(options);
+    let mut received = Vec::new();
+    let result = fs
+        .open(&VfsPath::parse("report.txt").unwrap(), &Cancel::new())
+        .unwrap()
+        .read_to_end(&mut received);
+
+    assert!(
+        result.is_err(),
+        "partial content was treated as a complete file"
+    );
+    assert_eq!(received, b"hell");
+    assert_eq!(
+        std::fs::read(directory.path().join("report.txt")).unwrap(),
+        b"hello remote world"
+    );
+}
+
+#[test]
 fn a_file_reads_back_byte_for_byte() {
     let (_directory, _server, fs) = connected(accounted(true));
     let mut handle = fs

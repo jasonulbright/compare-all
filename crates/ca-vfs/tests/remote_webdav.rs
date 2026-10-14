@@ -54,7 +54,24 @@ fn fixture() -> tempfile::TempDir {
         vec![7u8; 2048],
     )
     .unwrap();
+    std::fs::create_dir_all(directory.path().join("docs/docs")).unwrap();
+    std::fs::write(directory.path().join("tom&jerry.txt"), b"ampersand").unwrap();
+    std::fs::write(
+        directory.path().join("tom & jerry.txt"),
+        b"spaced ampersand",
+    )
+    .unwrap();
     directory
+}
+
+/// Escape text inserted into a DAV XML response.
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
 }
 
 /// The share handler.
@@ -152,7 +169,7 @@ fn entry_xml(root: &Path, path: &Path) -> String {
         .strip_prefix(root)
         .map(|value| value.to_string_lossy().replace('\\', "/"))
         .unwrap_or_default();
-    let href = format!("/{relative}");
+    let href = xml_escape(&format!("/{relative}"));
     let Ok(metadata) = std::fs::metadata(path) else {
         return String::new();
     };
@@ -246,6 +263,22 @@ fn a_listing_reports_names_sizes_and_times() {
     assert!(entries
         .iter()
         .any(|entry| entry.name == "sub" && entry.is_dir()));
+    assert!(entries.iter().any(|entry| entry.name == "tom&jerry.txt"));
+    assert!(entries.iter().any(|entry| entry.name == "tom & jerry.txt"));
+}
+
+#[test]
+fn a_child_folder_with_the_same_name_as_its_parent_is_listed() {
+    let (_directory, _server, fs) = connected(Behaviour::default());
+    let entries = fs
+        .list(&VfsPath::parse("docs").unwrap(), &Cancel::new())
+        .unwrap();
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry.name == "docs" && entry.is_dir()),
+        "{entries:?}"
+    );
 }
 
 #[test]

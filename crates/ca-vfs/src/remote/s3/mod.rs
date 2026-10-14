@@ -276,6 +276,11 @@ impl S3Fs {
             cancel.check()?;
             let page = self.page(&prefix, "", token.as_deref(), cancel)?;
             for object in page.objects {
+                if !object.key.starts_with(&prefix) {
+                    return Err(VfsError::protocol(format!(
+                        "the listing of {path} named an object outside its prefix"
+                    )));
+                }
                 out.push(object.key);
             }
             if out.len() > MAX_LISTED {
@@ -321,15 +326,20 @@ struct Listing {
 }
 
 /// Read a listing reply.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the XML event state machine keeps field context explicit in one pass"
+)]
 fn parse_listing(body: &[u8]) -> VfsResult<Listing> {
     let mut reader = quick_xml::Reader::from_reader(body);
-    reader.config_mut().trim_text(true);
+    reader.config_mut().trim_text(false);
     let mut buffer = Vec::new();
     let mut out = Listing::default();
     let mut current = Object::default();
     let mut in_contents = false;
     let mut in_prefix = false;
     let mut field: Option<&'static str> = None;
+    let mut value = String::new();
 
     loop {
         match reader.read_event_into(&mut buffer) {
@@ -340,32 +350,90 @@ fn parse_listing(body: &[u8]) -> VfsResult<Listing> {
                     current = Object::default();
                 }
                 b"CommonPrefixes" => in_prefix = true,
-                b"Key" => field = Some("key"),
-                b"Size" => field = Some("size"),
-                b"LastModified" => field = Some("modified"),
-                b"ETag" => field = Some("etag"),
-                b"Prefix" if in_prefix => field = Some("prefix"),
-                b"NextContinuationToken" => field = Some("next"),
+                b"Key" => {
+                    field = Some("key");
+                    value.clear();
+                }
+                b"Size" => {
+                    field = Some("size");
+                    value.clear();
+                }
+                b"LastModified" => {
+                    field = Some("modified");
+                    value.clear();
+                }
+                b"ETag" => {
+                    field = Some("etag");
+                    value.clear();
+                }
+                b"Prefix" if in_prefix => {
+                    field = Some("prefix");
+                    value.clear();
+                }
+                b"NextContinuationToken" => {
+                    field = Some("next");
+                    value.clear();
+                }
                 _ => {}
             },
             Ok(Event::Text(text)) => {
-                let value = String::from_utf8_lossy(text.as_ref()).into_owned();
-                match field {
-                    Some("key") if in_contents => current.key = value,
-                    Some("size") if in_contents => current.size = value.trim().parse().unwrap_or(0),
-                    Some("modified") if in_contents => {
-                        current.modified = crate::remote::timestamp::parse_iso8601_utc(&value);
-                    }
-                    Some("etag") if in_contents => {
-                        current.etag = Some(value.trim_matches('"').to_owned());
-                    }
-                    Some("prefix") if in_prefix => out.prefixes.push(value),
-                    Some("next") => out.next = Some(value),
-                    _ => {}
+                let decoded = reader.decoder().decode(text.as_ref()).map_err(|error| {
+                    VfsError::protocol(format!("the listing contains invalid text: {error}"))
+                })?;
+                let unescaped = quick_xml::escape::unescape(&decoded).map_err(|error| {
+                    VfsError::protocol(format!("the listing contains an invalid entity: {error}"))
+                })?;
+                if field.is_some() {
+                    value.push_str(&unescaped);
+                }
+            }
+            Ok(Event::CData(text)) if field.is_some() => {
+                let decoded = reader.decoder().decode(text.as_ref()).map_err(|error| {
+                    VfsError::protocol(format!("the listing contains invalid text: {error}"))
+                })?;
+                value.push_str(&decoded);
+            }
+            Ok(Event::GeneralRef(reference)) if field.is_some() => {
+                let decoded = reference.decode().map_err(|error| {
+                    VfsError::protocol(format!("the listing contains an invalid entity: {error}"))
+                })?;
+                if let Some(character) = reference.resolve_char_ref().map_err(|error| {
+                    VfsError::protocol(format!(
+                        "the listing contains an invalid character reference: {error}"
+                    ))
+                })? {
+                    value.push(character);
+                } else if let Some(replacement) =
+                    quick_xml::escape::resolve_predefined_entity(&decoded)
+                {
+                    value.push_str(replacement);
+                } else {
+                    return Err(VfsError::protocol(
+                        "the listing contains an unknown entity".to_owned(),
+                    ));
                 }
             }
             Ok(Event::End(end)) => {
                 match end.name().as_ref() {
+                    b"Key" if field == Some("key") && in_contents => {
+                        current.key = std::mem::take(&mut value);
+                    }
+                    b"Size" if field == Some("size") && in_contents => {
+                        current.size = value.trim().parse().unwrap_or(0);
+                    }
+                    b"LastModified" if field == Some("modified") && in_contents => {
+                        current.modified =
+                            crate::remote::timestamp::parse_iso8601_utc(value.trim());
+                    }
+                    b"ETag" if field == Some("etag") && in_contents => {
+                        current.etag = Some(value.trim().trim_matches('"').to_owned());
+                    }
+                    b"Prefix" if field == Some("prefix") && in_prefix => {
+                        out.prefixes.push(std::mem::take(&mut value));
+                    }
+                    b"NextContinuationToken" if field == Some("next") => {
+                        out.next = Some(std::mem::take(&mut value).trim().to_owned());
+                    }
                     b"Contents" => {
                         in_contents = false;
                         if !current.key.is_empty() {
@@ -818,6 +886,13 @@ mod tests {
         );
         assert_eq!(listing.prefixes, vec!["sub/".to_owned()]);
         assert!(listing.next.is_none());
+    }
+
+    #[test]
+    fn a_key_keeps_text_split_by_cdata() {
+        let body = br"<ListBucketResult><Contents><Key>photos/tom<![CDATA[&]]>jerry.jpg</Key><Size>1</Size></Contents></ListBucketResult>";
+        let listing = parse_listing(body).unwrap();
+        assert_eq!(listing.objects[0].key, "photos/tom&jerry.jpg");
     }
 
     #[test]

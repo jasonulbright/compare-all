@@ -90,7 +90,7 @@ impl WebDavFs {
 
     /// The address of one path in the share.
     fn url(&self, path: &VfsPath) -> Url {
-        let mut target = self.base.path.clone();
+        let mut target = self.base.path.trim_end_matches('/').to_owned();
         for component in path.components() {
             target.push('/');
             target.push_str(&encode_component(component));
@@ -185,13 +185,18 @@ struct Property {
 }
 
 /// Read a multi-status reply.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the XML event state machine keeps property context explicit in one pass"
+)]
 fn parse_multistatus(body: &[u8]) -> VfsResult<Vec<Property>> {
     let mut reader = quick_xml::Reader::from_reader(body);
-    reader.config_mut().trim_text(true);
+    reader.config_mut().trim_text(false);
     let mut buffer = Vec::new();
     let mut out: Vec<Property> = Vec::new();
     let mut current = Property::default();
     let mut field: Option<Field> = None;
+    let mut value = String::new();
     let mut depth_in_response = false;
 
     loop {
@@ -204,10 +209,20 @@ fn parse_multistatus(body: &[u8]) -> VfsResult<Vec<Property>> {
                 }
                 b"href" if depth_in_response && current.href.is_empty() => {
                     field = Some(Field::Href);
+                    value.clear();
                 }
-                b"getcontentlength" => field = Some(Field::Length),
-                b"getlastmodified" => field = Some(Field::Modified),
-                b"creationdate" => field = Some(Field::Created),
+                b"getcontentlength" => {
+                    field = Some(Field::Length);
+                    value.clear();
+                }
+                b"getlastmodified" => {
+                    field = Some(Field::Modified);
+                    value.clear();
+                }
+                b"creationdate" => {
+                    field = Some(Field::Created);
+                    value.clear();
+                }
                 b"collection" => current.collection = true,
                 _ => {}
             },
@@ -217,20 +232,60 @@ fn parse_multistatus(body: &[u8]) -> VfsResult<Vec<Property>> {
                 }
             }
             Ok(Event::Text(text)) => {
-                let value = String::from_utf8_lossy(text.as_ref()).into_owned();
-                match field {
-                    Some(Field::Href) => current.href = value,
-                    Some(Field::Length) => current.length = value.trim().parse().ok(),
-                    Some(Field::Modified) => {
-                        current.modified = crate::remote::timestamp::parse_http_date(&value);
-                    }
-                    Some(Field::Created) => {
-                        current.created = crate::remote::timestamp::parse_iso8601_utc(&value);
-                    }
-                    None => {}
+                let decoded = reader.decoder().decode(text.as_ref()).map_err(|error| {
+                    VfsError::protocol(format!("the listing contains invalid text: {error}"))
+                })?;
+                let unescaped = quick_xml::escape::unescape(&decoded).map_err(|error| {
+                    VfsError::protocol(format!("the listing contains an invalid entity: {error}"))
+                })?;
+                if field.is_some() {
+                    value.push_str(&unescaped);
+                }
+            }
+            Ok(Event::CData(text)) if field.is_some() => {
+                let decoded = reader.decoder().decode(text.as_ref()).map_err(|error| {
+                    VfsError::protocol(format!("the listing contains invalid text: {error}"))
+                })?;
+                value.push_str(&decoded);
+            }
+            Ok(Event::GeneralRef(reference)) if field.is_some() => {
+                let decoded = reference.decode().map_err(|error| {
+                    VfsError::protocol(format!("the listing contains an invalid entity: {error}"))
+                })?;
+                if let Some(character) = reference.resolve_char_ref().map_err(|error| {
+                    VfsError::protocol(format!(
+                        "the listing contains an invalid character reference: {error}"
+                    ))
+                })? {
+                    value.push(character);
+                } else if let Some(replacement) =
+                    quick_xml::escape::resolve_predefined_entity(&decoded)
+                {
+                    value.push_str(replacement);
+                } else {
+                    return Err(VfsError::protocol(
+                        "the listing contains an unknown entity".to_owned(),
+                    ));
                 }
             }
             Ok(Event::End(end)) => {
+                match (local_name(end.name().as_ref()), field) {
+                    (b"href", Some(Field::Href)) => {
+                        std::mem::take(&mut value)
+                            .trim()
+                            .clone_into(&mut current.href);
+                    }
+                    (b"getcontentlength", Some(Field::Length)) => {
+                        current.length = value.trim().parse().ok();
+                    }
+                    (b"getlastmodified", Some(Field::Modified)) => {
+                        current.modified = crate::remote::timestamp::parse_http_date(value.trim());
+                    }
+                    (b"creationdate", Some(Field::Created)) => {
+                        current.created = crate::remote::timestamp::parse_iso8601_utc(value.trim());
+                    }
+                    _ => {}
+                }
                 if local_name(end.name().as_ref()) == b"response" {
                     depth_in_response = false;
                     if !current.href.is_empty() {
@@ -283,6 +338,27 @@ fn belongs_to(href: &str, base: &Url) -> bool {
         return true;
     }
     Url::parse(href).is_ok_and(|target| target.origin() == base.origin())
+}
+
+/// True when a DAV response names the requested resource itself.
+fn same_resource(href: &str, requested: &Url) -> bool {
+    let href_path = if href.contains("://") {
+        let Ok(target) = Url::parse(href) else {
+            return false;
+        };
+        target.path
+    } else {
+        href.to_owned()
+    };
+    path_segments(&href_path) == path_segments(&requested.path)
+}
+
+/// Decode URI path segments separately so escaped slashes remain in their
+/// original segment while percent-encoded names compare with request paths.
+fn path_segments(path: &str) -> Vec<String> {
+    let path = path.split(['?', '#']).next().unwrap_or(path);
+    let path = path.trim_end_matches('/');
+    path.split('/').map(decode_component).collect()
 }
 
 /// The last component of an address, decoded.
@@ -342,7 +418,7 @@ impl FileSystem for WebDavFs {
         let found = self.propfind(dir, "1", cancel)?;
         let mut out = Vec::new();
         let mut taken = crate::remote::ListedNames::default();
-        let self_name = dir.name().map(str::to_owned);
+        let requested = self.url(dir);
         for item in found {
             cancel.check()?;
             // An address naming another server describes nothing in this
@@ -354,7 +430,7 @@ impl FileSystem for WebDavFs {
                 continue;
             };
             // The reply repeats the folder that was asked about.
-            if Some(&raw) == self_name.as_ref() && item.collection {
+            if item.collection && same_resource(&item.href, &requested) {
                 continue;
             }
             let mut reason = None;
@@ -623,6 +699,13 @@ mod tests {
         assert!(!second.collection);
         assert_eq!(second.length, Some(1234));
         assert_eq!(href_name(&second.href).as_deref(), Some("report one.txt"));
+    }
+
+    #[test]
+    fn an_href_keeps_text_split_by_cdata() {
+        let body = br#"<D:multistatus xmlns:D="DAV:"><D:response><D:href>/share/tom<![CDATA[&]]>jerry.txt</D:href></D:response></D:multistatus>"#;
+        let found = parse_multistatus(body).unwrap();
+        assert_eq!(found[0].href, "/share/tom&jerry.txt");
     }
 
     #[test]
