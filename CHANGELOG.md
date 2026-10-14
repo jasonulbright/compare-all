@@ -1,3 +1,39 @@
+# v2026.10.14.0005
+
+## Merge takes restore selected input consistently after joined-line edits
+
+### Fixes
+
+- Restore explicitly taken merge sections consistently in either take order.
+- Keep joined text once after reloads and line takes.
+- Preserve unresolved conflicts when a line take makes no text change.
+- Keep merge output and saved bytes in sync after removing a joined separator.
+- Preserve a replaced file's access list, named streams, creation time, and Hidden and System flags on Windows.
+- Preserve file permissions during copies, replacements and backups on Linux and macOS.
+- Replace a Windows file link with the copied file while leaving the link's target intact.
+- Open folders and select other items in the system file manager; show macOS packages from the inside and report missing items.
+- Handle file names beginning with a hyphen in Open With.
+- Sweep only temporary copy folders created by the application.
+
+### Security
+
+- Set backup access before writing its content, and refuse a backup when the required access cannot be preserved.
+- Keep operation journals and their folder private to the current user on Linux and macOS.
+- Hide URL passwords in script logs and errors.
+- Validate RAR archive signatures before opening entries.
+- Limit 7z decoding to 256 MiB per coder, 272 MiB per block and 32 nested coders.
+- Copy archive entries with Windows device names out under valid file names.
+- Use the trusted Subversion executable for remote sessions.
+
+### Changes
+
+- Ask before permanent deletion on shares and removable drives; report when a location has no recycle bin.
+- Refuse ambiguous Windows write names and renames that name another folder.
+- Refuse Windows backups when the destination cannot keep the file's access list or the account cannot finish the backup.
+- Refuse a Windows backup when a conditional access entry cannot be reproduced safely.
+- Give the owner the write bit when clearing read-only on Linux and macOS.
+- Name the item, operation, cause and available remedies when a local write or backup is refused.
+
 # v2026.10.04.0004
 
 ## Text Compare copies after an edit: 0 text errors in 1600 random test sequences
