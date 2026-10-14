@@ -27,6 +27,40 @@ pub struct SshTestServer {
 impl SshTestServer {
     /// Start a server over `root` that accepts one account.
     pub fn start(root: &Path, username: &str, password: &str) -> Self {
+        Self::start_with_rename_refusal(root, username, password, false)
+    }
+
+    /// Start a server that refuses every rename request.
+    pub fn start_refusing_renames(root: &Path, username: &str, password: &str) -> Self {
+        Self::start_with_rename_refusal(root, username, password, true)
+    }
+
+    /// Start a server that refuses one numbered rename request.
+    pub fn start_failing_rename_number(
+        root: &Path,
+        username: &str,
+        password: &str,
+        number: usize,
+    ) -> Self {
+        Self::start_with_rename_behavior(root, username, password, false, Some(number))
+    }
+
+    fn start_with_rename_refusal(
+        root: &Path,
+        username: &str,
+        password: &str,
+        refuse_renames: bool,
+    ) -> Self {
+        Self::start_with_rename_behavior(root, username, password, refuse_renames, None)
+    }
+
+    fn start_with_rename_behavior(
+        root: &Path,
+        username: &str,
+        password: &str,
+        refuse_renames: bool,
+        fail_rename_number: Option<usize>,
+    ) -> Self {
         let key = PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)
             .expect("a key can be generated");
         let public = key.public_key().clone();
@@ -59,6 +93,8 @@ impl SshTestServer {
                         root,
                         username,
                         password,
+                        refuse_renames,
+                        fail_rename_number,
                     };
                     loop {
                         if stop.raised() {
@@ -111,6 +147,8 @@ struct Server {
     root: PathBuf,
     username: String,
     password: String,
+    refuse_renames: bool,
+    fail_rename_number: Option<usize>,
 }
 
 impl russh::server::Server for Server {
@@ -121,6 +159,8 @@ impl russh::server::Server for Server {
             root: self.root.clone(),
             username: self.username.clone(),
             password: self.password.clone(),
+            refuse_renames: self.refuse_renames,
+            fail_rename_number: self.fail_rename_number,
             channels: HashMap::new(),
         }
     }
@@ -131,6 +171,8 @@ struct SshHandler {
     root: PathBuf,
     username: String,
     password: String,
+    refuse_renames: bool,
+    fail_rename_number: Option<usize>,
     channels: HashMap<ChannelId, Channel<Msg>>,
 }
 
@@ -184,7 +226,11 @@ impl russh::server::Handler for SshHandler {
             return Ok(());
         };
         session.channel_success(channel_id)?;
-        let handler = SftpHandler::new(self.root.clone());
+        let handler = SftpHandler::new(
+            self.root.clone(),
+            self.refuse_renames,
+            self.fail_rename_number,
+        );
         tokio::spawn(async move {
             russh_sftp::server::run(channel.into_stream(), handler).await;
         });
@@ -195,6 +241,9 @@ impl russh::server::Handler for SshHandler {
 /// The transfer subsystem, serving one folder.
 struct SftpHandler {
     root: PathBuf,
+    refuse_renames: bool,
+    fail_rename_number: Option<usize>,
+    rename_attempts: usize,
     version: Option<u32>,
     /// Open files and folders, keyed by the handle the client is given.
     files: HashMap<String, PathBuf>,
@@ -203,9 +252,12 @@ struct SftpHandler {
 }
 
 impl SftpHandler {
-    fn new(root: PathBuf) -> Self {
+    fn new(root: PathBuf, refuse_renames: bool, fail_rename_number: Option<usize>) -> Self {
         Self {
             root,
+            refuse_renames,
+            fail_rename_number,
+            rename_attempts: 0,
             version: None,
             files: HashMap::new(),
             directories: HashMap::new(),
@@ -483,6 +535,10 @@ impl russh_sftp::server::Handler for SftpHandler {
         oldpath: String,
         newpath: String,
     ) -> Result<Status, Self::Error> {
+        self.rename_attempts += 1;
+        if self.refuse_renames || self.fail_rename_number == Some(self.rename_attempts) {
+            return Err(StatusCode::PermissionDenied);
+        }
         let source = self.resolve(&oldpath).ok_or(StatusCode::PermissionDenied)?;
         let target = self.resolve(&newpath).ok_or(StatusCode::PermissionDenied)?;
         std::fs::rename(source, target).map_err(|_| StatusCode::Failure)?;

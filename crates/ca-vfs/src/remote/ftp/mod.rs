@@ -398,7 +398,13 @@ impl FtpFs {
         let reader = LimitedReader::new(
             Download {
                 channel,
-                _session: session,
+                session,
+                expected: (self.settings.transfer.transfer_type != TransferType::Ascii)
+                    .then_some(length)
+                    .flatten(),
+                bytes_read: 0,
+                finalized: false,
+                reply_timeout: self.context.call_timeout,
             },
             0,
             self.context.limits,
@@ -468,12 +474,56 @@ fn size_of(session: &mut Session, remote: &str) -> Option<u64> {
 /// A read that owns the connection it came from.
 struct Download {
     channel: Channel,
-    _session: Session,
+    session: Session,
+    expected: Option<u64>,
+    bytes_read: u64,
+    finalized: bool,
+    reply_timeout: Duration,
 }
 
 impl Read for Download {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.channel.read(buf)
+        if self.finalized || buf.is_empty() {
+            return Ok(0);
+        }
+        let read = self.channel.read(buf)?;
+        if read > 0 {
+            self.bytes_read = self
+                .bytes_read
+                .checked_add(read as u64)
+                .ok_or_else(|| std::io::Error::other("the transfer size overflowed"))?;
+            if self
+                .expected
+                .is_some_and(|expected| self.bytes_read > expected)
+            {
+                return Err(std::io::Error::other(
+                    "the server sent more bytes than the transfer size stated",
+                ));
+            }
+            return Ok(read);
+        }
+
+        self.finalized = true;
+        self.session
+            .set_deadline(crate::remote::net::Deadline::after(self.reply_timeout));
+        let reply = self.session.read_reply().map_err(crate::limits::carry)?;
+        if !(200..300).contains(&reply.code) {
+            return Err(std::io::Error::other(format!(
+                "the server refused the completed transfer with reply {}",
+                reply.code
+            )));
+        }
+        if self
+            .expected
+            .is_some_and(|expected| self.bytes_read != expected)
+        {
+            return Err(std::io::Error::other(format!(
+                "the server sent {} bytes for a transfer that stated {} bytes",
+                self.bytes_read,
+                self.expected.unwrap_or_default()
+            )));
+        }
+        Ok(0)
     }
 }
 

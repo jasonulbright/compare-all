@@ -205,6 +205,14 @@ pub enum VfsError {
         /// Fingerprint the server offered.
         offered: String,
     },
+    /// The server offered a key explicitly revoked by the known-hosts file.
+    #[error("host key for {host} is revoked: {fingerprint}")]
+    HostKeyRevoked {
+        /// Host and port the key was offered for.
+        host: String,
+        /// Fingerprint of the revoked key.
+        fingerprint: String,
+    },
     /// The server's reply does not follow the protocol.
     #[error("protocol error: {detail}")]
     Protocol {

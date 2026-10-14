@@ -193,6 +193,90 @@ fn a_write_reads_back_and_leaves_no_temporary_name() {
 }
 
 #[test]
+fn a_refused_replacement_rename_preserves_the_existing_file_and_reports_permission() {
+    let directory = fixture();
+    let settings_dir = tempfile::tempdir().unwrap();
+    let server = SshTestServer::start_refusing_renames(directory.path(), "operator", "hunter2");
+    let store = KnownHosts::new(settings_dir.path().join("known_hosts"));
+    store
+        .record(
+            "127.0.0.1",
+            server.port(),
+            &server.host_key_type,
+            &server.host_key,
+        )
+        .unwrap();
+    let settings = profile(&server, &settings_dir.path().join("known_hosts"));
+    let fs = SftpFs::connect(&settings, &context(), &Cancel::new()).unwrap();
+
+    let error = fs
+        .write_file(
+            &VfsPath::parse("report.txt").unwrap(),
+            &mut b"replacement".as_slice(),
+            &Cancel::new(),
+        )
+        .unwrap_err();
+
+    assert!(
+        matches!(
+            error,
+            VfsError::Io(ref io_error) if io_error.kind() == std::io::ErrorKind::PermissionDenied
+        ),
+        "{error}"
+    );
+    assert_eq!(
+        std::fs::read(directory.path().join("report.txt")).unwrap(),
+        b"hello remote world"
+    );
+}
+
+#[test]
+fn a_failed_staged_rename_restores_the_file_moved_to_backup() {
+    let directory = fixture();
+    let settings_dir = tempfile::tempdir().unwrap();
+    let server =
+        SshTestServer::start_failing_rename_number(directory.path(), "operator", "hunter2", 2);
+    let store = KnownHosts::new(settings_dir.path().join("known_hosts"));
+    store
+        .record(
+            "127.0.0.1",
+            server.port(),
+            &server.host_key_type,
+            &server.host_key,
+        )
+        .unwrap();
+    let settings = profile(&server, &settings_dir.path().join("known_hosts"));
+    let fs = SftpFs::connect(&settings, &context(), &Cancel::new()).unwrap();
+
+    let error = fs
+        .write_file(
+            &VfsPath::parse("report.txt").unwrap(),
+            &mut b"replacement".as_slice(),
+            &Cancel::new(),
+        )
+        .unwrap_err();
+
+    assert!(
+        matches!(
+            error,
+            VfsError::Io(ref io_error) if io_error.kind() == std::io::ErrorKind::PermissionDenied
+        ),
+        "{error}"
+    );
+    assert_eq!(
+        std::fs::read(directory.path().join("report.txt")).unwrap(),
+        b"hello remote world"
+    );
+    assert!(!std::fs::read_dir(directory.path())
+        .unwrap()
+        .flatten()
+        .any(|entry| entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".ca-upload-")));
+}
+
+#[test]
 fn an_interrupted_write_leaves_the_old_file_untouched() {
     let (directory, _settings, _server, fs) = connected();
     let path = VfsPath::parse("report.txt").unwrap();

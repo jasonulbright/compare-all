@@ -575,8 +575,11 @@ fn map_error(operation: &str, error: &russh_sftp::client::error::Error) -> VfsEr
     if lowered.contains("no such file") {
         return VfsError::protocol(format!("{operation} found nothing"));
     }
-    if lowered.contains("permission") {
-        return VfsError::auth_failed(format!("{operation} was refused: {text}"));
+    if lowered.contains("permission") || lowered.contains("denied") {
+        return VfsError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("{operation} was refused: {text}"),
+        ));
     }
     VfsError::protocol(format!("{operation} failed: {text}"))
 }
@@ -701,7 +704,12 @@ impl FileSystem for SftpFs {
         let attributes = self
             .core
             .run("stat", self.core.session.metadata(self.remote(path)))
-            .map_err(|_| VfsError::NotFound { path: path.clone() })?;
+            .map_err(|error| match error {
+                VfsError::Protocol { ref detail } if detail.contains("found nothing") => {
+                    VfsError::NotFound { path: path.clone() }
+                }
+                other => other,
+            })?;
         let name = path.name().unwrap_or_default().to_owned();
         Ok(to_entry(path.clone(), &name, &attributes))
     }
@@ -762,14 +770,74 @@ impl FileSystem for SftpFs {
             return Err(error);
         }
         let final_remote = self.remote(path);
-        let _ = self.core.run(
-            "delete",
-            self.core.session.remove_file(final_remote.clone()),
-        );
-        self.core.run(
+        let old_entry = match self.metadata(path) {
+            Ok(entry) if entry.is_dir() => {
+                let _ = self
+                    .core
+                    .run("delete", self.core.session.remove_file(remote_staging));
+                return Err(VfsError::IsADirectory { path: path.clone() });
+            }
+            Ok(_) => true,
+            Err(VfsError::NotFound { .. }) => false,
+            Err(error) => {
+                let _ = self
+                    .core
+                    .run("delete", self.core.session.remove_file(remote_staging));
+                return Err(error);
+            }
+        };
+        let backup = if old_entry {
+            let backup_path = parent.join(&temporary_name(name, nonce()))?;
+            Some(self.remote(&backup_path))
+        } else {
+            None
+        };
+        if let Some(backup) = &backup {
+            if let Err(error) = self.core.run(
+                "move old file aside",
+                self.core
+                    .session
+                    .rename(final_remote.clone(), backup.clone()),
+            ) {
+                let _ = self
+                    .core
+                    .run("delete", self.core.session.remove_file(remote_staging));
+                return Err(error);
+            }
+        }
+        if let Err(error) = self.core.run(
             "rename",
-            self.core.session.rename(remote_staging, final_remote),
-        )
+            self.core
+                .session
+                .rename(remote_staging.clone(), final_remote.clone()),
+        ) {
+            if let Some(backup) = backup {
+                if let Err(restore_error) = self.core.run(
+                    "restore old file",
+                    self.core
+                        .session
+                        .rename(backup.clone(), final_remote.clone()),
+                ) {
+                    let _ = self
+                        .core
+                        .run("delete", self.core.session.remove_file(remote_staging));
+                    return Err(VfsError::protocol(format!(
+                        "the replacement failed and the previous file could not be restored; it remains at {backup}: {restore_error}"
+                    )));
+                }
+            }
+            let _ = self
+                .core
+                .run("delete", self.core.session.remove_file(remote_staging));
+            return Err(error);
+        }
+        if let Some(backup) = backup {
+            self.core.run(
+                "delete old file backup",
+                self.core.session.remove_file(backup),
+            )?;
+        }
+        Ok(())
     }
 
     fn delete(&self, path: &VfsPath, cancel: &Cancel) -> VfsResult<()> {

@@ -212,6 +212,20 @@ fn a_chunk_that_does_not_end_with_a_line_ending_is_refused() {
 }
 
 #[test]
+fn a_chunk_ending_before_its_declared_length_is_refused() {
+    let server = RawServer::start(
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n10\r\nabcd".to_vec(),
+    );
+    let url = Url::parse(&server.url()).unwrap();
+    let mut response = plain_client()
+        .send("GET", &url, &[], RequestBody::Empty, &Cancel::new())
+        .unwrap();
+    let mut buffer = Vec::new();
+    assert!(response.body.read_to_end(&mut buffer).is_err());
+    assert_eq!(buffer, b"abcd");
+}
+
+#[test]
 fn a_reply_that_never_ends_its_headers_is_refused() {
     let mut reply = b"HTTP/1.1 200 OK\r\n".to_vec();
     for index in 0..400 {
@@ -1095,6 +1109,26 @@ fn a_marker_line_or_a_pattern_never_stands_for_a_host() {
         .verify("example.test", 22, "ssh-ed25519", b"key")
         .unwrap_err();
     assert!(matches!(error, VfsError::UnknownHostKey { .. }), "{error}");
+}
+
+#[test]
+fn a_revoked_key_is_rejected_even_when_a_normal_entry_accepts_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("known_hosts");
+    std::fs::write(
+        &path,
+        "@revoked * ssh-ed25519 c2FtZS1rZXk=\nexample.test ssh-ed25519 c2FtZS1rZXk=\n",
+    )
+    .unwrap();
+    let error = KnownHosts::new(&path)
+        .verify("example.test", 22, "ssh-ed25519", b"same-key")
+        .unwrap_err();
+    assert!(!matches!(error, VfsError::UnknownHostKey { .. }), "{error}");
+    assert!(
+        error.to_string().to_lowercase().contains("revoked"),
+        "{error}"
+    );
+    assert!(!error.needs_host_key());
 }
 
 // ------------------------------------------------------------------ transport

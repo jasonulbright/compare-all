@@ -132,11 +132,19 @@ impl KnownHosts {
     /// # Errors
     /// Returns [`VfsError::Io`] when the file exists and cannot be read.
     pub fn entries(&self) -> VfsResult<Vec<KnownHostEntry>> {
-        let text = match fs::read_to_string(&self.path) {
-            Ok(text) => text,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(error) => return Err(VfsError::Io(error)),
-        };
+        let text = self.read_text()?;
+        Ok(Self::parse_entries(&text))
+    }
+
+    fn read_text(&self) -> VfsResult<String> {
+        match fs::read_to_string(&self.path) {
+            Ok(text) => Ok(text),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+            Err(error) => Err(VfsError::Io(error)),
+        }
+    }
+
+    fn parse_entries(text: &str) -> Vec<KnownHostEntry> {
         let mut out = Vec::new();
         for line in text.lines() {
             let line = line.trim();
@@ -171,7 +179,7 @@ impl KnownHosts {
                 key: key.to_owned(),
             });
         }
-        Ok(out)
+        out
     }
 
     /// Check an offered key against the store.
@@ -182,7 +190,14 @@ impl KnownHosts {
     pub fn verify(&self, host: &str, port: u16, key_type: &str, key: &[u8]) -> VfsResult<()> {
         let label = host_label(host, port);
         let offered = base64::engine::general_purpose::STANDARD.encode(key);
-        let entries = self.entries()?;
+        let text = self.read_text()?;
+        if revoked_key_matches(&text, &label, &offered) {
+            return Err(VfsError::HostKeyRevoked {
+                host: label,
+                fingerprint: ssh_fingerprint(key),
+            });
+        }
+        let entries = Self::parse_entries(&text);
         let mut recorded: Option<String> = None;
         for entry in entries {
             if !entry.matches_host(&label) {
@@ -257,6 +272,71 @@ impl KnownHosts {
         ca_io::write_atomic_private(&self.path, text.as_bytes())?;
         Ok(())
     }
+}
+
+/// True when a matching `@revoked` line names the offered key.
+fn revoked_key_matches(text: &str, label: &str, offered: &str) -> bool {
+    text.lines().any(|line| {
+        let mut fields = line.split_whitespace();
+        matches!(fields.next(), Some("@revoked"))
+            && fields
+                .next()
+                .is_some_and(|patterns| host_list_matches(patterns, label))
+            && fields.next().is_some()
+            && fields.next().is_some_and(|key| key == offered)
+    })
+}
+
+/// Match a known-hosts comma-separated list of host patterns.
+fn host_list_matches(patterns: &str, label: &str) -> bool {
+    let mut positive_match = false;
+    for pattern in patterns.split(',') {
+        if let Some(negated) = pattern.strip_prefix('!') {
+            if host_pattern_matches(negated, label) {
+                return false;
+            }
+        } else if host_pattern_matches(pattern, label) {
+            positive_match = true;
+        }
+    }
+    positive_match
+}
+
+/// Match a clear or hashed known-hosts host field.
+fn host_pattern_matches(pattern: &str, label: &str) -> bool {
+    if let Some((salt, digest)) = hashed_parts(pattern) {
+        return hash_host(&salt, label) == digest;
+    }
+    glob_matches(pattern.as_bytes(), label.as_bytes())
+}
+
+/// Match the `*` and `?` wildcards used by known-hosts host patterns.
+fn glob_matches(pattern: &[u8], value: &[u8]) -> bool {
+    let (mut pattern_index, mut value_index) = (0, 0);
+    let (mut star, mut retry) = (None, 0);
+    while value_index < value.len() {
+        if pattern
+            .get(pattern_index)
+            .is_some_and(|byte| *byte == b'?' || byte.eq_ignore_ascii_case(&value[value_index]))
+        {
+            pattern_index += 1;
+            value_index += 1;
+        } else if pattern.get(pattern_index) == Some(&b'*') {
+            star = Some(pattern_index);
+            pattern_index += 1;
+            retry = value_index;
+        } else if let Some(star_index) = star {
+            pattern_index = star_index + 1;
+            retry += 1;
+            value_index = retry;
+        } else {
+            return false;
+        }
+    }
+    while pattern.get(pattern_index) == Some(&b'*') {
+        pattern_index += 1;
+    }
+    pattern_index == pattern.len()
 }
 
 #[cfg(test)]

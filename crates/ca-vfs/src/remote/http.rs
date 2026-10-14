@@ -325,8 +325,10 @@ impl Read for ResponseBody {
             };
             let read = self.transport.read(slice)?;
             if read == 0 {
-                self.done = true;
-                return Ok(0);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "the server closed a chunk before sending its declared length",
+                ));
             }
             self.chunk_left -= read as u64;
             if self.chunk_left == 0 {

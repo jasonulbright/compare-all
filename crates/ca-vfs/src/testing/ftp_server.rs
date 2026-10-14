@@ -32,6 +32,8 @@ pub struct Options {
     pub slow_transfer: Option<Duration>,
     /// Accept an upload and then close the data channel part way.
     pub break_uploads: bool,
+    /// Send only this many bytes of each download before refusing the transfer.
+    pub truncate_downloads: Option<usize>,
     /// Accept the connection and never answer.
     pub silent: bool,
     /// Refuse a data connection whose handshake does not resume a session.
@@ -408,14 +410,20 @@ fn serve(
                     .min(content.len());
                 session.restart = 0;
                 reply(&mut channel, "150 opening data channel")?;
-                send_data(
-                    &mut session,
-                    content.get(offset..).unwrap_or_default(),
-                    &config,
-                    options,
-                    stop,
-                )?;
-                reply(&mut channel, "226 transfer complete")?;
+                let transfer = content.get(offset..).unwrap_or_default();
+                let truncated = options
+                    .truncate_downloads
+                    .is_some_and(|limit| limit < transfer.len());
+                let transfer = options
+                    .truncate_downloads
+                    .and_then(|limit| transfer.get(..limit))
+                    .unwrap_or(transfer);
+                send_data(&mut session, transfer, &config, options, stop)?;
+                if truncated {
+                    reply(&mut channel, "426 transfer failed")?;
+                } else {
+                    reply(&mut channel, "226 transfer complete")?;
+                }
             }
             "STOR" => {
                 let target = resolve(&session, argument);
