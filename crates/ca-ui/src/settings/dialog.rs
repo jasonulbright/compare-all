@@ -332,13 +332,12 @@ impl SettingsDialog {
                 // The control still shows the stored value, so the page reads
                 // the same either way, but it takes no edit: a field no engine
                 // reads must never look as though it changed something.
-                let shown = ui.add_enabled_ui(false, |ui| {
-                    control(ui, field, &value);
+                let _ = ui.add_enabled_ui(false, |ui| {
+                    control(ui, field, &value, Some(reason));
                 });
-                let _ = crate::widgets::disabled_reason(shown.response, reason);
                 return;
             }
-            if let Some(edited) = control(ui, field, &value) {
+            if let Some(edited) = control(ui, field, &value, None) {
                 edits.push((field, edited));
             }
             if overridden && ui.small_button("Reset").clicked() {
@@ -377,112 +376,207 @@ impl SettingsDialog {
 }
 
 /// Draw the control for one field and report a new value when it changed.
-fn control(ui: &mut egui::Ui, field: &Field, value: &FieldValue) -> Option<FieldValue> {
-    let width = CONTROL_WIDTH.min(ui.available_width().max(60.0));
+fn control(
+    ui: &mut egui::Ui,
+    field: &Field,
+    value: &FieldValue,
+    reason: Option<&str>,
+) -> Option<FieldValue> {
     match (field.shape, value) {
-        (FieldShape::Flag, FieldValue::Flag(on)) => {
-            let mut on = *on;
-            if ui.checkbox(&mut on, "").changed() {
-                return Some(FieldValue::Flag(on));
-            }
-        }
-        (FieldShape::Count, FieldValue::Count(number)) => {
-            let mut number = *number;
-            let changed = crate::widgets::sized(ui, width, |ui| {
-                ui.add(egui::DragValue::new(&mut number).range(0..=field.limit))
-                    .changed()
-            });
-            if changed {
-                return Some(FieldValue::Count(number));
-            }
-        }
+        (FieldShape::Flag, FieldValue::Flag(on)) => control_flag(ui, field, *on, reason),
+        (FieldShape::Count, FieldValue::Count(number)) => control_count(ui, field, *number, reason),
         (FieldShape::Signed, FieldValue::Signed(number)) => {
-            let mut number = *number;
-            let changed = crate::widgets::sized(ui, width, |ui| {
-                ui.add(egui::DragValue::new(&mut number)).changed()
-            });
-            if changed {
-                return Some(FieldValue::Signed(number));
-            }
+            control_signed(ui, field, *number, reason)
         }
         (FieldShape::Decimal, FieldValue::Decimal(number)) => {
-            let mut number = *number;
-            let changed = crate::widgets::sized(ui, width, |ui| {
-                ui.add(egui::DragValue::new(&mut number).speed(0.01))
-                    .changed()
-            });
-            if changed {
-                return Some(FieldValue::Decimal(number));
-            }
+            control_decimal(ui, field, *number, reason)
         }
         (FieldShape::Text | FieldShape::Path, FieldValue::Text(text)) => {
-            let mut text = text.clone();
-            let changed = crate::widgets::sized(ui, width, |ui| {
-                ui.add(egui::TextEdit::singleline(&mut text).desired_width(width))
-                    .changed()
-            });
-            if changed {
-                return Some(FieldValue::Text(text));
-            }
+            control_text(ui, field, text, reason)
         }
-        (FieldShape::Choice, FieldValue::Choice(id)) => {
-            let mut chosen = id.clone();
-            let label = field
-                .choices
-                .iter()
-                .find(|choice| choice.id == id)
-                .map_or(id.as_str(), |choice| choice.label);
-            crate::widgets::sized(ui, width, |ui| {
-                egui::ComboBox::from_id_salt(ui.id().with(field.key))
-                    .selected_text(label)
-                    .show_ui(ui, |ui| {
-                        for choice in field.choices {
-                            ui.selectable_value(&mut chosen, choice.id.to_owned(), choice.label);
-                        }
-                    });
-            });
-            if &chosen != id {
-                return Some(FieldValue::Choice(chosen));
-            }
-        }
-        (FieldShape::Lines, FieldValue::Lines(lines)) => {
-            let mut text = lines.join("\n");
-            let changed = crate::widgets::sized(ui, width, |ui| {
-                ui.add(
-                    egui::TextEdit::multiline(&mut text)
-                        .desired_width(width)
-                        .desired_rows(2),
-                )
-                .changed()
-            });
-            if changed {
-                return Some(FieldValue::Lines(
-                    text.lines()
-                        .map(str::trim)
-                        .filter(|line| !line.is_empty())
-                        .map(str::to_owned)
-                        .collect(),
-                ));
-            }
-        }
+        (FieldShape::Choice, FieldValue::Choice(id)) => control_choice(ui, field, id, reason),
+        (FieldShape::Lines, FieldValue::Lines(lines)) => control_lines(ui, field, lines, reason),
         (FieldShape::Replacements, FieldValue::Replacements(items)) => {
-            return replacement_table(ui, field, items);
+            replacement_table(ui, field, items, reason)
         }
-        (FieldShape::Columns, FieldValue::Columns(items)) => {
-            return column_table(ui, items);
-        }
+        (FieldShape::Columns, FieldValue::Columns(items)) => column_table(ui, items, reason),
         _ => {
-            ui.label(value.display());
+            let response = ui.label(value.display());
+            describe_field_control(response, field.label, egui::WidgetType::Label, reason);
+            None
         }
     }
-    None
+}
+
+fn field_control_width(ui: &egui::Ui) -> f32 {
+    CONTROL_WIDTH.min(ui.available_width().max(60.0))
+}
+
+fn control_flag(
+    ui: &mut egui::Ui,
+    field: &Field,
+    selected: bool,
+    reason: Option<&str>,
+) -> Option<FieldValue> {
+    let mut selected = selected;
+    let response = ui.checkbox(&mut selected, "");
+    let changed = response.changed();
+    describe_field_checkbox(response, field.label, selected, reason);
+    changed.then_some(FieldValue::Flag(selected))
+}
+
+fn control_count(
+    ui: &mut egui::Ui,
+    field: &Field,
+    number: u64,
+    reason: Option<&str>,
+) -> Option<FieldValue> {
+    let mut number = number;
+    let response = crate::widgets::sized(ui, field_control_width(ui), |ui| {
+        ui.add(egui::DragValue::new(&mut number).range(0..=field.limit))
+    });
+    let changed = response.changed();
+    describe_field_control(response, field.label, egui::WidgetType::DragValue, reason);
+    changed.then_some(FieldValue::Count(number))
+}
+
+fn control_signed(
+    ui: &mut egui::Ui,
+    field: &Field,
+    number: i64,
+    reason: Option<&str>,
+) -> Option<FieldValue> {
+    let mut number = number;
+    let response = crate::widgets::sized(ui, field_control_width(ui), |ui| {
+        ui.add(egui::DragValue::new(&mut number))
+    });
+    let changed = response.changed();
+    describe_field_control(response, field.label, egui::WidgetType::DragValue, reason);
+    changed.then_some(FieldValue::Signed(number))
+}
+
+fn control_decimal(
+    ui: &mut egui::Ui,
+    field: &Field,
+    number: f64,
+    reason: Option<&str>,
+) -> Option<FieldValue> {
+    let mut number = number;
+    let response = crate::widgets::sized(ui, field_control_width(ui), |ui| {
+        ui.add(egui::DragValue::new(&mut number).speed(0.01))
+    });
+    let changed = response.changed();
+    describe_field_control(response, field.label, egui::WidgetType::DragValue, reason);
+    changed.then_some(FieldValue::Decimal(number))
+}
+
+fn control_text(
+    ui: &mut egui::Ui,
+    field: &Field,
+    value: &str,
+    reason: Option<&str>,
+) -> Option<FieldValue> {
+    let width = field_control_width(ui);
+    let mut text = value.to_owned();
+    let response = crate::widgets::sized(ui, width, |ui| {
+        ui.add(egui::TextEdit::singleline(&mut text).desired_width(width))
+    });
+    let changed = response.changed();
+    describe_field_control(response, field.label, egui::WidgetType::TextEdit, reason);
+    changed.then_some(FieldValue::Text(text))
+}
+
+fn control_choice(
+    ui: &mut egui::Ui,
+    field: &Field,
+    id: &str,
+    reason: Option<&str>,
+) -> Option<FieldValue> {
+    let mut chosen = id.to_owned();
+    let label = field
+        .choices
+        .iter()
+        .find(|choice| choice.id == id)
+        .map_or(id, |choice| choice.label);
+    let response = crate::widgets::sized(ui, field_control_width(ui), |ui| {
+        egui::ComboBox::from_id_salt(ui.id().with(field.key))
+            .selected_text(label)
+            .show_ui(ui, |ui| {
+                for choice in field.choices {
+                    ui.selectable_value(&mut chosen, choice.id.to_owned(), choice.label);
+                }
+            })
+            .response
+    });
+    describe_field_control(response, field.label, egui::WidgetType::ComboBox, reason);
+    (chosen != id).then_some(FieldValue::Choice(chosen))
+}
+
+fn control_lines(
+    ui: &mut egui::Ui,
+    field: &Field,
+    lines: &[String],
+    reason: Option<&str>,
+) -> Option<FieldValue> {
+    let width = field_control_width(ui);
+    let mut text = lines.join("\n");
+    let response = crate::widgets::sized(ui, width, |ui| {
+        ui.add(
+            egui::TextEdit::multiline(&mut text)
+                .desired_width(width)
+                .desired_rows(2),
+        )
+    });
+    let changed = response.changed();
+    describe_field_control(response, field.label, egui::WidgetType::TextEdit, reason);
+    changed.then(|| {
+        FieldValue::Lines(
+            text.lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(str::to_owned)
+                .collect(),
+        )
+    })
+}
+
+fn describe_field_control(
+    response: egui::Response,
+    label: &str,
+    widget_type: egui::WidgetType,
+    reason: Option<&str>,
+) {
+    let enabled = response.enabled();
+    response.widget_info(|| egui::WidgetInfo::labeled(widget_type, enabled, label));
+    if let Some(reason) = reason {
+        let _ = crate::widgets::disabled_reason(response, reason);
+    }
+}
+
+fn describe_field_checkbox(
+    response: egui::Response,
+    label: &str,
+    selected: bool,
+    reason: Option<&str>,
+) {
+    let enabled = response.enabled();
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Checkbox, enabled, selected, label)
+    });
+    if let Some(reason) = reason {
+        let _ = crate::widgets::disabled_reason(response, reason);
+    }
 }
 
 /// The per-column table, with one row per treatment and a button that adds one.
 ///
 /// A treatment naming no column states the inherited one, which the engine
 /// leaves out, so a new row starts on the first column rather than on none.
-fn column_table(ui: &mut egui::Ui, items: &[ColumnHandling]) -> Option<FieldValue> {
+fn column_table(
+    ui: &mut egui::Ui,
+    items: &[ColumnHandling],
+    reason: Option<&str>,
+) -> Option<FieldValue> {
     let mut edited = items.to_vec();
     let mut changed = false;
     let mut remove: Option<usize> = None;
@@ -490,29 +584,35 @@ fn column_table(ui: &mut egui::Ui, items: &[ColumnHandling]) -> Option<FieldValu
         for (index, item) in edited.iter_mut().enumerate() {
             ui.horizontal_wrapped(|ui| {
                 let mut column = item.column.unwrap_or_default();
-                changed |= crate::widgets::sized(ui, 80.0, |ui| {
+                let response = crate::widgets::sized(ui, 80.0, |ui| {
                     ui.add(egui::DragValue::new(&mut column).prefix("Column "))
-                        .changed()
                 });
+                changed |= response.changed();
+                describe_unavailable(response, reason);
                 item.column = Some(column);
-                changed |= ui.checkbox(&mut item.key, "Key").changed();
-                changed |= ui.checkbox(&mut item.unimportant, "Unimportant").changed();
-                changed |= ui
-                    .checkbox(&mut item.ignore_character_case, "Case")
-                    .changed();
-                changed |= ui
-                    .checkbox(&mut item.ignore_whitespace, "Whitespace")
-                    .changed();
-                if ui
+                let response = ui.checkbox(&mut item.key, "Key");
+                changed |= response.changed();
+                describe_unavailable(response, reason);
+                let response = ui.checkbox(&mut item.unimportant, "Unimportant");
+                changed |= response.changed();
+                describe_unavailable(response, reason);
+                let response = ui.checkbox(&mut item.ignore_character_case, "Case");
+                changed |= response.changed();
+                describe_unavailable(response, reason);
+                let response = ui.checkbox(&mut item.ignore_whitespace, "Whitespace");
+                changed |= response.changed();
+                describe_unavailable(response, reason);
+                let response = ui
                     .small_button("Remove")
-                    .on_hover_text("Drop this treatment")
-                    .clicked()
-                {
+                    .on_hover_text("Drop this treatment");
+                if response.clicked() {
                     remove = Some(index);
                 }
+                describe_unavailable(response, reason);
             });
         }
-        if ui.button("Add column").clicked() {
+        let response = ui.button("Add column");
+        if response.clicked() {
             edited.push(ColumnHandling {
                 column: Some(0),
                 use_default: false,
@@ -520,6 +620,7 @@ fn column_table(ui: &mut egui::Ui, items: &[ColumnHandling]) -> Option<FieldValu
             });
             changed = true;
         }
+        describe_unavailable(response, reason);
     });
     if let Some(index) = remove {
         edited.remove(index);
@@ -533,6 +634,7 @@ fn replacement_table(
     ui: &mut egui::Ui,
     field: &Field,
     items: &[ReplacementItem],
+    reason: Option<&str>,
 ) -> Option<FieldValue> {
     let mut edited = items.to_vec();
     let mut changed = false;
@@ -541,40 +643,46 @@ fn replacement_table(
         for (index, item) in edited.iter_mut().enumerate() {
             ui.horizontal_wrapped(|ui| {
                 let width = (ui.available_width() * 0.3).clamp(60.0, 200.0);
-                changed |= crate::widgets::sized(ui, width, |ui| {
+                let response = crate::widgets::sized(ui, width, |ui| {
                     ui.add(
                         egui::TextEdit::singleline(&mut item.find)
                             .hint_text("Find")
                             .desired_width(width),
                     )
-                    .changed()
                 });
-                changed |= crate::widgets::sized(ui, width, |ui| {
+                changed |= response.changed();
+                describe_unavailable(response, reason);
+                let response = crate::widgets::sized(ui, width, |ui| {
                     ui.add(
                         egui::TextEdit::singleline(&mut item.replace_with)
                             .hint_text("Replace with")
                             .desired_width(width),
                     )
-                    .changed()
                 });
-                changed |= ui.checkbox(&mut item.match_case, "Case").changed();
-                changed |= ui.checkbox(&mut item.whole_words_only, "Words").changed();
-                changed |= ui
-                    .checkbox(&mut item.regular_expression, "Pattern")
-                    .changed();
-                if ui
-                    .small_button("Remove")
-                    .on_hover_text("Drop this rule")
-                    .clicked()
-                {
+                changed |= response.changed();
+                describe_unavailable(response, reason);
+                let response = ui.checkbox(&mut item.match_case, "Case");
+                changed |= response.changed();
+                describe_unavailable(response, reason);
+                let response = ui.checkbox(&mut item.whole_words_only, "Words");
+                changed |= response.changed();
+                describe_unavailable(response, reason);
+                let response = ui.checkbox(&mut item.regular_expression, "Pattern");
+                changed |= response.changed();
+                describe_unavailable(response, reason);
+                let response = ui.small_button("Remove").on_hover_text("Drop this rule");
+                if response.clicked() {
                     remove = Some(index);
                 }
+                describe_unavailable(response, reason);
             });
         }
-        if ui.button("Add rule").clicked() {
+        let response = ui.button("Add rule");
+        if response.clicked() {
             edited.push(ReplacementItem::default());
             changed = true;
         }
+        describe_unavailable(response, reason);
     });
     if let Some(index) = remove {
         edited.remove(index);
@@ -582,6 +690,12 @@ fn replacement_table(
     }
     let _ = field;
     changed.then_some(FieldValue::Replacements(edited))
+}
+
+fn describe_unavailable(response: egui::Response, reason: Option<&str>) {
+    if let Some(reason) = reason {
+        let _ = crate::widgets::disabled_reason(response, reason);
+    }
 }
 
 #[cfg(test)]
@@ -769,5 +883,36 @@ mod tests {
                 .collect();
             assert_eq!(&drawn, names, "{kind} pages");
         }
+    }
+
+    #[test]
+    fn an_unavailable_reason_is_attached_to_the_disabled_checkbox() {
+        use crate::testing::probe::controls;
+
+        let mut dialog = dialog(SessionKind::FolderSync);
+        dialog.active = dialog
+            .tabs()
+            .iter()
+            .position(|tab| tab.name == "Sync")
+            .unwrap();
+        let field = dialog.tabs()[dialog.active]
+            .fields
+            .iter()
+            .find(|field| field.key == "sync.copy_orphans")
+            .unwrap();
+        let reason = field.unavailable.unwrap();
+        let mut probe = crate::testing::probe::Probe::new(1_280.0, 900.0);
+        let mut draw = |ctx: &egui::Context| {
+            let _ = dialog.show(ctx, &crate::theme::LIGHT);
+        };
+        let output = probe.frame(Vec::new(), &mut draw);
+        let checkbox = controls(&output)
+            .into_iter()
+            .find(|control| control.label == "Copy orphans")
+            .unwrap();
+        assert_eq!(checkbox.role, egui::accesskit::Role::CheckBox);
+        assert!(!checkbox.enabled);
+        assert_eq!(checkbox.toggled, Some(true));
+        assert_eq!(checkbox.description.as_deref(), Some(reason));
     }
 }

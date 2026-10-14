@@ -38,13 +38,21 @@ fn sample() -> Vec<Item> {
         Item::separator("separator-1"),
         Item::widget("slot", 60.0),
         Item::command("swap", Command::SwapSides, "Swap", true, ""),
-        Item::toggle("favor-left", Command::FavorLeft, "Favor Left", true, false),
+        Item::toggle(
+            "favor-left",
+            Command::FavorLeft,
+            "Favor Left",
+            true,
+            false,
+            "",
+        ),
         Item::toggle(
             "favor-right",
             Command::FavorRight,
             "Favor Right",
             true,
             true,
+            "",
         ),
         Item::command("report", Command::CompareReport, "Report", true, ""),
     ]
@@ -115,7 +123,14 @@ fn a_disabled_item_reports_nothing_on_the_bar_or_in_the_overflow_menu() {
             false,
             "Work is running",
         ),
-        Item::toggle("favor-left", Command::FavorLeft, "Favor Left", false, true),
+        Item::toggle(
+            "favor-left",
+            Command::FavorLeft,
+            "Favor Left",
+            false,
+            true,
+            "Work is running",
+        ),
         Item::command("swap", Command::SwapSides, "Swap", true, ""),
     ];
     for room in [WIDE_ROOM, NARROW_ROOM] {

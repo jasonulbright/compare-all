@@ -442,7 +442,7 @@ fn a_copy_into_a_read_only_pane_names_that_pane() {
 }
 
 #[test]
-fn a_copy_with_editing_off_names_the_read_only_pane_and_a_fixed_view_says_it_is_read_only() {
+fn a_copy_with_editing_off_names_the_session_switch_and_a_fixed_view_says_it_is_read_only() {
     let mut fixture = Fixture::new(COPY_LEFT, COPY_RIGHT);
     let mut settings = fixture.view.session_settings().clone();
     settings.specs.disable_editing = true;
@@ -451,11 +451,11 @@ fn a_copy_with_editing_off_names_the_read_only_pane_and_a_fixed_view_says_it_is_
     assert_no_reason_for_an_accepted_command(&fixture.view, "editing off");
     assert_eq!(
         fixture.view.refusal(Command::CopyToRight),
-        Some(super::RIGHT_READ_ONLY)
+        Some(super::EDITING_OFF)
     );
     assert_eq!(
         fixture.view.refusal(Command::CopyToLeft),
-        Some(super::LEFT_READ_ONLY)
+        Some(super::EDITING_OFF)
     );
 
     fixture.view.locked = true;
@@ -511,6 +511,134 @@ fn a_row_control_shows_the_wait_for_a_comparison_of_unchanged_text_on_hover() {
             described.as_deref(),
             Some(super::NOT_COMPARED_AGAIN),
             "{label}"
+        );
+    }
+}
+
+#[test]
+fn text_copy_controls_are_disabled_when_their_target_pane_is_read_only() {
+    use ca_ui::testing::probe::Probe;
+    use ca_ui::toolbar::Item;
+
+    let mut fixture = Fixture::new("one\nTWO\nthree\n", "one\ntwo\nthree\n");
+    fixture.view.right_pane.set_read_only(true);
+    assert!(!fixture.view.accepts(Command::CopyToOtherSide));
+    assert_eq!(
+        fixture.view.refusal(Command::CopyToOtherSide),
+        Some(super::RIGHT_READ_ONLY)
+    );
+    let copy = fixture
+        .view
+        .toolbar_items()
+        .into_iter()
+        .find_map(|item| match item {
+            Item::Command {
+                name: "copy",
+                enabled,
+                reason,
+                ..
+            } => Some((enabled, reason)),
+            _ => None,
+        })
+        .expect("the Copy toolbar item is listed");
+    assert_eq!(copy, (false, super::RIGHT_READ_ONLY));
+
+    let context = ca_ui::testing::context();
+    let mut probe = Probe::new(2_400.0, 900.0);
+    let view = &mut fixture.view;
+    let mut draw = |ctx: &egui::Context| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            view.ui(ui, &context);
+        });
+    };
+    probe.idle(&mut draw);
+    probe.idle(&mut draw);
+    assert!(
+        !probe
+            .find("Copy")
+            .expect("the Copy button is listed")
+            .enabled
+    );
+    let to_right = probe.find_all("Copy to Right");
+    let to_left = probe.find_all("Copy to Left");
+    assert!(
+        !to_right.is_empty(),
+        "expected a Copy to Right gutter arrow"
+    );
+    assert!(!to_left.is_empty(), "expected a Copy to Left gutter arrow");
+    assert!(to_right.iter().all(|arrow| !arrow.enabled));
+    assert!(to_left.iter().all(|arrow| arrow.enabled));
+}
+
+#[test]
+fn read_only_text_copy_controls_refuse_accessible_clicks() {
+    use ca_ui::testing::probe::Probe;
+
+    let mut fixture = Fixture::new("one\nTWO\nthree\n", "one\ntwo\nthree\n");
+    fixture.view.right_pane.set_read_only(true);
+    let before = fixture.text(Side::Right);
+    let mut probe = Probe::new(2_400.0, 900.0);
+    let context = ca_ui::testing::context();
+    {
+        let view = &mut fixture.view;
+        let mut draw = |ctx: &egui::Context| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                view.ui(ui, &context);
+            });
+        };
+        probe.idle(&mut draw);
+        probe.idle(&mut draw);
+
+        let copy = probe
+            .click("Copy", &mut draw)
+            .expect("the Copy button is listed");
+        assert!(!copy.enabled);
+
+        let arrows = probe.find_all("Copy to Right");
+        assert!(!arrows.is_empty(), "the read-only gutter arrows are drawn");
+        assert!(arrows.iter().all(|arrow| !arrow.enabled));
+        for arrow in arrows {
+            probe.press_at(arrow.rect.center(), &mut draw);
+        }
+    }
+    assert_eq!(fixture.text(Side::Right), before);
+}
+
+#[test]
+fn disabled_text_edit_commands_explain_loading_and_read_only_states() {
+    let mut fixture = Fixture::new("one\nTWO\n", "one\ntwo\n");
+    fixture.view.status = super::Status::Running("Starting");
+    for command in [
+        Command::Cut,
+        Command::Paste,
+        Command::IncreaseIndent,
+        Command::DecreaseIndent,
+        Command::Copy,
+        Command::SelectSection,
+        Command::ToggleOverwrite,
+    ] {
+        assert!(!fixture.view.accepts(command), "{command:?}");
+        assert_eq!(
+            fixture.view.refusal(command),
+            Some(super::NOT_COMPARED),
+            "{command:?}"
+        );
+    }
+
+    fixture.view.status = super::Status::Ready;
+    fixture.view.left_pane.set_read_only(true);
+    fixture.view.active = Side::Left;
+    for command in [
+        Command::Cut,
+        Command::Paste,
+        Command::IncreaseIndent,
+        Command::DecreaseIndent,
+    ] {
+        assert!(!fixture.view.accepts(command), "{command:?}");
+        assert_eq!(
+            fixture.view.refusal(command),
+            Some(super::LEFT_READ_ONLY),
+            "{command:?}"
         );
     }
 }

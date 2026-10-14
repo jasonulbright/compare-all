@@ -65,9 +65,12 @@ const EDITING_OFF: &str = "Editing is turned off for this session";
 /// Why a copy waits for the comparison.
 const NOT_COMPARED: &str = "Available once the comparison finishes";
 /// Why a copy is refused after the comparison failed.
-const FAILED: &str = "The comparison failed. Use Reload to compare again";
+const FAILED: &str = "The comparison failed. Use Reload Files to compare again";
 /// Why a copy is refused after the comparison was stopped.
-const STOPPED: &str = "The comparison was stopped. Use Reload to compare again";
+const STOPPED: &str = "The comparison was stopped. Use Reload Files to compare again";
+/// Recovery commands when a failed comparison has edits held in this view.
+const FAILED_HELD: &str = "The comparison failed. Use Recompare Files to compare again";
+const STOPPED_HELD: &str = "The comparison was stopped. Use Recompare Files to compare again";
 /// Why a copy is refused while a side read from the clipboard is shown.
 const CLIPBOARD_SIDE: &str = "A side comes from the clipboard, so no side takes an edit";
 /// Why a copy waits for a save, an export or a write to a live key.
@@ -76,6 +79,10 @@ const WRITING: &str = "Available once the current write finishes";
 const QUESTION_OPEN: &str = "Answer the open question first";
 /// Why a copy has nothing to act on.
 const NOTHING_CHOSEN: &str = "Select the items to copy first";
+/// Why no row can be copied when there is no comparison row.
+const NOTHING_TO_COPY: &str = "There is nothing to copy";
+/// Why no row can be copied when the filter hides every comparison row.
+const FILTER_HIDES_ITEMS: &str = "The display filter hides every item";
 
 /// Commands that change a side or write one.
 const CHANGES_A_SIDE: &[Command] = &[
@@ -687,6 +694,8 @@ impl RecordsView {
         }
         Some(match &self.progress {
             super::Progress::Running(_) => NOT_COMPARED,
+            super::Progress::Failed(_) if self.holds_edits() => FAILED_HELD,
+            super::Progress::Cancelled if self.holds_edits() => STOPPED_HELD,
             super::Progress::Failed(_) => FAILED,
             super::Progress::Cancelled => STOPPED,
             super::Progress::Ready if self.clipboard_input.iter().any(Option::is_some) => {
@@ -696,6 +705,12 @@ impl RecordsView {
             super::Progress::Ready if self.edit.work.is_some() => WRITING,
             super::Progress::Ready if self.edit.prompt.is_some() => QUESTION_OPEN,
             super::Progress::Ready if self.edit.origin.is_none() => NOT_COMPARED,
+            super::Progress::Ready
+                if self.listing.rows() == 0 && self.listing.nodes().is_empty() =>
+            {
+                NOTHING_TO_COPY
+            }
+            super::Progress::Ready if self.listing.rows() == 0 => FILTER_HIDES_ITEMS,
             super::Progress::Ready => NOTHING_CHOSEN,
         })
     }
@@ -1890,10 +1905,50 @@ mod tests {
             assert!(!view.accepts(command));
             assert_eq!(
                 view.refusal(command),
-                Some(super::NOTHING_CHOSEN),
+                Some(super::NOTHING_TO_COPY),
                 "{command:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_registry_copy_explains_when_the_filter_hides_every_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let (left, right) = testing::registry_pair(dir.path());
+        let mut view = RecordsView::new(Flavor::Registry, left, right, &context(), 37);
+        assert!(wait_until(Duration::from_secs(30), || {
+            view.poll();
+            view.has_comparison()
+        }));
+        assert!(!view.listing.nodes().is_empty());
+        view.set_filter(crate::model::DisplayFilter::None);
+        assert_eq!(view.listing.rows(), 0);
+        for command in [Command::CopyToRight, Command::CopyToOtherSide] {
+            assert!(!view.accepts(command));
+            assert_eq!(
+                view.refusal(command),
+                Some(super::FILTER_HIDES_ITEMS),
+                "{command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_registry_comparison_with_held_edits_names_recompare_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let (left, right) = testing::registry_pair(dir.path());
+        let mut view = RecordsView::new(Flavor::Registry, left, right, &context(), 38);
+        assert!(wait_until(Duration::from_secs(30), || {
+            view.poll();
+            view.has_comparison()
+        }));
+        view.run(Command::SelectAll);
+        view.run(Command::CopyToRight);
+        assert!(view.holds_edits());
+        view.progress = super::super::Progress::Failed("unreadable".to_owned());
+        assert_eq!(view.refusal(Command::CopyToRight), Some(super::FAILED_HELD));
+        assert!(view.accepts(Command::Recompare));
+        assert!(!view.accepts(Command::Reload));
     }
 
     #[test]

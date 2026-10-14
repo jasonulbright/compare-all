@@ -59,11 +59,17 @@ const SEPARATOR: f32 = 2.0;
 /// Reason shown on a control that needs a finished merge.
 const NOT_MERGED: &str = "Available once the merge finishes";
 /// Reason shown on a line that needs a merge after the merge failed.
-const MERGE_FAILED: &str = "The merge failed. Use Reload to merge again";
+const MERGE_FAILED: &str = "The merge failed. Use Reload Files to merge again";
 /// Reason shown on a line that needs a merge after the merge was stopped.
-const MERGE_STOPPED: &str = "The merge was stopped. Use Reload to merge again";
+const MERGE_STOPPED: &str = "The merge was stopped. Use Reload Files to merge again";
+/// Why a center-pane command is unavailable in a two-way merge.
+const NO_CENTER: &str = "This merge has no center pane";
+/// Why conflict navigation has nothing to visit.
+const NO_CONFLICTS: &str = "There are no conflicts to move to";
 /// Reason shown on a control that needs an output file.
 const NO_OUTPUT: &str = "This session names no output file";
+/// Why a save command must wait for the current write.
+const WRITING: &str = "Available once the current write finishes";
 /// What the view says when an edit of the output is asked for while the
 /// editing switch of the session is on.
 const EDITING_OFF: &str = "Editing is turned off for this session";
@@ -1726,57 +1732,56 @@ impl MergeView {
     #[must_use]
     #[allow(clippy::too_many_lines)]
     pub fn toolbar_items(&self) -> Vec<toolbar::Item> {
-        let ready = self.status == Status::Ready;
         vec![
             toolbar::Item::command(
                 "previous-conflict",
                 Command::PreviousConflict,
                 "Prev Conflict",
-                ready,
-                NOT_MERGED,
+                self.accepts(Command::PreviousConflict),
+                self.refusal(Command::PreviousConflict).unwrap_or(""),
             ),
             toolbar::Item::command(
                 "next-conflict",
                 Command::NextConflict,
                 "Next Conflict",
-                ready,
-                NOT_MERGED,
+                self.accepts(Command::NextConflict),
+                self.refusal(Command::NextConflict).unwrap_or(""),
             ),
             toolbar::Item::separator("separator-1"),
             toolbar::Item::command(
                 "take-left",
                 Command::TakeLeft,
                 "Take Left",
-                ready,
-                NOT_MERGED,
+                self.accepts(Command::TakeLeft),
+                self.refusal(Command::TakeLeft).unwrap_or(""),
             ),
             toolbar::Item::command(
                 "take-center",
                 Command::TakeCenter,
                 "Take Center",
-                ready && self.shows_center(),
-                NOT_MERGED,
+                self.accepts(Command::TakeCenter),
+                self.refusal(Command::TakeCenter).unwrap_or(""),
             ),
             toolbar::Item::command(
                 "take-right",
                 Command::TakeRight,
                 "Take Right",
-                ready,
-                NOT_MERGED,
+                self.accepts(Command::TakeRight),
+                self.refusal(Command::TakeRight).unwrap_or(""),
             ),
             toolbar::Item::command(
                 "take-both",
                 Command::TakeLeftThenRight,
                 "Take Both",
-                ready,
-                NOT_MERGED,
+                self.accepts(Command::TakeLeftThenRight),
+                self.refusal(Command::TakeLeftThenRight).unwrap_or(""),
             ),
             toolbar::Item::command(
                 "take-all",
                 Command::TakeAllNonConflicting,
                 "Take All",
-                ready,
-                NOT_MERGED,
+                self.accepts(Command::TakeAllNonConflicting),
+                self.refusal(Command::TakeAllNonConflicting).unwrap_or(""),
             ),
             toolbar::Item::toggle(
                 "favor-left",
@@ -1784,6 +1789,7 @@ impl MergeView {
                 "Favor Left",
                 true,
                 self.rules.favor_left,
+                "",
             ),
             toolbar::Item::toggle(
                 "favor-right",
@@ -1791,6 +1797,7 @@ impl MergeView {
                 "Favor Right",
                 true,
                 self.rules.favor_right,
+                "",
             ),
             toolbar::Item::toggle(
                 "ignore-same",
@@ -1798,29 +1805,37 @@ impl MergeView {
                 "Ignore Same",
                 true,
                 self.rules.ignore_same_changes,
+                "",
             ),
             toolbar::Item::separator("separator-2"),
             toolbar::Item::toggle(
                 "center-pane",
                 Command::ToggleCenterPane,
                 "Center Pane",
-                true,
+                self.accepts(Command::ToggleCenterPane),
                 self.shows_center(),
+                self.refusal(Command::ToggleCenterPane).unwrap_or(""),
             ),
             toolbar::Item::command(
                 "save",
                 Command::SaveFile,
                 "Save",
-                ready && self.paths.output.is_some() && !self.editing_off(),
-                NOT_MERGED,
+                self.accepts(Command::SaveFile),
+                self.refusal(Command::SaveFile).unwrap_or(""),
             ),
-            toolbar::Item::command("reload", Command::Reload, "Reload", true, NOT_MERGED),
+            toolbar::Item::command(
+                "reload",
+                Command::Reload,
+                "Reload Files",
+                self.accepts(Command::Reload),
+                self.refusal(Command::Reload).unwrap_or(""),
+            ),
             toolbar::Item::command(
                 "report",
                 Command::CompareReport,
                 "Report",
-                ready,
-                NOT_MERGED,
+                self.accepts(Command::CompareReport),
+                self.refusal(Command::CompareReport).unwrap_or(""),
             ),
             toolbar::Item::separator("separator-3"),
             toolbar::Item::widget("filter", FILTER_COMBO_WIDTH),
@@ -1830,6 +1845,7 @@ impl MergeView {
                 "Minor",
                 true,
                 self.rules.ignore_unimportant,
+                "",
             ),
         ]
     }
@@ -2578,15 +2594,30 @@ impl SessionView for MergeView {
     }
 
     fn refusal(&self, command: Command) -> Option<&'static str> {
-        let output_line = matches!(
+        let needs_merge = matches!(
             command,
             Command::Cut
                 | Command::Copy
                 | Command::Paste
                 | Command::SelectAll
                 | Command::SelectSection
+                | Command::TakeLeft
+                | Command::TakeCenter
+                | Command::TakeRight
+                | Command::TakeLeftThenRight
+                | Command::TakeRightThenLeft
+                | Command::TakeAllNonConflicting
+                | Command::TakeLeftLine
+                | Command::TakeCenterLine
+                | Command::TakeRightLine
+                | Command::CompareReport
+                | Command::NextConflict
+                | Command::PreviousConflict
+                | Command::SaveFile
+                | Command::Reload
+                | Command::ToggleCenterPane
         );
-        if !output_line || SessionView::accepts(self, command) {
+        if !needs_merge || SessionView::accepts(self, command) {
             return None;
         }
         if self.editing_off() && CHANGES_OUTPUT.contains(&command) {
@@ -2595,6 +2626,23 @@ impl SessionView for MergeView {
         Some(match self.status {
             Status::Failed(_) => MERGE_FAILED,
             Status::Cancelled => MERGE_STOPPED,
+            Status::Ready
+                if matches!(
+                    command,
+                    Command::TakeCenter | Command::TakeCenterLine | Command::ToggleCenterPane
+                ) && self.paths.is_two_way() =>
+            {
+                NO_CENTER
+            }
+            Status::Ready
+                if matches!(command, Command::NextConflict | Command::PreviousConflict) =>
+            {
+                NO_CONFLICTS
+            }
+            Status::Ready if command == Command::SaveFile && self.paths.output.is_none() => {
+                NO_OUTPUT
+            }
+            Status::Ready if command == Command::SaveFile && self.save_job.is_some() => WRITING,
             Status::Running(_) | Status::Ready => NOT_MERGED,
         })
     }
@@ -2969,6 +3017,7 @@ mod tests {
     use crate::model::Resolution;
     use ca_ui::command::Command;
     use ca_ui::testing::{context, raw_input};
+    use ca_ui::toolbar;
     use ca_ui::view::SessionView;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -3014,6 +3063,8 @@ mod tests {
 
     #[test]
     fn a_refused_output_line_says_what_the_merge_waits_for() {
+        use ca_ui::toolbar::Item;
+
         const LINES: [Command; 5] = [
             Command::Cut,
             Command::Copy,
@@ -3021,6 +3072,25 @@ mod tests {
             Command::SelectAll,
             Command::SelectSection,
         ];
+        const TAKES: [Command; 4] = [
+            Command::TakeLeft,
+            Command::TakeLeftLine,
+            Command::TakeRight,
+            Command::TakeAllNonConflicting,
+        ];
+        let toolbar_reason = |view: &MergeView, command| {
+            view.toolbar_items()
+                .into_iter()
+                .find_map(|item| match item {
+                    Item::Command {
+                        command: found,
+                        enabled,
+                        reason,
+                        ..
+                    } if found == command => Some((enabled, reason)),
+                    _ => None,
+                })
+        };
         let (mut view, _dir) = open("a\nb\n", Some("a\n"), "a\nc\n");
         for command in LINES {
             assert!(!view.accepts(command), "{command:?}");
@@ -3030,6 +3100,18 @@ mod tests {
                 "{command:?}"
             );
         }
+        for command in TAKES {
+            assert!(!view.accepts(command), "{command:?}");
+            assert_eq!(
+                view.refusal(command),
+                Some(super::NOT_MERGED),
+                "{command:?}"
+            );
+        }
+        assert_eq!(
+            toolbar_reason(&view, Command::CompareReport),
+            Some((false, super::NOT_MERGED))
+        );
         run_until_ready(&mut view);
         for command in LINES {
             assert!(view.accepts(command), "{command:?}");
@@ -3037,7 +3119,12 @@ mod tests {
         }
 
         view.session_settings.specs.disable_editing = true;
-        for command in [Command::Cut, Command::Paste] {
+        for command in [
+            Command::Cut,
+            Command::Paste,
+            Command::TakeLeft,
+            Command::TakeLeftLine,
+        ] {
             assert!(!view.accepts(command), "{command:?}");
             assert_eq!(
                 view.refusal(command),
@@ -3057,10 +3144,57 @@ mod tests {
         ] {
             view.status = status;
             assert!(view.accepts(Command::Reload));
-            for command in LINES {
+            for command in LINES.into_iter().chain(TAKES) {
                 assert_eq!(view.refusal(command), Some(expected), "{command:?}");
             }
+            assert_eq!(view.refusal(Command::CompareReport), Some(expected));
+            assert_eq!(
+                toolbar_reason(&view, Command::CompareReport),
+                Some((false, expected))
+            );
+            assert_eq!(
+                toolbar_reason(&view, Command::TakeLeft),
+                Some((false, expected))
+            );
         }
+    }
+
+    #[test]
+    fn a_two_way_merge_explains_why_center_pane_actions_are_unavailable() {
+        use ca_ui::toolbar::Item;
+
+        let toggle_reason = |view: &MergeView| {
+            view.toolbar_items()
+                .into_iter()
+                .find_map(|item| match item {
+                    Item::Command {
+                        command: Command::ToggleCenterPane,
+                        enabled,
+                        reason,
+                        checked: Some(_),
+                        ..
+                    } => Some((enabled, reason)),
+                    _ => None,
+                })
+        };
+        let (mut view, _dir) = open("a\nb\n", None, "a\nc\n");
+        assert_eq!(toggle_reason(&view), Some((false, super::NOT_MERGED)));
+        assert_eq!(
+            view.refusal(Command::ToggleCenterPane),
+            Some(super::NOT_MERGED)
+        );
+        run_until_ready(&mut view);
+        assert!(!view.accepts(Command::ToggleCenterPane));
+        assert!(!view.accepts(Command::TakeCenterLine));
+        assert_eq!(
+            view.refusal(Command::ToggleCenterPane),
+            Some(super::NO_CENTER)
+        );
+        assert_eq!(
+            view.refusal(Command::TakeCenterLine),
+            Some(super::NO_CENTER)
+        );
+        assert_eq!(toggle_reason(&view), Some((false, super::NO_CENTER)));
     }
 
     fn run_until_ready(view: &mut MergeView) {
@@ -3109,6 +3243,118 @@ mod tests {
         let _ = ctx.run(input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| view.ui(ui, held));
         });
+    }
+
+    fn click_accessible(view: &mut MergeView, label: &str) -> ca_ui::testing::probe::Control {
+        let mut probe = ca_ui::testing::probe::Probe::new(3_000.0, 900.0);
+        let held = context();
+        let mut draw = |ctx: &egui::Context| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                view.ui(ui, &held);
+            });
+        };
+        probe.idle(&mut draw);
+        probe.idle(&mut draw);
+        probe.click(label, &mut draw).unwrap()
+    }
+
+    #[test]
+    fn unavailable_merge_navigation_and_center_controls_refuse_accessible_clicks() {
+        let (mut no_conflicts, _dir) = open("same\n", Some("same\n"), "same\n");
+        run_until_ready(&mut no_conflicts);
+        assert_eq!(no_conflicts.model().totals().conflicts, 0);
+        for label in ["Prev Conflict", "Next Conflict"] {
+            let control = click_accessible(&mut no_conflicts, label);
+            assert!(!control.enabled, "{label}");
+        }
+
+        let (mut two_way, _dir) = open("a\nb\n", None, "a\nc\n");
+        run_until_ready(&mut two_way);
+        let output = two_way.output_text();
+        let take_center = click_accessible(&mut two_way, "Take Center");
+        assert!(!take_center.enabled);
+        let center = click_accessible(&mut two_way, "Center Pane");
+        assert!(!center.enabled);
+        assert!(!two_way.shows_center());
+        assert_eq!(two_way.output_text(), output);
+
+        two_way.status = super::Status::Running("Reading files");
+        two_way.job = None;
+        let center_loading = click_accessible(&mut two_way, "Center Pane");
+        assert!(!center_loading.enabled);
+        let reload_loading = click_accessible(&mut two_way, "Reload Files");
+        assert!(!reload_loading.enabled);
+        assert!(!two_way.shows_center());
+        assert!(two_way.job.is_none(), "the refused reload did not restart");
+    }
+
+    #[test]
+    fn editing_off_takes_refuse_accessible_clicks() {
+        let (mut view, _dir) = open("a\nleft\nc\n", Some("a\nbase\nc\n"), "a\nright\nc\n");
+        run_until_ready(&mut view);
+        let output = view.output_text();
+        view.session_settings.specs.disable_editing = true;
+        for label in [
+            "Take Left",
+            "Take Center",
+            "Take Right",
+            "Take Both",
+            "Take All",
+        ] {
+            let control = click_accessible(&mut view, label);
+            assert!(!control.enabled, "{label}");
+        }
+        assert_eq!(view.output_text(), output);
+    }
+
+    #[test]
+    fn take_center_remains_available_when_the_center_pane_is_hidden() {
+        let (mut view, _dir) = open("a\nleft\nc\n", Some("a\ncenter\nc\n"), "a\nright\nc\n");
+        run_until_ready(&mut view);
+        view.run(Command::ToggleCenterPane);
+        assert!(!view.shows_center());
+
+        let take_center = click_accessible(&mut view, "Take Center");
+        assert!(take_center.enabled);
+        assert_eq!(view.output_text(), "a\ncenter\nc\n");
+    }
+
+    #[test]
+    fn save_while_writing_and_reload_while_loading_refuse_accessible_clicks() {
+        use std::sync::Arc;
+
+        let (mut view, _dir) = open("a\nleft\nc\n", Some("a\nbase\nc\n"), "a\nright\nc\n");
+        run_until_ready(&mut view);
+        let (release, wait) = std::sync::mpsc::channel();
+        view.save_job = Some(Job::spawn_notifying(
+            move |emitter, _| {
+                wait.recv().unwrap();
+                emitter.send(MergeSaveMessage::Done {
+                    outcome: Box::new(ca_ui::save::SaveOutcome::NotWritable),
+                    output: String::new(),
+                    marks: Vec::new(),
+                });
+            },
+            Arc::new(|| {}),
+        ));
+        let save = click_accessible(&mut view, "Save");
+        assert!(!save.enabled);
+        assert!(view.save_job.is_some());
+
+        view.status = super::Status::Running("Reading files");
+        view.job = None;
+        let reload = click_accessible(&mut view, "Reload Files");
+        assert!(!reload.enabled);
+        assert!(view.job.is_none(), "the refused reload did not restart");
+        assert!(matches!(view.status, super::Status::Running(_)));
+
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while view.save_job.is_some() && Instant::now() < deadline {
+            view.tick();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(view.save_job.is_none());
     }
 
     #[test]
@@ -4447,6 +4693,21 @@ mod tests {
             },
             Arc::new(|| {}),
         ));
+
+        assert_eq!(view.refusal(Command::SaveFile), Some(super::WRITING));
+        let save_reason = view
+            .toolbar_items()
+            .into_iter()
+            .find_map(|item| match item {
+                toolbar::Item::Command {
+                    command: Command::SaveFile,
+                    enabled,
+                    reason,
+                    ..
+                } => Some((enabled, reason)),
+                _ => None,
+            });
+        assert_eq!(save_reason, Some((false, super::WRITING)));
 
         assert!(SessionView::is_busy(&view));
         assert!(!view.may_close());

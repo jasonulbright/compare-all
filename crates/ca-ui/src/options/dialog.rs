@@ -471,13 +471,12 @@ impl OptionsDialog {
                     });
             });
             if let Some(reason) = blocked {
-                let shown = ui.add_enabled_ui(false, |ui| {
-                    control(ui, field, &value);
+                let _ = ui.add_enabled_ui(false, |ui| {
+                    control(ui, field, &value, Some(reason));
                 });
-                let _ = crate::widgets::disabled_reason(shown.response, reason);
                 return;
             }
-            if let Some(edited) = control(ui, field, &value) {
+            if let Some(edited) = control(ui, field, &value, None) {
                 edits.push((field, edited));
             }
         });
@@ -930,44 +929,55 @@ fn working_folder_label(id: &str) -> &'static str {
 }
 
 /// Draw the control for one field and report a new value when it changed.
-fn control(ui: &mut egui::Ui, field: &OptionField, value: &FieldValue) -> Option<FieldValue> {
+fn control(
+    ui: &mut egui::Ui,
+    field: &OptionField,
+    value: &FieldValue,
+    reason: Option<&str>,
+) -> Option<FieldValue> {
     let width = CONTROL_WIDTH.min(ui.available_width().max(60.0));
     match (field.shape, value) {
         (FieldShape::Flag, FieldValue::Flag(on)) => {
             let mut on = *on;
-            if ui.checkbox(&mut on, "").changed() {
+            let response = ui.checkbox(&mut on, "");
+            let changed = response.changed();
+            describe_field_checkbox(response, field.label, on, reason);
+            if changed {
                 return Some(FieldValue::Flag(on));
             }
         }
         (FieldShape::Count, FieldValue::Count(number)) => {
             let mut number = *number;
-            let changed = crate::widgets::sized(ui, width, |ui| {
+            let response = crate::widgets::sized(ui, width, |ui| {
                 ui.add(egui::DragValue::new(&mut number).range(0..=field.limit))
-                    .changed()
             });
+            let changed = response.changed();
+            describe_field_control(response, field.label, egui::WidgetType::DragValue, reason);
             if changed {
                 return Some(FieldValue::Count(number));
             }
         }
         (FieldShape::Decimal, FieldValue::Decimal(number)) => {
             let mut number = *number;
-            let changed = crate::widgets::sized(ui, width, |ui| {
+            let response = crate::widgets::sized(ui, width, |ui| {
                 ui.add(egui::DragValue::new(&mut number).range(
                     ca_session::options::provisional::MINIMUM_POINT_SIZE
                         ..=ca_session::options::provisional::MAXIMUM_POINT_SIZE,
                 ))
-                .changed()
             });
+            let changed = response.changed();
+            describe_field_control(response, field.label, egui::WidgetType::DragValue, reason);
             if changed {
                 return Some(FieldValue::Decimal(number));
             }
         }
         (FieldShape::Text | FieldShape::Path, FieldValue::Text(text)) => {
             let mut text = text.clone();
-            let changed = crate::widgets::sized(ui, width, |ui| {
+            let response = crate::widgets::sized(ui, width, |ui| {
                 ui.add(egui::TextEdit::singleline(&mut text).desired_width(width))
-                    .changed()
             });
+            let changed = response.changed();
+            describe_field_control(response, field.label, egui::WidgetType::TextEdit, reason);
             if changed {
                 return Some(FieldValue::Text(text));
             }
@@ -979,29 +989,32 @@ fn control(ui: &mut egui::Ui, field: &OptionField, value: &FieldValue) -> Option
                 .iter()
                 .find(|choice| choice.id == id)
                 .map_or(id.as_str(), |choice| choice.label);
-            crate::widgets::sized(ui, width, |ui| {
+            let response = crate::widgets::sized(ui, width, |ui| {
                 egui::ComboBox::from_id_salt(ui.id().with(field.key))
                     .selected_text(label)
                     .show_ui(ui, |ui| {
                         for choice in field.choices {
                             ui.selectable_value(&mut chosen, choice.id.to_owned(), choice.label);
                         }
-                    });
+                    })
+                    .response
             });
+            describe_field_control(response, field.label, egui::WidgetType::ComboBox, reason);
             if &chosen != id {
                 return Some(FieldValue::Choice(chosen));
             }
         }
         (FieldShape::Lines, FieldValue::Lines(lines)) => {
             let mut text = lines.join("\n");
-            let changed = crate::widgets::sized(ui, width, |ui| {
+            let response = crate::widgets::sized(ui, width, |ui| {
                 ui.add(
                     egui::TextEdit::multiline(&mut text)
                         .desired_width(width)
                         .desired_rows(2),
                 )
-                .changed()
             });
+            let changed = response.changed();
+            describe_field_control(response, field.label, egui::WidgetType::TextEdit, reason);
             if changed {
                 return Some(FieldValue::Lines(
                     text.lines()
@@ -1013,10 +1026,39 @@ fn control(ui: &mut egui::Ui, field: &OptionField, value: &FieldValue) -> Option
             }
         }
         _ => {
-            ui.label(value.display());
+            let response = ui.label(value.display());
+            describe_field_control(response, field.label, egui::WidgetType::Label, reason);
         }
     }
     None
+}
+
+fn describe_field_control(
+    response: egui::Response,
+    label: &str,
+    widget_type: egui::WidgetType,
+    reason: Option<&str>,
+) {
+    let enabled = response.enabled();
+    response.widget_info(|| egui::WidgetInfo::labeled(widget_type, enabled, label));
+    if let Some(reason) = reason {
+        let _ = crate::widgets::disabled_reason(response, reason);
+    }
+}
+
+fn describe_field_checkbox(
+    response: egui::Response,
+    label: &str,
+    selected: bool,
+    reason: Option<&str>,
+) {
+    let enabled = response.enabled();
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Checkbox, enabled, selected, label)
+    });
+    if let Some(reason) = reason {
+        let _ = crate::widgets::disabled_reason(response, reason);
+    }
 }
 
 /// Why the whole dialog is unavailable, where a policy says so.
@@ -1266,5 +1308,46 @@ mod tests {
             dialog.select_page_named(page.name);
             assert_eq!(dialog.pages()[dialog.active_page()].name, page.name);
         }
+    }
+
+    #[test]
+    fn a_policy_reason_is_attached_to_the_disabled_checkbox() {
+        use crate::testing::probe::{controls, Probe};
+        use ca_session::{InMemoryPolicySource, PolicyKey, PolicyLoader};
+        use egui::accesskit::Role;
+
+        let policies: AdminPolicies = InMemoryPolicySource::new()
+            .with(PolicyKey::DisableCheckForUpdates, true)
+            .load()
+            .unwrap();
+        let mut dialog = OptionsDialog::new(&ProgramOptions::default(), policies, 19);
+        dialog.select_page_named("Tweaks");
+        let mut probe = Probe::new(1_280.0, 900.0);
+        let mut draw = |ctx: &egui::Context| {
+            let _ = dialog.show(ctx, &crate::theme::LIGHT);
+        };
+        let output = probe.frame(Vec::new(), &mut draw);
+        let checkbox = controls(&output)
+            .into_iter()
+            .find(|control| control.label == "Check for updates")
+            .unwrap();
+        assert_eq!(checkbox.role, Role::CheckBox);
+        assert!(!checkbox.enabled);
+        assert_eq!(checkbox.toggled, Some(true));
+        assert_eq!(
+            checkbox.description.as_deref(),
+            Some(super::schema::POLICY_REASON)
+        );
+        let interval = controls(&output)
+            .into_iter()
+            .find(|control| {
+                control.label == "Days between update checks" && control.role == Role::SpinButton
+            })
+            .unwrap();
+        assert!(!interval.enabled);
+        assert_eq!(
+            interval.description.as_deref(),
+            Some(super::schema::POLICY_REASON)
+        );
     }
 }

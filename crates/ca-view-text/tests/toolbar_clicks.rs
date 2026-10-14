@@ -65,7 +65,7 @@ const COMMANDS: &[Expected] = &[
     ("next-section", "Next Section", Command::NextSection),
     ("previous-section", "Prev Section", Command::PreviousSection),
     ("swap", "Swap", Command::SwapSides),
-    ("reload", "Reload", Command::Reload),
+    ("reload", "Reload Files", Command::Reload),
     ("report", "Report", Command::CompareReport),
 ];
 

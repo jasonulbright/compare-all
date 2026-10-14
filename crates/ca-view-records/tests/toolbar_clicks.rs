@@ -33,7 +33,7 @@ const COMMANDS: &[Expected] = &[
     ("next-difference", "Next", Command::NextDifference),
     ("expand", "Expand", Command::ExpandAll),
     ("collapse", "Collapse", Command::CollapseAll),
-    ("reload", "Reload", Command::Reload),
+    ("reload", "Reload Files", Command::Reload),
     ("recompare", "Recompare", Command::Recompare),
     ("swap", "Swap", Command::SwapSides),
     ("stop", "Stop", Command::Cancel),

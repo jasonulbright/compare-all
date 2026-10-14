@@ -645,6 +645,20 @@ impl SessionView for TextPatchView {
         }
     }
 
+    fn refusal(&self, command: Command) -> Option<&'static str> {
+        if matches!(
+            command,
+            Command::CopyToRight
+                | Command::CopyToLeft
+                | Command::CopyToOtherSide
+                | Command::CopyLineToRight
+                | Command::CopyLineToLeft
+        ) {
+            return Some("Line copying is not available in the patch view");
+        }
+        self.inner.as_ref().and_then(|inner| inner.refusal(command))
+    }
+
     fn run(&mut self, command: Command) {
         match command {
             Command::ApplyPatch => self.apply_to_target(),
@@ -720,5 +734,29 @@ mod tests {
             .commands()
             .iter()
             .any(|state| state.command == Command::OpenFile && state.enabled));
+    }
+
+    #[test]
+    fn patch_view_copy_lines_name_the_unsupported_action() {
+        let view = TextPatchView::new(
+            PathBuf::new(),
+            PathBuf::new(),
+            &ca_ui::testing::context(),
+            2,
+        );
+        for command in [
+            Command::CopyToRight,
+            Command::CopyToLeft,
+            Command::CopyToOtherSide,
+            Command::CopyLineToRight,
+            Command::CopyLineToLeft,
+        ] {
+            assert!(!view.accepts(command), "{command:?}");
+            assert_eq!(
+                view.refusal(command),
+                Some("Line copying is not available in the patch view"),
+                "{command:?}"
+            );
+        }
     }
 }

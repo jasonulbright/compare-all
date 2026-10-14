@@ -86,7 +86,7 @@ impl TableView {
     }
 
     /// True when the table on screen was parsed from the side's current text.
-    fn in_step(&self, side: Side) -> bool {
+    pub(super) fn in_step(&self, side: Side) -> bool {
         self.parsed_revision(side) == self.side_text(side).revision()
     }
 
@@ -155,7 +155,7 @@ impl TableView {
     }
 
     /// The file row and column of the current cell on one side.
-    fn file_cell(&self, side: Side) -> Option<(usize, usize)> {
+    pub(super) fn file_cell(&self, side: Side) -> Option<(usize, usize)> {
         let cursor = self.grid.cursor();
         let row = self.grid.source_row(cursor.row)?;
         let column = self.grid.column_at(cursor.column)?;

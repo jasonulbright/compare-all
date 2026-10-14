@@ -451,7 +451,7 @@ impl TextEditView {
             }
             SaveEvent::NotWritable => {
                 self.pane.set_read_only(true);
-                self.message = Some("The file cannot be written, so the pane is read only.".into());
+                self.message = Some("The file cannot be written, so the pane is read-only.".into());
                 self.close_requested = false;
             }
             SaveEvent::Failed(reason) => {
@@ -1207,6 +1207,39 @@ impl SessionView for TextEditView {
         }
     }
 
+    fn refusal(&self, command: Command) -> Option<&'static str> {
+        if matches!(
+            command,
+            Command::CopyToRight
+                | Command::CopyToLeft
+                | Command::CopyToOtherSide
+                | Command::CopyLineToRight
+                | Command::CopyLineToLeft
+        ) {
+            return Some("This single-file view has no second pane to copy to");
+        }
+        if self.accepts(command) {
+            return None;
+        }
+        match command {
+            Command::Cut
+            | Command::Paste
+            | Command::IncreaseIndent
+            | Command::DecreaseIndent
+            | Command::Undo
+            | Command::Redo => match self.status {
+                Status::Loading => Some("Available once the file finishes loading"),
+                Status::Failed(_) => Some("The file could not be loaded"),
+                Status::Ready if self.session_settings.specs.disable_editing => {
+                    Some("Editing is turned off for this session")
+                }
+                Status::Ready if self.pane.is_read_only() => Some("The file is read-only"),
+                Status::Ready => Some("The edit is not available right now"),
+            },
+            _ => None,
+        }
+    }
+
     fn run(&mut self, command: Command) {
         match command {
             Command::Undo => {
@@ -1344,5 +1377,24 @@ mod tests {
             view.explorer_target(),
             Some((path, ca_ui::launch::Selection::Files))
         );
+    }
+
+    #[test]
+    fn single_file_text_edit_copy_lines_name_the_missing_other_pane() {
+        let view = TextEditView::new(PathBuf::new(), &ca_ui::testing::context(), 3);
+        for command in [
+            Command::CopyToRight,
+            Command::CopyToLeft,
+            Command::CopyToOtherSide,
+            Command::CopyLineToRight,
+            Command::CopyLineToLeft,
+        ] {
+            assert!(!view.accepts(command), "{command:?}");
+            assert_eq!(
+                view.refusal(command),
+                Some("This single-file view has no second pane to copy to"),
+                "{command:?}"
+            );
+        }
     }
 }

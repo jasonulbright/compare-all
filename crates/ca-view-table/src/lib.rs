@@ -70,6 +70,22 @@ const CELL_PAD: f32 = 4.0;
 const FILTER_COMBO_WIDTH: f32 = 160.0;
 /// Size of the mark drawn on a key column's heading.
 const MARKER: f32 = 5.0;
+/// Why table actions that need aligned rows wait for a finished comparison.
+const NOT_COMPARED: &str = "Available once the comparison finishes";
+/// Why a cell cannot be copied while its editor is open.
+const CELL_EDITOR_OPEN: &str = "Close the cell editor before copying a cell";
+/// Why no table cell can be copied.
+const NO_CELL: &str = "Select a cell in both files to copy it";
+/// Why a parsed table cell has no safe writer.
+const CELL_NOT_WRITABLE: &str = "This cell cannot be written to the target file";
+/// Why a failed comparison cannot supply a cell.
+const FAILED: &str = "The comparison failed. Use Recompare Files to compare again";
+/// Why a first comparison can only be retried by reading its files again.
+const FAILED_RELOAD: &str = "The comparison failed. Use Reload Files to compare again";
+/// Why a stopped comparison cannot supply a cell.
+const STOPPED: &str = "The comparison was stopped. Use Recompare Files to compare again";
+/// Why a stopped first comparison can only be retried by reading its files again.
+const STOPPED_RELOAD: &str = "The comparison was stopped. Use Reload Files to compare again";
 
 /// Every command this view answers for.
 const HANDLED: &[Command] = &[
@@ -1100,14 +1116,14 @@ impl TableView {
                 Command::PreviousDifference,
                 "Previous",
                 ready,
-                "No comparison yet",
+                NOT_COMPARED,
             ),
             toolbar::Item::command(
                 "next-difference",
                 Command::NextDifference,
                 "Next",
                 ready,
-                "No comparison yet",
+                NOT_COMPARED,
             ),
             toolbar::Item::separator("separator-2"),
             toolbar::Item::command("settings", Command::SessionSettings, "Settings", true, ""),
@@ -1137,7 +1153,7 @@ impl TableView {
                 Command::CompareReport,
                 "Report",
                 ready,
-                "No comparison yet",
+                self.refusal(Command::CompareReport).unwrap_or(NOT_COMPARED),
             ),
             toolbar::Item::separator("separator-3"),
             toolbar::Item::widget("row-numbers", 120.0),
@@ -2278,6 +2294,51 @@ impl SessionView for TableView {
         ca_ui::view::declare(HANDLED, |command| self.accepts(command))
     }
 
+    fn refusal(&self, command: Command) -> Option<&'static str> {
+        let (source, target) = match command {
+            Command::CopyCellToRight => (Side::Left, Side::Right),
+            Command::CopyCellToLeft => (Side::Right, Side::Left),
+            Command::CopyCellToOtherSide => (self.active, self.active.other()),
+            Command::CompareReport => {
+                if self.accepts(command) {
+                    return None;
+                }
+                return Some(match self.status {
+                    Status::Running(_) | Status::Ready => NOT_COMPARED,
+                    Status::Failed(_) if self.accepts(Command::Recompare) => FAILED,
+                    Status::Failed(_) => FAILED_RELOAD,
+                    Status::Cancelled if self.accepts(Command::Recompare) => STOPPED,
+                    Status::Cancelled => STOPPED_RELOAD,
+                });
+            }
+            _ => return None,
+        };
+        if self.accepts(command) {
+            return None;
+        }
+        Some(match self.status {
+            Status::Running(_) => NOT_COMPARED,
+            Status::Failed(_) if self.accepts(Command::Recompare) => FAILED,
+            Status::Failed(_) => FAILED_RELOAD,
+            Status::Cancelled if self.accepts(Command::Recompare) => STOPPED,
+            Status::Cancelled => STOPPED_RELOAD,
+            Status::Ready if self.cell_editor.is_some() => CELL_EDITOR_OPEN,
+            Status::Ready => {
+                if let Some(reason) = self.write_block(target) {
+                    reason
+                } else if !self.in_step(source)
+                    || !self.in_step(target)
+                    || self.file_cell(source).is_none()
+                    || self.file_cell(target).is_none()
+                {
+                    NO_CELL
+                } else {
+                    CELL_NOT_WRITABLE
+                }
+            }
+        })
+    }
+
     fn accepts(&self, command: Command) -> bool {
         let ready = self.has_comparison();
         match command {
@@ -3153,6 +3214,54 @@ mod tests {
 
         assert!(!view.accepts(Command::CopyCellToOtherSide));
         assert!(!view.accepts(Command::CopyCellToRight));
+        assert_eq!(view.refusal(Command::CopyCellToRight), Some(super::NO_CELL));
+    }
+
+    #[test]
+    fn a_cell_copy_reason_names_the_editor_or_write_block() {
+        let (_dir, left, right) = files("id,name\n1,Ann\n", "id,name\n1,Bob\n");
+        let ctx = egui::Context::default();
+        let mut view = TableView::new(left, right, &context(), 39);
+        assert_eq!(
+            view.refusal(Command::CopyCellToRight),
+            Some(super::NOT_COMPARED)
+        );
+        assert!(settle(&mut view, &ctx));
+        view.grid.set_cursor(Cursor { row: 0, column: 1 });
+        view.set_active_side(Side::Left);
+        view.begin_cell_edit();
+        assert!(view.cell_editor.is_some());
+        assert_eq!(
+            view.refusal(Command::CopyCellToRight),
+            Some(super::CELL_EDITOR_OPEN)
+        );
+
+        view.cell_editor = None;
+        view.read_only = true;
+        assert_eq!(
+            view.refusal(Command::CopyCellToRight),
+            Some("The file is a copy taken out of an archive, so it cannot be edited or saved.")
+        );
+    }
+
+    #[test]
+    fn a_failed_first_table_load_names_the_command_that_can_retry_it() {
+        let (_dir, left, right) = files("id,name\n1,Ann\n", "id,name\n1,Bob\n");
+        let mut view = TableView::new(left, right, &context(), 40);
+        assert!(view.sides.is_none());
+        for (status, expected) in [
+            (
+                super::Status::Failed("unreadable".to_owned()),
+                super::FAILED_RELOAD,
+            ),
+            (super::Status::Cancelled, super::STOPPED_RELOAD),
+        ] {
+            view.status = status;
+            assert!(view.accepts(Command::Reload));
+            assert!(!view.accepts(Command::Recompare));
+            assert_eq!(view.refusal(Command::CopyCellToRight), Some(expected));
+            assert_eq!(view.refusal(Command::CompareReport), Some(expected));
+        }
     }
 
     #[test]

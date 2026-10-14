@@ -384,13 +384,14 @@ impl Item {
         label: &'static str,
         enabled: bool,
         checked: bool,
+        reason: &'static str,
     ) -> Self {
         Self::Command {
             name,
             command,
             label,
             enabled,
-            reason: "",
+            reason,
             checked: Some(checked),
         }
     }
