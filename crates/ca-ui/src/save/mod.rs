@@ -75,6 +75,17 @@ pub trait FileSystem: Send + Sync {
     /// `None` when it is absent.
     fn stamp(&self, path: &Path) -> Option<Stamp>;
 
+    /// Inspect the target without treating a read failure as an absent file.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying error when the target cannot be inspected.
+    /// Implementations that can report read errors should override this method;
+    /// the default preserves the optional stamp behavior.
+    fn try_stamp(&self, path: &Path) -> io::Result<Option<Stamp>> {
+        Ok(self.stamp(path))
+    }
+
     /// True when the target can be replaced.
     fn is_writable(&self, path: &Path) -> bool;
 
@@ -98,8 +109,8 @@ pub trait FileSystem: Send + Sync {
         expected: Baseline,
         accept_disk_change: bool,
     ) -> Result<(), SaveOutcome> {
-        if disk_changed(self.stamp(target), expected, accept_disk_change) {
-            return Err(SaveOutcome::ChangedOnDisk);
+        if let Some(outcome) = check_disk_change(self, target, expected, accept_disk_change) {
+            return Err(outcome);
         }
         self.replace(target, bytes).map_err(SaveOutcome::from)
     }
@@ -154,6 +165,39 @@ impl FileSystem for RealFileSystem {
         })
     }
 
+    fn try_stamp(&self, path: &Path) -> io::Result<Option<Stamp>> {
+        let inspect = || -> io::Result<Stamp> {
+            #[cfg(windows)]
+            let (data, identity) = {
+                let handle = winapi_util::Handle::from_path(path)?;
+                let data = handle.as_file().metadata()?;
+                let identity = winapi_util::file::information(&handle)
+                    .ok()
+                    .map(|info| (info.volume_serial_number(), info.file_index()));
+                (data, identity)
+            };
+            #[cfg(not(windows))]
+            let data = std::fs::metadata(path)?;
+            #[cfg(unix)]
+            let identity = {
+                use std::os::unix::fs::MetadataExt;
+                Some((data.dev(), data.ino()))
+            };
+            #[cfg(not(any(windows, unix)))]
+            let identity = None;
+            Ok(Stamp {
+                size: data.len(),
+                modified: data.modified().ok(),
+                identity,
+            })
+        };
+        match inspect() {
+            Ok(stamp) => Ok(Some(stamp)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     fn is_writable(&self, path: &Path) -> bool {
         match std::fs::metadata(path) {
             Ok(data) => !data.permissions().readonly(),
@@ -177,13 +221,8 @@ impl FileSystem for RealFileSystem {
             writer.write_all(bytes)?;
             Ok(())
         };
-        let check = || {
-            if disk_changed(self.stamp(target), expected, accept_disk_change) {
-                Err(SaveOutcome::ChangedOnDisk)
-            } else {
-                Ok(())
-            }
-        };
+        let check =
+            || check_disk_change(self, target, expected, accept_disk_change).map_or(Ok(()), Err);
         if expected == Baseline::Absent && !accept_disk_change {
             ca_io::replace_new_checked(target, produce, check)
         } else {
@@ -207,13 +246,7 @@ impl FileSystem for RealFileSystem {
                         writer.write_all(bytes)?;
                         Ok(())
                     },
-                    || {
-                        if disk_changed(self.stamp(target), expected, false) {
-                            Err(SaveOutcome::ChangedOnDisk)
-                        } else {
-                            Ok(())
-                        }
-                    },
+                    || check_disk_change(self, target, expected, false).map_or(Ok(()), Err),
                     |backup| self.stamp(backup) != Some(previous),
                 )
                 .map(|((), backup)| backup);
@@ -294,18 +327,27 @@ pub fn save(
 }
 
 /// [`SaveOutcome::ChangedOnDisk`] when the target no longer matches `expected`.
+/// An inspection error returns [`SaveOutcome::Failed`] with its cause.
 ///
 /// A caller that produces its bytes fallibly runs this before the encode, so a
 /// file that changed underneath is reported rather than encoded for nothing.
 #[must_use]
 pub fn check_disk_change(
-    files: &dyn FileSystem,
+    files: &(impl FileSystem + ?Sized),
     path: &Path,
     expected: Baseline,
     accept_disk_change: bool,
 ) -> Option<SaveOutcome> {
-    disk_changed(files.stamp(path), expected, accept_disk_change)
-        .then_some(SaveOutcome::ChangedOnDisk)
+    if accept_disk_change || expected == Baseline::Unchecked {
+        return None;
+    }
+    match files.try_stamp(path) {
+        Ok(actual) => disk_changed(actual, expected, false).then_some(SaveOutcome::ChangedOnDisk),
+        Err(error) => Some(SaveOutcome::Failed(format!(
+            "Cannot inspect {}: {error}",
+            path.display()
+        ))),
+    }
 }
 
 fn disk_changed(actual: Option<Stamp>, expected: Baseline, accept_disk_change: bool) -> bool {
@@ -484,6 +526,8 @@ mod tests {
         writable: Mutex<bool>,
         rename_fails: Mutex<bool>,
         write_fails: Mutex<bool>,
+        inspection_fails: Mutex<bool>,
+        fail_inspection_on_writability_check: Mutex<bool>,
         change_on_writability_check: Mutex<Option<Vec<u8>>>,
     }
 
@@ -531,7 +575,20 @@ mod tests {
             })
         }
 
+        fn try_stamp(&self, path: &Path) -> io::Result<Option<Stamp>> {
+            if Self::read(&self.inspection_fails) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "output locked",
+                ));
+            }
+            Ok(self.stamp(path))
+        }
+
         fn is_writable(&self, path: &Path) -> bool {
+            if Self::read(&self.fail_inspection_on_writability_check) {
+                Self::set(&self.inspection_fails, true);
+            }
             if let Ok(mut pending) = self.change_on_writability_check.lock() {
                 if let Some(bytes) = pending.take() {
                     self.put(path, &bytes);
@@ -597,6 +654,31 @@ mod tests {
             SaveOutcome::ChangedOnDisk
         );
         assert_eq!(files.bytes(&target).unwrap(), b"another writer");
+    }
+
+    #[test]
+    fn an_inspection_error_is_not_reported_as_a_disk_change() {
+        for fail_after_preflight in [false, true] {
+            let target = path();
+            let files = FakeFiles::with(&target, b"old");
+            let baseline = Baseline::of(&files, &target);
+            FakeFiles::set(&files.inspection_fails, !fail_after_preflight);
+            FakeFiles::set(
+                &files.fail_inspection_on_writability_check,
+                fail_after_preflight,
+            );
+            // Merge saves use the backup wrapper even with backups disabled.
+            let wrapped = super::backup::WithBackups { files, rule: None };
+            let outcome = save(&wrapped, &target, b"our edit", baseline, false);
+            assert_eq!(
+                outcome,
+                SaveOutcome::Failed(format!(
+                    "Cannot inspect {}: output locked",
+                    target.display()
+                ))
+            );
+            assert_eq!(wrapped.files.bytes(&target).unwrap(), b"old");
+        }
     }
 
     #[test]

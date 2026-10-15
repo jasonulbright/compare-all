@@ -160,6 +160,10 @@ impl<F: FileSystem> FileSystem for WithBackups<F> {
         self.files.stamp(path)
     }
 
+    fn try_stamp(&self, path: &Path) -> io::Result<Option<Stamp>> {
+        self.files.try_stamp(path)
+    }
+
     fn is_writable(&self, path: &Path) -> bool {
         self.files.is_writable(path)
     }
