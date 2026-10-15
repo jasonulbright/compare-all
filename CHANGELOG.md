@@ -1,3 +1,26 @@
+# v2026.10.15.0006
+
+## Text Merge
+
+- Keep edits recoverable after a failed save and ask before closing the view.
+- Check generated output for decoding replacements before writing it.
+
+## Folder Merge
+
+- Show expected and current modified times when a source changes after planning.
+
+## Remote comparisons
+
+- Detect incomplete FTP and HTTP downloads instead of treating them as complete.
+- Keep the previous file when an SFTP replacement fails.
+- Parse escaped S3 and WebDAV listing entries correctly and reject keys outside the requested folder.
+- Reject revoked SSH host keys even when another rule accepts the same key.
+
+## Commands and packaging
+
+- Show accurate reasons when commands are unavailable.
+- Check AppImage catalog compatibility under Firejail before publishing.
+
 # v2026.10.14.0005
 
 ## Merge takes restore selected input consistently after joined-line edits
