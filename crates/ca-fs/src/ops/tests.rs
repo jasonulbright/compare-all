@@ -2121,6 +2121,69 @@ fn copy_preserves_contents_and_modification_time() {
 }
 
 #[test]
+fn a_copy_with_a_time_only_source_change_reports_both_times_and_is_refused() {
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    let source = left.path().join("a.txt");
+    std::fs::write(&source, b"payload!").unwrap();
+    RealFs
+        .set_modified(
+            &source,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_600_000_000),
+        )
+        .unwrap();
+
+    let root = compared(left.path(), right.path());
+    let bases = Bases {
+        left: left.path(),
+        right: right.path(),
+    };
+    let plan = plan_copy(&selection(&root, &["a.txt"]), Side::Left, bases, &options());
+    let expected_time = plan.steps[0]
+        .expected
+        .source
+        .as_ref()
+        .and_then(|state| state.modified)
+        .expect("the source time in the plan");
+    RealFs
+        .set_modified(&source, expected_time + Duration::from_secs(10))
+        .unwrap();
+
+    let policy = SkipAndCaptureDrift::default();
+    let report = run_with(&plan, &policy);
+    let drift = policy
+        .drift
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("drift question");
+    assert!(
+        drift
+            .expected
+            .contains("a 8 byte file (modified at 2020-09-13 12:26:40 UTC)"),
+        "{}",
+        drift.expected
+    );
+    assert!(
+        drift
+            .found
+            .contains("a 8 byte file (modified at 2020-09-13 12:26:50 UTC)"),
+        "{}",
+        drift.found
+    );
+    assert!(!report.is_clean(), "the changed source must not be copied");
+    match &report.results[0].outcome {
+        StepOutcome::Skipped { reason } => {
+            assert!(reason.contains(&drift.expected), "{reason}");
+            assert!(reason.contains(&drift.found), "{reason}");
+        }
+        other => panic!("time drift was not refused: {other:?}"),
+    }
+    assert!(!right.path().join("a.txt").exists());
+    assert_eq!(std::fs::read(&source).unwrap(), b"payload!");
+}
+
+#[test]
 fn copy_carries_a_whole_subtree() {
     let left = tempfile::tempdir().unwrap();
     let right = tempfile::tempdir().unwrap();
@@ -2725,6 +2788,22 @@ impl ErrorPolicy for ProceedOnDrift {
     }
     fn on_drift(&self, _step: &PlanStep, _drift: &Drift) -> ConflictDecision {
         ConflictDecision::Proceed
+    }
+}
+
+#[derive(Default)]
+struct SkipAndCaptureDrift {
+    drift: Mutex<Option<Drift>>,
+}
+
+impl ErrorPolicy for SkipAndCaptureDrift {
+    fn on_error(&self, _step: &PlanStep, _attempt: u32, _message: &str) -> Decision {
+        Decision::Skip
+    }
+
+    fn on_drift(&self, _step: &PlanStep, drift: &Drift) -> ConflictDecision {
+        *self.drift.lock().unwrap() = Some(drift.clone());
+        ConflictDecision::Skip
     }
 }
 
