@@ -477,3 +477,41 @@ fn undoing_an_edit_at_the_output_end_returns_the_lines_to_their_own_sections() {
     );
     assert_eq!(waiting, 1);
 }
+
+#[test]
+fn undo_and_redo_replay_an_edit_that_empties_one_section() {
+    let (mut view, _dir) = f1();
+    let initial = view.output_text();
+    assert_eq!(view.model().output_range(1), Some(1..2));
+
+    delete_selection(&mut view, (1, 0), (2, 0));
+
+    let edited = view.output_text();
+    let group = view.output_pane.buffer().undo_group_id().unwrap();
+    assert_eq!(edited, "a\nc\nd\ng\nh\ni\nX\nf\n");
+    assert_eq!(view.model().output_range(1), Some(1..1));
+    assert!(view
+        .edit_history
+        .get(&group)
+        .is_some_and(|step| !step.touches_several_sections()));
+    assert!(!view.take_history.contains_key(&group));
+
+    crate::model::ownership::REABSORBS.with(|count| count.set(0));
+    view.run(Command::Undo);
+    assert_eq!(
+        crate::model::ownership::REABSORBS.with(std::cell::Cell::get),
+        0
+    );
+    assert_output_lines_match_pane(&view);
+    assert_eq!(view.output_text(), initial);
+    assert_eq!(view.model().output_range(1), Some(1..2));
+
+    view.run(Command::Redo);
+    assert_eq!(
+        crate::model::ownership::REABSORBS.with(std::cell::Cell::get),
+        0
+    );
+    assert_output_lines_match_pane(&view);
+    assert_eq!(view.output_text(), edited);
+    assert_eq!(view.model().output_range(1), Some(1..1));
+}
