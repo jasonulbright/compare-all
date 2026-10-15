@@ -19,6 +19,11 @@ use ca_ui::save::text::SaveConsent;
 use ca_ui::save::{Baseline, FileSystem, SaveOutcome};
 use std::path::Path;
 
+#[cfg(test)]
+thread_local! {
+    static LOSSY_INPUT_LINE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Exit code for a merge that finished with nothing left to review.
 pub const EXIT_SUCCESS: i32 = 0;
 /// Exit code for a merge whose output was written with conflicts still in it.
@@ -345,17 +350,45 @@ pub fn to_bytes(
 /// source that did not decode cleanly and therefore needs explicit consent.
 #[must_use]
 pub fn contains_lossy_input(model: &MergeModel, sources: &Sources) -> bool {
-    let has_lossy_source = sources.left.had_errors
+    let has_lossy_source = sources_had_decode_errors(sources);
+    has_lossy_source
+        && model.output_lines().iter().any(|line| {
+            #[cfg(test)]
+            LOSSY_INPUT_LINE_VISITS.with(|visits| {
+                visits.set(visits.get().saturating_add(1));
+            });
+            line.contains('\u{fffd}')
+        })
+}
+
+#[cfg(test)]
+pub(crate) fn reset_lossy_input_line_visits() {
+    LOSSY_INPUT_LINE_VISITS.with(|visits| visits.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn lossy_input_line_visits() -> usize {
+    LOSSY_INPUT_LINE_VISITS.with(std::cell::Cell::get)
+}
+
+/// Whether any source file had decoding errors.
+#[must_use]
+pub(crate) fn sources_had_decode_errors(sources: &Sources) -> bool {
+    sources.left.had_errors
         || sources
             .center
             .as_ref()
             .is_some_and(|source| source.had_errors)
-        || sources.right.had_errors;
-    has_lossy_source
-        && model
-            .output_lines()
-            .iter()
-            .any(|line| line.contains('\u{fffd}'))
+        || sources.right.had_errors
+}
+
+/// Whether the text a save will write needs consent for decoded replacements.
+///
+/// The UI save worker calls this on its snapshot so the frame thread never
+/// walks every output line to answer the consent question.
+#[must_use]
+pub(crate) fn contains_lossy_replacement(text: &str, has_lossy_source: bool) -> bool {
+    has_lossy_source && text.contains('\u{fffd}')
 }
 
 fn encoded(
