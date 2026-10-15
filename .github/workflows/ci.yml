@@ -36,7 +36,7 @@ jobs:
           - name: windows
             runs-on: windows-latest
           - name: linux
-            runs-on: ubuntu-latest
+            runs-on: ubuntu-24.04
           - name: macos
             runs-on: macos-latest
     runs-on: ${{ matrix.runs-on }}
