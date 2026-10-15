@@ -694,10 +694,23 @@ fn drift(fs: &dyn FileOps, step: &PlanStep) -> Option<Drift> {
                 && (expected.size != found.size
                     || !times_agree(expected.modified, found.modified)));
         if moved_on {
+            let time_only_change = !expected.is_dir
+                && !found.is_dir
+                && expected.is_link == found.is_link
+                && expected.size == found.size
+                && !times_agree(expected.modified, found.modified);
+            let (expected_description, found_description) = if time_only_change {
+                (
+                    describe_expected_with_time(expected),
+                    describe_found_with_time(&found),
+                )
+            } else {
+                (describe_expected(expected), describe_found(&found))
+            };
             return Some(Drift {
                 path: path.to_path_buf(),
-                expected: describe_expected(expected),
-                found: describe_found(&found),
+                expected: expected_description,
+                found: found_description,
             });
         }
         // A folder that gained content since it was listed is never carried
@@ -766,6 +779,43 @@ fn describe_found(state: &TargetState) -> String {
     } else {
         format!("a {} byte file", state.size)
     }
+}
+
+fn describe_expected_with_time(state: &PathState) -> String {
+    format!(
+        "a {} byte file (modified at {})",
+        state.size,
+        describe_modified_time(state.modified)
+    )
+}
+
+fn describe_found_with_time(state: &TargetState) -> String {
+    format!(
+        "a {} byte file (modified at {})",
+        state.size,
+        describe_modified_time(state.modified)
+    )
+}
+
+fn describe_modified_time(time: Option<SystemTime>) -> String {
+    let Some(time) = time else {
+        return "an unknown time".to_string();
+    };
+    let seconds = match time.duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(elapsed) => i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX),
+        Err(error) => {
+            let elapsed = error.duration();
+            let whole_seconds = i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX);
+            if elapsed.subsec_nanos() == 0 {
+                whole_seconds.saturating_neg()
+            } else {
+                whole_seconds.saturating_add(1).saturating_neg()
+            }
+        }
+    };
+    let (year, month, day, hour, minute, second) =
+        ca_vfs::remote::timestamp::unix_to_civil(seconds);
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02} UTC")
 }
 
 /// Swap two files through a staged name in one of their own directories.
