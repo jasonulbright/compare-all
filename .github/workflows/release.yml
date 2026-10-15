@@ -266,7 +266,7 @@ jobs:
   publish:
     needs: [windows, unix]
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 60
     permissions:
       contents: write
     steps:
@@ -277,6 +277,21 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+      # The publisher runs on Ubuntu 24.04, but the catalog procedure is
+      # intentionally executed in an Ubuntu 22.04 container matching the audit.
+      - name: Test the AppImage with the catalog Firejail gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          bash scripts/run-appimage-catalog-gate.sh "dist/compare-all-$version-x86_64.AppImage" \
+            "$RUNNER_TEMP/appimage-catalog-check"
+      - if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: appimage-catalog-check
+          path: ${{ runner.temp }}/appimage-catalog-check
+          if-no-files-found: ignore
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
