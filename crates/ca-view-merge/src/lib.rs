@@ -340,6 +340,8 @@ pub struct MergeView {
     /// Whether the adopted result already differs from the last written or
     /// freshly generated output. This is computed once when a merge completes.
     output_changed_on_load: bool,
+    /// A save failed, so even an untouched generated output still needs writing.
+    save_failed: bool,
     message: Option<String>,
     failed: bool,
     notify: Arc<dyn Fn() + Send + Sync>,
@@ -559,6 +561,7 @@ impl MergeView {
             saved_output: None,
             saved_conflicts: None,
             output_changed_on_load: false,
+            save_failed: false,
             message: None,
             failed: false,
             notify: Arc::clone(&context.notify),
@@ -701,9 +704,13 @@ impl MergeView {
 
     /// True when the output differs from the text this session last wrote,
     /// or, before the first write, from the output the merge run produced.
+    /// A failed save also leaves the output needing a write.
     #[must_use]
     pub fn is_modified(&self) -> bool {
-        self.output_changed_on_load || self.output_pane.is_modified() || self.marks_changed
+        self.save_failed
+            || self.output_changed_on_load
+            || self.output_pane.is_modified()
+            || self.marks_changed
     }
 
     /// The sections that wait for review, which a save writes as markers.
@@ -963,6 +970,7 @@ impl MergeView {
                 self.written_marks = saving_marks;
                 self.marks_changed = self.waiting_sections() != self.written_marks;
                 self.output_changed_on_load = false;
+                self.save_failed = false;
                 if let Some(revision) = saving_revision {
                     self.output_pane.buffer_mut().mark_saved_revision(revision);
                 }
@@ -982,10 +990,12 @@ impl MergeView {
             SaveOutcome::WouldLose(reason) => self.question = Some(Question::AcceptLoss(reason)),
             SaveOutcome::NotWritable => {
                 self.failed = true;
+                self.save_failed = true;
                 self.message = Some("The output file cannot be replaced".to_owned());
             }
             SaveOutcome::Failed(reason) => {
                 self.failed = true;
+                self.save_failed = true;
                 self.message = Some(format!("The output was not written: {reason}"));
             }
         }
@@ -3024,6 +3034,15 @@ mod tests {
     use std::time::{Duration, Instant};
 
     fn open(left: &str, center: Option<&str>, right: &str) -> (MergeView, tempfile::TempDir) {
+        open_with_output(left, center, right, None)
+    }
+
+    fn open_with_output(
+        left: &str,
+        center: Option<&str>,
+        right: &str,
+        output: Option<&str>,
+    ) -> (MergeView, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let write = |name: &str, text: &str| {
             let path = dir.path().join(name);
@@ -3036,6 +3055,9 @@ mod tests {
             right: write("right.txt", right),
             output: Some(dir.path().join("out.txt")),
         };
+        if let Some(text) = output {
+            write("out.txt", text);
+        }
         let view = MergeView::over(paths, ca_ui::view::Titles::default(), &context(), 7);
         (view, dir)
     }
@@ -4600,6 +4622,79 @@ mod tests {
         );
 
         assert_eq!(view.question(), Some(&Question::OverwriteChanged));
+    }
+
+    #[test]
+    fn a_failed_save_of_generated_output_requires_a_successful_write_before_close() {
+        for outcome in [
+            ca_ui::save::SaveOutcome::NotWritable,
+            ca_ui::save::SaveOutcome::Failed("output locked".to_owned()),
+        ] {
+            let (mut view, dir) = open("new\n", Some("old\n"), "old\n");
+            run_until_ready(&mut view);
+            assert!(!view.is_modified());
+
+            view.finish_save(outcome, String::new(), Vec::new());
+
+            assert!(view.is_modified());
+            assert_eq!(view.exit_code(), Some(100));
+            assert!(!view.may_close());
+            assert_eq!(view.question(), Some(&Question::CloseModified));
+            view.answer(false);
+            view.run(Command::Reload);
+            run_until_ready(&mut view);
+            assert!(view.is_modified());
+            assert_eq!(save_and_read(&mut view, &dir), b"new\n");
+            assert!(!view.is_modified());
+            assert!(view.may_close());
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn a_locked_output_reports_the_cause_and_keeps_generated_output_modified_until_retry() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        // No sharing prevents inspection; read sharing permits inspection but
+        // prevents replacement. Both failures must protect the generated output.
+        for sharing in [0, 1] {
+            let (mut view, dir) =
+                open_with_output("new\n", Some("old\n"), "old\n", Some("original\n"));
+            run_until_ready(&mut view);
+            assert!(!view.is_modified());
+            let target = dir.path().join("out.txt");
+            let locked = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(sharing)
+                .open(&target)
+                .unwrap();
+
+            view.run(Command::SaveFile);
+            assert!(ca_ui::testing::wait_until(Duration::from_secs(20), || {
+                view.drain_save();
+                !view.is_saving()
+            }));
+
+            assert_eq!(view.question(), None);
+            let message = view.message.as_deref().unwrap();
+            assert!(message.contains("(os error 32)"), "{message}");
+            if sharing == 0 {
+                assert!(message.contains("Cannot inspect"), "{message}");
+                assert!(message.contains(&target.display().to_string()), "{message}");
+            }
+            assert_eq!(view.exit_code(), Some(100));
+            assert!(view.is_modified());
+            assert!(!view.may_close());
+            assert_eq!(view.question(), Some(&Question::CloseModified));
+            view.answer(false);
+            drop(locked);
+            assert_eq!(std::fs::read(&target).unwrap(), b"original\n");
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 4);
+
+            assert_eq!(save_and_read(&mut view, &dir), b"new\n");
+            assert!(!view.is_modified());
+            assert!(view.may_close());
+        }
     }
 
     #[test]
