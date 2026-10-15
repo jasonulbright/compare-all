@@ -246,6 +246,8 @@ enum MergeSaveMessage {
         output: String,
         marks: Vec<usize>,
     },
+    NeedsConflictConsent,
+    NeedsLossConsent,
     Cancelled,
 }
 
@@ -928,6 +930,21 @@ impl MergeView {
         for message in messages {
             match message {
                 MergeSaveMessage::Cancelled => finished = true,
+                MergeSaveMessage::NeedsConflictConsent => {
+                    self.saving_revision = None;
+                    self.saving_conflicts = None;
+                    self.question = Some(Question::SaveWithConflicts);
+                    finished = true;
+                }
+                MergeSaveMessage::NeedsLossConsent => {
+                    self.saving_revision = None;
+                    self.saving_conflicts = None;
+                    self.question = Some(Question::AcceptLoss(
+                        "The output includes replacement characters from an input that did not decode cleanly."
+                            .to_owned(),
+                    ));
+                    finished = true;
+                }
                 MergeSaveMessage::Done {
                     outcome,
                     output,
@@ -1584,15 +1601,6 @@ impl MergeView {
             self.message = Some(EDITING_OFF.to_owned());
             return;
         }
-        if !self.consent.accept_loss
-            && output::contains_lossy_input(&self.data.model, &self.data.sources)
-        {
-            self.question = Some(Question::AcceptLoss(
-                "The output includes replacement characters from an input that did not decode cleanly."
-                    .to_owned(),
-            ));
-            return;
-        }
         let Some(path) = self.paths.output.clone() else {
             self.message = Some(NO_OUTPUT.to_owned());
             return;
@@ -1604,11 +1612,12 @@ impl MergeView {
             self.absorb_output_edits();
         }
         let conflicts = self.data.model.totals().conflicts_remaining;
-        if conflicts > 0 && !self.accept_markers {
+        let has_lossy_source = output::sources_had_decode_errors(&self.data.sources);
+        if conflicts > 0 && !self.accept_markers && !has_lossy_source {
             self.question = Some(Question::SaveWithConflicts);
             return;
         }
-        let markers = (conflicts > 0).then(|| self.marker_labels());
+        let markers = (conflicts > 0 && self.accept_markers).then(|| self.marker_labels());
         let marker_plan = markers
             .as_ref()
             .map(|_| output::MarkerSavePlan::from_model(&self.data.model));
@@ -1621,6 +1630,7 @@ impl MergeView {
         let template = self.data.sources.left.clone();
         let expected = self.output_baseline;
         let consent = self.consent;
+        let accept_markers = self.accept_markers;
         let rules = self.save_rules.clone();
         self.save_job = Some(Job::spawn_notifying(
             move |emitter, _| {
@@ -1642,6 +1652,17 @@ impl MergeView {
                     }
                     _ => None,
                 };
+                let output_to_write = marked.as_deref().unwrap_or(&saved_output);
+                if !consent.accept_loss
+                    && output::contains_lossy_replacement(output_to_write, has_lossy_source)
+                {
+                    emitter.send(MergeSaveMessage::NeedsLossConsent);
+                    return;
+                }
+                if conflicts > 0 && !accept_markers {
+                    emitter.send(MergeSaveMessage::NeedsConflictConsent);
+                    return;
+                }
                 let marks = marker_plan
                     .as_ref()
                     .map_or_else(Vec::new, output::MarkerSavePlan::waiting_sections);
@@ -3237,6 +3258,15 @@ mod tests {
         panic!("the merge never became ready");
     }
 
+    fn wait_for_save(view: &mut MergeView) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while view.save_job.is_some() && Instant::now() < deadline {
+            view.tick();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(view.save_job.is_none(), "the save worker did not finish");
+    }
+
     fn finish_search(view: &mut MergeView) {
         assert!(ca_ui::testing::wait_until(Duration::from_secs(20), || {
             view.tick();
@@ -4527,7 +4557,7 @@ mod tests {
     }
 
     #[test]
-    fn saving_output_that_contains_a_decode_replacement_asks_first() {
+    fn saving_generated_output_with_a_decode_replacement_asks_on_the_worker() {
         let utf16 = |text: &str| {
             let mut bytes = vec![0xff, 0xfe];
             for unit in text.encode_utf16() {
@@ -4547,10 +4577,144 @@ mod tests {
         assert!(view.data.sources.left.had_errors);
         assert!(view.output_text().contains('\u{fffd}'));
 
+        super::output::reset_lossy_input_line_visits();
         view.run(Command::SaveFile);
 
+        assert_eq!(super::output::lossy_input_line_visits(), 0);
+        assert!(view.question().is_none());
+        assert!(view.save_job.is_some());
+        wait_for_save(&mut view);
         assert!(matches!(view.question(), Some(Question::AcceptLoss(_))));
         assert!(!dir.path().join("out.txt").exists());
+
+        view.answer(true);
+        assert!(view.save_job.is_some());
+        wait_for_save(&mut view);
+        let saved = ca_text::LoadedText::load(
+            &std::fs::read(dir.path().join("out.txt")).unwrap(),
+            &ca_text::DecodeOptions::default(),
+        );
+        assert!(saved.buffer.text().contains('\u{fffd}'));
+    }
+
+    #[test]
+    fn save_checks_the_current_output_after_a_take_and_undo_redo() {
+        let utf16 = |text: &str| {
+            let mut bytes = vec![0xff, 0xfe];
+            for unit in text.encode_utf16() {
+                bytes.extend_from_slice(&unit.to_le_bytes());
+            }
+            bytes
+        };
+        let mut malformed = utf16("a\nb\nc\n");
+        malformed.extend_from_slice(&0xd800_u16.to_le_bytes());
+        let (mut view, dir) =
+            open_bytes(&malformed, Some(&utf16("a\nb\nc\n")), &utf16("a\nb\nc\n"));
+        run_until_ready(&mut view);
+        assert!(view.data.sources.left.had_errors);
+        assert!(view.output_text().contains('\u{fffd}'));
+
+        let replacement_line = view
+            .model()
+            .output_lines()
+            .iter()
+            .position(|line| line.contains('\u{fffd}'))
+            .unwrap();
+        view.current = view
+            .model()
+            .section_of_output_line(u32::try_from(replacement_line).unwrap())
+            .unwrap();
+        view.run(Command::TakeCenter);
+        assert!(!view.output_text().contains('\u{fffd}'));
+        view.run(Command::Undo);
+        assert!(view.output_text().contains('\u{fffd}'));
+        view.run(Command::Redo);
+        assert!(!view.output_text().contains('\u{fffd}'));
+
+        view.run(Command::SaveFile);
+        assert!(view.question().is_none());
+        assert!(view.save_job.is_some());
+        wait_for_save(&mut view);
+        assert!(view.question().is_none());
+        assert!(dir.path().join("out.txt").exists());
+    }
+
+    #[test]
+    fn saving_a_user_inserted_replacement_asks_even_when_model_output_lacks_it() {
+        let utf16 = |text: &str| {
+            let mut bytes = vec![0xff, 0xfe];
+            for unit in text.encode_utf16() {
+                bytes.extend_from_slice(&unit.to_le_bytes());
+            }
+            bytes
+        };
+        let mut malformed = utf16("a\n");
+        malformed.extend_from_slice(&0xd800_u16.to_le_bytes());
+        malformed.extend_from_slice(
+            &"\nc\n"
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>(),
+        );
+        let (mut view, dir) =
+            open_bytes(&malformed, Some(&utf16("a\nb\nc\n")), &utf16("a\nR\nc\n"));
+        run_until_ready(&mut view);
+        assert!(view.data.sources.left.had_errors);
+        view.run(Command::NextConflict);
+        view.run(Command::TakeCenter);
+        view.output_pane
+            .place(ca_ui::editor::Caret::new(0, 0), false);
+        view.output_pane.type_character('\u{fffd}');
+        assert!(view.output_pane.buffer().text().contains('\u{fffd}'));
+        assert!(!view.output_text().contains('\u{fffd}'));
+
+        view.run(Command::SaveFile);
+        assert!(view.question().is_none());
+        wait_for_save(&mut view);
+        assert!(matches!(view.question(), Some(Question::AcceptLoss(_))));
+        assert!(!dir.path().join("out.txt").exists());
+    }
+
+    #[test]
+    fn marker_output_checks_replacements_from_conflict_inputs() {
+        let utf16 = |text: &str| {
+            let mut bytes = vec![0xff, 0xfe];
+            for unit in text.encode_utf16() {
+                bytes.extend_from_slice(&unit.to_le_bytes());
+            }
+            bytes
+        };
+        let mut malformed = utf16("a\n");
+        malformed.extend_from_slice(&0xd800_u16.to_le_bytes());
+        malformed.extend_from_slice(
+            &"\nc\n"
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>(),
+        );
+        let (mut view, dir) =
+            open_bytes(&malformed, Some(&utf16("a\nb\nc\n")), &utf16("a\nR\nc\n"));
+        run_until_ready(&mut view);
+        assert!(view.data.sources.left.had_errors);
+        assert!(!view.output_text().contains('\u{fffd}'));
+
+        view.run(Command::SaveFile);
+        wait_for_save(&mut view);
+        assert_eq!(view.question(), Some(&Question::SaveWithConflicts));
+        view.answer(true);
+        wait_for_save(&mut view);
+        assert!(matches!(view.question(), Some(Question::AcceptLoss(_))));
+        assert!(!dir.path().join("out.txt").exists());
+
+        view.answer(true);
+        wait_for_save(&mut view);
+        let saved = ca_text::LoadedText::load(
+            &std::fs::read(dir.path().join("out.txt")).unwrap(),
+            &ca_text::DecodeOptions::default(),
+        );
+        let text = saved.buffer.text();
+        assert!(text.contains("<<<<<<<"));
+        assert!(text.contains('\u{fffd}'));
     }
 
     #[test]
