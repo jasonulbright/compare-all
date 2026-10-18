@@ -874,6 +874,7 @@ dependencies = [
  "ca-io",
  "ca-session",
  "ca-ui",
+ "ca-update",
  "ca-vfs",
  "ca-view-folder",
  "ca-view-hex",
