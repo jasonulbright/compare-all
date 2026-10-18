@@ -4,7 +4,7 @@
 //! finished result for the view to apply. Every step polls the cancellation
 //! flag, so a newer request stops an older run rather than waiting for it.
 
-use crate::model::{split, Inputs, MergeModel, Pane};
+use crate::model::{split, Inputs, Layout, MergeModel, Pairing, Pane};
 use crate::settings::EngineOptions;
 use ca_text::{DecodeOptions, EolStyle, LoadedText};
 use ca_ui::save::{Baseline, FileSystem, RealFileSystem, Stamp};
@@ -102,6 +102,18 @@ pub struct MergeData {
     /// first one it is given, so a file written under that name later is a
     /// change and not the state the session started from.
     pub output_baseline: Baseline,
+    /// The sections of this merge paired with those of the merge it
+    /// replaces, when the run was given that merge's layout.
+    pub pairing: Option<Pairing>,
+}
+
+/// The merge a run replaces, whose decisions the view carries over.
+#[derive(Debug, Clone, Default)]
+pub struct Earlier {
+    /// Its inputs and section ranges.
+    pub layout: Layout,
+    /// True when its left and right inputs were the other way round.
+    pub swapped: bool,
 }
 
 /// What the worker posts back.
@@ -159,10 +171,20 @@ pub fn spawn(
     paths: MergePaths,
     options: EngineOptions,
     decoding: MergeDecoding,
+    earlier: Option<Earlier>,
     notify: Arc<dyn Fn() + Send + Sync>,
 ) -> Job<MergeMessage> {
     Job::spawn_notifying(
-        move |emitter, cancel| run(&paths, &options, &decoding, emitter, cancel),
+        move |emitter, cancel| {
+            run(
+                &paths,
+                &options,
+                &decoding,
+                earlier.as_ref(),
+                emitter,
+                cancel,
+            );
+        },
         notify,
     )
 }
@@ -171,6 +193,7 @@ fn run(
     paths: &MergePaths,
     options: &EngineOptions,
     decoding: &MergeDecoding,
+    earlier: Option<&Earlier>,
     emitter: &Emitter<MergeMessage>,
     cancel: &Cancel,
 ) {
@@ -178,7 +201,10 @@ fn run(
         emitter.send(MergeMessage::Progress(step));
     };
     match read_and_merge(paths, options, decoding, cancel, &progress) {
-        Ok(Some(data)) => {
+        Ok(Some(mut data)) => {
+            if let Some(earlier) = earlier {
+                data.pairing = Some(data.model.pair_with(&earlier.layout, earlier.swapped));
+            }
             emitter.send(MergeMessage::Ready(Box::new(data)));
         }
         Ok(None) => {}
@@ -257,6 +283,7 @@ pub fn read_and_merge(
         sources,
         widest,
         output_baseline,
+        pairing: None,
     }))
 }
 
@@ -300,10 +327,15 @@ mod tests {
     use std::time::{Duration, Instant};
 
     fn collect(paths: MergePaths) -> Vec<MergeMessage> {
+        collect_after(paths, None)
+    }
+
+    fn collect_after(paths: MergePaths, earlier: Option<super::Earlier>) -> Vec<MergeMessage> {
         let mut job = spawn(
             paths,
             crate::settings::options_from(&ca_session::settings::TextMergeSettings::default()),
             super::MergeDecoding::default(),
+            earlier,
             Arc::new(|| {}),
         );
         let deadline = Instant::now() + Duration::from_secs(20);
@@ -332,6 +364,29 @@ mod tests {
                 _ => None,
             })
             .expect("the merge finished")
+    }
+
+    /// The worker pairs the sections of a reload with the merge it replaces,
+    /// so the view does not compare section texts when it adopts the result.
+    #[test]
+    fn a_reload_comes_back_paired_with_the_merge_it_replaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = MergePaths {
+            left: write(dir.path(), "left.txt", "a\nL\nc\np\nq\nr\ns\n"),
+            center: Some(write(dir.path(), "center.txt", "a\nb\nc\np\nq\nr\ns\n")),
+            right: write(dir.path(), "right.txt", "a\nR\nc\np\nq\nr\ns\n"),
+            output: None,
+        };
+        let first = ready(collect(paths.clone()));
+        assert!(first.pairing.is_none());
+        let earlier = super::Earlier {
+            layout: first.model.layout(),
+            swapped: false,
+        };
+        let second = ready(collect_after(paths, Some(earlier)));
+        let pairing = second.pairing.as_ref().expect("a pairing");
+        assert!(pairing.fits(&first.model, &second.model, false));
+        assert!(!pairing.fits(&first.model, &second.model, true));
     }
 
     #[test]
@@ -392,6 +447,7 @@ mod tests {
             paths,
             crate::settings::options_from(&ca_session::settings::TextMergeSettings::default()),
             super::MergeDecoding::default(),
+            None,
             Arc::new(|| {}),
         );
         job.cancel();

@@ -544,6 +544,7 @@ impl MergeView {
                 }),
                 widest: 0,
                 output_baseline: Baseline::Unchecked,
+                pairing: None,
             },
             status: Status::Running("Reading files"),
             job: None,
@@ -1009,6 +1010,10 @@ impl MergeView {
                 left: crate::settings::decode_from(&self.session_settings.format.left_encoding),
                 right: crate::settings::decode_from(&self.session_settings.format.right_encoding),
             },
+            Some(jobs::Earlier {
+                layout: self.data.model.layout(),
+                swapped: self.swapped,
+            }),
             Arc::clone(&self.notify),
         ));
     }
@@ -1146,11 +1151,10 @@ impl MergeView {
         let generated_output = data.model.output_text();
         data.model.set_rules(self.rules);
         let generated_marks: Vec<usize> = waiting_in(&data.model);
-        if std::mem::take(&mut self.swapped) {
-            data.model.carry_over_swapped(&self.data.model);
-        } else {
-            data.model.carry_over(&self.data.model);
-        }
+        let swapped = std::mem::take(&mut self.swapped);
+        let pairing = data.pairing.take();
+        data.model
+            .carry_over_paired(&self.data.model, swapped, pairing.as_ref());
         let baseline = self.saved_output.as_deref().unwrap_or(&generated_output);
         self.output_changed_on_load = !output_lines_equal_text(data.model.output_lines(), baseline);
         // The baseline of the output is taken once. A later run must not adopt
