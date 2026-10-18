@@ -1185,6 +1185,45 @@ fn a_stalled_download_ends_after_the_idle_limit() {
 }
 
 #[test]
+fn a_stalled_download_closes_its_connection_after_the_idle_limit() {
+    use ca_update::net::Transport;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let (closed_sender, closed) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        let mut buffer = [0u8; 4096];
+        let _ = stream.read(&mut buffer);
+        let head = "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: 4000\r\nConnection: close\r\n\r\n";
+        let _ = stream.write_all(head.as_bytes());
+        let _ = stream.write_all(&[7u8; 600]);
+        let _ = stream.flush();
+        // Send nothing more and wait until the client closes the socket.
+        let stalled = std::time::Instant::now();
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(40)));
+        let mut rest = [0u8; 16];
+        let _ = stream.read(&mut rest);
+        let _ = closed_sender.send(stalled.elapsed());
+    });
+    let transport = HttpTransport::new(
+        "compare-all/test".to_owned(),
+        ProxyConfig::direct(),
+        Duration::from_secs(1),
+    )
+    .allowing_plain_http();
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("file.part");
+    let cancel = Arc::new(AtomicBool::new(false));
+    // The size cap of a real release makes the outer limit days long.
+    let result = transport.download(&format!("{base}/f"), &out, 512 * 1024 * 1024, &cancel);
+    assert!(result.is_err());
+    let waited = closed.recv_timeout(Duration::from_secs(60)).unwrap();
+    assert!(waited < Duration::from_secs(10), "{waited:?}");
+}
+
+#[test]
 fn the_installer_runs_only_for_an_install_for_one_user() {
     let server = Server::start();
     let msi = msi_bytes();
