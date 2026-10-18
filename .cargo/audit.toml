@@ -1,0 +1,8 @@
+[advisories]
+# quick-xml 0.30.0 is reached only through zbus_xml 4.0.0 under atspi-common.
+# zbus_xml parses the D-Bus interface XML shipped inside the atspi-common
+# source at compile time (zbus_lockstep_macros) and in atspi-common unit
+# tests. No shipped code path calls it, so no untrusted XML reaches the
+# affected attribute check or the NsReader namespace resolver. Remove these
+# entries when eframe moves to an accesskit_unix release without zbus_xml.
+ignore = ["RUSTSEC-2026-0194", "RUSTSEC-2026-0195"]
