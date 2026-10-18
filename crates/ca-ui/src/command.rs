@@ -693,20 +693,33 @@ impl ShortcutTable {
         let mut per_view = std::collections::BTreeMap::new();
         for view in MenuView::ALL {
             let mut table = bindings(*view);
-            let inherited = matches!(view, MenuView::Version | MenuView::Media)
-                .then(|| options.view(MenuView::Other.id()))
-                .flatten();
-            for stated in inherited.into_iter().chain(options.view(view.id())) {
-                for (command, keys) in &stated.shortcuts {
-                    let Some(command) = Command::from_id(command) else {
-                        continue;
-                    };
-                    table.retain(|(_, held)| *held != command);
-                    for text in keys {
-                        if let Some(stroke) = Keystroke::from_text(text) {
-                            table.retain(|(held, _)| *held != stroke);
-                            table.push((stroke, command));
-                        }
+            let own = options.view(view.id());
+            let inherited = match view {
+                MenuView::Version | MenuView::Media => options.view(MenuView::Other.id()),
+                MenuView::FolderMerge => options.view(MenuView::Merge.id()),
+                _ => None,
+            };
+            // A folder merge takes a text merge binding only for a command it
+            // shares and states no binding of its own for: applying both
+            // would let the inherited keys take strokes from other commands.
+            let inherited = inherited
+                .into_iter()
+                .flat_map(|stated| &stated.shortcuts)
+                .filter(|(command, _)| {
+                    *view != MenuView::FolderMerge
+                        || (own.is_none_or(|own| !own.shortcuts.contains_key(*command))
+                            && Command::from_id(command).is_some_and(shared_with_folder_merges))
+                });
+            let stated = inherited.chain(own.into_iter().flat_map(|stated| &stated.shortcuts));
+            for (command, keys) in stated {
+                let Some(command) = Command::from_id(command) else {
+                    continue;
+                };
+                table.retain(|(_, held)| *held != command);
+                for text in keys {
+                    if let Some(stroke) = Keystroke::from_text(text) {
+                        table.retain(|(held, _)| *held != stroke);
+                        table.push((stroke, command));
                     }
                 }
             }
@@ -766,6 +779,49 @@ pub fn route(view: MenuView, stroke: Keystroke) -> Option<Command> {
             .or_else(|| merge(stroke))
             .or_else(|| text(stroke)),
     })
+}
+
+/// Every command a folder merge view answers for.
+pub const FOLDER_MERGE_COMMANDS: &[Command] = &[
+    Command::SwapSides,
+    Command::Reload,
+    Command::Recompare,
+    Command::CompareReport,
+    Command::SelectAll,
+    Command::SelectAllFiles,
+    Command::Find,
+    Command::FindNext,
+    Command::FindPrevious,
+    Command::NextDifference,
+    Command::PreviousDifference,
+    Command::ShowAll,
+    Command::ShowDifferences,
+    Command::ShowConflicts,
+    Command::ShowLeftChanges,
+    Command::ShowRightChanges,
+    Command::ShowMergeable,
+    Command::ShowSame,
+    Command::ShowNone,
+    Command::ToggleIgnoreSameChanges,
+    Command::TakeLeft,
+    Command::TakeCenter,
+    Command::TakeRight,
+    Command::NextConflict,
+    Command::PreviousConflict,
+    Command::ToggleCenterPane,
+    Command::MergeFolders,
+    Command::CopyToOutput,
+    Command::OpenTextMerge,
+    Command::CompareToOutput,
+];
+
+/// True for a command a folder merge has in common with a text merge: one
+/// the folder merge view answers for, or one every bar routes alike.
+fn shared_with_folder_merges(command: Command) -> bool {
+    FOLDER_MERGE_COMMANDS.contains(&command)
+        || bindings(MenuView::FolderMerge)
+            .into_iter()
+            .any(|(stroke, held)| held == command && shared(stroke) == Some(command))
 }
 
 /// The bindings the folder merge bar puts ahead of the merge bar: a folder
@@ -1290,6 +1346,70 @@ mod tests {
         assert_eq!(
             table.shortcuts_of(MenuView::Version, Command::Recompare),
             [rebound]
+        );
+    }
+
+    #[test]
+    fn folder_merges_keep_text_merge_bindings_of_the_commands_they_share() {
+        use super::ShortcutTable;
+        let mut options = ca_session::options::CommandOptions::default();
+        for (command, key) in [
+            (Command::TakeLeft, "Ctrl+Alt+J"),
+            (Command::CloseTab, "Ctrl+Alt+K"),
+            (Command::NextSection, "Ctrl+Alt+M"),
+            (Command::TakeRight, "Ctrl+Alt+U"),
+        ] {
+            options.set_shortcuts(MenuView::Merge.id(), command.id(), vec![key.to_owned()]);
+        }
+        options.set_shortcuts(
+            MenuView::FolderMerge.id(),
+            Command::TakeRight.id(),
+            vec!["Ctrl+Alt+Y".to_owned()],
+        );
+        let table = ShortcutTable::from_options(&options);
+        let folder = MenuView::FolderMerge;
+
+        assert_eq!(
+            table.shortcuts_of(folder, Command::TakeLeft),
+            [Keystroke::with_command_alt(Key::J)]
+        );
+        assert_eq!(
+            super::route_with(folder, Keystroke::with_command(Key::L), &table),
+            None,
+            "the built-in key still answers"
+        );
+        assert_eq!(
+            table.shortcuts_of(folder, Command::CloseTab),
+            [Keystroke::with_command_alt(Key::K)]
+        );
+        assert_eq!(
+            table.shortcuts_of(folder, Command::TakeRight),
+            [Keystroke::with_command_alt(Key::Y)],
+            "the text merge binding replaced the folder merge one"
+        );
+        assert_eq!(
+            super::route_with(folder, Keystroke::with_command_alt(Key::U), &table),
+            None
+        );
+        assert_eq!(
+            super::route_with(folder, Keystroke::with_command_alt(Key::M), &table),
+            None,
+            "a command folder merges lack took a text merge binding"
+        );
+        assert_eq!(
+            super::route_with(folder, Keystroke::with_command(Key::N), &table),
+            Some(Command::NextDifference)
+        );
+
+        let merge = MenuView::Merge;
+        assert_eq!(
+            table.shortcuts_of(merge, Command::TakeRight),
+            [Keystroke::with_command_alt(Key::U)],
+            "a folder merge binding reached text merges"
+        );
+        assert_eq!(
+            table.shortcuts_of(merge, Command::NextSection),
+            [Keystroke::with_command_alt(Key::M)]
         );
     }
 

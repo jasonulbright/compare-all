@@ -93,38 +93,7 @@ fn is_merge_difference(row: &MergeRow) -> bool {
 }
 
 /// Every command from the shared vocabulary this view answers for.
-const HANDLED: &[Command] = &[
-    Command::SwapSides,
-    Command::Reload,
-    Command::Recompare,
-    Command::CompareReport,
-    Command::SelectAll,
-    Command::SelectAllFiles,
-    Command::Find,
-    Command::FindNext,
-    Command::FindPrevious,
-    Command::NextDifference,
-    Command::PreviousDifference,
-    Command::ShowAll,
-    Command::ShowDifferences,
-    Command::ShowConflicts,
-    Command::ShowLeftChanges,
-    Command::ShowRightChanges,
-    Command::ShowMergeable,
-    Command::ShowSame,
-    Command::ShowNone,
-    Command::ToggleIgnoreSameChanges,
-    Command::TakeLeft,
-    Command::TakeCenter,
-    Command::TakeRight,
-    Command::NextConflict,
-    Command::PreviousConflict,
-    Command::ToggleCenterPane,
-    Command::MergeFolders,
-    Command::CopyToOutput,
-    Command::OpenTextMerge,
-    Command::CompareToOutput,
-];
+const HANDLED: &[Command] = ca_ui::command::FOLDER_MERGE_COMMANDS;
 
 /// Which rows the view shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
