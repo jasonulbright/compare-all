@@ -1055,7 +1055,7 @@ fn a_helper_that_finds_the_apply_claimed_leaves_everything_alone() {
 }
 
 #[test]
-fn a_helper_that_applies_nothing_does_not_start_the_program() {
+fn a_helper_starts_the_program_only_after_it_ended_and_no_apply_runs_elsewhere() {
     let server = Server::start();
     let target = program_folder();
     let starts = AtomicUsize::new(0);
@@ -1084,13 +1084,14 @@ fn a_helper_that_applies_nothing_does_not_start_the_program() {
     assert_ne!(run(&staging), 0);
     drop(claim);
     assert_eq!(starts.load(Ordering::SeqCst), 0);
-    // Another helper applied the update and cleared it.
+    // Another helper applied the update and cleared it. The program closed
+    // with "Restart to update" comes back once it has ended.
     let (_keep, empty) = staging_dir();
     assert_ne!(run(&empty), 0);
-    assert_eq!(starts.load(Ordering::SeqCst), 0);
+    assert_eq!(starts.load(Ordering::SeqCst), 1);
     // This helper applies the update.
     assert_eq!(run(&staging), 0);
-    assert_eq!(starts.load(Ordering::SeqCst), 1);
+    assert_eq!(starts.load(Ordering::SeqCst), 2);
     // The end of the program is not seen.
     let (_keep, other) = staging_dir();
     stage_portable(&server, &other);
@@ -1111,7 +1112,25 @@ fn a_helper_that_applies_nothing_does_not_start_the_program() {
         },
     );
     assert_ne!(code, 0);
-    assert_eq!(starts.load(Ordering::SeqCst), 1);
+    assert_eq!(starts.load(Ordering::SeqCst), 2);
+    // Nothing staged and the end of the program is not seen.
+    let (_keep, empty) = staging_dir();
+    let arguments = ca_update::apply::HelperArguments {
+        staging: empty.dir().to_path_buf(),
+        ..arguments
+    };
+    let code = ca_update::apply::helper_main_with(
+        &arguments,
+        &FakeSigner::signed_by(SIGNER),
+        SIGNER,
+        &running(),
+        Duration::from_millis(300),
+        &|| {
+            starts.fetch_add(1, Ordering::SeqCst);
+        },
+    );
+    assert_ne!(code, 0);
+    assert_eq!(starts.load(Ordering::SeqCst), 2);
 }
 
 #[test]
