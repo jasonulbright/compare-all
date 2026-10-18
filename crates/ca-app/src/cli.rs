@@ -448,9 +448,30 @@ pub fn run_left_side(
     settings_directory: &Path,
     probe: &dyn Fn(&Path) -> PathKind,
 ) -> Result<Startup, i32> {
+    let lasts = ca_ui::paths::settings_notice_for(settings_directory).is_none();
+    run_left_side_in(startup, settings_directory, lasts, probe)
+}
+
+/// [`run_left_side`] with the answer to whether `settings_directory` outlives
+/// this process.
+///
+/// A folder that is removed at exit cannot carry the path to the next start,
+/// so remembering into it is refused instead of reported as done.
+fn run_left_side_in(
+    startup: Startup,
+    settings_directory: &Path,
+    lasts: bool,
+    probe: &dyn Fn(&Path) -> PathKind,
+) -> Result<Startup, i32> {
     let file = settings_directory.join(LEFT_SIDE_FILE);
     match startup {
         Startup::RememberLeft(path) => {
+            if !lasts {
+                return Ok(Startup::Rejected(
+                    "The left side could not be remembered: no folder for settings is available, so the path would be lost when this program ends."
+                        .to_owned(),
+                ));
+            }
             let path = std::path::absolute(&path).unwrap_or(path);
             let written = std::fs::create_dir_all(settings_directory)
                 .and_then(|()| ca_io::write_atomic(&file, path.to_string_lossy().as_bytes()));
@@ -611,6 +632,21 @@ mod tests {
             super::run_left_side(Startup::Home, &settings, &folders),
             Ok(Startup::Home)
         );
+    }
+
+    #[test]
+    fn the_left_side_is_not_reported_remembered_when_state_does_not_last() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dir.path().join("settings");
+        let folders = probe(&["dir-"]);
+        let outcome = super::run_left_side_in(
+            Startup::RememberLeft(dir.path().join("dir-left")),
+            &settings,
+            false,
+            &folders,
+        );
+        assert!(matches!(outcome, Ok(Startup::Rejected(_))), "{outcome:?}");
+        assert!(!settings.exists());
     }
 
     #[test]
