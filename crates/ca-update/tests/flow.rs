@@ -1936,6 +1936,27 @@ fn an_install_whose_program_cannot_be_set_aside_does_not_start() {
     assert!(staging.read_apply_failure().is_none());
 }
 
+/// One elevated step at a time sets aside, installs and restores; a second
+/// one waits a bounded time and then gives up without a change.
+#[cfg(windows)]
+#[test]
+fn only_one_elevated_step_holds_the_install_folder() {
+    use ca_update::install::{hold_install_lock, INSTALL_LOCK_NAME};
+    let parent = tempfile::tempdir().unwrap();
+    let first = hold_install_lock(parent.path(), Duration::ZERO).unwrap();
+    let started = std::time::Instant::now();
+    assert!(hold_install_lock(parent.path(), Duration::from_millis(600)).is_none());
+    assert!(started.elapsed() >= Duration::from_millis(600));
+    // Another account cannot delete or replace the held file either.
+    assert!(std::fs::remove_file(parent.path().join(INSTALL_LOCK_NAME)).is_err());
+    drop(first);
+    assert!(!parent.path().join(INSTALL_LOCK_NAME).exists());
+    let second = hold_install_lock(parent.path(), Duration::ZERO);
+    assert!(second.is_some());
+    drop(second);
+    assert_eq!(std::fs::read_dir(parent.path()).unwrap().count(), 0);
+}
+
 fn flip_a_byte(staging: &Staging) {
     let path = staging.asset_path(&staging.read_record().unwrap());
     let mut bytes = std::fs::read(&path).unwrap();

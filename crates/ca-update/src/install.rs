@@ -172,6 +172,11 @@ pub fn install_main(staging: &Path, checks: &Checks<'_>) -> i32 {
     let Ok(parent) = crate::system::program_files() else {
         return NOT_PREPARED;
     };
+    // Every elevated step uses the same program name and unused-copy name,
+    // so only one may set aside, install and restore at a time.
+    let Some(_install_lock) = hold_install_lock(&parent, INSTALL_LOCK_WAIT) else {
+        return KEPT;
+    };
     sweep_work_folders(&parent);
     let Ok(work) = prepare_work_folder(&parent) else {
         return NOT_PREPARED;
@@ -456,6 +461,60 @@ pub fn installer_command(msi: &Path) -> Command {
 
 fn run_installer(mut command: Command) -> Option<i32> {
     command.status().ok().and_then(|status| status.code())
+}
+
+/// The file in the program files folder that one elevated step holds from
+/// before the set-aside until after the restore.
+pub const INSTALL_LOCK_NAME: &str = "compare-all-update.lock";
+
+/// How long an elevated step waits for another one to release the install
+/// lock before it keeps the staged update for a later close.
+const INSTALL_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// The install lock. The file shares nothing and is deleted when its handle
+/// closes, also when the process ends in any other way.
+#[derive(Debug)]
+pub struct InstallLock {
+    _file: std::fs::File,
+}
+
+/// Hold the install lock in `parent`, waiting at most `wait` while another
+/// step holds it. `None` when it stays held or cannot be created.
+#[must_use]
+pub fn hold_install_lock(parent: &Path, wait: std::time::Duration) -> Option<InstallLock> {
+    let started = std::time::Instant::now();
+    loop {
+        if let Ok(file) = open_install_lock(&parent.join(INSTALL_LOCK_NAME)) {
+            return Some(InstallLock { _file: file });
+        }
+        if started.elapsed() >= wait {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+}
+
+#[cfg(windows)]
+fn open_install_lock(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const DELETE: u32 = 0x0001_0000;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .access_mode(GENERIC_WRITE | DELETE)
+        .share_mode(0)
+        .custom_flags(FILE_FLAG_DELETE_ON_CLOSE)
+        .open(path)
+}
+
+#[cfg(not(windows))]
+fn open_install_lock(_: &Path) -> std::io::Result<std::fs::File> {
+    Err(std::io::Error::other(
+        "this platform has no installer for every user",
+    ))
 }
 
 /// The file each elevated step keeps open in its work folder while it runs.
