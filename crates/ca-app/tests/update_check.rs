@@ -116,7 +116,12 @@ fn a_newer_release_found_at_start_opens_its_page_in_the_browser() {
     // A second window inside the interval asks nothing.
     let mut again = app_in(dir.path(), format!("{}/releases/latest", server.url()));
     assert!(run_frames(&mut again, |app| app.options().is_ready()));
-    assert!(run_frames(&mut again, |app| !app.is_checking_for_updates()));
+    let frames = std::cell::Cell::new(0);
+    assert!(run_frames(&mut again, |_| {
+        frames.set(frames.get() + 1);
+        frames.get() > 30
+    }));
+    assert!(!again.is_checking_for_updates());
     assert_eq!(asked.load(Ordering::SeqCst), 1);
     assert!(again.update_notice().is_none());
 }
@@ -126,7 +131,8 @@ fn the_help_menu_check_says_when_no_newer_release_exists() {
     let dir = tempfile::tempdir().unwrap();
     let (server, asked) = server(format!("v{VERSION}"));
     let mut app = app_in(dir.path(), format!("{}/releases/latest", server.url()));
-    assert!(run_frames(&mut app, |app| app.options().is_ready()
+    assert!(run_frames(&mut app, |app| asked.load(Ordering::SeqCst)
+        == 1
         && !app.is_checking_for_updates()));
     assert!(app.update_notice().is_none());
     assert_eq!(asked.load(Ordering::SeqCst), 1);

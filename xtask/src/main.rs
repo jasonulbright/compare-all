@@ -11,6 +11,7 @@
 mod icon;
 mod notices;
 mod package;
+mod update_manifest;
 mod version;
 
 use std::path::Path;
@@ -31,7 +32,12 @@ fn main() -> anyhow::Result<()> {
         Some("icon") => icon::run(root)?,
         Some("package") => package::run(root)?,
         Some("notices") => notices::run(root)?,
-        _ => anyhow::bail!("usage: cargo xtask <bump|version|build|icon|package|notices>"),
+        Some("update-manifest") => {
+            update_manifest::run(&std::env::args().skip(2).collect::<Vec<_>>())?;
+        }
+        _ => anyhow::bail!(
+            "usage: cargo xtask <bump|version|build|icon|package|notices|update-manifest>"
+        ),
     }
     Ok(())
 }
