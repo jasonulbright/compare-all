@@ -824,7 +824,7 @@ fn xml_space(
         // Entities declared in a document type are not expanded, so a named
         // reference stands for no characters here, as it does in text.
         let characters = attribute
-            .unescape_value_with(|name| {
+            .normalized_value_with(quick_xml::XmlVersion::Implicit1_0, 128, |name| {
                 Some(quick_xml::escape::resolve_predefined_entity(name).unwrap_or(""))
             })
             .map_err(xml_reason)?;
@@ -832,7 +832,9 @@ fn xml_space(
             return Err("invalid XML character reference".to_owned());
         }
         if attribute.key.as_ref() == b"xml:space" {
-            let value = attribute.unescape_value().map_err(xml_reason)?;
+            let value = attribute
+                .normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                .map_err(xml_reason)?;
             preserve = match value.as_ref() {
                 "preserve" => true,
                 "default" => false,
@@ -950,6 +952,49 @@ fn check_cancel(cancel: &dyn Cancel) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{format, format_cancellable, pair_format, StructuredFormat};
+
+    fn attribute_run(count: usize) -> String {
+        use std::fmt::Write;
+        let mut out = String::new();
+        for n in 0..count {
+            let _ = write!(out, " a{n}=\"1\"");
+        }
+        out
+    }
+
+    #[test]
+    fn a_start_tag_with_many_attributes_formats_in_linear_time() {
+        let attributes = attribute_run(120_000);
+        let started = std::time::Instant::now();
+        let formatted = format(&format!("<r{attributes}/>"), StructuredFormat::Xml);
+        assert!(formatted.is_ok());
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_start_tag_repeating_an_attribute_after_many_names_is_refused() {
+        let attributes = attribute_run(5_000);
+        let error = format(
+            &format!("<r{attributes} a42=\"2\"/>"),
+            StructuredFormat::Xml,
+        )
+        .err()
+        .unwrap_or_default();
+        assert!(error.ends_with("duplicate XML attribute"), "{error}");
+    }
+
+    #[test]
+    fn line_breaks_inside_attribute_values_do_not_break_xml_space() {
+        let formatted = format(
+            "<r xml:space=\"preserve\" note=\"a\r\nb\tc\"><x/></r>",
+            StructuredFormat::Xml,
+        );
+        assert!(formatted.is_ok(), "{formatted:?}");
+        let error = format("<r xml:space=\"preserve\n\"/>", StructuredFormat::Xml)
+            .err()
+            .unwrap_or_default();
+        assert!(error.contains("xml:space"), "{error}");
+    }
 
     #[test]
     fn xml_diagnostics_escape_direction_controls() {
