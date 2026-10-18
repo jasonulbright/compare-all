@@ -235,17 +235,22 @@ fn windows_proxy() -> ProxyConfig {
 /// ends; a transfer that stops is ended by the idle limit long before.
 const SLOWEST_RATE: u64 = 1024;
 
+/// Longest time one download may take, whatever its size. A server that
+/// sends a byte just before each idle limit ends here.
+pub const DOWNLOAD_DEADLINE: Duration = Duration::from_secs(2 * 60 * 60);
+
 /// HTTP over `ureq`, with the platform certificate verifier.
 ///
 /// A document must arrive in full within `timeout`. A download must connect
 /// and answer within `timeout`, and then fails only when no byte arrives for
 /// `timeout`, or the file exceeds its size, or the outer limit derived from
-/// the size and [`SLOWEST_RATE`] passes.
+/// the size and [`SLOWEST_RATE`] passes, or [`DOWNLOAD_DEADLINE`] passes.
 #[derive(Debug, Clone)]
 pub struct HttpTransport {
     user_agent: String,
     proxy: ProxyConfig,
     timeout: Duration,
+    deadline: Duration,
     allow_plain_http: bool,
 }
 
@@ -257,6 +262,7 @@ impl HttpTransport {
             user_agent,
             proxy,
             timeout,
+            deadline: DOWNLOAD_DEADLINE,
             allow_plain_http: false,
         }
     }
@@ -265,6 +271,14 @@ impl HttpTransport {
         self.timeout
             .saturating_mul(2)
             .saturating_add(Duration::from_secs(max_bytes / SLOWEST_RATE))
+            .min(self.deadline)
+    }
+
+    /// Use `deadline` instead of [`DOWNLOAD_DEADLINE`].
+    #[must_use]
+    pub fn with_download_deadline(mut self, deadline: Duration) -> Self {
+        self.deadline = deadline;
+        self
     }
 
     /// Accept `http://` addresses. For tests against a local server only.
@@ -339,7 +353,7 @@ impl Transport for HttpTransport {
         let this = self.clone();
         let url = url.to_owned();
         let overall = self.timeout;
-        cancellable(cancel, None, move |flag, progress| {
+        cancellable(cancel, None, None, move |flag, progress| {
             let response = this.open(&url, overall, None)?;
             let mut reader = response.into_body().into_reader();
             let mut out = Vec::new();
@@ -360,7 +374,7 @@ impl Transport for HttpTransport {
         let destination = destination.to_path_buf();
         let overall = self.download_limit(max_bytes);
         let idle = Some(self.timeout);
-        cancellable(cancel, idle, move |flag, progress| {
+        cancellable(cancel, idle, Some(overall), move |flag, progress| {
             let response = this.open(&url, overall, idle)?;
             progress.touch();
             let content_type = response.body().mime_type().map(str::to_owned);
@@ -411,13 +425,15 @@ impl Progress {
 }
 
 /// Run `work` on its own thread and give up on it when `cancel` is set, or
-/// when `idle` passes without the work reporting progress. Giving up sets the
-/// flag the work reads between reads. A read that blocks is not interrupted
-/// from outside; a download agent limits each wait for data to `idle`, so
-/// the abandoned thread ends and closes its connection shortly after.
+/// when `idle` passes without the work reporting progress, or when `deadline`
+/// passes. Giving up sets the flag the work reads between reads. A read that
+/// blocks is not interrupted from outside; a download agent limits each wait
+/// for data to `idle` and the whole request to `deadline`, so the abandoned
+/// thread ends and closes its connection shortly after.
 fn cancellable<T: Send + 'static>(
     cancel: &Arc<AtomicBool>,
     idle: Option<Duration>,
+    deadline: Option<Duration>,
     work: impl FnOnce(Arc<AtomicBool>, Progress) -> Result<T, String> + Send + 'static,
 ) -> Result<T, String> {
     let (sender, receiver) = std::sync::mpsc::channel();
@@ -439,6 +455,10 @@ fn cancellable<T: Send + 'static>(
                 if idle.is_some_and(|limit| progress.idle() > limit) {
                     stop.store(true, Ordering::Relaxed);
                     return Err("the transfer stopped receiving data".to_owned());
+                }
+                if deadline.is_some_and(|limit| progress.start.elapsed() > limit) {
+                    stop.store(true, Ordering::Relaxed);
+                    return Err("the download took longer than allowed".to_owned());
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
