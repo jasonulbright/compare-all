@@ -10,6 +10,8 @@
 )]
 
 use ca_fs::{Change, MergeStatus, Pane, Resolution};
+use ca_session::settings::folder::ContentComparison;
+use ca_session::settings::SessionSettings;
 use ca_session::SessionKind;
 use ca_ui::command::Command;
 use ca_ui::testing::{context, sized_input};
@@ -108,6 +110,7 @@ impl Fixture {
         // call asks the desktop shell for permission and blocks on a dialog.
         view.operation_options_mut().use_recycle_bin = false;
         assert!(poll_until(&mut view, |view| view.tree().is_some()));
+        without_content_comparison(&mut view);
         view
     }
 
@@ -680,4 +683,16 @@ fn a_running_merge_keeps_the_tab_open_and_says_it_is_busy() {
     assert!(!view.may_close());
     assert!(poll_until(&mut view, FolderMergeView::has_summary));
     assert!(!view.is_busy());
+}
+
+/// The fixtures stamp a copy with a new time but keep its bytes, which only a
+/// comparison without a content test reports as a change.
+fn without_content_comparison(view: &mut FolderMergeView) {
+    let Some(SessionSettings::FolderMerge(mut settings)) = view.settings() else {
+        panic!("a folder merge reports folder merge settings");
+    };
+    settings.comparison.content_comparison = ContentComparison::None;
+    view.apply_settings(&SessionSettings::FolderMerge(settings));
+    assert!(poll_until(view, SessionView::is_ready));
+    assert!(poll_until(view, |view| view.tree().is_some()));
 }
