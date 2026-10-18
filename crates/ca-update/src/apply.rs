@@ -12,7 +12,7 @@ use crate::flow::Endpoints;
 use crate::mode::{detect, InstallMode};
 use crate::signature::SignatureVerifier;
 use crate::staging::{AssetKind, DownloadWarning, StagedRecord, Staging};
-use crate::verify::{verify_file, Expected};
+use crate::verify::{verify_file, Expected, PORTABLE_FILES};
 use crate::version::Version;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -24,57 +24,67 @@ pub const HELPER_ARGUMENT: &str = "--apply-update";
 
 const WAIT_FOR_EXIT: Duration = Duration::from_secs(120);
 
-/// Replace the program files in `target` with the files in `fresh`, keeping
-/// every other file in `target`. Any failure restores the earlier files.
+/// Replace the program files in `target` with the files of
+/// [`PORTABLE_FILES`] found in `fresh`, keeping every other file in `target`.
+/// Any failure restores the earlier files.
 ///
 /// `before_each` runs before each file is installed; an error from it counts as
 /// a failure of that file.
 ///
 /// # Errors
-/// Returns why the replacement failed. The folder is then as it was.
+/// Returns why the replacement failed. The folder is then as it was, unless
+/// an earlier file could not be put back: the error then names the backup
+/// folder, which is kept.
 pub fn apply_portable_with(
     target: &Path,
     fresh: &Path,
     before_each: &dyn Fn(&str) -> std::io::Result<()>,
 ) -> Result<(), String> {
-    let mut names: Vec<OsString> = std::fs::read_dir(fresh)
-        .map_err(|error| error.to_string())?
-        .flatten()
-        .filter(|entry| entry.path().is_file())
-        .map(|entry| entry.file_name())
+    let names: Vec<&str> = PORTABLE_FILES
+        .iter()
+        .copied()
+        .filter(|name| fresh.join(name).is_file())
         .collect();
-    names.sort();
     let backup = target.join(format!(".update-backup-{}", std::process::id()));
     std::fs::create_dir_all(&backup).map_err(|error| format!("cannot prepare backup: {error}"))?;
     // (name, had an earlier file)
-    let mut done: Vec<(OsString, bool)> = Vec::new();
+    let mut done: Vec<(&str, bool)> = Vec::new();
     let result = (|| -> Result<(), String> {
         for name in &names {
-            let label = name.to_string_lossy().into_owned();
-            before_each(&label).map_err(|error| format!("{label}: {error}"))?;
+            before_each(name).map_err(|error| format!("{name}: {error}"))?;
             let live = target.join(name);
             let had = live.exists();
             if had {
                 std::fs::rename(&live, backup.join(name))
-                    .map_err(|error| format!("cannot move {label} aside: {error}"))?;
+                    .map_err(|error| format!("cannot move {name} aside: {error}"))?;
             }
-            done.push((name.clone(), had));
-            let incoming = target.join(format!("{label}.new"));
+            done.push((name, had));
+            let incoming = target.join(format!("{name}.new"));
             std::fs::copy(fresh.join(name), &incoming)
-                .map_err(|error| format!("cannot copy {label}: {error}"))?;
+                .map_err(|error| format!("cannot copy {name}: {error}"))?;
             std::fs::rename(&incoming, &live)
-                .map_err(|error| format!("cannot place {label}: {error}"))?;
+                .map_err(|error| format!("cannot place {name}: {error}"))?;
         }
         Ok(())
     })();
     if let Err(reason) = result {
+        let mut unrestored = Vec::new();
         for (name, had) in done.iter().rev() {
             let live = target.join(name);
             let _ = std::fs::remove_file(&live);
-            let _ = std::fs::remove_file(target.join(format!("{}.new", name.to_string_lossy())));
+            let _ = std::fs::remove_file(target.join(format!("{name}.new")));
             if *had {
-                let _ = std::fs::rename(backup.join(name), &live);
+                if let Err(error) = std::fs::rename(backup.join(name), &live) {
+                    unrestored.push(format!("{name} ({error})"));
+                }
             }
+        }
+        if !unrestored.is_empty() {
+            return Err(format!(
+                "{reason}; could not restore {}; the earlier files are kept in {}",
+                unrestored.join(", "),
+                backup.display()
+            ));
         }
         let _ = std::fs::remove_dir_all(&backup);
         return Err(reason);
@@ -83,19 +93,17 @@ pub fn apply_portable_with(
 }
 
 /// The command that installs `msi` as a major upgrade with a progress window
-/// and no questions.
+/// and no questions. A machine install writes no log: the folder a log could
+/// go to is writable by the user, and the installer runs with system rights.
 #[must_use]
 pub fn msi_command(msi: &Path, machine: bool, log: &Path) -> Command {
-    let root = std::env::var_os("SystemRoot").unwrap_or_else(|| OsString::from(r"C:\Windows"));
-    let mut command =
-        ca_io::host_command::host_command(Path::new(&root).join("System32").join("msiexec.exe"));
-    command
-        .arg("/i")
-        .arg(msi)
-        .args(["/passive", "/norestart", "/L*v"])
-        .arg(log);
+    let root = crate::system::system_root().unwrap_or_else(|_| PathBuf::from(r"C:\Windows"));
+    let mut command = ca_io::host_command::host_command(root.join("System32").join("msiexec.exe"));
+    command.arg("/i").arg(msi).args(["/passive", "/norestart"]);
     if machine {
         command.arg("ALLUSERS=1");
+    } else {
+        command.arg("/L*v").arg(log);
     }
     command
 }
@@ -199,6 +207,17 @@ pub struct Trust<'a> {
     pub signer_name: &'a str,
     /// Where release pages are.
     pub endpoints: &'a Endpoints,
+    /// The build that is installed now. Only a newer build is applied.
+    pub running: &'a Version,
+}
+
+/// True when the program applies a staged update of a copy installed this
+/// way. An install for every user is never applied by the program: that
+/// needs an elevated installer, and the update is offered as a download page
+/// instead.
+#[must_use]
+pub const fn applies_automatically(mode: InstallMode) -> bool {
+    !matches!(mode, InstallMode::Installed { machine: true })
 }
 
 /// Apply the staged update. Returns the version installed.
@@ -214,12 +233,21 @@ pub fn apply_staged(
     before_each: &dyn Fn(&str) -> std::io::Result<()>,
     target_dir: &Path,
 ) -> Result<Version, String> {
+    if !applies_automatically(mode) {
+        return Err("an install for every user is not updated by the program".to_owned());
+    }
     let record = staging
         .read_record()
         .ok_or("no valid staged update exists")?;
     let version = record
         .parsed_version()
         .ok_or("the staged version is invalid")?;
+    if version <= *trust.running {
+        return Err(format!(
+            "the staged version {version} is not newer than {}",
+            trust.running
+        ));
+    }
     let kind = record
         .kind()
         .ok_or("the staged file is not a release file")?;
@@ -237,6 +265,7 @@ pub fn apply_staged(
         size: record.size,
         sha256: &record.sha256,
         signer: trust.signer_name,
+        version: &version,
     };
     let file = staging.asset_path(&record);
     let checked = verify_file(&file, &expected, trust.signer, &scratch);
@@ -263,25 +292,32 @@ fn run_installer(mut command: Command) -> Result<(), String> {
 }
 
 /// The entry point of the helper process. Returns the exit code.
+///
+/// A helper that cannot claim the staged update ends at once and changes
+/// nothing: another helper applies it.
 #[must_use]
 pub fn helper_main(
     arguments: &HelperArguments,
     signer: &dyn SignatureVerifier,
     signer_name: &str,
+    running: &Version,
 ) -> i32 {
     let staging = Staging::new(arguments.staging.clone());
+    let Ok(claim) = staging.begin_apply() else {
+        return 2;
+    };
     let endpoints = Endpoints::github();
     let trust = Trust {
         signer,
         signer_name,
         endpoints: &endpoints,
+        running,
     };
     let mode = detect(&arguments.executable);
     let target = arguments
         .executable
         .parent()
         .map_or_else(PathBuf::new, Path::to_path_buf);
-    let _ = staging.begin_apply();
     let outcome = if wait_until_free(&arguments.executable, WAIT_FOR_EXIT) {
         apply_staged(&staging, mode, &trust, &run_installer, &|_| Ok(()), &target)
     } else {
@@ -291,7 +327,8 @@ pub fn helper_main(
         Ok(_) => 0,
         Err(_) => 1,
     };
-    if let Err(_reason) = &outcome {
+    if let Err(reason) = &outcome {
+        staging.write_apply_failure(reason);
         if let Some(version) = staging.read_record().and_then(|r| r.parsed_version()) {
             let _ = staging.write_warning(&DownloadWarning::new(
                 &version,
@@ -300,7 +337,7 @@ pub fn helper_main(
         }
     }
     staging.clear();
-    staging.end_apply();
+    drop(claim);
     if arguments.relaunch {
         let _ = ca_io::host_command::host_command(&arguments.executable)
             .args(&arguments.program_arguments)

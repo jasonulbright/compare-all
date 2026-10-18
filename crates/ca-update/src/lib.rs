@@ -10,6 +10,7 @@ pub mod mode;
 pub mod net;
 pub mod signature;
 pub mod staging;
+pub mod system;
 pub mod verify;
 mod version;
 
