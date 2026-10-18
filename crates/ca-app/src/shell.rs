@@ -1744,10 +1744,11 @@ impl App {
         network: bool,
         notify: &Arc<dyn Fn() + Send + Sync>,
     ) {
-        if self.update.job.is_some() {
+        // The policy suppresses every check and every update notice, also for
+        // an update staged before it was set; staged files stay in place.
+        if self.update.job.is_some() || self.policies.check_for_updates_disabled() {
             return;
         }
-        let network = network && !self.policies.check_for_updates_disabled();
         if !network && !at_launch {
             return;
         }
@@ -3852,18 +3853,18 @@ impl App {
             self.update.restart_on_leave,
             std::sync::atomic::Ordering::SeqCst,
         );
-        let enabled = self.resolved.stored.tweaks.check_for_updates
-            && !self.policies.check_for_updates_disabled();
+        let enabled = self.resolved.stored.tweaks.check_for_updates;
+        let forbidden = self.policies.check_for_updates_disabled();
         let applies = self
             .update
             .source
             .as_ref()
             .and_then(|source| source.mode)
             .is_some_and(ca_update::apply::applies_automatically);
-        // With checks off only "Restart to update" applies a staged update;
-        // a plain close leaves it staged.
+        // With the option off only "Restart to update" applies a staged
+        // update; a plain close leaves it staged. The policy applies nothing.
         exit.apply_allowed.store(
-            applies && (enabled || self.update.restart_on_leave),
+            applies && !forbidden && (enabled || self.update.restart_on_leave),
             std::sync::atomic::Ordering::SeqCst,
         );
         exit.normal_close

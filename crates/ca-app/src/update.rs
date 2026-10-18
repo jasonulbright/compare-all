@@ -373,9 +373,9 @@ pub struct ExitHook {
     pub normal_close: AtomicBool,
     /// The close was asked for by "Restart to update".
     pub relaunch: AtomicBool,
-    /// The copy is one the program updates by itself, and at the close either
-    /// update checks were on (option and policy) or the close was asked for
-    /// by "Restart to update".
+    /// The copy is one the program updates by itself, the policy does not
+    /// turn updates off, and at the close either the option was on or the
+    /// close was asked for by "Restart to update".
     pub apply_allowed: AtomicBool,
 }
 
