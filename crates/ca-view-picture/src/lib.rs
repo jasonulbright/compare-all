@@ -659,30 +659,30 @@ impl PictureView {
         })
     }
 
-    /// The side whose picture Copy puts on the clipboard: the focused pane
-    /// when it shows one side, otherwise the side the controls name.
-    fn copy_side(&self) -> Side {
-        match self.focused {
-            Pane::Left => Side::Left,
-            Pane::Right => Side::Right,
-            Pane::Difference => self.active_side,
+    /// The picture Copy puts on the clipboard: the full-size image the
+    /// focused pane draws, with its rotation, flips and scaling applied.
+    /// Before a comparison has finished a side pane falls back to its
+    /// decoded file, and the difference pane has nothing to copy.
+    fn copy_image(&self) -> Option<Arc<ca_image::RgbaImage>> {
+        if let Some(outcome) = self.outcome.as_ref() {
+            return Some(Arc::clone(match self.focused {
+                Pane::Left => &outcome.left,
+                Pane::Right => &outcome.right,
+                Pane::Difference => &outcome.result,
+            }));
         }
-    }
-
-    fn copy_image(&self, side: Side) -> Option<&SideImage> {
-        match side {
-            Side::Left => self.left_image.as_ref(),
-            Side::Right => self.right_image.as_ref(),
-        }
+        let side = match self.focused {
+            Pane::Left => self.left_image.as_ref(),
+            Pane::Right => self.right_image.as_ref(),
+            Pane::Difference => None,
+        };
+        side.map(|side| Arc::clone(&side.image))
     }
 
     /// Convert the focused picture on a worker; a later frame hands it to the
     /// clipboard.
     fn start_copy(&mut self) {
-        let Some(image) = self
-            .copy_image(self.copy_side())
-            .map(|side| side.image.clone())
-        else {
+        let Some(image) = self.copy_image() else {
             return;
         };
         self.message = None;
@@ -981,7 +981,7 @@ impl SessionView for PictureView {
         ca_ui::view::declare(HANDLED, |command| match command {
             Command::Cancel => self.job.is_some(),
             Command::OpenFile => self.picker.is_none(),
-            Command::Copy => self.copy_image(self.copy_side()).is_some() && self.copy_job.is_none(),
+            Command::Copy => self.copy_image().is_some() && self.copy_job.is_none(),
             Command::Recompare => self.left_image.is_some() && self.right_image.is_some(),
             Command::CompareReport => self.is_ready(),
             _ => true,
@@ -2259,6 +2259,64 @@ mod tests {
             copied[0].pixels[0],
             egui::Color32::from_rgba_unmultiplied(1, 2, 3, 255)
         );
+    }
+
+    #[test]
+    fn copy_puts_the_focused_pane_as_shown_on_the_clipboard() {
+        let mut view = PictureView::new(
+            PathBuf::from("left.png"),
+            PathBuf::from("right.png"),
+            &context(),
+            4,
+        );
+        ca_ui::view::SessionView::tick(&mut view);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while view.job.is_some() && std::time::Instant::now() < deadline {
+            ca_ui::view::SessionView::tick(&mut view);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let mut left = source_image(SourceFormat::Png, None);
+        left.image = std::sync::Arc::new(
+            ca_image::RgbaImage::from_pixels(2, 1, vec![10, 20, 30, 255, 40, 50, 60, 255]).unwrap(),
+        );
+        let mut right = source_image(SourceFormat::Png, None);
+        right.image =
+            std::sync::Arc::new(ca_image::RgbaImage::filled(1, 2, [1, 2, 3, 255]).unwrap());
+        view.left_image = Some(left);
+        view.right_image = Some(right);
+        view.rotate(Side::Left, true);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while (view.job.is_some() || view.status != super::Status::Ready)
+            && std::time::Instant::now() < deadline
+        {
+            ca_ui::view::SessionView::tick(&mut view);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let outcome = view.outcome.as_ref().unwrap();
+        let shown = |image: &ca_image::RgbaImage| {
+            egui::ColorImage::from_rgba_unmultiplied(
+                [image.width() as usize, image.height() as usize],
+                image.pixels(),
+            )
+        };
+        let left_shown = shown(&outcome.left);
+        let result_shown = shown(&outcome.result);
+        assert_eq!(left_shown.size, [1, 2]);
+
+        view.focused = super::Pane::Left;
+        view.run(super::Command::Copy);
+        let copied = copy_output_images(&mut view);
+        assert_eq!(copied.len(), 1);
+        assert_eq!(copied[0].size, left_shown.size);
+        assert_eq!(copied[0].pixels, left_shown.pixels);
+
+        view.focused = super::Pane::Difference;
+        assert!(view.accepts(super::Command::Copy));
+        view.run(super::Command::Copy);
+        let copied = copy_output_images(&mut view);
+        assert_eq!(copied.len(), 1);
+        assert_eq!(copied[0].size, result_shown.size);
+        assert_eq!(copied[0].pixels, result_shown.pixels);
     }
 
     #[test]
