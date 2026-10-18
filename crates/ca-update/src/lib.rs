@@ -5,6 +5,7 @@
 
 pub mod apply;
 pub mod flow;
+pub mod install;
 pub mod manifest;
 pub mod mode;
 pub mod net;

@@ -1146,23 +1146,88 @@ fn a_check_while_another_copy_holds_the_claim_reports_it_and_changes_nothing() {
 
 #[test]
 fn the_machine_installer_command_writes_no_log_in_the_user_folder() {
-    let command = ca_update::apply::msi_command(
-        Path::new(r"C:\stage\a.msi"),
-        true,
-        Path::new(r"C:\stage\installer.log"),
+    let args = |command: &std::process::Command| -> Vec<String> {
+        command
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    };
+    let program = Path::new(r"C:\Program Files\compare-all\compare-all.exe");
+    let elevate = ca_update::apply::elevate_command(program, Path::new(r"C:\stage"));
+    let installer =
+        ca_update::install::installer_command(Path::new(r"C:\Program Files\work\a.msi"));
+    for args in [args(&elevate), args(&installer)] {
+        assert!(
+            !args
+                .iter()
+                .any(|a| a.to_ascii_uppercase().starts_with("/L")),
+            "{args:?}"
+        );
+        assert!(!args.iter().any(|a| a.contains(".log")), "{args:?}");
+    }
+}
+
+#[test]
+fn the_elevation_prompt_starts_the_installed_program_and_not_the_installer() {
+    let program = Path::new(r"C:\Program Files\compare-all\compare-all.exe");
+    let command = ca_update::apply::elevate_command(program, Path::new(r"C:\stage"));
+    assert!(command
+        .get_program()
+        .to_string_lossy()
+        .to_ascii_lowercase()
+        .ends_with(r"\system32\windowspowershell\v1.0\powershell.exe"));
+    let script = command.get_args().last().unwrap().to_string_lossy();
+    assert!(script.contains("Verb='runas'"), "{script}");
+    assert!(
+        script.contains(ca_update::install::INSTALL_ARGUMENT),
+        "{script}"
     );
-    let args: Vec<String> = command
+    assert!(!script.to_ascii_lowercase().contains("msiexec"), "{script}");
+    let environment: HashMap<String, String> = command
+        .get_envs()
+        .filter_map(|(k, v)| {
+            Some((
+                k.to_string_lossy().into_owned(),
+                v?.to_string_lossy().into_owned(),
+            ))
+        })
+        .collect();
+    assert_eq!(
+        environment.get("CA_PROGRAM").map(String::as_str),
+        Some(program.to_str().unwrap())
+    );
+    assert_eq!(
+        environment.get("CA_UPDATE_DIR").map(String::as_str),
+        Some(r"C:\stage")
+    );
+    assert!(!environment.keys().any(|k| k.eq_ignore_ascii_case("TEMP")));
+    assert!(!environment.keys().any(|k| k.eq_ignore_ascii_case("TMP")));
+
+    // The elevated program runs the system installer on its own copy.
+    let copy = Path::new(r"C:\Program Files\compare-all-update-7\a.msi");
+    let installer = ca_update::install::installer_command(copy);
+    assert!(installer
+        .get_program()
+        .to_string_lossy()
+        .to_ascii_lowercase()
+        .ends_with(r"\system32\msiexec.exe"));
+    let args: Vec<String> = installer
         .get_args()
         .map(|a| a.to_string_lossy().into_owned())
         .collect();
-    assert!(
-        !args.iter().any(|a| a.eq_ignore_ascii_case("/L*v")),
-        "{args:?}"
+    assert_eq!(
+        args,
+        [
+            "/i",
+            copy.to_str().unwrap(),
+            "/passive",
+            "/norestart",
+            "ALLUSERS=1"
+        ]
     );
-    assert!(
-        !args.iter().any(|a| a.contains("installer.log")),
-        "{args:?}"
-    );
+    assert!(!installer
+        .get_envs()
+        .any(|(k, _)| k.eq_ignore_ascii_case("TEMP") || k.eq_ignore_ascii_case("TMP")));
 }
 
 /// A server that sends the headers at once and then the body in small pieces.
@@ -1348,10 +1413,11 @@ fn the_installer_runs_elevated_only_for_an_install_for_every_user() {
         result.unwrap();
         let args = seen.lock().unwrap()[0].clone();
         if machine {
-            // The installer starts through an elevation prompt and writes no log.
+            // The installed program starts through an elevation prompt and
+            // no log is written.
             let script = args.last().unwrap();
             assert!(script.contains("Verb='runas'"), "{script}");
-            assert!(script.contains("ALLUSERS=1"), "{script}");
+            assert!(script.contains("--install-update"), "{script}");
             assert!(!args.iter().any(|a| a.contains("/L*v")), "{args:?}");
             continue;
         }
@@ -1424,12 +1490,8 @@ fn the_installer_file_cannot_be_replaced_while_the_installer_runs() {
 fn an_elevation_that_cannot_start_is_a_declined_elevation() {
     use ca_update::apply::{installer_result, ELEVATION_DECLINED};
     let dir = tempfile::tempdir().unwrap();
-    let mut command = ca_update::apply::msi_command(
-        &dir.path().join("a.msi"),
-        true,
-        &dir.path().join("installer.log"),
-    );
-    command.env("CA_MSIEXEC", dir.path().join("missing.exe"));
+    let mut command =
+        ca_update::apply::elevate_command(&dir.path().join("missing.exe"), dir.path());
     let status = command.status().unwrap();
     assert_eq!(
         installer_result(status.code()),
@@ -1539,4 +1601,252 @@ fn a_staged_version_not_newer_than_the_running_build_is_not_applied() {
         std::fs::read(target.path().join("compare-all.exe")).unwrap(),
         b"old exe"
     );
+}
+
+fn elevated_setup() -> (
+    Server,
+    tempfile::TempDir,
+    Staging,
+    tempfile::TempDir,
+    tempfile::TempDir,
+) {
+    let server = Server::start();
+    let (keep, staging) = stage_installer(&server, InstallMode::Installed { machine: true });
+    let work = tempfile::tempdir().unwrap();
+    let install = tempfile::tempdir().unwrap();
+    std::fs::write(install.path().join("compare-all.exe"), b"old exe").unwrap();
+    (server, keep, staging, work, install)
+}
+
+fn folder_files(dir: &Path) -> Vec<(String, Vec<u8>)> {
+    let mut files: Vec<(String, Vec<u8>)> = std::fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .filter(|e| e.path().is_file())
+        .map(|e| {
+            (
+                e.file_name().to_string_lossy().into_owned(),
+                std::fs::read(e.path()).unwrap(),
+            )
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+#[test]
+fn the_elevated_step_installs_its_own_checked_copy_and_removes_it() {
+    use ca_update::install::{install_from, Checks};
+    let (_server, _keep, staging, work, install) = elevated_setup();
+    let record = staging.read_record().unwrap();
+    let program = install.path().join("compare-all.exe");
+    let signer = FakeSigner::signed_by(SIGNER);
+    let checks = Checks {
+        signer: &signer,
+        signer_name: SIGNER,
+        running: &running(),
+    };
+    let staged_before = folder_files(staging.dir());
+    let seen = Mutex::new(None);
+    let code = install_from(&staging, work.path(), Some(&program), &checks, &|command| {
+        let copy = std::path::PathBuf::from(command.get_args().nth(1).unwrap());
+        let bytes = std::fs::read(&copy).unwrap();
+        *seen.lock().unwrap() = Some((copy, bytes, program.exists()));
+        Some(0)
+    });
+    assert_eq!(code, 0);
+    let (copy, bytes, program_in_place) = seen.lock().unwrap().take().unwrap();
+    assert_eq!(copy.parent(), Some(work.path()));
+    assert_eq!(bytes, msi_bytes());
+    assert!(!program_in_place, "the program file stayed in use");
+    assert!(!copy.exists());
+    // The elevated step writes nothing in the staging folder of the user.
+    assert_eq!(folder_files(staging.dir()), staged_before);
+    assert!(staging.asset_path(&record).exists());
+}
+
+#[test]
+fn a_staged_installer_replaced_after_the_copy_is_not_what_is_installed() {
+    use ca_update::install::{install_from, Checks};
+    let (_server, _keep, staging, work, install) = elevated_setup();
+    let staged = staging.asset_path(&staging.read_record().unwrap());
+    let program = install.path().join("compare-all.exe");
+    let signer = FakeSigner::signed_by(SIGNER);
+    let checks = Checks {
+        signer: &signer,
+        signer_name: SIGNER,
+        running: &running(),
+    };
+    let installed = Mutex::new(Vec::new());
+    let code = install_from(&staging, work.path(), Some(&program), &checks, &|command| {
+        // The file of the user is swapped between the check and the install.
+        std::fs::write(&staged, b"other installer").unwrap();
+        let copy = std::path::PathBuf::from(command.get_args().nth(1).unwrap());
+        *installed.lock().unwrap() = std::fs::read(copy).unwrap();
+        Some(0)
+    });
+    assert_eq!(code, 0);
+    assert_eq!(*installed.lock().unwrap(), msi_bytes());
+}
+
+#[test]
+fn a_failed_install_puts_the_program_file_back() {
+    use ca_update::install::{install_from, Checks};
+    let (_server, _keep, staging, work, install) = elevated_setup();
+    let program = install.path().join("compare-all.exe");
+    let signer = FakeSigner::signed_by(SIGNER);
+    let checks = Checks {
+        signer: &signer,
+        signer_name: SIGNER,
+        running: &running(),
+    };
+    let code = install_from(&staging, work.path(), Some(&program), &checks, &|_| {
+        Some(1603)
+    });
+    assert_eq!(code, 1603);
+    assert_eq!(std::fs::read(&program).unwrap(), b"old exe");
+    assert_eq!(std::fs::read_dir(work.path()).unwrap().count(), 0);
+}
+
+fn flip_a_byte(staging: &Staging) {
+    let path = staging.asset_path(&staging.read_record().unwrap());
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes[20] ^= 1;
+    std::fs::write(path, bytes).unwrap();
+}
+
+fn add_a_byte(staging: &Staging) {
+    let path = staging.asset_path(&staging.read_record().unwrap());
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes.push(0);
+    std::fs::write(path, bytes).unwrap();
+}
+
+fn break_the_record(staging: &Staging) {
+    std::fs::write(staging.dir().join("staged.json"), b"{").unwrap();
+}
+
+fn leave_alone(_: &Staging) {}
+
+/// Name, change to the staged files, verifier, installed version.
+type Case<'a> = (&'a str, fn(&Staging), &'a FakeSigner, &'a Version);
+
+#[test]
+fn the_elevated_step_refuses_a_staged_installer_that_fails_a_check() {
+    use ca_update::install::{install_from, Checks, REFUSED};
+    let signer = FakeSigner::signed_by(SIGNER);
+    let other = FakeSigner::signed_by("Someone Else");
+    let newer = Version::parse("2026.12.31.0001").unwrap();
+    let current = running();
+    let cases: [Case<'_>; 5] = [
+        ("changed", flip_a_byte, &signer, &current),
+        ("longer", add_a_byte, &signer, &current),
+        ("bad record", break_the_record, &signer, &current),
+        ("other signer", leave_alone, &other, &current),
+        ("not newer", leave_alone, &signer, &newer),
+    ];
+    for (name, tamper, verifier, installed) in cases {
+        let (_server, _keep, staging, work, install) = elevated_setup();
+        let program = install.path().join("compare-all.exe");
+        tamper(&staging);
+        let before = folder_files(staging.dir());
+        let checks = Checks {
+            signer: verifier,
+            signer_name: SIGNER,
+            running: installed,
+        };
+        let ran = AtomicBool::new(false);
+        let code = install_from(&staging, work.path(), Some(&program), &checks, &|_| {
+            ran.store(true, Ordering::SeqCst);
+            Some(0)
+        });
+        assert_eq!(code, REFUSED, "{name}");
+        assert!(!ran.load(Ordering::SeqCst), "{name}");
+        assert_eq!(std::fs::read(&program).unwrap(), b"old exe", "{name}");
+        assert_eq!(folder_files(staging.dir()), before, "{name}");
+        assert_eq!(std::fs::read_dir(work.path()).unwrap().count(), 0, "{name}");
+    }
+}
+
+#[test]
+fn the_elevated_program_needs_its_own_argument_and_one_folder() {
+    use ca_update::install::{parse_install_arguments, INSTALL_ARGUMENT};
+    use std::ffi::OsString;
+    let args = |list: &[&str]| -> Vec<OsString> { list.iter().map(OsString::from).collect() };
+    assert_eq!(
+        parse_install_arguments(&args(&[INSTALL_ARGUMENT, r"C:\stage"])),
+        Some(std::path::PathBuf::from(r"C:\stage"))
+    );
+    assert_eq!(parse_install_arguments(&args(&[INSTALL_ARGUMENT])), None);
+    assert_eq!(
+        parse_install_arguments(&args(&[INSTALL_ARGUMENT, "a", "b"])),
+        None
+    );
+    assert_eq!(
+        parse_install_arguments(&args(&["--apply-update", "a"])),
+        None
+    );
+}
+
+/// The access list of `folder` in the system's text form.
+#[cfg(windows)]
+fn access_list(folder: &Path) -> String {
+    let saved = tempfile::tempdir().unwrap();
+    let file = saved.path().join("acl.txt");
+    let status = ca_io::host_command::host_command("icacls")
+        .arg(folder)
+        .arg("/save")
+        .arg(&file)
+        .stdout(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let bytes = std::fs::read(&file).unwrap();
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .collect();
+    String::from_utf16_lossy(&units)
+}
+
+#[cfg(windows)]
+#[test]
+fn the_work_folder_is_open_to_administrators_and_the_system_only() {
+    use ca_update::install::{prepare_work_folder, sweep_work_folders, WORK_FOLDER_PREFIX};
+    let parent = tempfile::tempdir().unwrap();
+    let left = parent.path().join(format!("{WORK_FOLDER_PREFIX}1"));
+    std::fs::create_dir(&left).unwrap();
+    std::fs::write(left.join("old.msi"), b"old").unwrap();
+    let other = parent.path().join("other");
+    std::fs::create_dir(&other).unwrap();
+    sweep_work_folders(parent.path());
+    assert!(!left.exists());
+    assert!(other.exists());
+
+    let work = prepare_work_folder(parent.path()).unwrap();
+    assert_eq!(
+        work.file_name().unwrap().to_string_lossy(),
+        format!("{WORK_FOLDER_PREFIX}{}", std::process::id())
+    );
+    let acl = access_list(&work);
+    let dacl = acl
+        .split("D:")
+        .nth(1)
+        .unwrap_or_default()
+        .trim_end_matches(['\r', '\n', '\0', ' ']);
+    // Protected, with no inherited entry: full control for Administrators
+    // (BA) and SYSTEM (SY), for the folder, its files and its subfolders.
+    assert!(dacl.starts_with("PAI("), "{acl}");
+    let mut entries: Vec<&str> = dacl["PAI".len()..].split_inclusive(')').collect();
+    entries.sort_unstable();
+    assert_eq!(entries, ["(A;OICI;FA;;;BA)", "(A;OICI;FA;;;SY)"], "{acl}");
+    // The owner can still reset the list, which the clean-up needs.
+    let status = ca_io::host_command::host_command("icacls")
+        .arg(&work)
+        .arg("/reset")
+        .stdout(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success());
+    std::fs::remove_dir_all(&work).unwrap();
 }
