@@ -435,7 +435,9 @@ pub fn helper_main(
 /// [`helper_main`] that waits at most `wait` for the claim on the staging
 /// folder, which a download in another run of the program or another helper
 /// may hold. A helper that gets no claim, or finds nothing staged once it has
-/// one, changes nothing and reports no failure.
+/// one, changes nothing, reports no failure and does not start the program:
+/// the helper that holds or held the claim starts it. The program is started
+/// again only after the program that started the helper has ended.
 #[must_use]
 pub fn helper_main_waiting(
     arguments: &HelperArguments,
@@ -444,12 +446,28 @@ pub fn helper_main_waiting(
     running: &Version,
     wait: Duration,
 ) -> i32 {
+    helper_main_with(arguments, signer, signer_name, running, wait, &|| {
+        let _ = ca_io::host_command::host_command(&arguments.executable)
+            .args(&arguments.program_arguments)
+            .spawn();
+    })
+}
+
+/// [`helper_main_waiting`] that calls `start_program` to start the program
+/// again.
+#[must_use]
+pub fn helper_main_with(
+    arguments: &HelperArguments,
+    signer: &dyn SignatureVerifier,
+    signer_name: &str,
+    running: &Version,
+    wait: Duration,
+    start_program: &dyn Fn(),
+) -> i32 {
     let staging = Staging::new(arguments.staging.clone());
     let relaunch = || {
         if arguments.relaunch {
-            let _ = ca_io::host_command::host_command(&arguments.executable)
-                .args(&arguments.program_arguments)
-                .spawn();
+            start_program();
         }
     };
     let started = Instant::now();
@@ -457,15 +475,10 @@ pub fn helper_main_waiting(
         match staging.begin_apply() {
             Ok(claim) => break claim,
             Err(_) if started.elapsed() < wait => std::thread::sleep(Duration::from_millis(250)),
-            Err(_) => {
-                relaunch();
-                return 2;
-            }
+            Err(_) => return 2,
         }
     };
     if staging.read_record().is_none() {
-        drop(claim);
-        relaunch();
         return 2;
     }
     let endpoints = Endpoints::github();
@@ -484,11 +497,15 @@ pub fn helper_main_waiting(
         InstallMode::Installed { machine: true } => wait_for_parent(WAIT_FOR_EXIT),
         _ => wait_until_free(&arguments.executable, WAIT_FOR_EXIT),
     };
+    let program_ended = ended.is_ok();
     let outcome = ended
         .and_then(|()| apply_staged(&staging, mode, &trust, &run_installer, &|_| Ok(()), &target));
     let code = finish_apply(&staging, &claim, &outcome, &endpoints);
     drop(claim);
-    relaunch();
+    // A program that did not end is still open; a second copy is not started.
+    if program_ended {
+        relaunch();
+    }
     code
 }
 
