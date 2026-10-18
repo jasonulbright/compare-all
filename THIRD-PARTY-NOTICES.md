@@ -501,7 +501,7 @@ Used by: `moxcms 0.8.1`, `pxfm 0.1.30`
 
 ## Apache License 2.0 (Apache-2.0)
 
-Used by: `lzma-rust2 0.16.5`, `lzma-rust2 0.20.1`, `lzma-rust2 0.21.0`, `sevenz-rust2 0.22.2`
+Used by: `lzma-rust2 0.20.1`, `lzma-rust2 0.21.0`, `lzma-rust2 0.22.0`, `sevenz-rust2 0.22.2`
 
 ```text
                                  Apache License
@@ -1544,7 +1544,7 @@ Apache License
 
 ## Apache License 2.0 (Apache-2.0)
 
-Used by: `ab_glyph 0.2.32`, `ab_glyph_rasterizer 0.1.10`, `accesskit_winit 0.23.1`, `blake3 1.8.7`, `constant_time_eq 0.4.2`, `owned_ttf_parser 0.25.1`, `pageant 0.2.3`, `russh 0.63.3`, `russh-cryptovec 0.62.0`, `russh-util 0.52.0`
+Used by: `ab_glyph 0.2.32`, `ab_glyph_rasterizer 0.1.10`, `accesskit_winit 0.23.1`, `blake3 1.8.7`, `constant_time_eq 0.4.2`, `constant_time_eq 0.6.1`, `owned_ttf_parser 0.25.1`, `pageant 0.2.3`, `russh 0.63.3`, `russh-cryptovec 0.62.0`, `russh-util 0.52.0`
 
 ```text
 Apache License
@@ -9574,7 +9574,7 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 ## MIT License (MIT)
 
-Used by: `tracing-core 0.1.36`, `zip 8.6.0`
+Used by: `tracing-core 0.1.36`, `zip 9.0.5`
 
 ```text
 The MIT License (MIT)
@@ -10459,7 +10459,7 @@ SOFTWARE.
 
 ## MIT License (MIT)
 
-Used by: `quick-xml 0.30.0`, `quick-xml 0.38.4`, `quick-xml 0.41.0`
+Used by: `quick-xml 0.30.0`, `quick-xml 0.41.0`
 
 ```text
 The MIT License (MIT)
