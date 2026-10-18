@@ -249,9 +249,6 @@ pub struct HexView {
     /// selected when it arrives.
     find_len: u64,
     replace_job: Option<Job<FindAllMessage>>,
-    /// Content revision the running replace all scanned. A scan over content
-    /// that changed since holds offsets into bytes that are gone.
-    replace_revision: u64,
     goto_open: bool,
     /// The go to field takes the keyboard on the next frame.
     goto_focus: bool,
@@ -354,7 +351,6 @@ impl HexView {
             find_job: None,
             find_len: 0,
             replace_job: None,
-            replace_revision: 0,
             goto_open: false,
             goto_focus: false,
             goto_text: String::new(),
@@ -961,26 +957,24 @@ impl HexView {
             self.replace_job = None;
         }
         for message in messages {
-            let FindAllMessage::Found(side, offsets) = message else {
-                continue;
-            };
-            if self.buffer(side).revision() != self.replace_revision {
-                self.message =
-                    Some("The content changed during the search. Replace All again.".to_owned());
-                continue;
-            }
-            let Ok(needle) = find::pattern_bytes(&self.byte_find(), self.encoding) else {
-                continue;
-            };
-            let Some(replacement) = self.replacement_bytes() else {
-                continue;
-            };
-            let count =
-                self.buffer_mut(side)
-                    .replace_all(&offsets, needle.len() as u64, &replacement);
-            self.message = Some(format!("{count} replaced."));
-            if count > 0 {
-                self.note_change();
+            match message {
+                FindAllMessage::Prepared(side, step) => match self.buffer_mut(side).install(step) {
+                    Some(count) => {
+                        self.message = Some(format!("{count} replaced."));
+                        if count > 0 {
+                            self.note_change();
+                        }
+                    }
+                    None => {
+                        self.message = Some(
+                            "The content changed during the search. Replace All again.".to_owned(),
+                        );
+                    }
+                },
+                FindAllMessage::Failed(detail) => {
+                    self.message = Some(format!("Replace All failed: {detail}"));
+                }
+                FindAllMessage::Cancelled => {}
             }
         }
     }
@@ -1333,7 +1327,7 @@ impl HexView {
         self.find_len = needle.len() as u64;
         self.find_job = Some(find::spawn(
             side,
-            Arc::new(self.buffer(side).bytes().to_vec()),
+            self.buffer(side).snapshot(),
             needle,
             from,
             direction,
@@ -1420,17 +1414,20 @@ impl HexView {
                 return;
             }
         };
-        if self.replacement_bytes().is_none() {
+        let Some(replacement) = self.replacement_bytes() else {
             return;
-        }
+        };
         let side = self.active;
-        self.replace_revision = self.buffer(side).revision();
         self.message = Some("Searching".to_owned());
-        self.replace_job = Some(find::spawn_all(
+        self.replace_job = Some(find::spawn_replace_all(
             side,
             self.buffer(side).snapshot(),
-            needle,
-            settings.match_case,
+            self.buffer(side).revision(),
+            find::ReplaceAll {
+                needle,
+                replacement,
+                match_case: settings.match_case,
+            },
             self.notify.clone(),
         ));
     }
@@ -3619,5 +3616,100 @@ mod tests {
             view.accepts(Command::OpenFile),
             "Open File stays off for a picker that has answered"
         );
+    }
+
+    fn view_over(left: &[u8]) -> HexView {
+        let mut view = HexView::from_data(
+            PathBuf::from("left.bin"),
+            PathBuf::from("right.bin"),
+            &context(),
+            1,
+            crate::jobs::HexData::default(),
+        );
+        view.left_bytes = crate::edit::ByteBuffer::new(left.to_vec());
+        view.place_caret(Side::Left, 0);
+        view
+    }
+
+    fn finish_replace_all(view: &mut HexView) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while view.replace_job.is_some() && Instant::now() < deadline {
+            view.poll_replace();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(view.replace_job.is_none());
+    }
+
+    #[test]
+    fn find_shares_the_side_with_its_worker_instead_of_copying_it() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let mut view = view_over(b"aXbXc");
+        let probe = Arc::downgrade(&view.left_bytes.snapshot());
+        let holders = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&holders);
+        view.notify = Arc::new(move || {
+            seen.fetch_max(probe.strong_count(), Ordering::SeqCst);
+        });
+        view.set_find_pattern("X", crate::find::PatternKind::Text);
+        view.run_find(crate::find::Direction::Forward);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while view.find_job.is_some() && Instant::now() < deadline {
+            view.poll_find();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(view.caret(Side::Left).offset, 1);
+        assert_eq!(
+            holders.load(Ordering::SeqCst),
+            2,
+            "the worker reads the buffer's own bytes"
+        );
+    }
+
+    #[test]
+    fn replace_all_with_one_match_copies_nothing_here_while_a_report_holds_the_side() {
+        let mut view = view_over(b"aXb");
+        let report = view.left_bytes.snapshot();
+        view.set_find_pattern("X", crate::find::PatternKind::Text);
+        view.set_replacement("Y");
+        let before = crate::edit::whole_copies();
+        view.replace_all_matches();
+        finish_replace_all(&mut view);
+        assert_eq!(view.left_bytes.bytes(), b"aYb");
+        assert_eq!(view.message.as_deref(), Some("1 replaced."));
+        assert_eq!(crate::edit::whole_copies(), before);
+        assert_eq!(report.as_slice(), b"aXb");
+    }
+
+    #[test]
+    fn replace_all_with_many_matches_builds_the_new_side_off_this_thread() {
+        let mut view = view_over(b"aXbXcX");
+        view.set_find_pattern("X", crate::find::PatternKind::Text);
+        view.set_replacement("YY");
+        let before = crate::edit::whole_copies();
+        view.replace_all_matches();
+        finish_replace_all(&mut view);
+        assert_eq!(view.left_bytes.bytes(), b"aYYbYYcYY");
+        assert_eq!(view.message.as_deref(), Some("3 replaced."));
+        assert_eq!(crate::edit::whole_copies(), before);
+        view.run(Command::Undo);
+        assert_eq!(view.left_bytes.bytes(), b"aXbXcX");
+        assert!(!view.left_bytes.is_modified());
+    }
+
+    #[test]
+    fn a_failed_replace_all_search_is_reported_as_a_failure() {
+        use ca_ui::worker::Terminal as _;
+        let mut view = view_over(b"aXb");
+        let (job, _held) =
+            ca_ui::testing::job_held_after(vec![crate::find::FindAllMessage::panicked(
+                "boom".to_owned(),
+            )]);
+        view.replace_job = Some(job);
+        view.tick();
+        let message = view.message.clone().unwrap_or_default();
+        assert!(!message.contains("replaced"), "{message}");
+        assert!(message.contains("failed"), "{message}");
+        assert_eq!(view.left_bytes.bytes(), b"aXb");
     }
 }
