@@ -1023,9 +1023,6 @@ pub enum UpdateNotice {
     /// A newer release was downloaded and could not be installed, for the
     /// reason given.
     NotInstalled(crate::update::Release, String),
-    /// A newer release is staged for an install the program does not update
-    /// by itself (an install for every user).
-    Available(crate::update::Release),
     /// The answer to a check asked for from the Help menu.
     Message(String),
 }
@@ -1798,21 +1795,12 @@ impl App {
         let outcomes = job.drain();
         let finished = job.is_finished();
         let manual = self.update.manual;
-        let applies = self
-            .update
-            .source
-            .as_ref()
-            .and_then(|source| source.mode)
-            .is_none_or(ca_update::apply::applies_automatically);
         let mut next_in = None;
         for outcome in outcomes {
             let notice = match outcome {
                 Outcome::Newer(release) => Some(UpdateNotice::Newer(release)),
-                Outcome::Staged(release) | Outcome::Waiting(release) if applies => {
-                    Some(UpdateNotice::Ready(release))
-                }
                 Outcome::Staged(release) | Outcome::Waiting(release) => {
-                    Some(UpdateNotice::Available(release))
+                    Some(UpdateNotice::Ready(release))
                 }
                 Outcome::NotDue(wait) => {
                     next_in = Some(wait);
@@ -1857,8 +1845,7 @@ impl App {
         let Some(
             UpdateNotice::Newer(release)
             | UpdateNotice::NotDownloaded(release)
-            | UpdateNotice::NotInstalled(release, _)
-            | UpdateNotice::Available(release),
+            | UpdateNotice::NotInstalled(release, _),
         ) = self.update.notice.take()
         else {
             return;
@@ -1927,16 +1914,6 @@ impl App {
                     ui.label(format!(
                         "Version {} could not be installed: {reason}. \
                          Open the downloads page now?",
-                        release.version
-                    ));
-                    ui.horizontal(|ui| {
-                        visit = ui.button("OK").clicked();
-                        dismiss = ui.button("Cancel").clicked();
-                    });
-                }
-                UpdateNotice::Available(release) => {
-                    ui.label(format!(
-                        "Version {} is available. Open the downloads page now?",
                         release.version
                     ));
                     ui.horizontal(|ui| {
@@ -3859,8 +3836,7 @@ impl App {
             .update
             .source
             .as_ref()
-            .and_then(|source| source.mode)
-            .is_some_and(ca_update::apply::applies_automatically);
+            .is_some_and(|source| source.mode.is_some());
         // With the option off only "Restart to update" applies a staged
         // update; a plain close leaves it staged. The policy applies nothing.
         exit.apply_allowed.store(
