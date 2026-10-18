@@ -585,6 +585,22 @@ fn a_utc_timestamp_extra_field_is_preferred_over_the_dos_stamp() {
 }
 
 #[test]
+fn an_extended_timestamp_without_the_modified_bit_falls_back_to_the_dos_stamp() {
+    let mut extra = extended_timestamp(1_600_000_000);
+    extra[4] = 0;
+    let bytes = zip_manual(&[ManualEntry::new("f.txt", b"x").with_extra(extra)], &[]);
+    let fs = open_memory(bytes, "unflagged.zip").unwrap();
+    let entry = fs.metadata(&VfsPath::parse("f.txt").unwrap()).unwrap();
+    assert_eq!(entry.time_fidelity, TimeFidelity::LocalTwoSecond);
+    let seconds = entry.modified.and_then(|time| {
+        time.duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|elapsed| elapsed.as_secs())
+    });
+    assert_ne!(seconds, Some(1_600_000_000));
+}
+
+#[test]
 fn a_dos_stamp_is_marked_as_a_local_wall_clock() {
     let bytes = zip_manual(&[ManualEntry::new("f.txt", b"x")], &[]);
     let fs = open_memory(bytes, "dos.zip").unwrap();

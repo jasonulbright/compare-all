@@ -110,6 +110,11 @@ pub(crate) fn list(
     let mut archive = zip::ZipArchive::new(reader).map_err(map_zip_open)?;
     let records = central_records(backing, span)?;
     let repeated = repeated_names(records.as_deref(), archive.len());
+    let extras: HashMap<u64, &[u8]> = records
+        .iter()
+        .flatten()
+        .map(|record| (record.start, record.extra.as_slice()))
+        .collect();
 
     let mut out: Vec<RawEntry> = Vec::new();
     // Names that differ only by case or by combining marks land on one file
@@ -125,7 +130,17 @@ pub(crate) fn list(
                 if repeated.contains(file.name_raw()) {
                     spelled.insert(file.name_raw().to_vec(), stored_name(&file));
                 }
-                Ok(record_row(&file, position))
+                let start = file.central_header_start();
+                let read_back;
+                let extra = match extras.get(&start) {
+                    Some(extra) => Some(*extra),
+                    None if reader_extended_mtime(&file).is_some() => {
+                        read_back = central_extra_at(backing, start);
+                        read_back.as_deref()
+                    }
+                    None => None,
+                };
+                Ok(record_row(&file, extra, position))
             }
             Err(error) => Err(error.to_string()),
         };
@@ -175,7 +190,11 @@ pub(super) fn stored_name<R: Read>(file: &zip::read::ZipFile<'_, R>) -> String {
     )
 }
 
-fn record_row<R: Read>(file: &zip::read::ZipFile<'_, R>, position: usize) -> Option<RawEntry> {
+fn record_row<R: Read>(
+    file: &zip::read::ZipFile<'_, R>,
+    central_extra: Option<&[u8]>,
+    position: usize,
+) -> Option<RawEntry> {
     let kind = if file.is_dir() {
         EntryKind::Directory
     } else {
@@ -194,7 +213,7 @@ fn record_row<R: Read>(file: &zip::read::ZipFile<'_, R>, position: usize) -> Opt
         uid: None,
         gid: None,
     };
-    let (modified, fidelity) = read_timestamps(file);
+    let (modified, fidelity) = read_timestamps(file, central_extra);
     // A zero CRC is what an entry whose sizes live in a data descriptor
     // carries in the central directory of some writers, so it says nothing
     // about the content and is not offered as a checksum.
@@ -269,6 +288,10 @@ struct CentralRecord {
     size: u64,
     crc: u32,
     is_dir: bool,
+    /// Offset of the record in the container.
+    start: u64,
+    /// The extra field bytes of the record.
+    extra: Vec<u8>,
 }
 
 /// Every record the central directory lists, in the order it lists them.
@@ -290,17 +313,31 @@ fn central_records(
     reader.seek(SeekFrom::Start(span.offset))?;
     let mut directory = io::BufReader::new(reader.take(span.size));
     let mut out = Vec::new();
+    let mut start = span.offset;
     while (out.len() as u64) < span.total {
-        let Some(record) = read_central_record(&mut directory) else {
+        let Some((record, length)) = read_central_record(&mut directory, start) else {
             return Ok(None);
         };
+        let Some(next) = start.checked_add(length) else {
+            return Ok(None);
+        };
+        start = next;
         out.push(record);
     }
     Ok(Some(out))
 }
 
-/// One central directory record, or `None` when the bytes are not one.
-fn read_central_record<R: Read>(reader: &mut R) -> Option<CentralRecord> {
+/// The extra field bytes of the central directory record at `start`, or
+/// `None` when the bytes there are not one.
+fn central_extra_at(backing: &ArchiveBacking, start: u64) -> Option<Vec<u8>> {
+    let mut reader = backing.reader().ok()?;
+    reader.seek(SeekFrom::Start(start)).ok()?;
+    read_central_record(&mut io::BufReader::new(reader), start).map(|(record, _)| record.extra)
+}
+
+/// One central directory record that starts at `start`, with the bytes it
+/// occupies, or `None` when the bytes are not one.
+fn read_central_record<R: Read>(reader: &mut R, start: u64) -> Option<(CentralRecord, u64)> {
     let mut fixed = [0u8; 46];
     reader.read_exact(&mut fixed).ok()?;
     if read_u32(&fixed, 0)? != CENTRAL_SIGNATURE {
@@ -323,12 +360,20 @@ fn read_central_record<R: Read>(reader: &mut R) -> Option<CentralRecord> {
         u64::from(size)
     };
     let is_dir = matches!(name.last(), Some(b'/' | b'\\'));
-    Some(CentralRecord {
-        name,
-        size,
-        crc,
-        is_dir,
-    })
+    let length = u64::try_from(fixed.len() + name.len() + extra.len())
+        .ok()?
+        .checked_add(comment)?;
+    Some((
+        CentralRecord {
+            name,
+            size,
+            crc,
+            is_dir,
+            start,
+            extra,
+        },
+        length,
+    ))
 }
 
 /// The expanded size a zip64 extra field states, which comes first in it
@@ -688,8 +733,14 @@ const EXTRA_EXTENDED_TIMESTAMP: u16 = 0x5455;
 /// reported as such, read as UTC here and moved into the zone of the container
 /// once the listing is built; the extra fields carry real UTC and are
 /// preferred when present.
+///
+/// The reader drops the flags of an extended timestamp field it reads from the
+/// central directory and reports any four bytes after them as the modified
+/// time, so that stamp is read from `central_extra`, the raw field bytes,
+/// where the flags can be checked; without them no extended stamp is used.
 fn read_timestamps<R>(
     file: &zip::read::ZipFile<'_, R>,
+    central_extra: Option<&[u8]>,
 ) -> (Option<std::time::SystemTime>, TimeFidelity)
 where
     R: Read,
@@ -697,7 +748,10 @@ where
     if let Some(time) = reader_ntfs_mtime(file).and_then(unix_to_system_time) {
         return (Some(time), TimeFidelity::Utc);
     }
-    if let Some(time) = reader_extended_mtime(file).and_then(unix_to_system_time) {
+    if let Some(time) = central_extra
+        .and_then(extended_mtime)
+        .and_then(unix_to_system_time)
+    {
         return (Some(time), TimeFidelity::Utc);
     }
     let dos = file.last_modified().and_then(|stamp| {
