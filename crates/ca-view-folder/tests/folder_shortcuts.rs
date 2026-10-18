@@ -11,7 +11,7 @@ use ca_ui::view::{OpenRequest, SessionView};
 use ca_view_folder::{FolderMergeView, FolderSyncView, FolderView};
 use egui::Key;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 const PATIENCE: Duration = Duration::from_secs(30);
 const WINDOW: [f32; 2] = [2_400.0, 900.0];
@@ -27,6 +27,24 @@ fn wait(mut ready: impl FnMut() -> bool) -> bool {
         }
         std::thread::sleep(Duration::from_millis(2));
     }
+}
+
+/// The modified time of every file the tests write.
+const FILE_TIME: Duration = Duration::from_secs(1_700_000_000);
+
+/// Write `body` to `path` with the fixed modified time.
+///
+/// The default quick test compares modified times to the second, so two equal
+/// files written on either side of a second boundary would compare as
+/// different.
+fn write_file(path: &Path, body: &[u8]) {
+    std::fs::write(path, body).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(SystemTime::UNIX_EPOCH + FILE_TIME)
+        .unwrap();
 }
 
 struct Fixture {
@@ -56,7 +74,7 @@ impl Fixture {
     fn write(&self, side: &str, rel: &str, body: &[u8]) {
         let path = self.path(side).join(rel);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, body).unwrap();
+        write_file(&path, body);
     }
 
     fn view(&self) -> FolderView {
@@ -178,6 +196,19 @@ fn ctrl_r_and_ctrl_l_copy_the_selection_in_a_folder_comparison() {
         !view.accepts(Command::CopyToLeft),
         "the copy to the right is running or asking, so a second one waits"
     );
+}
+
+#[test]
+fn a_folder_sync_has_no_copy_keys() {
+    let fixture = Fixture::new();
+    let sync = FolderSyncView::from(fixture.view());
+    assert_eq!(sync.menu_view(), MenuView::FolderSync);
+    for stroke in [
+        Keystroke::with_command(Key::R),
+        Keystroke::with_command(Key::L),
+    ] {
+        assert_eq!(route(sync.menu_view(), stroke), None, "{stroke:?}");
+    }
 }
 
 #[test]
@@ -580,14 +611,14 @@ fn merge_moves_continue_from_a_cursor_the_filter_hides() {
     }
     for name in ["a.txt", "b.txt", "c.txt", "d.txt"] {
         for side in ["center", "right"] {
-            std::fs::write(dir.path().join(side).join(name), b"base").unwrap();
+            write_file(&dir.path().join(side).join(name), b"base");
         }
         let left: &[u8] = if matches!(name, "a.txt" | "c.txt") {
             b"left change"
         } else {
             b"base"
         };
-        std::fs::write(dir.path().join("left").join(name), left).unwrap();
+        write_file(&dir.path().join("left").join(name), left);
     }
     let request = OpenRequest::new(
         SessionKind::FolderMerge,
