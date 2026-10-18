@@ -107,19 +107,43 @@ pub fn install_folder_usable(program: &Path, work_parent: &Path) -> bool {
 }
 
 /// True when `first` and `second` exist and, with every link resolved, are
-/// on the same drive. A path that cannot be resolved counts as another
-/// volume.
+/// on the same volume: the same volume root, serial number and file system.
+/// A path that cannot be resolved counts as another volume.
 #[must_use]
 pub fn same_volume(first: &Path, second: &Path) -> bool {
-    let drive = |path: &Path| {
-        resolve(path).and_then(|resolved| {
-            resolved
-                .components()
-                .next()
-                .map(|part| part.as_os_str().to_string_lossy().to_lowercase())
-        })
-    };
-    matches!((drive(first), drive(second)), (Some(a), Some(b)) if a == b)
+    matches!(
+        (volume_identity(first), volume_identity(second)),
+        (Some(a), Some(b)) if a == b
+    )
+}
+
+/// The volume that holds `path`: the folder the volume is mounted at, its
+/// serial number and its file system. A folder that mounts another volume
+/// keeps its drive letter when links are resolved, so the drive alone does
+/// not name the volume.
+#[cfg(windows)]
+fn volume_identity(path: &Path) -> Option<(String, u32, String)> {
+    let resolved = resolve(path)?;
+    let root = winsafe::GetVolumePathName(resolved.to_str()?).ok()?;
+    let (mut serial, mut file_system) = (0, String::new());
+    winsafe::GetVolumeInformation(
+        Some(&root),
+        None,
+        Some(&mut serial),
+        None,
+        None,
+        Some(&mut file_system),
+    )
+    .ok()?;
+    Some((root.to_lowercase(), serial, file_system))
+}
+
+#[cfg(not(windows))]
+fn volume_identity(path: &Path) -> Option<(String, u32, String)> {
+    use std::os::unix::fs::MetadataExt;
+    let resolved = resolve(path)?;
+    let device = std::fs::metadata(&resolved).ok()?.dev();
+    Some((device.to_string(), 0, String::new()))
 }
 
 /// True when an update of the install for every user at `program` can be

@@ -1104,6 +1104,7 @@ dependencies = [
  "tempfile",
  "ureq",
  "winreg",
+ "winsafe",
  "zip",
 ]
 
