@@ -153,6 +153,8 @@ const HANDLED: &[Command] = &[
     Command::PreviousDifference,
     Command::NextSection,
     Command::PreviousSection,
+    Command::NextExistingLine,
+    Command::PreviousExistingLine,
     Command::ShowAll,
     Command::ShowDifferences,
     Command::ShowSame,
@@ -1515,6 +1517,29 @@ impl TextView {
                 }
                 .to_owned(),
             );
+        }
+    }
+
+    /// Move to the nearest shown row after or before the current one that
+    /// carries a line on the active side, skipping the gap rows.
+    ///
+    /// Nothing happens where no such row lies in that direction.
+    fn step_existing(&mut self, forward: bool) {
+        if !self.rows_current() {
+            return;
+        }
+        let side = self.active;
+        let model = &self.data.model;
+        let holds = |row: &usize| {
+            self.visible.shows(*row) && model.row(*row).is_some_and(|r| side.line_of(r).is_some())
+        };
+        let found = if forward {
+            (self.caret.saturating_add(1)..model.row_count()).find(holds)
+        } else {
+            (0..self.caret.min(model.row_count())).rev().find(holds)
+        };
+        if let Some(row) = found {
+            self.move_to_row(row);
         }
     }
 
@@ -4080,6 +4105,10 @@ impl TextView {
         use egui::Key;
         let shift = modifiers.shift;
         let word = modifiers.command;
+        // Alt and Shift+Delete name commands, not text edits or caret moves.
+        if modifiers.alt || (shift && !word && key == Key::Delete) {
+            return false;
+        }
         let motion = match key {
             Key::ArrowLeft => Some(if word { Motion::WordLeft } else { Motion::Left }),
             Key::ArrowRight => Some(if word {
@@ -4108,9 +4137,11 @@ impl TextView {
             return false;
         }
         if modifiers.command {
-            return match key {
-                Key::Backspace => self.delete_word(false),
-                Key::Delete => self.delete_word(true),
+            return match (shift, key) {
+                (true, Key::Backspace) => self.active_pane_mut().delete_to_line_start(),
+                (true, Key::Delete) => self.active_pane_mut().delete_to_line_end(),
+                (false, Key::Backspace) => self.delete_word(false),
+                (false, Key::Delete) => self.delete_word(true),
                 _ => false,
             };
         }
@@ -4899,6 +4930,8 @@ impl SessionView for TextView {
             | Command::PreviousDifference
             | Command::NextSection
             | Command::PreviousSection
+            | Command::NextExistingLine
+            | Command::PreviousExistingLine
             | Command::SelectSection => self.rows_current(),
             Command::ShowAll
             | Command::ShowDifferences
@@ -4998,6 +5031,8 @@ impl SessionView for TextView {
             | Command::PreviousDifference
             | Command::NextSection
             | Command::PreviousSection
+            | Command::NextExistingLine
+            | Command::PreviousExistingLine
             | Command::SelectSection => None,
             Command::CopyToRight | Command::CopyLineToRight => Some(Side::Right),
             Command::CopyToLeft | Command::CopyLineToLeft => Some(Side::Left),
@@ -5023,6 +5058,8 @@ impl SessionView for TextView {
             | Command::PreviousDifference
             | Command::NextSection
             | Command::PreviousSection => self.navigate(command),
+            Command::NextExistingLine => self.step_existing(true),
+            Command::PreviousExistingLine => self.step_existing(false),
             Command::CompareReport => self.report.request(),
             Command::ShowAll => self.set_filter(DisplayFilter::All),
             Command::ShowDifferences => self.set_filter(DisplayFilter::Differences),

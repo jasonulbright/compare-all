@@ -2900,6 +2900,10 @@ impl SessionView for HexView {
         ca_ui::view::declare(HANDLED, |command| self.accepts(command))
     }
 
+    fn menu_view(&self) -> ca_ui::command::MenuView {
+        ca_ui::command::MenuView::Hex
+    }
+
     fn refusal(&self, command: Command) -> Option<&'static str> {
         let target_reason = match command {
             Command::CopyToRight => Some((&self.right_bytes, RIGHT_READ_ONLY)),

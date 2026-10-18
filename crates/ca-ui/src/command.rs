@@ -59,6 +59,9 @@ pub enum MenuView {
     Version,
     /// The media metadata comparison bar.
     Media,
+    /// The byte comparison bar: the shared bar with byte wording for the
+    /// difference steps.
+    Hex,
     /// The shared bar every other view carries.
     Other,
 }
@@ -150,6 +153,11 @@ commands! {
     SyncBaseFolders, "Sync Base Folders", Session, None, "Open the base folders in a folder sync.";
     CompareParentFolders, "Compare Parent Folders", Session, None, "Open a folder comparison of the two parents.";
     Exit, "Exit", Session, Some("Ctrl+Q"), "Leave the program.";
+    SessionHome, "Session Home", Hidden, Some("Alt+Home"), "Show the launcher tab.";
+    TabNext, "Next Tab", Hidden, Some("Ctrl+Tab"), "Activate the tab to the right, wrapping at the end.";
+    TabPrevious, "Previous Tab", Hidden, Some("Ctrl+Shift+Tab"), "Activate the tab to the left, wrapping at the start.";
+    NextExistingLine, "Next Existing Line", Hidden, Some("Alt+Down"), "Move to the next row that has a line on the active side.";
+    PreviousExistingLine, "Previous Existing Line", Hidden, Some("Alt+Up"), "Move to the previous row that has a line on the active side.";
 
     // File.
     OpenFile, "Open File...", File, Some("Ctrl+O"), "Read a file into one side.";
@@ -374,7 +382,7 @@ impl Command {
     #[must_use]
     pub const fn label_in(self, view: MenuView) -> &'static str {
         match (self, view) {
-            (Self::Reload, MenuView::Folder) => "Refresh",
+            (Self::Reload, MenuView::Folder | MenuView::FolderMerge) => "Refresh",
             (Self::Recompare, MenuView::Folder) => "Full Refresh",
             (Self::CompareReport, MenuView::Folder) => "Folder Compare Report...",
             (Self::CompareInfo, MenuView::Folder) => "Folder Compare Info",
@@ -404,6 +412,15 @@ impl Command {
             (Self::ToggleLineNumbers, MenuView::Table) => "Row Numbers",
             (Self::ShowDifferences, MenuView::Merge | MenuView::FolderMerge) => "Show Changes",
             (Self::ShowSame, MenuView::Merge | MenuView::FolderMerge) => "Show Unchanged",
+            (Self::NextSection, MenuView::Table) => "Next Difference Row",
+            (Self::PreviousSection, MenuView::Table) => "Previous Difference Row",
+            (Self::NextDifference, MenuView::Table) => "Next Difference Cell",
+            (Self::PreviousDifference, MenuView::Table) => "Previous Difference Cell",
+            (Self::NextSection, MenuView::Hex) => "Next Difference Bytes",
+            (Self::PreviousSection, MenuView::Hex) => "Previous Difference Bytes",
+            (Self::Reload, MenuView::Registry) => "Reload",
+            (Self::Recompare, MenuView::Registry) => "Recompare",
+            (Self::OpenFile, MenuView::Registry) => "Open...",
             _ => self.label(),
         }
     }
@@ -418,22 +435,41 @@ impl Command {
             (Self::TakeRightThenLeft, MenuView::Merge | MenuView::FolderMerge) => {
                 Some("Ctrl+Shift+B")
             }
-            (Self::TakeLeftLine, MenuView::Merge | MenuView::FolderMerge) => Some("Ctrl+Shift+L"),
-            (Self::TakeRightLine, MenuView::Merge | MenuView::FolderMerge) => Some("Ctrl+Shift+R"),
+            (Self::TakeLeftLine, MenuView::Merge | MenuView::FolderMerge)
+            | (Self::CopyCellToLeft, MenuView::Table) => Some("Ctrl+Shift+L"),
+            (Self::TakeRightLine, MenuView::Merge | MenuView::FolderMerge)
+            | (Self::CopyCellToRight, MenuView::Table) => Some("Ctrl+Shift+R"),
             (Self::NextConflict, MenuView::Merge | MenuView::FolderMerge) => Some("Alt+N"),
             (Self::PreviousConflict, MenuView::Merge | MenuView::FolderMerge) => Some("Alt+P"),
-            (Self::NextDifference, MenuView::Folder | MenuView::FolderMerge) => Some("Ctrl+N"),
-            (Self::PreviousDifference, MenuView::Folder | MenuView::FolderMerge) => Some("Ctrl+P"),
+            (
+                Self::NextDifference,
+                MenuView::Folder
+                | MenuView::FolderMerge
+                | MenuView::Registry
+                | MenuView::Version
+                | MenuView::Media,
+            ) => Some("Ctrl+N"),
+            (
+                Self::PreviousDifference,
+                MenuView::Folder
+                | MenuView::FolderMerge
+                | MenuView::Registry
+                | MenuView::Version
+                | MenuView::Media,
+            ) => Some("Ctrl+P"),
             (Self::SelectAllFiles, MenuView::Merge | MenuView::FolderMerge | MenuView::Folder) => {
                 Some("Ctrl+Shift+A")
             }
             (Self::RefreshSelection, MenuView::Folder) => Some("Shift+F5"),
-            (Self::Rename, MenuView::Folder) => Some("F2"),
-            (Self::NewFolder, MenuView::Folder) => Some("Ins"),
+            (Self::Rename, MenuView::Folder | MenuView::Registry) => Some("F2"),
+            (Self::NewFolder, MenuView::Folder) | (Self::NewValue, MenuView::Registry) => {
+                Some("Ins")
+            }
+            (Self::MergeInfo, MenuView::Merge) => Some("Ctrl+I"),
             (Self::Legend, MenuView::Folder) => Some("Ctrl+Alt+L"),
             (Self::Back, MenuView::Folder) => Some("Alt+Left"),
             (Self::Forward, MenuView::Folder) => Some("Alt+Right"),
-            (Self::CompareInfo, MenuView::Table)
+            (Self::CompareInfo, MenuView::Table | MenuView::Merge)
             | (
                 Self::NextSection
                 | Self::PreviousSection
@@ -444,8 +480,6 @@ impl Command {
                 | Self::Copy
                 | Self::Paste
                 | Self::SelectSection
-                | Self::CopyToRight
-                | Self::CopyToLeft
                 | Self::CopyLineToRight
                 | Self::CopyLineToLeft
                 | Self::IncreaseIndent
@@ -465,7 +499,12 @@ impl Command {
                 Self::CopyToRight | Self::CopyToLeft | Self::CopyLineToRight | Self::CopyLineToLeft,
                 MenuView::Merge | MenuView::FolderMerge,
             )
-            | (Self::NextSection | Self::PreviousSection, MenuView::FolderMerge) => None,
+            | (Self::CopyLineToRight | Self::CopyLineToLeft, MenuView::Table)
+            | (
+                Self::NextSection | Self::PreviousSection,
+                MenuView::FolderMerge | MenuView::Registry | MenuView::Version | MenuView::Media,
+            )
+            | (Self::ToggleOverwrite, MenuView::Registry) => None,
             _ => self.shortcut_text(),
         }
     }
@@ -514,6 +553,17 @@ impl Keystroke {
             key,
             command: false,
             shift: false,
+            alt: true,
+        }
+    }
+
+    /// A press of `key` with alt and shift.
+    #[must_use]
+    pub const fn with_alt_shift(key: egui::Key) -> Self {
+        Self {
+            key,
+            command: false,
+            shift: true,
             alt: true,
         }
     }
@@ -574,6 +624,7 @@ impl MenuView {
         MenuView::Registry,
         MenuView::Version,
         MenuView::Media,
+        MenuView::Hex,
         MenuView::Other,
     ];
 
@@ -589,6 +640,7 @@ impl MenuView {
             MenuView::Registry => "registry",
             MenuView::Version => "version",
             MenuView::Media => "media",
+            MenuView::Hex => "hex",
             MenuView::Other => "other",
         }
     }
@@ -605,6 +657,7 @@ impl MenuView {
             MenuView::Registry => "Registry comparisons",
             MenuView::Version => "Version comparisons",
             MenuView::Media => "Media comparisons",
+            MenuView::Hex => "Byte comparisons",
             MenuView::Other => "Every other view",
         }
     }
@@ -695,20 +748,25 @@ impl ShortcutTable {
             let mut table = bindings(*view);
             let own = options.view(view.id());
             let inherited = match view {
-                MenuView::Version | MenuView::Media => options.view(MenuView::Other.id()),
+                MenuView::Version | MenuView::Media | MenuView::Hex => {
+                    options.view(MenuView::Other.id())
+                }
                 MenuView::FolderMerge => options.view(MenuView::Merge.id()),
                 _ => None,
             };
             // A folder merge takes a text merge binding only for a command it
             // shares and states no binding of its own for: applying both
             // would let the inherited keys take strokes from other commands.
+            // A window command has no view to differ in, so it is always shared.
             let inherited = inherited
                 .into_iter()
                 .flat_map(|stated| &stated.shortcuts)
                 .filter(|(command, _)| {
                     *view != MenuView::FolderMerge
                         || (own.is_none_or(|own| !own.shortcuts.contains_key(*command))
-                            && Command::from_id(command).is_some_and(shared_with_folder_merges))
+                            && Command::from_id(command).is_some_and(|command| {
+                                shared_with_folder_merges(command) || is_window_command(command)
+                            }))
                 });
             let stated = inherited.chain(own.into_iter().flat_map(|stated| &stated.shortcuts));
             for (command, keys) in stated {
@@ -762,17 +820,21 @@ impl ShortcutTable {
 
 /// The command a keystroke asks for in `view` under the built-in bindings.
 ///
-/// Alt is reserved for the menu bar, so a binding fires under alt only where
-/// the observed shortcut carries it.
+/// A binding fires under alt only where the observed shortcut carries it, so
+/// an alt press that names no command stays free for the menu bar.
 #[must_use]
 pub fn route(view: MenuView, stroke: Keystroke) -> Option<Command> {
+    if view == MenuView::Merge {
+        if let Some(command) = merge_info(stroke) {
+            return Some(command);
+        }
+    }
     shared(stroke).or_else(|| match view {
-        MenuView::Text
-        | MenuView::Table
-        | MenuView::Registry
-        | MenuView::Version
-        | MenuView::Media
-        | MenuView::Other => text(stroke),
+        MenuView::Text | MenuView::Hex | MenuView::Other => text(stroke),
+        MenuView::Table => table(stroke).or_else(|| text(stroke)),
+        MenuView::Registry | MenuView::Version | MenuView::Media => {
+            records(view, stroke).or_else(|| text(stroke))
+        }
         MenuView::Folder => folder(stroke),
         MenuView::Merge => merge(stroke).or_else(|| text(stroke)),
         MenuView::FolderMerge => folder_merge(stroke)
@@ -824,6 +886,30 @@ fn shared_with_folder_merges(command: Command) -> bool {
             .any(|(stroke, held)| held == command && shared(stroke) == Some(command))
 }
 
+/// True for a command that acts on the window, not on the content of a view.
+fn is_window_command(command: Command) -> bool {
+    matches!(command.menu(), Menu::Tools | Menu::Help)
+        || matches!(
+            command,
+            Command::NewSession
+                | Command::NewTab
+                | Command::NewWindow
+                | Command::OpenSession
+                | Command::LoadWorkspace
+                | Command::SaveWorkspaceAs
+                | Command::SaveSession
+                | Command::SaveSessionAs
+                | Command::SessionSettings
+                | Command::ToggleLocked
+                | Command::ClearSession
+                | Command::CloseTab
+                | Command::Exit
+                | Command::SessionHome
+                | Command::TabNext
+                | Command::TabPrevious
+        )
+}
+
 /// The bindings the folder merge bar puts ahead of the merge bar: a folder
 /// merge has no sections, so Ctrl+N and Ctrl+P move between differences as
 /// they do in a folder comparison.
@@ -835,6 +921,36 @@ fn folder_merge(stroke: Keystroke) -> Option<Command> {
     match (stroke.command, stroke.shift, stroke.key) {
         (true, false, Key::N) => Some(Command::NextDifference),
         (true, false, Key::P) => Some(Command::PreviousDifference),
+        _ => None,
+    }
+}
+
+/// The bindings the table bar puts ahead of the text bar: Ctrl with Shift
+/// copies cells where the text bar copies lines.
+fn table(stroke: Keystroke) -> Option<Command> {
+    use egui::Key;
+    if stroke.alt {
+        return None;
+    }
+    match (stroke.command, stroke.shift, stroke.key) {
+        (true, true, Key::R) => Some(Command::CopyCellToRight),
+        (true, true, Key::L) => Some(Command::CopyCellToLeft),
+        _ => None,
+    }
+}
+
+/// The bindings the record bars put ahead of the text bar: the records have
+/// one kind of difference, so Ctrl+N and Ctrl+P step through it.
+fn records(view: MenuView, stroke: Keystroke) -> Option<Command> {
+    use egui::Key;
+    if stroke.alt {
+        return None;
+    }
+    match (stroke.command, stroke.shift, stroke.key) {
+        (true, false, Key::N) => Some(Command::NextDifference),
+        (true, false, Key::P) => Some(Command::PreviousDifference),
+        (false, false, Key::F2) if view == MenuView::Registry => Some(Command::Rename),
+        (false, false, Key::Insert) if view == MenuView::Registry => Some(Command::NewValue),
         _ => None,
     }
 }
@@ -852,11 +968,18 @@ pub fn route_with(view: MenuView, stroke: Keystroke, table: &ShortcutTable) -> O
 fn shared(stroke: Keystroke) -> Option<Command> {
     use egui::Key;
     if stroke.alt {
-        return None;
+        return match (stroke.command, stroke.shift, stroke.key) {
+            (false, false, Key::Home) => Some(Command::SessionHome),
+            (false, false, Key::ArrowDown) => Some(Command::NextExistingLine),
+            (false, false, Key::ArrowUp) => Some(Command::PreviousExistingLine),
+            _ => None,
+        };
     }
     match (stroke.command, stroke.shift, stroke.key) {
         (true, false, Key::T) => Some(Command::NewTab),
-        (true, false, Key::W) => Some(Command::CloseTab),
+        (true, false, Key::W | Key::F4) => Some(Command::CloseTab),
+        (true, false, Key::Tab) => Some(Command::TabNext),
+        (true, true, Key::Tab) => Some(Command::TabPrevious),
         (true, false, Key::Q) => Some(Command::Exit),
         (true, true, Key::O) => Some(Command::OpenSession),
         (true, true, Key::S) => Some(Command::SaveSession),
@@ -884,6 +1007,8 @@ fn text(stroke: Keystroke) -> Option<Command> {
         return match (stroke.command, stroke.shift, stroke.key) {
             (true, true, Key::N) => Some(Command::NextReplacement),
             (true, true, Key::P) => Some(Command::PreviousReplacement),
+            (false, false, Key::Backspace) => Some(Command::Undo),
+            (false, true, Key::Backspace) => Some(Command::Redo),
             _ => None,
         };
     }
@@ -897,10 +1022,10 @@ fn text(stroke: Keystroke) -> Option<Command> {
         (true, false, Key::S) => Some(Command::SaveFile),
         (false, false, Key::F12) => Some(Command::SaveFileAs),
         (true, false, Key::Z) => Some(Command::Undo),
-        (true, false, Key::Y) => Some(Command::Redo),
-        (true, false, Key::X) => Some(Command::Cut),
-        (true, false, Key::C) => Some(Command::Copy),
-        (true, false, Key::V) => Some(Command::Paste),
+        (true, false, Key::Y) | (true, true, Key::Z) => Some(Command::Redo),
+        (true, false, Key::X) | (false, true, Key::Delete) => Some(Command::Cut),
+        (true, false, Key::C | Key::Insert) => Some(Command::Copy),
+        (true, false, Key::V) | (false, true, Key::Insert) => Some(Command::Paste),
         (true, false, Key::D) => Some(Command::SelectSection),
         (false, false, Key::F7) => Some(Command::AlignWith),
         (true, false, Key::R) => Some(Command::CopyToRight),
@@ -914,6 +1039,12 @@ fn text(stroke: Keystroke) -> Option<Command> {
         (false, false, Key::Insert) => Some(Command::ToggleOverwrite),
         _ => None,
     }
+}
+
+/// The binding the merge bar puts ahead of the shared bindings: the merge has
+/// its own info page.
+fn merge_info(stroke: Keystroke) -> Option<Command> {
+    (stroke == Keystroke::with_command(egui::Key::I)).then_some(Command::MergeInfo)
 }
 
 /// The bindings the merge bar puts ahead of the text comparison bar.
@@ -955,6 +1086,8 @@ fn folder(stroke: Keystroke) -> Option<Command> {
     match (stroke.command, stroke.shift, stroke.key) {
         (true, false, Key::N) => Some(Command::NextDifference),
         (true, false, Key::P) => Some(Command::PreviousDifference),
+        (true, false, Key::R) => Some(Command::CopyToRight),
+        (true, false, Key::L) => Some(Command::CopyToLeft),
         (true, true, Key::A) => Some(Command::SelectAllFiles),
         (false, false, Key::F2) => Some(Command::Rename),
         (false, false, Key::Insert) => Some(Command::NewFolder),
@@ -962,6 +1095,17 @@ fn folder(stroke: Keystroke) -> Option<Command> {
         _ => None,
     }
 }
+
+/// The second keys of the edit commands, and the record bars' F2.
+const EDIT_ALTERNATES: [Keystroke; 7] = [
+    Keystroke::plain(egui::Key::F2),
+    Keystroke::with_command_shift(egui::Key::Z),
+    Keystroke::with_shift(egui::Key::Delete),
+    Keystroke::with_command(egui::Key::Insert),
+    Keystroke::with_shift(egui::Key::Insert),
+    Keystroke::with_alt(egui::Key::Backspace),
+    Keystroke::with_alt_shift(egui::Key::Backspace),
+];
 
 /// Every keystroke the bar of `view` answers, for the tests and for a future
 /// customization surface.
@@ -971,6 +1115,12 @@ pub fn bindings(view: MenuView) -> Vec<(Keystroke, Command)> {
     let mut strokes = vec![
         Keystroke::with_command(Key::T),
         Keystroke::with_command(Key::W),
+        Keystroke::with_command(Key::F4),
+        Keystroke::with_command(Key::Tab),
+        Keystroke::with_command_shift(Key::Tab),
+        Keystroke::with_alt(Key::Home),
+        Keystroke::with_alt(Key::ArrowDown),
+        Keystroke::with_alt(Key::ArrowUp),
         Keystroke::with_command(Key::Q),
         Keystroke::with_command_shift(Key::O),
         Keystroke::with_command_shift(Key::S),
@@ -1006,6 +1156,7 @@ pub fn bindings(view: MenuView) -> Vec<(Keystroke, Command)> {
         | MenuView::Registry
         | MenuView::Version
         | MenuView::Media
+        | MenuView::Hex
         | MenuView::Other => {
             strokes.extend([
                 Keystroke::with_command_shift(Key::N),
@@ -1035,8 +1186,11 @@ pub fn bindings(view: MenuView) -> Vec<(Keystroke, Command)> {
                 Keystroke::with_command_alt_shift(Key::N),
                 Keystroke::with_command_alt_shift(Key::P),
             ]);
+            strokes.extend(EDIT_ALTERNATES);
         }
         MenuView::Folder => strokes.extend([
+            Keystroke::with_command(Key::R),
+            Keystroke::with_command(Key::L),
             Keystroke::with_command(Key::N),
             Keystroke::with_command(Key::P),
             Keystroke::with_command_shift(Key::A),
@@ -1458,5 +1612,331 @@ mod tests {
                 "{command:?}"
             );
         }
+    }
+
+    fn every_bar_but(skipped: &[MenuView]) -> Vec<MenuView> {
+        MenuView::ALL
+            .iter()
+            .copied()
+            .filter(|view| !skipped.contains(view))
+            .collect()
+    }
+
+    #[test]
+    fn a_folder_comparison_copies_with_ctrl_r_and_ctrl_l() {
+        assert_eq!(
+            route(MenuView::Folder, Keystroke::with_command(Key::R)),
+            Some(Command::CopyToRight)
+        );
+        assert_eq!(
+            route(MenuView::Folder, Keystroke::with_command(Key::L)),
+            Some(Command::CopyToLeft)
+        );
+        assert_eq!(
+            Command::CopyToRight.shortcut_in(MenuView::Folder),
+            Some("Ctrl+R")
+        );
+    }
+
+    #[test]
+    fn a_table_copies_cells_with_ctrl_shift_and_rows_with_ctrl() {
+        for (stroke, command) in [
+            (
+                Keystroke::with_command_shift(Key::R),
+                Command::CopyCellToRight,
+            ),
+            (
+                Keystroke::with_command_shift(Key::L),
+                Command::CopyCellToLeft,
+            ),
+            (Keystroke::with_command(Key::R), Command::CopyToRight),
+            (Keystroke::with_command(Key::L), Command::CopyToLeft),
+        ] {
+            assert_eq!(route(MenuView::Table, stroke), Some(command), "{stroke:?}");
+        }
+        assert_eq!(
+            route(MenuView::Text, Keystroke::with_command_shift(Key::R)),
+            Some(Command::CopyLineToRight)
+        );
+        assert_eq!(
+            Command::CopyCellToLeft.shortcut_in(MenuView::Table),
+            Some("Ctrl+Shift+L")
+        );
+        assert_eq!(Command::CopyLineToLeft.shortcut_in(MenuView::Table), None);
+    }
+
+    #[test]
+    fn a_text_merge_shows_its_info_page_on_ctrl_i() {
+        assert_eq!(
+            route(MenuView::Merge, Keystroke::with_command(Key::I)),
+            Some(Command::MergeInfo)
+        );
+        assert_eq!(
+            route(MenuView::FolderMerge, Keystroke::with_command(Key::I)),
+            Some(Command::CompareInfo)
+        );
+        assert_eq!(
+            route(MenuView::Text, Keystroke::with_command(Key::I)),
+            Some(Command::CompareInfo)
+        );
+        assert_eq!(
+            Command::MergeInfo.shortcut_in(MenuView::Merge),
+            Some("Ctrl+I")
+        );
+        assert_eq!(Command::CompareInfo.shortcut_in(MenuView::Merge), None);
+    }
+
+    #[test]
+    fn record_views_step_through_differences_with_ctrl_n_and_ctrl_p() {
+        for view in [MenuView::Registry, MenuView::Version, MenuView::Media] {
+            assert_eq!(
+                route(view, Keystroke::with_command(Key::N)),
+                Some(Command::NextDifference),
+                "{view:?}"
+            );
+            assert_eq!(
+                route(view, Keystroke::with_command(Key::P)),
+                Some(Command::PreviousDifference),
+                "{view:?}"
+            );
+            assert_eq!(
+                Command::NextDifference.shortcut_in(view),
+                Some("Ctrl+N"),
+                "{view:?}"
+            );
+            assert_eq!(Command::NextSection.shortcut_in(view), None, "{view:?}");
+        }
+    }
+
+    #[test]
+    fn the_registry_renames_on_f2_and_adds_a_value_on_insert() {
+        assert_eq!(
+            route(MenuView::Registry, Keystroke::plain(Key::F2)),
+            Some(Command::Rename)
+        );
+        assert_eq!(
+            route(MenuView::Registry, Keystroke::plain(Key::Insert)),
+            Some(Command::NewValue)
+        );
+        assert_eq!(
+            route(MenuView::Text, Keystroke::plain(Key::Insert)),
+            Some(Command::ToggleOverwrite)
+        );
+        assert_eq!(route(MenuView::Version, Keystroke::plain(Key::F2)), None);
+    }
+
+    #[test]
+    fn ctrl_f4_closes_the_tab_in_every_view() {
+        for view in MenuView::ALL.iter().copied() {
+            assert_eq!(
+                route(view, Keystroke::with_command(Key::F4)),
+                Some(Command::CloseTab),
+                "{view:?}"
+            );
+            assert!(
+                bindings(view).contains(&(Keystroke::with_command(Key::F4), Command::CloseTab)),
+                "{view:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_edit_commands_carry_their_secondary_keys() {
+        for view in every_bar_but(&[MenuView::Folder]) {
+            for (stroke, command) in [
+                (Keystroke::with_alt(Key::Backspace), Command::Undo),
+                (Keystroke::with_alt_shift(Key::Backspace), Command::Redo),
+                (Keystroke::with_command_shift(Key::Z), Command::Redo),
+                (Keystroke::with_shift(Key::Delete), Command::Cut),
+                (Keystroke::with_command(Key::Insert), Command::Copy),
+                (Keystroke::with_shift(Key::Insert), Command::Paste),
+            ] {
+                assert_eq!(route(view, stroke), Some(command), "{stroke:?} in {view:?}");
+                assert!(
+                    bindings(view).contains(&(stroke, command)),
+                    "{stroke:?} in {view:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_secondary_key_leaves_the_primary_key_in_place() {
+        for view in every_bar_but(&[MenuView::Folder]) {
+            for (stroke, command) in [
+                (Keystroke::with_command(Key::Z), Command::Undo),
+                (Keystroke::with_command(Key::Y), Command::Redo),
+                (Keystroke::with_command(Key::X), Command::Cut),
+                (Keystroke::with_command(Key::C), Command::Copy),
+                (Keystroke::with_command(Key::V), Command::Paste),
+            ] {
+                assert_eq!(route(view, stroke), Some(command), "{stroke:?} in {view:?}");
+            }
+        }
+        assert_eq!(Command::Cut.shortcut_in(MenuView::Text), Some("Ctrl+X"));
+    }
+
+    #[test]
+    fn captions_follow_the_content_each_view_steps_through() {
+        for (command, view, caption) in [
+            (Command::Reload, MenuView::FolderMerge, "Refresh"),
+            (Command::NextSection, MenuView::Table, "Next Difference Row"),
+            (
+                Command::PreviousSection,
+                MenuView::Table,
+                "Previous Difference Row",
+            ),
+            (
+                Command::NextDifference,
+                MenuView::Table,
+                "Next Difference Cell",
+            ),
+            (
+                Command::PreviousDifference,
+                MenuView::Table,
+                "Previous Difference Cell",
+            ),
+            (Command::NextSection, MenuView::Hex, "Next Difference Bytes"),
+            (
+                Command::PreviousSection,
+                MenuView::Hex,
+                "Previous Difference Bytes",
+            ),
+            (Command::Reload, MenuView::Registry, "Reload"),
+            (Command::Recompare, MenuView::Registry, "Recompare"),
+            (Command::OpenFile, MenuView::Registry, "Open..."),
+        ] {
+            assert_eq!(command.label_in(view), caption, "{command:?} in {view:?}");
+        }
+        assert_eq!(
+            Command::NextSection.label_in(MenuView::Text),
+            "Next Difference Section"
+        );
+    }
+
+    #[test]
+    fn alt_with_a_navigation_key_routes_and_alt_with_a_letter_stays_with_the_menu_bar() {
+        for view in MenuView::ALL.iter().copied() {
+            for (stroke, command) in [
+                (Keystroke::with_alt(Key::Home), Command::SessionHome),
+                (
+                    Keystroke::with_alt(Key::ArrowDown),
+                    Command::NextExistingLine,
+                ),
+                (
+                    Keystroke::with_alt(Key::ArrowUp),
+                    Command::PreviousExistingLine,
+                ),
+            ] {
+                assert_eq!(route(view, stroke), Some(command), "{stroke:?} in {view:?}");
+                assert!(
+                    bindings(view).contains(&(stroke, command)),
+                    "{stroke:?} in {view:?}"
+                );
+            }
+            for letter in [Key::F, Key::E, Key::V, Key::T, Key::H, Key::S, Key::A] {
+                assert_eq!(
+                    route(view, Keystroke::with_alt(letter)),
+                    None,
+                    "Alt+{letter:?} in {view:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ctrl_tab_and_ctrl_shift_tab_switch_tabs_in_every_view() {
+        for view in MenuView::ALL.iter().copied() {
+            assert_eq!(
+                route(view, Keystroke::with_command(Key::Tab)),
+                Some(Command::TabNext),
+                "{view:?}"
+            );
+            assert_eq!(
+                route(view, Keystroke::with_command_shift(Key::Tab)),
+                Some(Command::TabPrevious),
+                "{view:?}"
+            );
+        }
+        assert_eq!(Command::TabNext.shortcut_text(), Some("Ctrl+Tab"));
+    }
+
+    #[test]
+    fn a_user_binding_beats_a_changed_default() {
+        use super::ShortcutTable;
+        let mut options = ca_session::options::CommandOptions::default();
+        options.set_shortcuts(
+            MenuView::Text.id(),
+            Command::TabNext.id(),
+            vec!["Ctrl+Alt+K".to_owned()],
+        );
+        options.set_shortcuts(
+            MenuView::Text.id(),
+            Command::FindNext.id(),
+            vec!["Ctrl+Tab".to_owned()],
+        );
+        options.set_shortcuts(
+            MenuView::Text.id(),
+            Command::Cut.id(),
+            vec!["Ctrl+Alt+X".to_owned()],
+        );
+        let table = ShortcutTable::from_options(&options);
+        let text = MenuView::Text;
+        assert_eq!(
+            super::route_with(text, Keystroke::with_command(Key::Tab), &table),
+            Some(Command::FindNext)
+        );
+        assert_eq!(
+            table.shortcuts_of(text, Command::TabNext),
+            [Keystroke::with_command_alt(Key::K)]
+        );
+        assert_eq!(
+            table.shortcuts_of(text, Command::Cut),
+            [Keystroke::with_command_alt(Key::X)],
+            "the secondary key went with the primary one"
+        );
+        assert_eq!(
+            super::route_with(text, Keystroke::with_shift(Key::Delete), &table),
+            None
+        );
+        assert_eq!(
+            super::route_with(MenuView::Folder, Keystroke::with_command(Key::Tab), &table),
+            Some(Command::TabNext),
+            "another bar keeps its default"
+        );
+    }
+
+    #[test]
+    fn a_text_merge_binding_of_a_window_command_reaches_folder_merges() {
+        use super::ShortcutTable;
+        let mut options = ca_session::options::CommandOptions::default();
+        options.set_shortcuts(
+            MenuView::Merge.id(),
+            Command::Options.id(),
+            vec!["Ctrl+Alt+O".to_owned()],
+        );
+        options.set_shortcuts(
+            MenuView::Merge.id(),
+            Command::About.id(),
+            vec!["Ctrl+Alt+B".to_owned()],
+        );
+        options.set_shortcuts(
+            MenuView::FolderMerge.id(),
+            Command::About.id(),
+            vec!["Ctrl+Alt+A".to_owned()],
+        );
+        let table = ShortcutTable::from_options(&options);
+        assert_eq!(
+            table.shortcuts_of(MenuView::FolderMerge, Command::Options),
+            [Keystroke::with_command_alt(Key::O)]
+        );
+        assert_eq!(
+            table.shortcuts_of(MenuView::FolderMerge, Command::About),
+            [Keystroke::with_command_alt(Key::A)],
+            "a folder merge binding of its own wins"
+        );
+        assert!(table
+            .shortcuts_of(MenuView::Text, Command::Options)
+            .is_empty());
     }
 }

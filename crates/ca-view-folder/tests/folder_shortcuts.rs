@@ -161,6 +161,26 @@ fn the_folder_keys_reach_the_commands() {
 }
 
 #[test]
+fn ctrl_r_and_ctrl_l_copy_the_selection_in_a_folder_comparison() {
+    let fixture = Fixture::new();
+    let mut view = fixture.view();
+    refused(&view, Command::CopyToRight);
+    expect(&mut view, Command::SelectAll);
+    for (stroke, command) in [
+        (Keystroke::with_command(Key::R), Command::CopyToRight),
+        (Keystroke::with_command(Key::L), Command::CopyToLeft),
+    ] {
+        assert_eq!(route(MenuView::Folder, stroke), Some(command), "{stroke:?}");
+        assert!(view.accepts(command), "{command:?} was refused");
+    }
+    view.run(Command::CopyToRight);
+    assert!(
+        !view.accepts(Command::CopyToLeft),
+        "the copy to the right is running or asking, so a second one waits"
+    );
+}
+
+#[test]
 fn next_and_previous_difference_walk_the_differences_and_open_folders() {
     let fixture = Fixture::new();
     let mut view = fixture.view();

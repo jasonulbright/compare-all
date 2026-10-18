@@ -526,6 +526,7 @@ const fn menu_view(view: ToolbarView) -> crate::command::MenuView {
         ToolbarView::Table => MenuView::Table,
         ToolbarView::Merge => MenuView::Merge,
         ToolbarView::FolderMerge => MenuView::FolderMerge,
+        ToolbarView::Hex => MenuView::Hex,
         _ => MenuView::Other,
     }
 }
