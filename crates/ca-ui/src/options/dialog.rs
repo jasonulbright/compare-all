@@ -928,6 +928,19 @@ fn working_folder_label(id: &str) -> &'static str {
     }
 }
 
+/// A number field held to `range` only while the user edits it.
+///
+/// A saved value beyond the range stays as saved; the default clamp would
+/// rewrite it on the first frame the field is drawn.
+fn bounded<Num: egui::emath::Numeric>(
+    value: &mut Num,
+    range: std::ops::RangeInclusive<Num>,
+) -> egui::DragValue<'_> {
+    egui::DragValue::new(value)
+        .range(range)
+        .clamp_existing_to_range(false)
+}
+
 /// Draw the control for one field and report a new value when it changed.
 fn control(
     ui: &mut egui::Ui,
@@ -949,13 +962,7 @@ fn control(
         (FieldShape::Count, FieldValue::Count(number)) => {
             let mut number = *number;
             let response = crate::widgets::sized(ui, width, |ui| {
-                // A saved value beyond the limit stays until the user edits it;
-                // the default clamp would rewrite it on the first frame.
-                ui.add(
-                    egui::DragValue::new(&mut number)
-                        .range(0..=field.limit)
-                        .clamp_existing_to_range(false),
-                )
+                ui.add(bounded(&mut number, 0..=field.limit))
             });
             let changed = response.changed();
             describe_field_control(response, field.label, egui::WidgetType::DragValue, reason);
@@ -966,14 +973,11 @@ fn control(
         (FieldShape::Decimal, FieldValue::Decimal(number)) => {
             let mut number = *number;
             let response = crate::widgets::sized(ui, width, |ui| {
-                ui.add(
-                    egui::DragValue::new(&mut number)
-                        .range(
-                            ca_session::options::provisional::MINIMUM_POINT_SIZE
-                                ..=ca_session::options::provisional::MAXIMUM_POINT_SIZE,
-                        )
-                        .clamp_existing_to_range(false),
-                )
+                ui.add(bounded(
+                    &mut number,
+                    ca_session::options::provisional::MINIMUM_POINT_SIZE
+                        ..=ca_session::options::provisional::MAXIMUM_POINT_SIZE,
+                ))
             });
             let changed = response.changed();
             describe_field_control(response, field.label, egui::WidgetType::DragValue, reason);

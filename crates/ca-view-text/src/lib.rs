@@ -605,6 +605,7 @@ impl TextView {
         self.locked
     }
 
+    #[allow(clippy::too_many_lines)]
     fn blank(left: PathBuf, right: PathBuf, context: &ViewContext, instance: u64) -> Self {
         Self {
             id: egui::Id::new(("text-compare", instance)),
