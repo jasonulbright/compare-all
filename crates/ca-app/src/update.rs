@@ -168,8 +168,7 @@ pub struct Check {
     pub timeout: Duration,
     /// Report the earlier failure and the staged update before the check.
     pub report_pending: bool,
-    /// Ask the network. False only reports what an earlier run left, and
-    /// removes a staged update, which is then never applied.
+    /// Ask the network. False only reports what an earlier run left.
     pub network: bool,
 }
 
@@ -269,8 +268,8 @@ pub fn spawn(check: Check, notify: Arc<dyn Fn() + Send + Sync>) -> Job<Outcome> 
 }
 
 /// What an earlier run left: a staged update that waits, or a release that
-/// could not be downloaded. Reads local files only. With checks off, a staged
-/// update is removed instead of reported.
+/// could not be downloaded or installed. Reads local files only and removes
+/// nothing, so a launch with checks off still offers a verified update.
 fn pending(check: &Check) -> Vec<Outcome> {
     let staging = Staging::new(check.source.staging.clone());
     let mut out = Vec::new();
@@ -278,9 +277,7 @@ fn pending(check: &Check) -> Vec<Outcome> {
         page: check.source.endpoints.page(&version),
         version,
     };
-    if !check.network {
-        staging.clear();
-    } else if let Some(version) = staging
+    if let Some(version) = staging
         .read_record()
         .and_then(|record| record.parsed_version())
         .filter(|version| *version > check.current)
@@ -376,8 +373,9 @@ pub struct ExitHook {
     pub normal_close: AtomicBool,
     /// The close was asked for by "Restart to update".
     pub relaunch: AtomicBool,
-    /// At the close, update checks were on (option and policy) and the copy
-    /// is one the program updates by itself.
+    /// The copy is one the program updates by itself, and at the close either
+    /// update checks were on (option and policy) or the close was asked for
+    /// by "Restart to update".
     pub apply_allowed: AtomicBool,
 }
 

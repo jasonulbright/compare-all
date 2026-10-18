@@ -1733,8 +1733,8 @@ impl App {
 
     /// Start a check on a worker, unless one is running.
     ///
-    /// Without `network` the worker only reports what an earlier run left and
-    /// removes a staged update. A check asked for while the option is off
+    /// Without `network` the worker only reports what an earlier run left. A
+    /// check asked for while the option is off
     /// reports a newer release and downloads nothing.
     fn spawn_update_check(
         &mut self,
@@ -3860,8 +3860,12 @@ impl App {
             .as_ref()
             .and_then(|source| source.mode)
             .is_some_and(ca_update::apply::applies_automatically);
-        exit.apply_allowed
-            .store(enabled && applies, std::sync::atomic::Ordering::SeqCst);
+        // With checks off only "Restart to update" applies a staged update;
+        // a plain close leaves it staged.
+        exit.apply_allowed.store(
+            applies && (enabled || self.update.restart_on_leave),
+            std::sync::atomic::Ordering::SeqCst,
+        );
         exit.normal_close
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
