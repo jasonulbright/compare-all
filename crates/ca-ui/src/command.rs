@@ -46,6 +46,9 @@ pub enum MenuView {
     Table,
     /// The folder comparison bar.
     Folder,
+    /// The folder synchronization bar: the folder comparison bar without its
+    /// copy keys.
+    FolderSync,
     /// The three way merge bar: the shared bar with the merge's own Edit and
     /// View menus and take keys.
     Merge,
@@ -381,6 +384,7 @@ impl Command {
     /// command reads differently in the two compare types.
     #[must_use]
     pub const fn label_in(self, view: MenuView) -> &'static str {
+        let view = view.folder_bar();
         match (self, view) {
             (Self::Reload, MenuView::Folder | MenuView::FolderMerge) => "Refresh",
             (Self::Recompare, MenuView::Folder) => "Full Refresh",
@@ -428,7 +432,18 @@ impl Command {
     /// The keystroke the bar of `view` shows beside the label.
     #[must_use]
     pub const fn shortcut_in(self, view: MenuView) -> Option<&'static str> {
+        if matches!(view, MenuView::FolderSync)
+            && matches!(self, Self::CopyToRight | Self::CopyToLeft)
+        {
+            return None;
+        }
+        let view = view.folder_bar();
         match (self, view) {
+            (Self::NextExistingLine | Self::PreviousExistingLine, _)
+                if !matches!(view, MenuView::Text | MenuView::Table | MenuView::Merge) =>
+            {
+                None
+            }
             (Self::TakeLeft, MenuView::Merge | MenuView::FolderMerge) => Some("Ctrl+L"),
             (Self::TakeRight, MenuView::Merge | MenuView::FolderMerge) => Some("Ctrl+R"),
             (Self::TakeLeftThenRight, MenuView::Merge | MenuView::FolderMerge) => Some("Ctrl+B"),
@@ -611,6 +626,69 @@ impl Keystroke {
             alt: true,
         }
     }
+
+    /// The pressed keys among `events`, each with its index in the list.
+    #[must_use]
+    pub fn pressed_in(events: &[egui::Event]) -> Vec<(usize, Self)> {
+        events
+            .iter()
+            .enumerate()
+            .filter_map(|(index, event)| match event {
+                egui::Event::Key {
+                    key,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } => Some((
+                    index,
+                    Self {
+                        key: *key,
+                        command: modifiers.command,
+                        shift: modifiers.shift,
+                        alt: modifiers.alt,
+                    },
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+/// True when text that arrives with a key held under `modifiers` is typing.
+///
+/// Ctrl or Command without Alt is a shortcut chord, and some backends deliver
+/// its letter as text beside the key press. Ctrl with Alt is how Windows
+/// reports Alt Gr, and Alt alone composes characters on macOS, so their text is
+/// typed unless a command ran for the key.
+#[must_use]
+pub const fn chord_types_text(modifiers: egui::Modifiers) -> bool {
+    modifiers.alt || !(modifiers.command || modifiers.ctrl)
+}
+
+/// Remove the text events that belong to the key events at `keys`.
+///
+/// A backend delivers a key press and the character it types as two events,
+/// the text right after the key. A key that ran a command typed nothing, so
+/// without this an Alt Gr or Option chord bound to a command would also insert
+/// its character into whatever editor reads the frame's events.
+pub fn drop_text_of(events: &mut Vec<egui::Event>, keys: &[usize]) {
+    if keys.is_empty() {
+        return;
+    }
+    let mut owner: Option<usize> = None;
+    let mut index = 0;
+    events.retain(|event| {
+        let position = index;
+        index += 1;
+        match event {
+            egui::Event::Key { .. } => {
+                owner = Some(position);
+                true
+            }
+            egui::Event::Text(_) => !owner.is_some_and(|key| keys.contains(&key)),
+            _ => true,
+        }
+    });
 }
 
 impl MenuView {
@@ -619,6 +697,7 @@ impl MenuView {
         MenuView::Text,
         MenuView::Table,
         MenuView::Folder,
+        MenuView::FolderSync,
         MenuView::Merge,
         MenuView::FolderMerge,
         MenuView::Registry,
@@ -635,6 +714,7 @@ impl MenuView {
             MenuView::Text => "text",
             MenuView::Table => "table",
             MenuView::Folder => "folder",
+            MenuView::FolderSync => "folder-sync",
             MenuView::Merge => "merge",
             MenuView::FolderMerge => "folder-merge",
             MenuView::Registry => "registry",
@@ -652,6 +732,7 @@ impl MenuView {
             MenuView::Text => "File comparisons",
             MenuView::Table => "Table comparisons",
             MenuView::Folder => "Folder comparisons",
+            MenuView::FolderSync => "Folder synchronizations",
             MenuView::Merge => "Text merges",
             MenuView::FolderMerge => "Folder merges",
             MenuView::Registry => "Registry comparisons",
@@ -659,6 +740,16 @@ impl MenuView {
             MenuView::Media => "Media comparisons",
             MenuView::Hex => "Byte comparisons",
             MenuView::Other => "Every other view",
+        }
+    }
+
+    /// The folder comparison bar for a folder synchronization, whose labels
+    /// and other keys it shares; every other bar as it is.
+    #[must_use]
+    pub const fn folder_bar(self) -> Self {
+        match self {
+            MenuView::FolderSync => MenuView::Folder,
+            view => view,
         }
     }
 
@@ -752,6 +843,7 @@ impl ShortcutTable {
                     options.view(MenuView::Other.id())
                 }
                 MenuView::FolderMerge => options.view(MenuView::Merge.id()),
+                MenuView::FolderSync => options.view(MenuView::Folder.id()),
                 _ => None,
             };
             // A folder merge takes a text merge binding only for a command it
@@ -830,13 +922,18 @@ pub fn route(view: MenuView, stroke: Keystroke) -> Option<Command> {
         }
     }
     shared(stroke).or_else(|| match view {
-        MenuView::Text | MenuView::Hex | MenuView::Other => text(stroke),
-        MenuView::Table => table(stroke).or_else(|| text(stroke)),
+        MenuView::Text => existing_line(stroke).or_else(|| text(stroke)),
+        MenuView::Hex | MenuView::Other => text(stroke),
+        MenuView::Table => table(stroke)
+            .or_else(|| existing_line(stroke))
+            .or_else(|| text(stroke)),
         MenuView::Registry | MenuView::Version | MenuView::Media => {
             records(view, stroke).or_else(|| text(stroke))
         }
-        MenuView::Folder => folder(stroke),
-        MenuView::Merge => merge(stroke).or_else(|| text(stroke)),
+        MenuView::Folder | MenuView::FolderSync => folder(view, stroke),
+        MenuView::Merge => merge(stroke)
+            .or_else(|| existing_line(stroke))
+            .or_else(|| text(stroke)),
         MenuView::FolderMerge => folder_merge(stroke)
             .or_else(|| merge(stroke))
             .or_else(|| text(stroke)),
@@ -970,8 +1067,6 @@ fn shared(stroke: Keystroke) -> Option<Command> {
     if stroke.alt {
         return match (stroke.command, stroke.shift, stroke.key) {
             (false, false, Key::Home) => Some(Command::SessionHome),
-            (false, false, Key::ArrowDown) => Some(Command::NextExistingLine),
-            (false, false, Key::ArrowUp) => Some(Command::PreviousExistingLine),
             _ => None,
         };
     }
@@ -996,6 +1091,19 @@ fn shared(stroke: Keystroke) -> Option<Command> {
         (true, false, Key::Plus | Key::Equals) => Some(Command::IncreaseFontSize),
         (true, false, Key::Minus) => Some(Command::DecreaseFontSize),
         (true, false, Key::Num0) => Some(Command::ResetFontSize),
+        _ => None,
+    }
+}
+
+/// The existing-line moves, bound only in the bars whose views make them.
+fn existing_line(stroke: Keystroke) -> Option<Command> {
+    use egui::Key;
+    if !stroke.alt || stroke.command || stroke.shift {
+        return None;
+    }
+    match stroke.key {
+        Key::ArrowDown => Some(Command::NextExistingLine),
+        Key::ArrowUp => Some(Command::PreviousExistingLine),
         _ => None,
     }
 }
@@ -1072,8 +1180,9 @@ fn merge(stroke: Keystroke) -> Option<Command> {
     }
 }
 
-/// The bindings the folder comparison bar adds.
-fn folder(stroke: Keystroke) -> Option<Command> {
+/// The bindings the folder comparison bar adds; a folder synchronization has
+/// no copy keys.
+fn folder(view: MenuView, stroke: Keystroke) -> Option<Command> {
     use egui::Key;
     if stroke.alt {
         return match (stroke.command, stroke.shift, stroke.key) {
@@ -1086,8 +1195,8 @@ fn folder(stroke: Keystroke) -> Option<Command> {
     match (stroke.command, stroke.shift, stroke.key) {
         (true, false, Key::N) => Some(Command::NextDifference),
         (true, false, Key::P) => Some(Command::PreviousDifference),
-        (true, false, Key::R) => Some(Command::CopyToRight),
-        (true, false, Key::L) => Some(Command::CopyToLeft),
+        (true, false, Key::R) if view == MenuView::Folder => Some(Command::CopyToRight),
+        (true, false, Key::L) if view == MenuView::Folder => Some(Command::CopyToLeft),
         (true, true, Key::A) => Some(Command::SelectAllFiles),
         (false, false, Key::F2) => Some(Command::Rename),
         (false, false, Key::Insert) => Some(Command::NewFolder),
@@ -1188,7 +1297,7 @@ pub fn bindings(view: MenuView) -> Vec<(Keystroke, Command)> {
             ]);
             strokes.extend(EDIT_ALTERNATES);
         }
-        MenuView::Folder => strokes.extend([
+        MenuView::Folder | MenuView::FolderSync => strokes.extend([
             Keystroke::with_command(Key::R),
             Keystroke::with_command(Key::L),
             Keystroke::with_command(Key::N),
@@ -1210,8 +1319,61 @@ pub fn bindings(view: MenuView) -> Vec<(Keystroke, Command)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{bindings, route, Command, Keystroke, MenuView};
+    use super::{bindings, chord_types_text, drop_text_of, route, Command, Keystroke, MenuView};
     use egui::Key;
+
+    fn key_event(key: Key, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }
+    }
+
+    #[test]
+    fn only_the_text_of_a_key_that_ran_a_command_is_dropped() {
+        let altgr = egui::Modifiers {
+            alt: true,
+            ctrl: true,
+            command: true,
+            ..egui::Modifiers::NONE
+        };
+        let mut events = vec![
+            key_event(Key::Q, altgr),
+            egui::Event::Text("@".to_owned()),
+            key_event(Key::E, altgr),
+            egui::Event::Text("\u{20ac}".to_owned()),
+            egui::Event::Text("x".to_owned()),
+        ];
+        let pressed = Keystroke::pressed_in(&events);
+        assert_eq!(pressed.len(), 2);
+        assert_eq!(pressed[1].0, 2);
+        drop_text_of(&mut events, &[2]);
+        assert_eq!(
+            events,
+            vec![
+                key_event(Key::Q, altgr),
+                egui::Event::Text("@".to_owned()),
+                key_event(Key::E, altgr),
+            ]
+        );
+    }
+
+    #[test]
+    fn altgr_and_option_chords_type_and_control_chords_do_not() {
+        let with = |ctrl: bool, alt: bool| egui::Modifiers {
+            alt,
+            ctrl,
+            command: ctrl,
+            ..egui::Modifiers::NONE
+        };
+        assert!(chord_types_text(with(false, false)));
+        assert!(chord_types_text(with(true, true)), "AltGr");
+        assert!(chord_types_text(with(false, true)), "Option");
+        assert!(!chord_types_text(with(true, false)));
+    }
 
     #[test]
     fn a_folder_merge_moves_between_differences_where_a_text_merge_moves_between_sections() {
@@ -1394,6 +1556,7 @@ mod tests {
         for view in [
             MenuView::Text,
             MenuView::Folder,
+            MenuView::FolderSync,
             MenuView::Merge,
             MenuView::FolderMerge,
         ] {
@@ -1742,7 +1905,7 @@ mod tests {
 
     #[test]
     fn the_edit_commands_carry_their_secondary_keys() {
-        for view in every_bar_but(&[MenuView::Folder]) {
+        for view in every_bar_but(&[MenuView::Folder, MenuView::FolderSync]) {
             for (stroke, command) in [
                 (Keystroke::with_alt(Key::Backspace), Command::Undo),
                 (Keystroke::with_alt_shift(Key::Backspace), Command::Redo),
@@ -1762,7 +1925,7 @@ mod tests {
 
     #[test]
     fn a_secondary_key_leaves_the_primary_key_in_place() {
-        for view in every_bar_but(&[MenuView::Folder]) {
+        for view in every_bar_but(&[MenuView::Folder, MenuView::FolderSync]) {
             for (stroke, command) in [
                 (Keystroke::with_command(Key::Z), Command::Undo),
                 (Keystroke::with_command(Key::Y), Command::Redo),
@@ -1817,23 +1980,12 @@ mod tests {
     #[test]
     fn alt_with_a_navigation_key_routes_and_alt_with_a_letter_stays_with_the_menu_bar() {
         for view in MenuView::ALL.iter().copied() {
-            for (stroke, command) in [
-                (Keystroke::with_alt(Key::Home), Command::SessionHome),
-                (
-                    Keystroke::with_alt(Key::ArrowDown),
-                    Command::NextExistingLine,
-                ),
-                (
-                    Keystroke::with_alt(Key::ArrowUp),
-                    Command::PreviousExistingLine,
-                ),
-            ] {
-                assert_eq!(route(view, stroke), Some(command), "{stroke:?} in {view:?}");
-                assert!(
-                    bindings(view).contains(&(stroke, command)),
-                    "{stroke:?} in {view:?}"
-                );
-            }
+            let stroke = Keystroke::with_alt(Key::Home);
+            assert_eq!(route(view, stroke), Some(Command::SessionHome), "{view:?}");
+            assert!(
+                bindings(view).contains(&(stroke, Command::SessionHome)),
+                "{view:?}"
+            );
             for letter in [Key::F, Key::E, Key::V, Key::T, Key::H, Key::S, Key::A] {
                 assert_eq!(
                     route(view, Keystroke::with_alt(letter)),
@@ -1938,5 +2090,77 @@ mod tests {
         assert!(table
             .shortcuts_of(MenuView::Text, Command::Options)
             .is_empty());
+    }
+
+    #[test]
+    fn a_text_merge_binding_of_a_command_folder_merges_refuse_stays_in_text_merges() {
+        use super::ShortcutTable;
+        let mut options = ca_session::options::CommandOptions::default();
+        options.set_shortcuts(
+            MenuView::Merge.id(),
+            Command::TakeLeft.id(),
+            vec!["Ctrl+Alt+T".to_owned()],
+        );
+        options.set_shortcuts(
+            MenuView::Merge.id(),
+            Command::NextExistingLine.id(),
+            vec!["Ctrl+L".to_owned()],
+        );
+        let table = ShortcutTable::from_options(&options);
+        assert_eq!(
+            table.claimed_by(MenuView::Merge, Keystroke::with_command(Key::L)),
+            Some(Command::NextExistingLine)
+        );
+        assert_eq!(
+            table.shortcuts_of(MenuView::FolderMerge, Command::TakeLeft),
+            [Keystroke::with_command_alt(Key::T)],
+            "a shared command follows the text merge binding"
+        );
+        assert_eq!(
+            table.claimed_by(MenuView::FolderMerge, Keystroke::with_command(Key::L)),
+            None
+        );
+        assert!(table
+            .shortcuts_of(MenuView::FolderMerge, Command::NextExistingLine)
+            .is_empty());
+    }
+
+    #[test]
+    fn the_existing_line_keys_bind_only_in_the_views_that_move_by_existing_lines() {
+        for view in MenuView::ALL.iter().copied() {
+            let handles = matches!(view, MenuView::Text | MenuView::Table | MenuView::Merge);
+            for (stroke, command) in [
+                (
+                    Keystroke::with_alt(Key::ArrowDown),
+                    Command::NextExistingLine,
+                ),
+                (
+                    Keystroke::with_alt(Key::ArrowUp),
+                    Command::PreviousExistingLine,
+                ),
+            ] {
+                let expected = handles.then_some(command);
+                assert_eq!(route(view, stroke), expected, "{stroke:?} in {view:?}");
+                assert_eq!(
+                    bindings(view).contains(&(stroke, command)),
+                    handles,
+                    "{stroke:?} in {view:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn copy_keys_of_a_folder_comparison_stay_out_of_folder_syncs() {
+        for stroke in [
+            Keystroke::with_command(Key::R),
+            Keystroke::with_command(Key::L),
+        ] {
+            assert_eq!(route(MenuView::FolderSync, stroke), None, "{stroke:?}");
+        }
+        assert_eq!(
+            route(MenuView::Folder, Keystroke::with_command(Key::R)),
+            Some(Command::CopyToRight)
+        );
     }
 }

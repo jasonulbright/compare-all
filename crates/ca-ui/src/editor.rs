@@ -762,11 +762,18 @@ impl Pane {
         self.anchor = self.caret;
     }
 
-    /// Delete from the caret back to the first column.
+    /// Delete the selection, or from the caret back to the first column.
     ///
     /// Returns true when the text changed.
     pub fn delete_to_line_start(&mut self) -> bool {
-        if self.read_only || self.caret.index == 0 {
+        if self.read_only {
+            return false;
+        }
+        if self.delete_selection_chars() {
+            self.goal_column = None;
+            return true;
+        }
+        if self.caret.index == 0 {
             return false;
         }
         let end = self.char_of(self.caret);
@@ -778,12 +785,17 @@ impl Pane {
         true
     }
 
-    /// Delete from the caret to the end of the line, terminator excluded.
+    /// Delete the selection, or from the caret to the end of the line,
+    /// terminator excluded.
     ///
     /// Returns true when the text changed.
     pub fn delete_to_line_end(&mut self) -> bool {
         if self.read_only {
             return false;
+        }
+        if self.delete_selection_chars() {
+            self.goal_column = None;
+            return true;
         }
         let start = self.char_of(self.caret);
         let end = self.char_of(Caret::new(self.caret.line, self.line_len(self.caret.line)));
@@ -1440,6 +1452,31 @@ mod tests {
         assert_eq!(pane.buffer().text(), "abc\nxyz\n");
         pane.delete_to_line_start();
         assert_eq!(pane.buffer().text(), "\nxyz\n");
+    }
+
+    #[test]
+    fn deleting_to_a_line_end_with_a_selection_deletes_the_selection_in_one_step() {
+        type Delete = fn(&mut Pane) -> bool;
+        let deletes: [Delete; 2] = [Pane::delete_to_line_start, Pane::delete_to_line_end];
+        for delete in deletes {
+            for (from, to) in [(3, 1), (1, 3)] {
+                let mut pane = Pane::from_text("abcdef\nxyz\n");
+                pane.place(Caret::new(0, from), false);
+                pane.place(Caret::new(0, to), true);
+                assert!(delete(&mut pane));
+                assert_eq!(pane.buffer().text(), "adef\nxyz\n", "{from} to {to}");
+                assert_eq!(pane.caret(), Caret::new(0, 1));
+                assert_eq!(pane.selection(), None);
+                assert!(pane.undo());
+                assert_eq!(pane.buffer().text(), "abcdef\nxyz\n");
+                assert!(!pane.undo());
+            }
+            let mut pane = Pane::from_text("abc\nxyz\n");
+            pane.place(Caret::new(0, 2), false);
+            pane.place(Caret::new(1, 1), true);
+            assert!(delete(&mut pane));
+            assert_eq!(pane.buffer().text(), "abyz\n", "a selection across lines");
+        }
     }
 
     #[test]

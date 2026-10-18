@@ -1732,6 +1732,49 @@ mod tests {
     }
 
     #[test]
+    fn the_cell_editor_takes_altgr_text() {
+        let (_dir, left, right) = files(CSV, CSV);
+        let mut view = open(&left, &right);
+        at(&mut view, 1, 1);
+        let ctx = egui::Context::default();
+        let frame = |view: &mut TableView, events: Vec<egui::Event>| {
+            let input = ca_ui::testing::event_input(1_280.0, 800.0, events);
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    view.ui(ui, &context());
+                });
+            });
+        };
+        let key = |key, modifiers| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        };
+        let altgr = egui::Modifiers {
+            alt: true,
+            ctrl: true,
+            command: true,
+            ..egui::Modifiers::default()
+        };
+        view.begin_cell_edit();
+        frame(&mut view, Vec::new());
+        frame(&mut view, Vec::new());
+        frame(
+            &mut view,
+            vec![key(egui::Key::Q, altgr), egui::Event::Text("@".to_owned())],
+        );
+        assert!(view.is_editing_cell());
+        frame(
+            &mut view,
+            vec![key(egui::Key::Enter, egui::Modifiers::default())],
+        );
+        settle(&mut view);
+        assert_eq!(view.grid.cell_text(1, 1, Side::Left), "Bob@");
+    }
+
+    #[test]
     fn a_lossy_load_asks_before_an_edited_save() {
         // 0xFF is not valid UTF-8, so the load needs a replacement character.
         let source = b"id,name\n1,A\xFFn\n";
