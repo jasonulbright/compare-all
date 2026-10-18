@@ -145,3 +145,77 @@ fn the_help_menu_check_says_when_no_newer_release_exists() {
     ));
     assert_eq!(asked.load(Ordering::SeqCst), 2);
 }
+
+#[test]
+fn the_help_menu_check_is_refused_while_a_check_is_running() {
+    use ca_ui::command::MenuView;
+    use ca_ui::testing::probe::Probe;
+    use std::cell::RefCell;
+    use std::sync::atomic::AtomicBool;
+
+    let dir = tempfile::tempdir().unwrap();
+    let asked = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(AtomicBool::new(false));
+    let count = Arc::clone(&asked);
+    let gate = Arc::clone(&release);
+    let tag = format!("v{VERSION}");
+    let server = HttpTestServer::start(
+        move |_| {
+            count.fetch_add(1, Ordering::SeqCst);
+            let give_up = Instant::now() + Duration::from_secs(30);
+            while !gate.load(Ordering::SeqCst) && Instant::now() < give_up {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Reply::body(
+                200,
+                "application/json",
+                format!(r#"{{"tag_name":"{tag}"}}"#).into_bytes(),
+            )
+        },
+        None,
+    );
+    let app = RefCell::new(app_in(
+        dir.path(),
+        format!("{}/releases/latest", server.url()),
+    ));
+    let mut probe = Probe::new(1600.0, 900.0);
+    let mut run = |ctx: &egui::Context| app.borrow_mut().frame(ctx);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while asked.load(Ordering::SeqCst) == 0 {
+        probe.idle(&mut run);
+        assert!(Instant::now() < deadline, "the check never asked");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    probe.idle(&mut run);
+
+    assert!(app.borrow().is_checking_for_updates());
+    assert!(!app.borrow().accepts(Command::CheckForUpdates));
+    let label = Command::CheckForUpdates.label_in(MenuView::Other);
+    probe.click("Help", &mut run).unwrap();
+    let line = probe.find(label).unwrap();
+    assert!(!line.enabled);
+    probe.hover(line.rect.center(), &mut run);
+    let line = probe.find(label).unwrap();
+    assert!(line
+        .description
+        .as_deref()
+        .is_some_and(|text| !text.is_empty()));
+    probe.click("Help", &mut run).unwrap();
+
+    app.borrow_mut().run(Command::CheckForUpdates, &context());
+    for _ in 0..30 {
+        probe.idle(&mut run);
+    }
+    assert_eq!(asked.load(Ordering::SeqCst), 1);
+    assert!(app.borrow().is_checking_for_updates());
+
+    release.store(true, Ordering::SeqCst);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while app.borrow().is_checking_for_updates() {
+        probe.idle(&mut run);
+        assert!(Instant::now() < deadline, "the check never ended");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(app.borrow().accepts(Command::CheckForUpdates));
+    assert_eq!(asked.load(Ordering::SeqCst), 1);
+}
