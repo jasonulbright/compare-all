@@ -2728,6 +2728,34 @@ fn the_work_folder_is_open_to_administrators_and_the_system_only() {
     std::fs::remove_dir_all(&work).unwrap();
 }
 
+#[cfg(windows)]
+#[test]
+fn a_work_folder_with_extra_explicit_entries_is_cleaned() {
+    use ca_update::install::{restrict_to_administrators, work_folder_access_is_exact};
+    let parent = tempfile::tempdir().unwrap();
+    let folder = parent.path().join("work");
+    std::fs::create_dir(&folder).unwrap();
+    let grant = ca_io::host_command::host_command("icacls")
+        .arg(&folder)
+        .args([
+            "/grant",
+            "*S-1-5-11:(OI)(CI)F",
+            "*S-1-1-0:(OI)(CI)R",
+            "*S-1-5-32-545:(OI)(CI)M",
+            "*S-1-3-0:(OI)(CI)F",
+            "/q",
+        ])
+        .stdout(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(grant.success());
+    let before = ca_update::access::read_sddls(&[folder.as_path()]).unwrap();
+    assert!(!work_folder_access_is_exact(&before[0]), "{before:?}");
+    restrict_to_administrators(&folder).unwrap();
+    let after = ca_update::access::read_sddls(&[folder.as_path()]).unwrap();
+    assert!(work_folder_access_is_exact(&after[0]), "{after:?}");
+}
+
 /// The owner of `path` in the system's text form.
 #[cfg(windows)]
 fn owner_of(path: &Path) -> String {

@@ -292,7 +292,7 @@ pub fn install_main(staging: &Path, checks: &Checks<'_>) -> i32 {
         return NOT_APPLICABLE;
     };
     let Ok(work) = prepare_work_folder(&parent) else {
-        return NOT_PREPARED;
+        return KEPT;
     };
     let code = install_from(
         &Staging::new(staging),
@@ -755,44 +755,120 @@ fn hold_lock(path: &Path) -> std::io::Result<std::fs::File> {
     options.open(path)
 }
 
+/// Make administrators the owner of `folder`, remove every inherited and
+/// every other explicit entry, and check the result.
+///
+/// # Errors
+/// Returns why the access list could not be set, or that it is not exactly
+/// the expected one after the change.
 #[cfg(windows)]
-fn restrict_to_administrators(folder: &Path) -> Result<(), String> {
+pub fn restrict_to_administrators(folder: &Path) -> Result<(), String> {
     // An owner has implicit rights to change the access list. Without an
     // explicit owner, the owner is whatever the token gives new objects,
     // which policy can set to the account of the administrator. The owner
     // rights entry limits the owner of each new child to reading it.
     own_by_administrators(folder)?;
-    set_access_list(folder, WORK_FOLDER_ACCESS_LIST)
+    icacls(folder, ["/inheritance:r", "/q"])?;
+    icacls(
+        folder,
+        [
+            "/grant:r",
+            "*S-1-5-32-544:(OI)(CI)F",
+            "*S-1-5-18:(OI)(CI)F",
+            "*S-1-3-4:(OI)(CI)(IO)(R)",
+            "/q",
+        ],
+    )?;
+    // The account that created the folder can hold an explicit entry that
+    // none of the grants above replaces.
+    for trustee in unexpected_trustees(folder)? {
+        icacls(folder, ["/remove", trustee.as_str(), "/q"])?;
+    }
+    let read = crate::access::read_sddls(&[folder])?;
+    if read
+        .first()
+        .is_some_and(|sddl| work_folder_access_is_exact(sddl))
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "the access list of {} is not the expected one",
+            folder.display()
+        ))
+    }
 }
 
-/// The access list of a work folder: protected, with no inherited entry.
-#[cfg(windows)]
-const WORK_FOLDER_ACCESS_LIST: &str = "D:PAI(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICIIO;FR;;;OW)";
+/// The entries of a work folder; none is inherited.
+const WORK_FOLDER_ENTRIES: [&str; 3] =
+    ["(A;OICI;FA;;;BA)", "(A;OICI;FA;;;SY)", "(A;OICIIO;FR;;;OW)"];
 
-/// Replace the access list of `folder` by exactly `sddl`.
-///
-/// Granting entries one by one keeps an entry that the account of the
-/// caller adds by itself, such as one for the built-in administrator
-/// account. A restored list holds the given entries only.
-#[cfg(windows)]
-fn set_access_list(folder: &Path, sddl: &str) -> Result<(), String> {
-    use std::ffi::OsStr;
-    let (Some(name), Some(parent)) = (folder.file_name(), folder.parent()) else {
-        return Err(format!(
-            "cannot set the access list of {}",
-            folder.display()
-        ));
+/// Whether `sddl` names administrators as owner and holds a protected access
+/// list of exactly [`WORK_FOLDER_ENTRIES`], in any order.
+#[must_use]
+pub fn work_folder_access_is_exact(sddl: &str) -> bool {
+    let Some(rest) = sddl.trim().strip_prefix("O:BA") else {
+        return false;
     };
-    let list = folder.join("access.lst");
-    let text = format!("{}\r\n{sddl}\r\n\r\n", name.to_string_lossy());
-    let bytes: Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
-    std::fs::write(&list, bytes).map_err(|error| format!("cannot set the access list: {error}"))?;
-    let applied = icacls(
-        parent,
-        [OsStr::new("/restore"), list.as_os_str(), OsStr::new("/q")],
-    );
-    let _ = std::fs::remove_file(&list);
-    applied
+    let Some((_, dacl)) = rest.split_once("D:") else {
+        return false;
+    };
+    let Some(entries) = dacl.strip_prefix("PAI") else {
+        return false;
+    };
+    let mut found: Vec<&str> = entries.split_inclusive(')').collect();
+    found.sort_unstable();
+    let mut expected = WORK_FOLDER_ENTRIES;
+    expected.sort_unstable();
+    found == expected
+}
+
+/// The SIDs of the entries of `folder` that are not for administrators, the
+/// system or owner rights, as `*S-1-...` arguments for `icacls`. Windows
+/// `PowerShell` resolves the account names of the entries. The path comes
+/// from the environment, never from the script text.
+#[cfg(windows)]
+fn unexpected_trustees(folder: &Path) -> Result<Vec<String>, String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let root = crate::system::system_root()?;
+    let shell = root.join("System32").join("WindowsPowerShell").join("v1.0");
+    let output = ca_io::host_command::host_command(shell.join("powershell.exe"))
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-NoLogo",
+            "-Command",
+            "$ErrorActionPreference='Stop';\
+             foreach($r in (Get-Acl -LiteralPath $env:CA_PATH).Access){\
+             $s=$r.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value;\
+             if(@('S-1-5-32-544','S-1-5-18','S-1-3-4') -notcontains $s){'*'+$s}}",
+        ])
+        .env_clear()
+        .env("SystemRoot", &root)
+        .env("PSModulePath", shell.join("Modules"))
+        .env("CA_PATH", folder)
+        .current_dir(root.join("System32"))
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|error| format!("cannot read the access list: {error}"))?;
+    if !output.status.success() {
+        return Err("cannot read the access list".to_owned());
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut trustees: Vec<String> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| {
+            line.strip_prefix("*S-1-")
+                .is_some_and(|rest| rest.chars().all(|c| c == '-' || c.is_ascii_digit()))
+        })
+        .map(str::to_owned)
+        .collect();
+    trustees.sort_unstable();
+    trustees.dedup();
+    Ok(trustees)
 }
 
 /// Make administrators the owner of `path`.
@@ -835,8 +911,12 @@ fn icacls<A: AsRef<std::ffi::OsStr>>(
     }
 }
 
+/// Other platforms have no install for every user.
+///
+/// # Errors
+/// Always.
 #[cfg(not(windows))]
-fn restrict_to_administrators(_: &Path) -> Result<(), String> {
+pub fn restrict_to_administrators(_: &Path) -> Result<(), String> {
     Err("this platform has no installer for every user".to_owned())
 }
 
@@ -907,6 +987,34 @@ fn remove_after_exit(_: &Path) {}
 
 #[cfg(test)]
 mod tests {
+    use super::work_folder_access_is_exact as exact;
+
+    const EXACT: &str =
+        "O:BAG:S-1-5-21-1-2-3-1001D:PAI(A;OICIIO;FR;;;OW)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
+
+    #[test]
+    fn the_expected_work_folder_access_is_exact_in_any_order() {
+        assert!(exact(EXACT));
+        assert!(exact(
+            "O:BAG:SYD:PAI(A;OICI;FA;;;BA)(A;OICIIO;FR;;;OW)(A;OICI;FA;;;SY)\r\n"
+        ));
+    }
+
+    #[test]
+    fn an_extra_missing_or_inherited_entry_is_not_exact() {
+        assert!(!exact(&format!("{EXACT}(A;OICI;FA;;;LA)")));
+        assert!(!exact(&EXACT.replace("(A;OICI;FA;;;SY)", "")));
+        assert!(!exact(&EXACT.replace("D:PAI", "D:AI")));
+        assert!(!exact(&EXACT.replace("D:PAI", "D:P")));
+        assert!(!exact(&format!("{EXACT}(A;ID;FA;;;BU)")));
+        assert!(!exact(&EXACT.replace("O:BA", "O:SY")));
+        assert!(!exact(
+            &EXACT.replace("(A;OICI;FA;;;BA)", "(A;OICI;FA;;;LA)")
+        ));
+        assert!(!exact(&EXACT.replace("FR;;;OW", "FA;;;OW")));
+        assert!(!exact(""));
+    }
+
     #[test]
     fn the_product_identity_is_the_identity_the_installer_source_gives() {
         let source = include_str!("../../../installer/compare-all.wxs");
