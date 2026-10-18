@@ -131,6 +131,12 @@ pub const ELEVATION_DECLINED: &str = "the elevation was declined or failed";
 /// another install. The staged update stays for the next close.
 pub const INSTALLER_BUSY: &str = "another install is in progress";
 
+/// The reason [`apply_staged`] gives when the elevated step changed nothing
+/// and kept the staged update: it could not set the program file aside, or
+/// another elevated step held the install folder. The update stays for the
+/// next close.
+pub const INSTALL_PUT_OFF: &str = "the install for every user was put off";
+
 /// `ERROR_INSTALL_ALREADY_RUNNING`.
 const INSTALLER_BUSY_CODE: i32 = 1618;
 
@@ -229,7 +235,8 @@ pub fn elevate_command(program: &Path, staging: &Path) -> Command {
 /// # Errors
 /// [`ELEVATION_DECLINED`] when the elevation did not happen or the user
 /// cancelled the installer, [`INSTALLER_BUSY`] when another install held the
-/// installer; otherwise why the install failed.
+/// installer, [`INSTALL_PUT_OFF`] when the elevated step kept the update for
+/// a later close; otherwise why the install failed.
 pub fn installer_result(code: Option<i32>) -> Result<(), String> {
     if elevation_error(code).is_some() {
         return Err(ELEVATION_DECLINED.to_owned());
@@ -241,6 +248,7 @@ pub fn installer_result(code: Option<i32>) -> Result<(), String> {
         Some(crate::install::REFUSED) => {
             Err("the installer failed its check before the install for every user".to_owned())
         }
+        Some(crate::install::KEPT) => Err(INSTALL_PUT_OFF.to_owned()),
         Some(crate::install::NOT_PREPARED) => {
             Err("the install for every user could not be prepared".to_owned())
         }
@@ -448,7 +456,8 @@ fn run_installer(mut command: Command) -> Result<(), String> {
 /// Record what one apply did and release the staging folder. Returns the
 /// exit code of the helper.
 ///
-/// A declined elevation or a busy installer changes nothing: the staged
+/// A declined elevation, a busy installer or an install that was put off
+/// changes nothing: the staged
 /// update stays and is offered again at the next close, with no warning. Any
 /// other failure keeps the reason and the download warning and removes the
 /// staged update.
@@ -465,7 +474,7 @@ pub fn finish_apply(
             0
         }
         Err(reason) if reason == ELEVATION_DECLINED => 3,
-        Err(reason) if reason == INSTALLER_BUSY => 4,
+        Err(reason) if reason == INSTALLER_BUSY || reason == INSTALL_PUT_OFF => 4,
         Err(reason) => {
             staging.write_apply_failure(reason);
             if let Some(version) = staging.read_record().and_then(|r| r.parsed_version()) {
