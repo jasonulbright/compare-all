@@ -22,17 +22,17 @@ pub mod measured {
 /// Defaults that no other setting constrains.
 pub mod provisional {
     /// Seconds two timestamps may differ by before the pair counts as changed.
-    pub const TIMESTAMP_TOLERANCE_SECONDS: u32 = 0;
+    pub const TIMESTAMP_TOLERANCE_SECONDS: u32 = 2;
     /// Lines scanned ahead and behind when looking for a matching line.
-    pub const SKEW_TOLERANCE_LINES: u32 = 500;
+    pub const SKEW_TOLERANCE_LINES: u32 = 2000;
     /// Rows scanned ahead and behind when looking for a matching row.
-    pub const SKEW_TOLERANCE_ROWS: u32 = 500;
+    pub const SKEW_TOLERANCE_ROWS: u32 = 2000;
     /// Minutes between automatic refreshes when automatic refresh is on.
     pub const AUTO_REFRESH_MINUTES: u32 = 5;
     /// Bytes shown per row in a hexadecimal view.
     pub const HEX_BYTES_PER_ROW: u32 = 16;
     /// Content at or below this size is read without holding a file lock.
-    pub const HEX_UNLOCKED_LOAD_LIMIT_BYTES: u64 = 16 * 1024 * 1024;
+    pub const HEX_UNLOCKED_LOAD_LIMIT_BYTES: u64 = 2 * 1024 * 1024;
     /// Greatest per-pixel difference still counted as unimportant.
     pub const PICTURE_TOLERANCE: u8 = 0;
     /// Percentage of the second image mixed into a blended view.

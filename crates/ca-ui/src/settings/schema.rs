@@ -195,6 +195,10 @@ const SECONDS_LIMIT: u64 = 7 * 24 * 60 * 60;
 const SKEW_LIMIT: u64 = 100_000;
 /// Greatest size a byte threshold offers.
 const SIZE_LIMIT: u64 = 1 << 40;
+/// Greatest gap, in lines, a merge conflict separation offers.
+const CONFLICT_SEPARATION_LIMIT: u64 = 256;
+/// Greatest size, in bytes, a hexadecimal load without a lock offers.
+const HEX_UNLOCKED_LOAD_LIMIT: u64 = 32 * 1024 * 1024;
 
 /// Declares the two sides, the editing guard and the description of a kind.
 /// The second form draws the editing guard disabled with `reason`, for a kind
@@ -858,7 +862,7 @@ const TEXT_MERGE: &[Tab] = &[
                 TextMerge,
                 conflicts.separation_lines,
                 u32,
-                SKEW_LIMIT,
+                CONFLICT_SEPARATION_LIMIT,
                 "Conflict separation, lines"
             ),
         ),
@@ -1004,7 +1008,7 @@ const HEX_COMPARE: &[Tab] = &[
                 HexCompare,
                 comparison.unlocked_load_limit_bytes,
                 u64,
-                SIZE_LIMIT,
+                HEX_UNLOCKED_LOAD_LIMIT,
                 "Load without a lock up to, in bytes"
             )
             .unavailable("Every side is already read without holding a lock."),
