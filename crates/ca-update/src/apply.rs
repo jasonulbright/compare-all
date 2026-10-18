@@ -127,6 +127,13 @@ fn restore(saved: &Path, live: &Path) -> std::io::Result<()> {
 /// approved, was refused by policy, or the elevated program did not start.
 pub const ELEVATION_DECLINED: &str = "the elevation was declined or failed";
 
+/// The reason [`apply_staged`] gives when the system installer was busy with
+/// another install. The staged update stays for the next close.
+pub const INSTALLER_BUSY: &str = "another install is in progress";
+
+/// `ERROR_INSTALL_ALREADY_RUNNING`.
+const INSTALLER_BUSY_CODE: i32 = 1618;
+
 /// `ERROR_CANCELLED`, the code of a declined elevation prompt.
 const DECLINED_CODE: i32 = 1223;
 
@@ -221,7 +228,8 @@ pub fn elevate_command(program: &Path, staging: &Path) -> Command {
 ///
 /// # Errors
 /// [`ELEVATION_DECLINED`] when the elevation did not happen or the user
-/// cancelled the installer; otherwise why the install failed.
+/// cancelled the installer, [`INSTALLER_BUSY`] when another install held the
+/// installer; otherwise why the install failed.
 pub fn installer_result(code: Option<i32>) -> Result<(), String> {
     if elevation_error(code).is_some() {
         return Err(ELEVATION_DECLINED.to_owned());
@@ -229,6 +237,7 @@ pub fn installer_result(code: Option<i32>) -> Result<(), String> {
     match code {
         Some(0 | 1641 | 3010) => Ok(()),
         Some(DECLINED_CODE | INSTALL_CANCELLED_CODE) => Err(ELEVATION_DECLINED.to_owned()),
+        Some(INSTALLER_BUSY_CODE) => Err(INSTALLER_BUSY.to_owned()),
         Some(crate::install::REFUSED) => {
             Err("the installer failed its check before the install for every user".to_owned())
         }
@@ -439,9 +448,10 @@ fn run_installer(mut command: Command) -> Result<(), String> {
 /// Record what one apply did and release the staging folder. Returns the
 /// exit code of the helper.
 ///
-/// A declined elevation changes nothing: the staged update stays and is
-/// offered again at the next close, with no warning. Any other failure keeps
-/// the reason and the download warning and removes the staged update.
+/// A declined elevation or a busy installer changes nothing: the staged
+/// update stays and is offered again at the next close, with no warning. Any
+/// other failure keeps the reason and the download warning and removes the
+/// staged update.
 #[must_use]
 pub fn finish_apply(
     staging: &Staging,
@@ -455,6 +465,7 @@ pub fn finish_apply(
             0
         }
         Err(reason) if reason == ELEVATION_DECLINED => 3,
+        Err(reason) if reason == INSTALLER_BUSY => 4,
         Err(reason) => {
             staging.write_apply_failure(reason);
             if let Some(version) = staging.read_record().and_then(|r| r.parsed_version()) {

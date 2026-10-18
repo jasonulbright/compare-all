@@ -1606,6 +1606,45 @@ fn a_declined_elevation_keeps_the_staged_update_without_a_warning() {
     assert!(staging.read_warning().is_some());
 }
 
+/// `ERROR_INSTALL_ALREADY_RUNNING`: another install, such as a system
+/// update, holds the installer. The update stays staged for the next close,
+/// for an install for one user and for every user.
+#[test]
+fn an_installer_busy_with_another_install_keeps_the_staged_update() {
+    use ca_update::apply::{finish_apply, installer_result};
+    for machine in [false, true] {
+        let server = Server::start();
+        let mode = InstallMode::Installed { machine };
+        let (_keep, staging) = stage_installer(&server, mode);
+        let record = staging.read_record().unwrap();
+        let signer = FakeSigner::signed_by(SIGNER);
+        let endpoints = server.endpoints();
+        let trust = Trust {
+            signer: &signer,
+            signer_name: SIGNER,
+            endpoints: &endpoints,
+            running: &running(),
+        };
+        let claim = staging.begin_apply().unwrap();
+        let target = program_folder();
+        let outcome = apply_staged(
+            &staging,
+            mode,
+            &trust,
+            &|_| installer_result(Some(1618)),
+            &|_| Ok(()),
+            target.path(),
+        );
+        assert!(outcome.is_err());
+        assert_ne!(finish_apply(&staging, &claim, &outcome, &endpoints), 0);
+        drop(claim);
+        assert_eq!(staging.read_record(), Some(record.clone()), "{machine}");
+        assert!(staging.asset_path(&record).exists());
+        assert!(staging.read_warning().is_none());
+        assert!(staging.read_apply_failure().is_none());
+    }
+}
+
 #[test]
 fn a_staged_version_not_newer_than_the_running_build_is_not_applied() {
     let server = Server::start();
