@@ -268,7 +268,11 @@ pub fn spawn_all(
 ) -> Job<FindAllMessage> {
     Job::spawn_notifying(
         move |emitter, cancel| {
-            if let Some(found) = find_every(&bytes, &needle, match_case, cancel) {
+            let found = find_every(&bytes, &needle, match_case, cancel);
+            // The reader edits the buffer as soon as it sees the result. A
+            // handle still held here makes that edit copy the whole side.
+            drop(bytes);
+            if let Some(found) = found {
                 emitter.send(FindAllMessage::Found(side, found));
             }
         },
@@ -449,6 +453,33 @@ mod tests {
         let bytes = b"Alpha BETA";
         assert_eq!(find_forward(bytes, b"beta", 0, true), None);
         assert_eq!(find_forward(bytes, b"beta", 0, false), Some(6));
+    }
+
+    #[test]
+    fn a_find_all_result_arrives_after_the_job_lets_go_of_the_bytes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let buffer = crate::edit::ByteBuffer::new(b"aXbXc".to_vec());
+        let probe = Arc::downgrade(&buffer.snapshot());
+        let holders = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&holders);
+        let mut job = super::spawn_all(
+            Side::Left,
+            buffer.snapshot(),
+            b"X".to_vec(),
+            true,
+            Arc::new(move || {
+                seen.fetch_max(probe.strong_count(), Ordering::SeqCst);
+            }),
+        );
+        let mut found = false;
+        assert!(wait_until(Duration::from_secs(10), || {
+            found |= job
+                .drain()
+                .iter()
+                .any(|message| matches!(message, super::FindAllMessage::Found(..)));
+            found
+        }));
+        assert_eq!(holders.load(Ordering::SeqCst), 1);
     }
 
     fn run(from: u64, direction: Direction, wrap: bool) -> Vec<FindMessage> {
