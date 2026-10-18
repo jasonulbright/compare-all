@@ -19,6 +19,7 @@ flate2 = { version = "1", default-features = false, features = ["rust_backend"] 
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.56"
+winsafe = { version = "0.0.24", features = ["kernel"] }
 
 [dev-dependencies]
 tempfile.workspace = true
