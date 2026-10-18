@@ -2099,6 +2099,45 @@ fn the_unused_program_copy_belongs_to_administrators() {
     }
 }
 
+/// A file scanner opens a new program file for a short time without delete
+/// sharing. A hold on the new copy before it moves into the install folder
+/// is waited out, so it does not put the update off.
+#[cfg(windows)]
+#[test]
+fn a_short_hold_on_the_new_program_copy_does_not_put_the_update_off() {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_SHARE_READ_WRITE: u32 = 0x3;
+    let install = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let program = install.path().join("compare-all.exe");
+    std::fs::write(&program, b"old exe").unwrap();
+    let fresh = work.path().join("compare-all-standby.exe");
+    let stop = AtomicBool::new(false);
+    let held = AtomicBool::new(false);
+    let moved = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            while !stop.load(Ordering::SeqCst) {
+                if let Ok(file) = std::fs::OpenOptions::new()
+                    .read(true)
+                    .share_mode(FILE_SHARE_READ_WRITE)
+                    .open(&fresh)
+                {
+                    held.store(true, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(500));
+                    drop(file);
+                    return;
+                }
+            }
+        });
+        let moved = ca_update::install::set_aside_observed(&program, work.path(), &|| {});
+        stop.store(true, Ordering::SeqCst);
+        moved
+    });
+    assert!(held.load(Ordering::SeqCst));
+    assert!(moved.is_ok(), "{moved:?}");
+    assert_eq!(std::fs::read(&program).unwrap(), b"old exe");
+}
+
 /// When the program file cannot be set aside, the installer does not start
 /// and the staged update stays without a warning.
 #[test]
