@@ -3,6 +3,7 @@
 //! Nothing here runs unless the application calls it, and nothing here
 //! registers a task, service or startup entry with the system.
 
+pub mod access;
 pub mod apply;
 pub mod flow;
 pub mod install;

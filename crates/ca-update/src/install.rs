@@ -51,6 +51,35 @@ pub const NOT_PREPARED: i32 = 0x1000_0002;
 /// installer; the staged update stays for a later close.
 pub const KEPT: i32 = 0x1000_0003;
 
+/// Exit code: this install cannot apply an update by itself, because the
+/// install folder or program file is open to other accounts or the staging
+/// folder is not one the elevated step reads. A later close gives the same
+/// result.
+pub const NOT_APPLICABLE: i32 = 0x1000_0004;
+
+/// True when the install folder of `program` and `program` itself are closed
+/// to accounts other than administrators, the system and the installer
+/// service. A descriptor that cannot be read counts as open.
+#[must_use]
+pub fn install_folder_closed(program: &Path) -> bool {
+    program.parent().is_some_and(|folder| {
+        [folder, program]
+            .iter()
+            .all(|path| crate::access::open_to_other_accounts(path) == Ok(false))
+    })
+}
+
+/// True when an update of the install for every user at `program` can be
+/// applied from `staging`: the elevated step would read that staging folder
+/// and the install folder is closed to other accounts. The helper asks this
+/// before the elevation prompt, so a prompt that can only end in a refusal is
+/// not shown.
+#[must_use]
+pub fn install_place_accepted(staging: &Path, program: &Path) -> bool {
+    accepted_staging(staging, &crate::system::profile_folders()).is_some()
+        && install_folder_closed(program)
+}
+
 /// What the copy of the installer must match.
 pub struct Checks<'a> {
     /// The Authenticode verifier.
@@ -157,7 +186,8 @@ fn is_inside(path: &Path, folder: &Path) -> bool {
 }
 
 /// The entry point of the elevated program. Returns the exit code: the code
-/// of the installer, [`REFUSED`], [`NOT_PREPARED`] or [`KEPT`].
+/// of the installer, [`REFUSED`], [`NOT_PREPARED`], [`KEPT`] or
+/// [`NOT_APPLICABLE`].
 #[must_use]
 pub fn install_main(staging: &Path, checks: &Checks<'_>) -> i32 {
     let Ok(program) = std::env::current_exe() else {
@@ -176,8 +206,11 @@ pub fn install_main(staging: &Path, checks: &Checks<'_>) -> i32 {
     };
     let _ = remove_stale_standby(&program);
     sweep_work_folders(&parent);
+    if !install_folder_closed(&program) {
+        return NOT_APPLICABLE;
+    }
     let Some(staging) = accepted_staging(staging, &crate::system::profile_folders()) else {
-        return REFUSED;
+        return NOT_APPLICABLE;
     };
     let Ok(work) = prepare_work_folder(&parent) else {
         return NOT_PREPARED;

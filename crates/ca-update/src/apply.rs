@@ -137,6 +137,14 @@ pub const INSTALLER_BUSY: &str = "another install is in progress";
 /// next close.
 pub const INSTALL_PUT_OFF: &str = "the install for every user was put off";
 
+/// The reason [`apply_staged`] gives when this install cannot apply an
+/// update by itself: its folder or program file is open to other accounts,
+/// or its staging folder is outside every user profile. The staged update is
+/// removed, the download warning shows, and that release is not downloaded
+/// again.
+pub const CANNOT_APPLY_HERE: &str =
+    "updates cannot be applied to this install automatically; install the release from its page";
+
 /// `ERROR_INSTALL_ALREADY_RUNNING`.
 const INSTALLER_BUSY_CODE: i32 = 1618;
 
@@ -249,6 +257,7 @@ pub fn installer_result(code: Option<i32>) -> Result<(), String> {
             Err("the installer failed its check before the install for every user".to_owned())
         }
         Some(crate::install::KEPT) => Err(INSTALL_PUT_OFF.to_owned()),
+        Some(crate::install::NOT_APPLICABLE) => Err(CANNOT_APPLY_HERE.to_owned()),
         Some(crate::install::NOT_PREPARED) => {
             Err("the install for every user could not be prepared".to_owned())
         }
@@ -572,8 +581,14 @@ pub fn helper_main_with(
         .map_or_else(PathBuf::new, Path::to_path_buf);
     let ended = wait_for_end();
     let program_ended = ended.is_ok();
-    let outcome = ended
-        .and_then(|()| apply_staged(&staging, mode, &trust, &run_installer, &|_| Ok(()), &target));
+    let outcome = ended.and_then(|()| {
+        if mode == (InstallMode::Installed { machine: true })
+            && !crate::install::install_place_accepted(staging.dir(), &arguments.executable)
+        {
+            return Err(CANNOT_APPLY_HERE.to_owned());
+        }
+        apply_staged(&staging, mode, &trust, &run_installer, &|_| Ok(()), &target)
+    });
     let code = finish_apply(&staging, &claim, &outcome, &endpoints);
     drop(claim);
     // A program that did not end is still open; a second copy is not started.

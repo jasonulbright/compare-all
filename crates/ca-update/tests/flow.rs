@@ -1664,6 +1664,80 @@ fn an_installer_busy_with_another_install_keeps_the_staged_update() {
     }
 }
 
+/// An install that cannot apply updates by itself removes the staged update
+/// once, warns, and does not download that release again; a newer release
+/// is tried.
+#[test]
+fn a_release_this_install_cannot_apply_is_not_downloaded_again() {
+    use ca_update::apply::{finish_apply, installer_result, CANNOT_APPLY_HERE};
+    use ca_update::install::NOT_APPLICABLE;
+    let server = Server::start();
+    let mode = InstallMode::Installed { machine: true };
+    let (_keep, staging) = stage_installer(&server, mode);
+    let signer = FakeSigner::signed_by(SIGNER);
+    let claim = staging.begin_apply().unwrap();
+    let outcome = installer_result(Some(NOT_APPLICABLE)).map(|()| running());
+    assert_eq!(outcome, Err(CANNOT_APPLY_HERE.to_owned()));
+    assert_eq!(
+        finish_apply(&staging, &claim, &outcome, &server.endpoints()),
+        1
+    );
+    drop(claim);
+    assert!(staging.read_record().is_none());
+    assert!(staging.read_warning().is_some());
+
+    let before = server.hits.load(Ordering::SeqCst);
+    let outcome = check(&server, &staging, &signer, Some(mode)).unwrap();
+    assert!(
+        matches!(&outcome, Outcome::DownloadFailed { reason, .. } if reason == CANNOT_APPLY_HERE),
+        "{outcome:?}"
+    );
+    // Only the latest release was read.
+    assert_eq!(server.hits.load(Ordering::SeqCst) - before, 1);
+    assert!(staging.read_record().is_none());
+    assert!(staging.read_warning().is_some());
+    assert_eq!(
+        staging.read_apply_failure().as_deref(),
+        Some(CANNOT_APPLY_HERE)
+    );
+
+    // Any other failure of the apply is tried again.
+    staging.write_apply_failure("the installer ended with code 1603");
+    assert!(matches!(
+        check(&server, &staging, &signer, Some(mode)).unwrap(),
+        Outcome::Staged { .. }
+    ));
+}
+
+/// The install folder and program file of an install for every user must be
+/// closed to other accounts; a folder in a profile is open to its user.
+#[cfg(windows)]
+#[test]
+fn an_install_folder_open_to_other_accounts_is_refused() {
+    use ca_update::install::{install_folder_closed, install_place_accepted, prepare_work_folder};
+    let open = program_folder();
+    let program = open.path().join("compare-all.exe");
+    assert!(program.is_file());
+    assert!(!install_folder_closed(&program));
+    let (_keep, staging) = staging_dir();
+    std::fs::create_dir_all(staging.dir()).unwrap();
+    assert!(!install_place_accepted(staging.dir(), &program));
+
+    // Administrators and the system only, as the program files folder gives.
+    let parent = tempfile::tempdir().unwrap();
+    let closed = prepare_work_folder(parent.path()).unwrap();
+    let program = closed.path().join("compare-all.exe");
+    std::fs::write(&program, b"old exe").unwrap();
+    assert!(install_folder_closed(&program));
+    let system = ca_update::system::program_files().unwrap();
+    assert!(install_folder_closed(&system.join("Common Files")));
+    // A missing program file cannot be read and counts as open.
+    assert!(!install_folder_closed(&closed.path().join("missing.exe")));
+    let path = closed.path().to_path_buf();
+    drop(closed);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
 #[test]
 fn a_staged_version_not_newer_than_the_running_build_is_not_applied() {
     let server = Server::start();
@@ -2020,6 +2094,14 @@ fn not_a_database(staging: &Staging) {
     restage(staging, NEXT, &bytes);
 }
 
+/// A record that names more bytes than any release may have; the elevated
+/// step copies and parses nothing.
+fn over_the_size_cap(staging: &Staging) {
+    let mut record = staging.read_record().unwrap();
+    record.size = ca_update::staging::MAX_ASSET_BYTES + 1;
+    staging.write_record(&record).unwrap();
+}
+
 /// Name, change to the staged files, verifier, installed version.
 type Case<'a> = (&'a str, fn(&Staging), &'a FakeSigner, &'a Version);
 
@@ -2030,7 +2112,7 @@ fn the_elevated_step_refuses_a_staged_installer_that_fails_a_check() {
     let other = FakeSigner::signed_by("Someone Else");
     let newer = Version::parse("2026.12.31.0001").unwrap();
     let current = running();
-    let cases: [Case<'_>; 9] = [
+    let cases: [Case<'_>; 10] = [
         ("changed", flip_a_byte, &signer, &current),
         ("longer", add_a_byte, &signer, &current),
         ("bad record", break_the_record, &signer, &current),
@@ -2045,6 +2127,7 @@ fn the_elevated_step_refuses_a_staged_installer_that_fails_a_check() {
             &current,
         ),
         ("no database", not_a_database, &signer, &current),
+        ("over the size cap", over_the_size_cap, &signer, &current),
     ];
     for (name, tamper, verifier, installed) in cases {
         let (_server, _keep, staging, work, install) = elevated_setup();
@@ -2323,6 +2406,12 @@ fn owner_of(path: &Path) -> String {
     .args(["-NoProfile", "-NonInteractive", "-Command"])
     .arg("(Get-Acl -LiteralPath $env:CA_TARGET).GetSecurityDescriptorSddlForm('Owner')")
     .env("CA_TARGET", path)
+    // A module path inherited from a newer PowerShell loads modules that
+    // Windows PowerShell cannot run, and Get-Acl then fails.
+    .env(
+        "PSModulePath",
+        root.join(r"System32\WindowsPowerShell\v1.0\Modules"),
+    )
     .output()
     .unwrap();
     String::from_utf8_lossy(&output.stdout).trim().to_owned()

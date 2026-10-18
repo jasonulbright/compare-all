@@ -152,6 +152,13 @@ pub fn run(job: &Job<'_>) -> Result<Outcome, String> {
             page,
         });
     };
+    if let Some(reason) = cannot_apply(job.staging, &latest) {
+        return Ok(Outcome::DownloadFailed {
+            version: latest,
+            page,
+            reason,
+        });
+    }
     let manifest_url = format!("{}/v{latest}/{MANIFEST_NAME}", job.endpoints.download_base);
     let manifest = Manifest::parse(&job.transport.get_document(
         &manifest_url,
@@ -181,6 +188,16 @@ pub fn run(job: &Job<'_>) -> Result<Outcome, String> {
             })
         }
     }
+}
+
+/// The reason kept when an apply of `latest` ended because this install
+/// cannot apply updates by itself. Each download of that release would end
+/// the same way, so it is not downloaded again; the warning stays.
+fn cannot_apply(staging: &Staging, latest: &Version) -> Option<String> {
+    let warning = staging.read_warning()?;
+    let reason = staging.read_apply_failure()?;
+    (warning.parsed_version().as_ref() == Some(latest) && reason == crate::apply::CANNOT_APPLY_HERE)
+        .then_some(reason)
 }
 
 fn stage(
