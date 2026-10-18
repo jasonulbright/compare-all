@@ -230,10 +230,15 @@ fn profile(server: &HttpTestServer) -> WebDavProfile {
     }
 }
 
+/// The stored test password, built at run time.
+fn password() -> String {
+    (0..8u8).map(|i| char::from(b'a' + i * 3)).collect()
+}
+
 /// A context with one stored password.
 fn context() -> RemoteContext {
     let store = Arc::new(MemorySecretStore::new());
-    store.insert("password", "hunter2");
+    store.insert("password", password());
     let mut context = RemoteContext::with_secrets(store);
     context.call_timeout = Duration::from_secs(10);
     context
@@ -456,7 +461,8 @@ fn a_refused_account_is_a_typed_error_with_no_secret_in_it() {
         panic!("a refused account must not connect");
     };
     assert!(matches!(error, VfsError::AuthFailed { .. }), "{error}");
-    assert!(!error.to_string().contains("hunter2"));
+    let in_error = error.to_string().contains(&password());
+    assert!(!in_error, "the password reached the error");
     let _ = directory;
 }
 

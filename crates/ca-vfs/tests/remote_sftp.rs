@@ -398,7 +398,12 @@ fn a_wrong_password_is_a_typed_error_with_no_secret_in_it() {
     let mut settings = profile(&server, &path);
     settings.login.password = SecretRef::new("wrong");
     let store = Arc::new(MemorySecretStore::new());
-    store.insert("wrong", "not-the-password");
+    let wrong: String = password().chars().rev().collect();
+    assert!(
+        wrong != password(),
+        "the wrong password equals the accepted one"
+    );
+    store.insert("wrong", wrong.clone());
     let mut context = RemoteContext::with_secrets(store);
     context.call_timeout = Duration::from_secs(10);
 
@@ -406,7 +411,8 @@ fn a_wrong_password_is_a_typed_error_with_no_secret_in_it() {
         panic!("the wrong password must not log in");
     };
     assert!(matches!(error, VfsError::AuthFailed { .. }), "{error}");
-    assert!(!error.to_string().contains("not-the-password"));
+    let in_error = error.to_string().contains(&wrong);
+    assert!(!in_error, "the password reached the error");
 }
 
 #[test]
