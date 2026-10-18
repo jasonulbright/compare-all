@@ -129,17 +129,21 @@ macro_rules! settings_group {
 /// a newer build added beside the known ones is preserved as well as an unknown
 /// field inside a known group.
 ///
-/// A group written `field: Type => Override = expression` starts from that
-/// expression instead of the group's own default, for a kind whose defaults
-/// differ from the other kinds sharing the group. A group absent from a
-/// document takes the same value, through the container-level serde default.
+/// A group written `field: Type => Override = expression, from "function"`
+/// starts from that expression instead of the group's own default, for a kind
+/// whose defaults differ from the other kinds sharing the group. A group absent
+/// from a document takes the same value, through the container-level serde
+/// default. A group present in a document is read by the named function, which
+/// must lay the stored fields over the same expression: the derived reader
+/// fills a field the group omits from the group's own default instead.
 macro_rules! settings_composite {
     (
         $(#[$group_doc:meta])*
         $name:ident / $override_name:ident {
             $(
                 $(#[$field_doc:meta])*
-                $field:ident : $ty:ty => $override_ty:ty $(= $default:expr)?
+                $field:ident : $ty:ty => $override_ty:ty
+                    $(= $default:expr, from $deserialize:literal)?
             ),* $(,)?
         }
     ) => {
@@ -149,6 +153,7 @@ macro_rules! settings_composite {
         pub struct $name {
             $(
                 $(#[$field_doc])*
+                $( #[serde(deserialize_with = $deserialize)] )?
                 pub $field: $ty,
             )*
             /// Groups written by another build, preserved verbatim.
