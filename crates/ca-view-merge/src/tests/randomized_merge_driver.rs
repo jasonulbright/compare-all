@@ -2151,8 +2151,11 @@ const PIECES: [&str; 3] = [
     "[r1]\n[u2]\n[u3]\n[u4]\n[r5]\n[u6]\n[u7]\n[u8]\n[c9]\n[u10]\n[u11]\n[u12]\n",
 ];
 
-/// Each selection `(from, to)` replaced by the typed character, or removed.
-fn edit_selections(view: &mut MergeView, edits: &[((u32, u32), (u32, u32), Option<char>)]) {
+/// A selection from one `(line, index)` to another, and the character typed
+/// over it, or none to remove it.
+type SelectionEdit = ((u32, u32), (u32, u32), Option<char>);
+
+fn edit_selections(view: &mut MergeView, edits: &[SelectionEdit]) {
     view.focus = crate::Pane::Output;
     for &(from, to, typed) in edits {
         view.output_pane.place(Caret::new(from.0, from.1), false);
