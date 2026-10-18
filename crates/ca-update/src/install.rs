@@ -762,33 +762,56 @@ fn restrict_to_administrators(folder: &Path) -> Result<(), String> {
     // which policy can set to the account of the administrator. The owner
     // rights entry limits the owner of each new child to reading it.
     own_by_administrators(folder)?;
-    icacls(
-        folder,
-        &[
-            "/inheritance:r",
-            "/grant:r",
-            "*S-1-5-32-544:(OI)(CI)F",
-            "*S-1-5-18:(OI)(CI)F",
-            "*S-1-3-4:(OI)(CI)(IO)R",
-            "/q",
-        ],
-    )
+    set_access_list(folder, WORK_FOLDER_ACCESS_LIST)
+}
+
+/// The access list of a work folder: protected, with no inherited entry.
+#[cfg(windows)]
+const WORK_FOLDER_ACCESS_LIST: &str = "D:PAI(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICIIO;FR;;;OW)";
+
+/// Replace the access list of `folder` by exactly `sddl`.
+///
+/// Granting entries one by one keeps an entry that the account of the
+/// caller adds by itself, such as one for the built-in administrator
+/// account. A restored list holds the given entries only.
+#[cfg(windows)]
+fn set_access_list(folder: &Path, sddl: &str) -> Result<(), String> {
+    use std::ffi::OsStr;
+    let (Some(name), Some(parent)) = (folder.file_name(), folder.parent()) else {
+        return Err(format!(
+            "cannot set the access list of {}",
+            folder.display()
+        ));
+    };
+    let list = folder.join("access.lst");
+    let text = format!("{}\r\n{sddl}\r\n\r\n", name.to_string_lossy());
+    let bytes: Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    std::fs::write(&list, bytes).map_err(|error| format!("cannot set the access list: {error}"))?;
+    let applied = icacls(
+        parent,
+        [OsStr::new("/restore"), list.as_os_str(), OsStr::new("/q")],
+    );
+    let _ = std::fs::remove_file(&list);
+    applied
 }
 
 /// Make administrators the owner of `path`.
 #[cfg(windows)]
 fn own_by_administrators(path: &Path) -> Result<(), String> {
-    icacls(path, &["/setowner", "*S-1-5-32-544", "/q"])
+    icacls(path, ["/setowner", "*S-1-5-32-544", "/q"])
 }
 
 /// Replace the access list of `path` by the one its folder gives.
 #[cfg(windows)]
 fn inherit_access_list(path: &Path) -> Result<(), String> {
-    icacls(path, &["/reset", "/q"])
+    icacls(path, ["/reset", "/q"])
 }
 
 #[cfg(windows)]
-fn icacls(path: &Path, arguments: &[&str]) -> Result<(), String> {
+fn icacls<A: AsRef<std::ffi::OsStr>>(
+    path: &Path,
+    arguments: impl IntoIterator<Item = A>,
+) -> Result<(), String> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let root = crate::system::system_root()?;
