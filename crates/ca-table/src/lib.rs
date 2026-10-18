@@ -72,7 +72,7 @@ pub use schema::{
     SchemaWarning, TypeSample,
 };
 pub use value::{CellValue, DateTime};
-pub use write::{cell_write, CellWrite, WriteError};
+pub use write::{cell_write, record_text, CellWrite, WriteError};
 
 /// Raw JSON carried through from a document this build does not understand.
 pub type Unknown = std::collections::BTreeMap<String, serde_json::Value>;
