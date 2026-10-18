@@ -1698,6 +1698,51 @@ mod tests {
     }
 
     #[test]
+    fn the_timestamp_tolerance_never_hides_a_size_or_content_difference() {
+        let dirs = pair();
+        std::fs::write(dirs.left.path().join("sized.txt"), b"short").unwrap();
+        std::fs::write(dirs.right.path().join("sized.txt"), b"longer").unwrap();
+        std::fs::write(dirs.left.path().join("edited.txt"), b"alpha").unwrap();
+        std::fs::write(dirs.right.path().join("edited.txt"), b"alphx").unwrap();
+        for name in ["sized.txt", "edited.txt"] {
+            set_modified(&dirs.left.path().join(name), 1_001);
+            set_modified(&dirs.right.path().join(name), 1_000);
+        }
+
+        let options = CompareOptions {
+            quick: QuickTests {
+                tolerance_seconds: 2,
+                ..QuickTests::default()
+            },
+            content: ContentTests {
+                enabled: true,
+                skip_if_quick_same: false,
+                override_quick: true,
+                ..ContentTests::default()
+            },
+            ..CompareOptions::default()
+        };
+        let mut tree = align(
+            &scan(dirs.left.path()),
+            &scan(dirs.right.path()),
+            &AlignmentOptions::default(),
+        );
+        compare_quick(&mut tree, &options);
+        assert_eq!(find(&tree, "sized.txt").status, NodeStatus::Different);
+        compare_contents_parallel(
+            &mut tree,
+            dirs.left.path(),
+            dirs.right.path(),
+            &options,
+            None,
+            &Cancel::new(),
+            &|_| {},
+        );
+        assert_eq!(find(&tree, "sized.txt").status, NodeStatus::Different);
+        assert_eq!(find(&tree, "edited.txt").status, NodeStatus::Different);
+    }
+
+    #[test]
     fn override_can_be_switched_off() {
         let dirs = pair();
         std::fs::write(dirs.left.path().join("a.txt"), b"same").unwrap();
