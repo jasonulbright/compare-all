@@ -12,7 +12,7 @@ use crate::mode::{detect, InstallMode};
 use crate::signature::SignatureVerifier;
 use crate::staging::{AssetKind, Staging};
 use crate::verify::{hold_read_only, verify_and_hold, Expected};
-use crate::version::Version;
+use crate::version::{InstallerVersion, Version};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -22,6 +22,12 @@ pub const INSTALL_ARGUMENT: &str = "--install-update";
 
 /// The file name of the installed program.
 pub const PROGRAM_NAME: &str = "compare-all.exe";
+
+/// The `UpgradeCode` of every release installer.
+pub const UPGRADE_CODE: &str = "{6F1C2A4E-3B7D-4E59-9A21-C0DE0A11C0A1}";
+
+/// The `ProductName` of every release installer.
+pub const PRODUCT_NAME: &str = "Compare All";
 
 /// Name prefix of the folders the elevated step creates in the program files
 /// folder.
@@ -125,7 +131,9 @@ pub fn install_from(
         signer: checks.signer_name,
         version: &version,
     };
-    if verify_and_hold(&copy, &expected, checks.signer, &work.join("scratch")).is_err() {
+    let checked = verify_and_hold(&copy, &expected, checks.signer, &work.join("scratch"))
+        .and_then(|_| check_package(&held, &version, checks.running));
+    if checked.is_err() {
         drop(held);
         let _ = std::fs::remove_file(&copy);
         return REFUSED;
@@ -145,6 +153,89 @@ pub fn install_from(
         }
     }
     code.unwrap_or(NOT_PREPARED)
+}
+
+/// What an installer database names in its `Property` table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageIdentity {
+    /// `ProductName`.
+    pub product_name: String,
+    /// `UpgradeCode`.
+    pub upgrade_code: String,
+    /// `ProductVersion`.
+    pub product_version: String,
+}
+
+/// Read the identity of the installer database open in `file`.
+///
+/// # Errors
+/// Returns why the file is not a database or lacks one of the properties.
+pub fn package_identity(file: &std::fs::File) -> Result<PackageIdentity, String> {
+    let mut package = msi::Package::open(file)
+        .map_err(|error| format!("the installer is not a valid database: {error}"))?;
+    let rows = package
+        .select_rows(msi::Select::table("Property").columns(&["Property", "Value"]))
+        .map_err(|error| format!("the installer has no property table: {error}"))?;
+    let (mut product_name, mut upgrade_code, mut product_version) = (None, None, None);
+    for row in rows {
+        if row.len() != 2 {
+            continue;
+        }
+        let (Some(name), Some(value)) = (row[0].as_str(), row[1].as_str()) else {
+            continue;
+        };
+        let slot = match name {
+            "ProductName" => &mut product_name,
+            "UpgradeCode" => &mut upgrade_code,
+            "ProductVersion" => &mut product_version,
+            _ => continue,
+        };
+        *slot = Some(value.to_owned());
+    }
+    match (product_name, upgrade_code, product_version) {
+        (Some(product_name), Some(upgrade_code), Some(product_version)) => Ok(PackageIdentity {
+            product_name,
+            upgrade_code,
+            product_version,
+        }),
+        _ => Err("the installer does not name its product".to_owned()),
+    }
+}
+
+/// Check that the database open in `file` is a release installer of this
+/// product, newer than `running`, the build the elevated program is. The
+/// staged record, which the user can write, only has to agree:
+/// `record_version` must have the product version of the database.
+///
+/// # Errors
+/// Returns the first check the database fails.
+pub fn check_package(
+    file: &std::fs::File,
+    record_version: &Version,
+    running: &Version,
+) -> Result<(), String> {
+    let identity = package_identity(file)?;
+    if !identity.upgrade_code.eq_ignore_ascii_case(UPGRADE_CODE)
+        || identity.product_name != PRODUCT_NAME
+    {
+        return Err("the installer belongs to another product".to_owned());
+    }
+    let product = InstallerVersion::parse(&identity.product_version)
+        .ok_or("the installer has no valid product version")?;
+    let installed = running
+        .installer_version()
+        .ok_or("the running build has no installer version")?;
+    if product <= installed {
+        return Err(format!(
+            "the installer holds {product}, the installed build is {installed}"
+        ));
+    }
+    if record_version.installer_version() != Some(product) {
+        return Err(format!(
+            "the installer holds {product}, the staged record names {record_version}"
+        ));
+    }
+    Ok(())
 }
 
 /// Copy `source` to `destination`, a new file, and fail unless `source` held
@@ -295,3 +386,14 @@ fn remove_after_exit(work: &Path) {
 
 #[cfg(not(windows))]
 fn remove_after_exit(_: &Path) {}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn the_product_identity_is_the_identity_the_installer_source_gives() {
+        let source = include_str!("../../../installer/compare-all.wxs");
+        let code = super::UPGRADE_CODE.trim_matches(['{', '}']);
+        assert!(source.contains(&format!("UpgradeCode=\"{code}\"")));
+        assert!(source.contains(&format!("Name=\"{}\"", super::PRODUCT_NAME)));
+    }
+}
