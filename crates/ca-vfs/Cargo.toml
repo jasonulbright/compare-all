@@ -15,7 +15,7 @@ thiserror.workspace = true
 crc32fast.workspace = true
 command-group.workspace = true
 tempfile.workspace = true
-zip = { version = "8.6", default-features = false, features = [
+zip = { version = "9.0", default-features = false, features = [
     "aes-crypto",
     "deflate-flate2",
     "deflate64",
@@ -125,7 +125,7 @@ sevenz-rust2 = { version = "0.22", default-features = false, features = [
     "util",
 ] }
 tar = { version = "0.4", default-features = false }
-zip = { version = "8.6", default-features = false, features = [
+zip = { version = "9.0", default-features = false, features = [
     "aes-crypto",
     "deflate-flate2",
     "deflate64",

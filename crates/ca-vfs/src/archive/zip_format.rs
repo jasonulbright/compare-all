@@ -123,7 +123,7 @@ pub(crate) fn list(
         let row = match archive.by_index_raw(position) {
             Ok(file) => {
                 if repeated.contains(file.name_raw()) {
-                    spelled.insert(file.name_raw().to_vec(), file.name().to_owned());
+                    spelled.insert(file.name_raw().to_vec(), stored_name(&file));
                 }
                 Ok(record_row(&file, position))
             }
@@ -131,7 +131,10 @@ pub(crate) fn list(
         };
         let row = match row {
             Ok(row) => row,
-            Err(error) => unreadable_row(archive.name_for_index(position), &error),
+            Err(error) => {
+                let name = archive.name_for_index(position).and_then(Result::ok);
+                unreadable_row(name.as_deref(), &error)
+            }
         };
         let Some(mut row) = row else {
             continue;
@@ -162,13 +165,24 @@ pub(crate) fn list(
 
 /// The listing row for the record at `position`, or `None` for a directory
 /// record that names the root.
+/// The entry name as the reader spells it. The reader fails only for a name it
+/// cannot decode, which no byte sequence triggers; the lossy form keeps the
+/// row visible regardless.
+pub(super) fn stored_name<R: Read>(file: &zip::read::ZipFile<'_, R>) -> String {
+    file.name().map_or_else(
+        |_| String::from_utf8_lossy(file.name_raw()).into_owned(),
+        std::borrow::Cow::into_owned,
+    )
+}
+
 fn record_row<R: Read>(file: &zip::read::ZipFile<'_, R>, position: usize) -> Option<RawEntry> {
     let kind = if file.is_dir() {
         EntryKind::Directory
     } else {
         EntryKind::File
     };
-    let (path, refusal) = stored_path(file.name(), kind == EntryKind::Directory).into_row()?;
+    let (path, refusal) =
+        stored_path(&stored_name(file), kind == EntryKind::Directory).into_row()?;
     let mode = file.unix_mode();
     let attributes = VfsAttributes {
         read_only: mode.is_some_and(|mode| mode & 0o200 == 0),
@@ -680,11 +694,10 @@ fn read_timestamps<R>(
 where
     R: Read,
 {
-    let extra = file.extra_data().unwrap_or_default();
-    if let Some(time) = ntfs_mtime(extra).and_then(unix_to_system_time) {
+    if let Some(time) = reader_ntfs_mtime(file).and_then(unix_to_system_time) {
         return (Some(time), TimeFidelity::Utc);
     }
-    if let Some(time) = extended_mtime(extra).and_then(unix_to_system_time) {
+    if let Some(time) = reader_extended_mtime(file).and_then(unix_to_system_time) {
         return (Some(time), TimeFidelity::Utc);
     }
     let dos = file.last_modified().and_then(|stamp| {
@@ -791,6 +804,27 @@ pub(super) fn extended_mtime(extra: &[u8]) -> Option<i64> {
         true
     });
     found
+}
+
+/// Unix seconds of the NTFS modification time the reader parsed.
+///
+/// The reader re-serializes only some fields, so the typed fields are the
+/// only source of these stamps.
+pub(super) fn reader_ntfs_mtime<R: Read>(file: &zip::read::ZipFile<'_, R>) -> Option<i64> {
+    file.extra_data_fields().find_map(|field| match field {
+        zip::ExtraField::Ntfs(ntfs) => windows_time_to_unix(ntfs.mtime()),
+        _ => None,
+    })
+}
+
+/// Unix seconds of the extended timestamp modification time the reader parsed.
+pub(super) fn reader_extended_mtime<R: Read>(file: &zip::read::ZipFile<'_, R>) -> Option<i64> {
+    file.extra_data_fields().find_map(|field| match field {
+        zip::ExtraField::ExtendedTimestamp(stamp) => stamp
+            .mod_time()
+            .map(|seconds| i64::from(i32::from_le_bytes(seconds.to_le_bytes()))),
+        _ => None,
+    })
 }
 
 /// Hundred-nanosecond ticks since 1601 turned into Unix seconds.
@@ -1040,7 +1074,7 @@ pub(crate) fn rewrite(
                 "writing to a zip that holds encrypted entries",
             ));
         }
-        let raw_name = entry.name().to_owned();
+        let raw_name = stored_name(&entry);
         if VfsPath::parse(&raw_name).is_err() {
             return Err(VfsError::unsupported(format!(
                 "writing to a zip that holds the unusable entry name {raw_name:?}"
@@ -1157,7 +1191,7 @@ fn kept_records<R: Read + Seek>(
                 "writing to a zip whose central directory the reader reads differently",
             ));
         }
-        let raw_name = entry.name().to_owned();
+        let raw_name = stored_name(&entry);
         let comment = entry.comment().to_owned();
         let parsed = VfsPath::parse(&raw_name).ok();
         let is_dir = entry.is_dir();
@@ -1236,7 +1270,7 @@ fn copy_added<W: Write>(
             if !record.agrees_with(&entry) {
                 return Err(unreadable());
             }
-            (entry.name().to_owned(), entry.comment().to_owned())
+            (stored_name(&entry), entry.comment().to_owned())
         };
         output.copy(&mut data, record, &name, &comment, cancel)?;
     }
@@ -1255,11 +1289,7 @@ fn renamed_over_names<R: Read + Seek>(
             ..
         } = mutation
         {
-            let name = source
-                .by_index_raw(*position)
-                .map_err(map_zip_open)?
-                .name()
-                .to_owned();
+            let name = stored_name(&source.by_index_raw(*position).map_err(map_zip_open)?);
             overwritten.insert(*position, name);
         }
     }
@@ -1325,7 +1355,7 @@ fn append_records<W: Write + Seek>(
 fn record_options(
     modified: std::time::SystemTime,
     zone: i32,
-) -> VfsResult<zip::write::FullFileOptions<'static>> {
+) -> VfsResult<zip::write::FullFileOptions<'static, 'static>> {
     let seconds = crate::remote::timestamp::unix_seconds(modified);
     let mut options =
         zip::write::FullFileOptions::default().last_modified_time(dos_stamp_of(seconds, zone));
@@ -1334,7 +1364,7 @@ fn record_options(
         let mut field = vec![0x01];
         field.extend_from_slice(&stamp.to_le_bytes());
         options
-            .add_extra_data(EXTRA_EXTENDED_TIMESTAMP, field, false)
+            .add_extra_field(EXTRA_EXTENDED_TIMESTAMP, field, false)
             .map_err(map_zip_open)?;
     }
     Ok(options)

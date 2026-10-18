@@ -1685,8 +1685,14 @@ fn extra_fields_on_disk(path: &std::path::Path) -> Vec<(String, Vec<u8>, Vec<u8>
         let extra_len = usize::from(u16::from_le_bytes([bytes[at + 28], bytes[at + 29]]));
         let start = at + 30 + name_len;
         let local = bytes[start..start + extra_len].to_vec();
-        let central = file.extra_data().unwrap_or_default().to_vec();
-        out.push((file.name().to_owned(), central, local));
+        let record = usize::try_from(file.central_header_start()).unwrap();
+        let central_name_len =
+            usize::from(u16::from_le_bytes([bytes[record + 28], bytes[record + 29]]));
+        let central_extra_len =
+            usize::from(u16::from_le_bytes([bytes[record + 30], bytes[record + 31]]));
+        let central_start = record + 46 + central_name_len;
+        let central = bytes[central_start..central_start + central_extra_len].to_vec();
+        out.push((file.name().unwrap().into_owned(), central, local));
     }
     out
 }
@@ -1734,7 +1740,7 @@ fn zip_with_time_fields(path: &std::path::Path, entries: &[(&str, i64, u16)]) {
         if *field == 0x5455 {
             let mut payload = vec![0x01];
             payload.extend_from_slice(&i32::try_from(*instant).unwrap().to_le_bytes());
-            options.add_extra_data(0x5455, payload, false).unwrap();
+            options.add_extra_field(0x5455, payload, false).unwrap();
         } else {
             let ticks = u64::try_from(*instant + 11_644_473_600).unwrap() * 10_000_000;
             let mut payload = vec![0u8; 4];
@@ -1743,7 +1749,7 @@ fn zip_with_time_fields(path: &std::path::Path, entries: &[(&str, i64, u16)]) {
             for _ in 0..3 {
                 payload.extend_from_slice(&ticks.to_le_bytes());
             }
-            options.add_extra_data(0x000A, payload, false).unwrap();
+            options.add_extra_field(0x000A, payload, false).unwrap();
         }
         if name.ends_with('/') {
             writer.add_directory(*name, options).unwrap();
