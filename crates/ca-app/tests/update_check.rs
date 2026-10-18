@@ -121,7 +121,7 @@ fn a_newer_release_found_at_start_opens_its_page_in_the_browser() {
         frames.set(frames.get() + 1);
         frames.get() > 30
     }));
-    assert!(!again.is_checking_for_updates());
+    assert!(run_frames(&mut again, App::launch_update_check_done));
     assert_eq!(asked.load(Ordering::SeqCst), 1);
     assert!(again.update_notice().is_none());
 }
