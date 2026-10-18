@@ -392,3 +392,14 @@ checksum = "6dc0e068dcf3a5bc8e054205b85b7720e1d49265bbc64bf515d2cf79197df69a"
 path = "dpi/LICENSE-LIBM-MIT"
 license = "MIT"
 checksum = "9eff396a99bafd208e7126602420d6864f6066c08b84485a5b032320a9c01997"
+
+[rustls-platform-verifier-android.clarify]
+license = "MIT OR Apache-2.0"
+[[rustls-platform-verifier-android.clarify.git]]
+path = "LICENSE-MIT"
+license = "MIT"
+checksum = "1c7cf76689c837a68ed8d704994e52a0f2940c087958f860d17f3186afbdcc0c"
+[[rustls-platform-verifier-android.clarify.git]]
+path = "LICENSE-APACHE"
+license = "Apache-2.0"
+checksum = "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"

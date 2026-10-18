@@ -14,7 +14,7 @@ serde_json.workspace = true
 msi = "0.10"
 sha2 = "0.11"
 ureq = { version = "3", default-features = false, features = ["rustls", "platform-verifier"] }
-zip = { version = "8.6", default-features = false, features = ["deflate-flate2"] }
+zip = { version = "9.0", default-features = false, features = ["deflate-flate2"] }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
 [target.'cfg(windows)'.dependencies]
