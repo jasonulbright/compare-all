@@ -1019,9 +1019,12 @@ fn a_password_in_a_location_reaches_neither_the_log_nor_the_error() {
     );
     let error = run_script(&source, &Substitution::none(), &mut session).unwrap_err();
     let text = std::fs::read_to_string(&target).expect("log");
-    assert!(text.contains("ftp://alice:***@127.0.0.1:1/pub"), "{text}");
-    assert!(!text.contains("hunter2"), "{text}");
-    assert!(!error.to_string().contains("hunter2"), "{error}");
+    let masked = text.contains("ftp://alice:***@127.0.0.1:1/pub");
+    assert!(masked, "the masked location is not in the log");
+    let in_log = text.contains("hunter2");
+    assert!(!in_log, "the password reached the log");
+    let in_error = error.to_string().contains("hunter2");
+    assert!(!in_error, "the password reached the error");
 }
 
 #[test]
@@ -1038,7 +1041,8 @@ fn a_password_that_holds_a_space_a_tab_or_a_slash_reaches_neither_the_log_nor_th
         );
         let error = run_script(&source, &Substitution::none(), &mut session).unwrap_err();
         let text = std::fs::read_to_string(&target).expect("log");
-        assert!(text.contains("ftp://alice:***@127.0.0.1:1/pub"), "{text}");
+        let masked = text.contains("ftp://alice:***@127.0.0.1:1/pub");
+        assert!(masked, "the masked location is not in the log");
         for part in [password, "hun", "ter", "2@"] {
             let in_log = text.contains(part);
             assert!(!in_log, "a password part reached the log");
@@ -1068,7 +1072,8 @@ fn a_password_after_text_in_brackets_that_is_no_address_reaches_neither_the_log_
         );
         let error = run_script(&source, &Substitution::none(), &mut session).unwrap_err();
         let text = std::fs::read_to_string(&target).expect("log");
-        assert!(text.contains(logged), "{text}");
+        let masked = text.contains(logged);
+        assert!(masked, "the masked location is not in the log");
         for part in ["hun", "ter2", "123/"] {
             let in_log = text.contains(part);
             assert!(!in_log, "a password part reached the log");
@@ -1121,11 +1126,10 @@ fn a_line_with_two_locations_is_logged_as_two_locations() {
         let source = format!("log verbose \"{}\"\nload {arguments}\n", target.display());
         let _ = run_script(&source, &Substitution::none(), &mut session);
         let text = std::fs::read_to_string(&target).expect("log");
-        assert!(
-            text.contains(logged),
-            "{logged:?} is not in the log: {text}"
-        );
-        assert!(!text.contains("hunter"), "{text}");
+        let masked = text.contains(logged);
+        assert!(masked, "the masked line is not in the log");
+        let in_log = text.contains("hunter");
+        assert!(!in_log, "a password reached the log");
     }
 }
 
@@ -1143,9 +1147,12 @@ fn a_password_with_digits_before_its_first_slash_reaches_neither_the_log_nor_the
         );
         let error = run_script(&source, &Substitution::none(), &mut session).unwrap_err();
         let text = std::fs::read_to_string(&target).expect("log");
-        assert!(text.contains("ftp://alice:***@127.0.0.1:1/pub"), "{text}");
-        assert!(!text.contains(password), "{text}");
-        assert!(!error.to_string().contains(password), "{error}");
+        let masked = text.contains("ftp://alice:***@127.0.0.1:1/pub");
+        assert!(masked, "the masked location is not in the log");
+        let in_log = text.contains(password);
+        assert!(!in_log, "the password reached the log");
+        let in_error = error.to_string().contains(password);
+        assert!(!in_error, "the password reached the error");
     }
 }
 
@@ -1561,6 +1568,11 @@ fn a_remote_location_with_no_stored_profile_is_refused_by_name() {
 
 // -- a remote side -----------------------------------------------------------
 
+/// The one password the remote test server accepts, built at run time.
+fn remote_password() -> String {
+    (0..8u8).map(|i| char::from(b'a' + i * 3)).collect()
+}
+
 /// A lookup that answers with one profile and one stored secret.
 #[derive(Debug)]
 struct OneRemote {
@@ -1574,7 +1586,7 @@ impl ca_script::ProfileLookup for OneRemote {
 
     fn secrets(&self) -> std::sync::Arc<dyn ca_vfs::SecretStore> {
         let store = ca_vfs::MemorySecretStore::new();
-        store.insert("password", "hunter2");
+        store.insert("password", remote_password());
         std::sync::Arc::new(store)
     }
 }
@@ -1587,7 +1599,7 @@ fn copy_writes_to_a_remote_side() {
     let server = ca_vfs::testing::ftp_server::FtpTestServer::start(
         remote_dir.path(),
         ca_vfs::testing::ftp_server::Options {
-            account: Some(("operator".to_owned(), "hunter2".to_owned())),
+            account: Some(("operator".to_owned(), remote_password())),
             mlsd: true,
             ..ca_vfs::testing::ftp_server::Options::default()
         },
