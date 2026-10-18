@@ -232,7 +232,7 @@ mod tests {
         let mut settings = TextMergeSettings::default();
         assert_eq!(
             options_from(&settings).merge.conflict_scope,
-            ConflictScope::Separation { lines: 2 }
+            ConflictScope::Separation { lines: 1 }
         );
         settings.conflicts.separation_lines = 9;
         assert_eq!(
@@ -284,13 +284,23 @@ mod tests {
     }
 
     /// The stored defaults state a skew bound the engine default leaves
-    /// unbounded; everything else matches the engine's own starting point.
+    /// unbounded and a narrower conflict separation than the engine default;
+    /// everything else matches the engine's own starting point.
     #[test]
-    fn the_stored_defaults_differ_from_the_engine_defaults_only_in_the_skew_bound() {
+    fn the_stored_defaults_differ_from_the_engine_defaults_only_in_the_skew_bound_and_separation() {
+        use ca_diff::merge3::ConflictScope;
         let options = options_from(&TextMergeSettings::default()).merge;
-        assert_eq!(options.compare.alignment.skew_tolerance, Some(500));
+        assert_eq!(options.compare.alignment.skew_tolerance, Some(2000));
         let engine = ca_diff::merge3::MergeOptions::default();
-        assert_eq!(options.conflict_scope, engine.conflict_scope);
+        assert_eq!(engine.compare.alignment.skew_tolerance, None);
+        assert_eq!(
+            options.conflict_scope,
+            ConflictScope::Separation { lines: 1 }
+        );
+        assert_eq!(
+            engine.conflict_scope,
+            ConflictScope::Separation { lines: 2 }
+        );
         assert_eq!(
             options.compare.ignore_line_endings,
             engine.compare.ignore_line_endings
