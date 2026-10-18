@@ -341,12 +341,21 @@ fn the_apply_starts_only_after_a_normal_close_with_a_newer_staged_update() {
     // Nothing staged: nothing to apply.
     let closed = ExitHook::default();
     closed.normal_close.store(true, Ordering::SeqCst);
+    closed.apply_allowed.store(true, Ordering::SeqCst);
     assert!(!finish_at_exit(&closed, &staging, &start));
 
     stage_fake(&staging_path, &next_version());
 
     // A crash or a forced end never sets the flag.
-    assert!(!finish_at_exit(&ExitHook::default(), &staging, &start));
+    let crashed = ExitHook::default();
+    crashed.apply_allowed.store(true, Ordering::SeqCst);
+    assert!(!finish_at_exit(&crashed, &staging, &start));
+    assert!(started.lock().unwrap().is_empty());
+
+    // Checks turned off, or an install for every user, never apply.
+    let refused = ExitHook::default();
+    refused.normal_close.store(true, Ordering::SeqCst);
+    assert!(!finish_at_exit(&refused, &staging, &start));
     assert!(started.lock().unwrap().is_empty());
 
     // A normal close applies and does not start the program again.
@@ -362,6 +371,222 @@ fn the_apply_starts_only_after_a_normal_close_with_a_newer_staged_update() {
     let old = Version::parse(VERSION).unwrap();
     stage_fake(&staging_path, &old);
     assert!(!finish_at_exit(&closed, &staging, &start));
+}
+
+fn write_warning(staging: &Path, server: &HttpTestServer, version: &Version) {
+    Staging::new(staging.to_path_buf())
+        .write_warning(&DownloadWarning::new(
+            version,
+            format!("{}/tag/v{version}", server.url()),
+        ))
+        .unwrap();
+}
+
+#[test]
+fn a_cancelled_restart_does_not_relaunch_after_a_later_close_of_the_last_tab() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app_in(dir.path());
+    assert!(run_frames(&mut app, |app| app.options().is_ready()));
+    app.open_home(&context());
+    assert!(app.tab_count() > 1);
+    let hook = app.update_exit_hook();
+    app.restart_to_update();
+    assert!(app.asks_before_closing());
+    app.answer_exit(false);
+    while app.tab_count() > 0 {
+        app.close_tab(0);
+    }
+    assert!(app.is_closing());
+    quiet_frames(&mut app, 2);
+    assert!(hook.normal_close.load(Ordering::SeqCst));
+    assert!(!hook.relaunch.load(Ordering::SeqCst));
+}
+
+#[test]
+fn a_download_warning_shows_without_a_network_call_when_checks_are_off() {
+    for by_policy in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = dir.path().join("stage");
+        let version = next_version();
+        let (server, asked) = release_server(version.to_string(), 404);
+        write_warning(&staging, &server, &version);
+        let mut app = app_in(dir.path());
+        app.update_from(source(
+            &server,
+            &staging,
+            Some(InstallMode::Installed { machine: false }),
+        ));
+        if by_policy {
+            let mut keys = BTreeMap::new();
+            keys.insert(PolicyKey::DisableCheckForUpdates, true);
+            app.set_policies(AdminPolicies::from_keys(&keys));
+        }
+        assert!(run_frames(&mut app, |app| app.options().is_ready()));
+        let mut options = app.options().options_or_default();
+        options.tweaks.check_for_updates = by_policy;
+        app.apply_options(options);
+        assert!(
+            run_frames(&mut app, |app| matches!(
+                app.update_notice(),
+                Some(UpdateNotice::NotDownloaded(_))
+            )),
+            "policy {by_policy}"
+        );
+        quiet_frames(&mut app, 10);
+        assert_eq!(asked.load(Ordering::SeqCst), 0, "policy {by_policy}");
+    }
+}
+
+#[test]
+fn a_staged_update_is_not_applied_when_checks_are_off() {
+    let dir = tempfile::tempdir().unwrap();
+    let staging = dir.path().join("stage");
+    let version = next_version();
+    stage_fake(&staging, &version);
+    let (server, asked) = release_server(version.to_string(), 404);
+    let mut app = app_in(dir.path());
+    app.update_from(source(
+        &server,
+        &staging,
+        Some(InstallMode::Installed { machine: false }),
+    ));
+    let hook = app.update_exit_hook();
+    assert!(run_frames(&mut app, |app| app.options().is_ready()));
+    let mut options = app.options().options_or_default();
+    options.tweaks.check_for_updates = false;
+    app.apply_options(options);
+    quiet_frames(&mut app, 20);
+    assert!(run_frames(&mut app, |app| !app.is_checking_for_updates()));
+    assert!(!matches!(app.update_notice(), Some(UpdateNotice::Ready(_))));
+    app.restart_to_update();
+    assert!(run_frames(&mut app, App::is_closing));
+    let started = Mutex::new(0);
+    let start = |_: &Staging, _: bool| {
+        *started.lock().unwrap() += 1;
+        Ok(())
+    };
+    assert!(!finish_at_exit(&hook, &Staging::new(staging), &start));
+    assert_eq!(*started.lock().unwrap(), 0);
+    assert_eq!(asked.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn a_per_machine_install_never_starts_the_installer_and_offers_the_downloads_page() {
+    let dir = tempfile::tempdir().unwrap();
+    let staging = dir.path().join("stage");
+    let version = next_version();
+    stage_fake(&staging, &version);
+    check_just_done(dir.path());
+    let (server, _) = release_server(version.to_string(), 404);
+    let mut app = app_in(dir.path());
+    app.update_from(source(
+        &server,
+        &staging,
+        Some(InstallMode::Installed { machine: true }),
+    ));
+    let hook = app.update_exit_hook();
+    assert!(run_frames(&mut app, |app| app.update_notice().is_some()));
+    assert_eq!(
+        app.update_notice(),
+        Some(&UpdateNotice::Available(ca_app::update::Release {
+            version,
+            page: format!("{}/tag/v{version}", server.url()),
+        }))
+    );
+    let opened = Arc::new(Mutex::new(Vec::new()));
+    app.set_spawner(Arc::new(Recorder(Arc::clone(&opened))));
+    let mut probe = Probe::new(1280.0, 800.0);
+    {
+        let mut run = |ctx: &egui::Context| app.frame(ctx);
+        probe.idle(&mut run);
+        probe.idle(&mut run);
+        let text = format!("Version {version} is available. Open the downloads page now?");
+        let output = probe.frame(Vec::new(), &mut run);
+        let painted = ca_ui::testing::probe::painted_texts(&output);
+        assert!(painted.contains(&text), "{painted:?}");
+        probe.click("OK", &mut run).unwrap();
+        probe.idle(&mut run);
+    }
+    assert!(run_frames(&mut app, |_| !opened.lock().unwrap().is_empty()));
+    assert!(opened.lock().unwrap()[0]
+        .arguments
+        .last()
+        .unwrap()
+        .ends_with(&format!("/tag/v{version}")));
+    app.restart_to_update();
+    assert!(run_frames(&mut app, App::is_closing));
+    let started = Mutex::new(0);
+    let start = |_: &Staging, _: bool| {
+        *started.lock().unwrap() += 1;
+        Ok(())
+    };
+    assert!(!finish_at_exit(&hook, &Staging::new(staging), &start));
+    assert_eq!(*started.lock().unwrap(), 0);
+}
+
+#[test]
+fn a_check_that_is_not_due_schedules_the_next_one_at_the_due_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let settings = dir.path().join("settings");
+    std::fs::create_dir_all(&settings).unwrap();
+    let day = 24 * 60 * 60;
+    let last = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        - 29 * day;
+    std::fs::write(settings.join("update-check"), format!("{last}\n")).unwrap();
+    let (server, asked) = release_server(next_version().to_string(), 404);
+    let mut app = app_in(dir.path());
+    app.update_from(source(&server, &dir.path().join("stage"), None));
+    assert!(run_frames(&mut app, |app| app.options().is_ready()));
+    let mut options = app.options().options_or_default();
+    options.tweaks.check_for_updates_days = 30;
+    app.apply_options(options);
+    assert!(run_frames(&mut app, |app| app
+        .next_update_check_in()
+        .is_some()));
+    let wait = app.next_update_check_in().unwrap();
+    assert!(wait <= Duration::from_secs(day + 60), "{wait:?}");
+    assert!(wait >= Duration::from_secs(day - 60), "{wait:?}");
+    assert_eq!(asked.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn a_manual_check_with_the_option_off_reports_and_downloads_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let staging = dir.path().join("stage");
+    let version = next_version();
+    let (server, asked) = release_server(version.to_string(), 404);
+    let mut app = app_in(dir.path());
+    app.update_from(source(
+        &server,
+        &staging,
+        Some(InstallMode::Installed { machine: false }),
+    ));
+    assert!(run_frames(&mut app, |app| app.options().is_ready()));
+    let mut options = app.options().options_or_default();
+    options.tweaks.check_for_updates = false;
+    app.apply_options(options);
+    assert!(run_frames(&mut app, |app| !app.is_checking_for_updates()));
+    quiet_frames(&mut app, 5);
+    assert_eq!(asked.load(Ordering::SeqCst), 0);
+    app.run(Command::CheckForUpdates, &context());
+    assert!(run_frames(&mut app, |app| matches!(
+        app.update_notice(),
+        Some(UpdateNotice::Newer(_))
+    )));
+    assert_eq!(asked.load(Ordering::SeqCst), 1);
+    assert!(Staging::new(staging).read_record().is_none());
+}
+
+#[test]
+fn the_program_file_carries_its_version_for_the_updater() {
+    let bytes = std::fs::read(env!("CARGO_BIN_EXE_compare-all")).unwrap();
+    assert_eq!(
+        ca_update::verify::embedded_version(&bytes).unwrap(),
+        Version::parse(VERSION).unwrap()
+    );
 }
 
 #[test]

@@ -1020,6 +1020,9 @@ pub enum UpdateNotice {
     Ready(crate::update::Release),
     /// A newer release exists and could not be downloaded.
     NotDownloaded(crate::update::Release),
+    /// A newer release is staged for an install the program does not update
+    /// by itself (an install for every user).
+    Available(crate::update::Release),
     /// The answer to a check asked for from the Help menu.
     Message(String),
 }
@@ -1286,6 +1289,14 @@ impl App {
     #[must_use]
     pub fn is_checking_for_updates(&self) -> bool {
         self.update.job.is_some()
+    }
+
+    /// How long until the next scheduled check while the window stays open.
+    #[must_use]
+    pub fn next_update_check_in(&self) -> Option<std::time::Duration> {
+        self.update
+            .next_check
+            .map(|at| at.saturating_duration_since(std::time::Instant::now()))
     }
 
     /// A window showing whatever the command line asked for, reading the stated
@@ -1658,6 +1669,8 @@ impl App {
         self.exit_question = false;
         if leave {
             self.try_leave();
+        } else {
+            self.update.restart_on_leave = false;
         }
     }
 
@@ -1696,9 +1709,7 @@ impl App {
         let days = tweaks.check_for_updates_days;
         if !self.update.started {
             self.update.started = true;
-            if enabled {
-                self.spawn_update_check(days, false, true, notify);
-            }
+            self.spawn_update_check(days, false, true, enabled, notify);
             return;
         }
         let Some(at) = self.update.next_check else {
@@ -1711,26 +1722,38 @@ impl App {
         let now = std::time::Instant::now();
         if now >= at {
             self.update.next_check = None;
-            self.spawn_update_check(days, false, false, notify);
+            self.spawn_update_check(days, false, false, true, notify);
         } else {
             ctx.request_repaint_after((at - now).min(std::time::Duration::from_secs(3600)));
         }
     }
 
     /// Start a check on a worker, unless one is running.
+    ///
+    /// Without `network` the worker only reports what an earlier run left and
+    /// removes a staged update. A check asked for while the option is off
+    /// reports a newer release and downloads nothing.
     fn spawn_update_check(
         &mut self,
         days: u32,
         forced: bool,
         at_launch: bool,
+        network: bool,
         notify: &Arc<dyn Fn() + Send + Sync>,
     ) {
-        if self.update.job.is_some() || self.policies.check_for_updates_disabled() {
+        if self.update.job.is_some() {
             return;
         }
-        let Some(source) = self.update.source.clone() else {
+        let network = network && !self.policies.check_for_updates_disabled();
+        if !network && !at_launch {
+            return;
+        }
+        let Some(mut source) = self.update.source.clone() else {
             return;
         };
+        if !self.resolved.stored.tweaks.check_for_updates {
+            source.mode = None;
+        }
         let Some(current) = crate::update::Version::parse(VERSION) else {
             return;
         };
@@ -1742,8 +1765,14 @@ impl App {
             forced,
         );
         check.report_pending = at_launch;
+        check.network = network;
         self.update.manual = forced;
         self.update.job = Some(crate::update::spawn(check, Arc::clone(notify)));
+    }
+
+    /// The check asked for from the Help menu.
+    fn check_for_updates_now(&mut self, notify: &Arc<dyn Fn() + Send + Sync>) {
+        self.spawn_update_check(0, true, false, true, notify);
     }
 
     /// Close the window, apply the staged update once the process has ended,
@@ -1765,11 +1794,25 @@ impl App {
         let outcomes = job.drain();
         let finished = job.is_finished();
         let manual = self.update.manual;
+        let applies = self
+            .update
+            .source
+            .as_ref()
+            .and_then(|source| source.mode)
+            .is_none_or(ca_update::apply::applies_automatically);
+        let mut next_in = None;
         for outcome in outcomes {
             let notice = match outcome {
                 Outcome::Newer(release) => Some(UpdateNotice::Newer(release)),
-                Outcome::Staged(release) | Outcome::Waiting(release) => {
+                Outcome::Staged(release) | Outcome::Waiting(release) if applies => {
                     Some(UpdateNotice::Ready(release))
+                }
+                Outcome::Staged(release) | Outcome::Waiting(release) => {
+                    Some(UpdateNotice::Available(release))
+                }
+                Outcome::NotDue(wait) => {
+                    next_in = Some(wait);
+                    None
                 }
                 Outcome::EarlierFailure(release) | Outcome::DownloadFailed(release, _) => {
                     Some(UpdateNotice::NotDownloaded(release))
@@ -1789,19 +1832,21 @@ impl App {
         if finished {
             self.update.job = None;
             let days = self.resolved.stored.tweaks.check_for_updates_days;
+            let interval = std::time::Duration::from_secs(u64::from(days) * 24 * 60 * 60);
             if days > 0 && self.update.source.is_some() {
-                self.update.next_check = Some(
-                    std::time::Instant::now()
-                        + std::time::Duration::from_secs(u64::from(days) * 24 * 60 * 60),
-                );
+                self.update.next_check = std::time::Instant::now()
+                    .checked_add(next_in.unwrap_or(interval).min(interval));
             }
         }
     }
 
     /// Open the page of the release the notice names in the browser.
     pub fn open_release_page(&mut self, notify: &Arc<dyn Fn() + Send + Sync>) {
-        let Some(UpdateNotice::Newer(release) | UpdateNotice::NotDownloaded(release)) =
-            self.update.notice.take()
+        let Some(
+            UpdateNotice::Newer(release)
+            | UpdateNotice::NotDownloaded(release)
+            | UpdateNotice::Available(release),
+        ) = self.update.notice.take()
         else {
             return;
         };
@@ -1858,6 +1903,16 @@ impl App {
                     ui.label(format!(
                         "Version {} is available but could not be downloaded. \
                          Open the downloads page now?",
+                        release.version
+                    ));
+                    ui.horizontal(|ui| {
+                        visit = ui.button("OK").clicked();
+                        dismiss = ui.button("Cancel").clicked();
+                    });
+                }
+                UpdateNotice::Available(release) => {
+                    ui.label(format!(
+                        "Version {} is available. Open the downloads page now?",
                         release.version
                     ));
                     ui.horizontal(|ui| {
@@ -2877,6 +2932,9 @@ impl App {
         }
         view.on_close();
         if self.tabs.is_empty() {
+            // Closing the last tab is an ordinary close, never the restart a
+            // cancelled "Restart to update" asked for.
+            self.update.restart_on_leave = false;
             self.closing = self.resolved.stored.tabs.close_window_with_last_tab;
             self.active = 0;
         } else if self.active >= self.tabs.len() {
@@ -3123,7 +3181,7 @@ impl App {
                     context,
                 );
             }
-            Command::CheckForUpdates => self.spawn_update_check(0, true, false, &context.notify),
+            Command::CheckForUpdates => self.check_for_updates_now(&context.notify),
             Command::CompareFilesUsing => {}
             Command::Explorer => self.reveal_active_item(context),
             Command::CompareParentFolders => {
@@ -3771,6 +3829,16 @@ impl App {
             self.update.restart_on_leave,
             std::sync::atomic::Ordering::SeqCst,
         );
+        let enabled = self.resolved.stored.tweaks.check_for_updates
+            && !self.policies.check_for_updates_disabled();
+        let applies = self
+            .update
+            .source
+            .as_ref()
+            .and_then(|source| source.mode)
+            .is_some_and(ca_update::apply::applies_automatically);
+        exit.apply_allowed
+            .store(enabled && applies, std::sync::atomic::Ordering::SeqCst);
         exit.normal_close
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
