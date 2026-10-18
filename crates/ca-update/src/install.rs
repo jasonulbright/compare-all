@@ -63,6 +63,91 @@ pub fn parse_install_arguments(arguments: &[OsString]) -> Option<PathBuf> {
     }
 }
 
+/// The last two folder names of every staging folder.
+const STAGING_TAIL: [&str; 2] = ["compare-all", "updates"];
+
+/// The staging folder that the elevated step reads, or `None` when it
+/// refuses `staging`. The folder must be a local drive path with no `.` or
+/// `..` part, end in `compare-all\updates`, and, with every link in it
+/// resolved, still be such a path inside one of `profiles`. A network path,
+/// a device path or a link that leads out of the profiles is refused, so the
+/// elevated account never opens a remote file. The resolved path is
+/// returned.
+#[must_use]
+pub fn accepted_staging(staging: &Path, profiles: &[PathBuf]) -> Option<PathBuf> {
+    if !is_local_path(staging) {
+        return None;
+    }
+    let resolved = resolve(staging)?;
+    let tail: Vec<String> = resolved
+        .components()
+        .rev()
+        .take(STAGING_TAIL.len())
+        .map(|part| part.as_os_str().to_string_lossy().to_lowercase())
+        .collect();
+    if !tail.iter().rev().eq(STAGING_TAIL.iter()) {
+        return None;
+    }
+    profiles
+        .iter()
+        .flat_map(|profile| [Some(profile.clone()), resolve(profile)])
+        .flatten()
+        .any(|profile| is_local_path(&profile) && is_inside(&resolved, &profile))
+        .then_some(resolved)
+}
+
+/// True for an absolute path on a drive letter with plain folder names only.
+fn is_local_path(path: &Path) -> bool {
+    use std::path::Component;
+    let mut parts = path.components();
+    #[cfg(windows)]
+    {
+        let Some(Component::Prefix(prefix)) = parts.next() else {
+            return false;
+        };
+        if !matches!(prefix.kind(), std::path::Prefix::Disk(_)) {
+            return false;
+        }
+    }
+    parts.next() == Some(Component::RootDir)
+        && parts.all(|part| matches!(part, Component::Normal(_)))
+}
+
+/// `path` with every link resolved, as a drive path. `None` when it does not
+/// exist or resolves to anything but a local drive path.
+fn resolve(path: &Path) -> Option<PathBuf> {
+    let resolved = std::fs::canonicalize(path).ok()?;
+    #[cfg(windows)]
+    {
+        use std::path::{Component, Prefix};
+        let mut parts = resolved.components();
+        let Some(Component::Prefix(prefix)) = parts.next() else {
+            return None;
+        };
+        let Prefix::VerbatimDisk(letter) = prefix.kind() else {
+            return None;
+        };
+        let mut plain = PathBuf::from(format!("{}:\\", char::from(letter)));
+        if parts.next() != Some(Component::RootDir) {
+            return None;
+        }
+        plain.extend(parts);
+        is_local_path(&plain).then_some(plain)
+    }
+    #[cfg(not(windows))]
+    {
+        is_local_path(&resolved).then_some(resolved)
+    }
+}
+
+/// True when `path` lies below `folder`; names compare without letter case.
+fn is_inside(path: &Path, folder: &Path) -> bool {
+    let fold = |part: std::path::Component<'_>| part.as_os_str().to_string_lossy().to_lowercase();
+    let mut inner = path.components().map(fold);
+    let outer: Vec<String> = folder.components().map(fold).collect();
+    outer.iter().all(|part| inner.next().as_ref() == Some(part)) && inner.next().is_some()
+}
+
 /// The entry point of the elevated program. Returns the exit code: the code
 /// of the installer, [`REFUSED`] or [`NOT_PREPARED`].
 #[must_use]
@@ -73,6 +158,9 @@ pub fn install_main(staging: &Path, checks: &Checks<'_>) -> i32 {
     if detect(&program) != (InstallMode::Installed { machine: true }) {
         return NOT_PREPARED;
     }
+    let Some(staging) = accepted_staging(staging, &crate::system::profile_folders()) else {
+        return REFUSED;
+    };
     let Ok(parent) = crate::system::program_files() else {
         return NOT_PREPARED;
     };
@@ -81,7 +169,7 @@ pub fn install_main(staging: &Path, checks: &Checks<'_>) -> i32 {
         return NOT_PREPARED;
     };
     let code = install_from(
-        &Staging::new(staging.to_path_buf()),
+        &Staging::new(staging),
         &work,
         Some(&program),
         checks,
@@ -242,7 +330,7 @@ pub fn check_package(
 /// exactly `size` bytes.
 fn copy_at_most(source: &Path, destination: &Path, size: u64) -> Result<(), String> {
     use std::io::Read;
-    let input = std::fs::File::open(source).map_err(|error| error.to_string())?;
+    let input = crate::verify::open_without_link(source).map_err(|error| error.to_string())?;
     let mut output = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)

@@ -183,14 +183,19 @@ impl Staging {
 
     /// The staged record, if one exists and is structurally sound. Unlike
     /// [`Staging::read_record`] it changes nothing in the folder, for a reader
-    /// that must not write there.
+    /// that must not write there. A record that is a link is not read.
     #[must_use]
     pub fn peek_record(&self) -> Option<StagedRecord> {
-        let path = self.dir.join(RECORD_FILE);
-        if std::fs::metadata(&path).ok()?.len() > MAX_RECORD_BYTES {
+        use std::io::Read;
+        let file = crate::verify::open_without_link(&self.dir.join(RECORD_FILE)).ok()?;
+        let mut bytes = Vec::new();
+        file.take(MAX_RECORD_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .ok()?;
+        if u64::try_from(bytes.len()).ok()? > MAX_RECORD_BYTES {
             return None;
         }
-        let record: StagedRecord = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+        let record: StagedRecord = serde_json::from_slice(&bytes).ok()?;
         record.is_consistent().then_some(record)
     }
 
