@@ -1108,7 +1108,7 @@ dependencies = [
  "md-5",
  "percent-encoding",
  "proptest",
- "quick-xml 0.38.4",
+ "quick-xml 0.41.0",
  "rand 0.10.2",
  "rcgen",
  "russh",
@@ -1217,7 +1217,7 @@ dependencies = [
  "ca-text",
  "ca-ui",
  "egui",
- "quick-xml 0.38.4",
+ "quick-xml 0.41.0",
  "saphyr-parser",
  "serde_json",
  "tempfile",
@@ -4435,15 +4435,6 @@ checksum = "eff6510e86862b57b210fd8cbe8ed3f0d7d600b9c2863cd4549a2e033c66e956"
 dependencies = [
  "memchr",
  "serde",
-]
-
-[[package]]
-name = "quick-xml"
-version = "0.38.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b66c2058c55a409d601666cffe35f04333cf1013010882cec174a7467cd4e21c"
-dependencies = [
- "memchr",
 ]
 
 [[package]]
