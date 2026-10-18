@@ -321,6 +321,38 @@ pub fn hold_read_only(path: &Path) -> std::io::Result<std::fs::File> {
     options.open(path)
 }
 
+/// Open the regular file at `path` for reading without following a link at
+/// its last component. A symbolic link, a junction or any other reparse
+/// point there is refused, so the file read is the file the folder holds.
+///
+/// # Errors
+/// Returns why the file could not be opened, or that it is not a regular
+/// file.
+pub fn open_without_link(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    #[cfg(windows)]
+    let link = {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    };
+    #[cfg(not(windows))]
+    let link = std::fs::symlink_metadata(path)?.file_type().is_symlink();
+    if link || !metadata.is_file() {
+        return Err(std::io::Error::other("not a regular file"));
+    }
+    Ok(file)
+}
+
 /// Copy `source` to `destination`, replacing a file left there, and return
 /// the copy held open as [`hold_read_only`] holds it. The held copy must
 /// have the bytes read from `source`: it is closed for a moment between the

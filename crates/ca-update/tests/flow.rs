@@ -1874,6 +1874,134 @@ fn the_elevated_program_needs_its_own_argument_and_one_folder() {
     );
 }
 
+/// A junction at `link` to `target`. Junctions need no privilege.
+#[cfg(windows)]
+fn junction(link: &Path, target: &Path) {
+    let status = ca_io::host_command::host_command("cmd")
+        .arg("/d")
+        .arg("/c")
+        .arg("mklink")
+        .arg("/J")
+        .arg(link)
+        .arg(target)
+        .stdout(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+#[cfg(windows)]
+#[test]
+fn the_elevated_step_reads_only_a_local_staging_folder_inside_a_profile() {
+    use ca_update::install::accepted_staging;
+    let root = tempfile::tempdir().unwrap();
+    let root_path = std::fs::canonicalize(root.path()).unwrap();
+    let root_text = root_path.to_string_lossy();
+    let root_plain = Path::new(root_text.trim_start_matches(r"\\?\")).to_path_buf();
+    let profile = root_plain.join("profile");
+    let staging = profile.join(r"AppData\Local\compare-all\updates");
+    std::fs::create_dir_all(&staging).unwrap();
+    let elsewhere = root_plain.join(r"elsewhere\compare-all\updates");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let wrong_tail = profile.join(r"AppData\Local\other\updates");
+    std::fs::create_dir_all(&wrong_tail).unwrap();
+    let profiles = [profile.clone()];
+
+    assert_eq!(accepted_staging(&staging, &profiles), Some(staging.clone()));
+    let upper = std::path::PathBuf::from(staging.to_string_lossy().to_uppercase());
+    assert!(accepted_staging(&upper, &profiles).is_some());
+
+    let verbatim = std::path::PathBuf::from(format!(r"\\?\{}", staging.display()));
+    let device = std::path::PathBuf::from(format!(r"\\.\{}", staging.display()));
+    let drive = staging.to_string_lossy()[..1].to_owned();
+    let unc = std::path::PathBuf::from(format!(
+        r"\\localhost\{drive}${}",
+        &staging.to_string_lossy()[2..]
+    ));
+    let dotted = profile.join(r"AppData\Local\compare-all\..\compare-all\updates");
+    let refused = [
+        ("network", unc),
+        ("verbatim", verbatim),
+        ("device", device),
+        ("relative", std::path::PathBuf::from(r"compare-all\updates")),
+        ("dotted", dotted),
+        ("outside", elsewhere.clone()),
+        ("tail", wrong_tail),
+        ("missing", profile.join(r"x\compare-all\updates")),
+    ];
+    for (name, path) in refused {
+        assert_eq!(accepted_staging(&path, &profiles), None, "{name}");
+    }
+    assert_eq!(accepted_staging(&staging, &[]), None);
+
+    // A link inside the profile that leads out of it.
+    let linked = profile.join(r"AppData\Roaming\compare-all");
+    std::fs::create_dir_all(linked.parent().unwrap()).unwrap();
+    junction(&linked, elsewhere.parent().unwrap());
+    assert!(linked.join("updates").is_dir());
+    assert_eq!(accepted_staging(&linked.join("updates"), &profiles), None);
+}
+
+#[test]
+fn profile_folders_expand_only_the_system_folders() {
+    use ca_update::system::expand_system_folders;
+    let root = Path::new(r"C:\Windows");
+    assert_eq!(
+        expand_system_folders(r"%SystemDrive%\Users\a", Some(root)),
+        Some(std::path::PathBuf::from(r"C:\Users\a"))
+    );
+    assert_eq!(
+        expand_system_folders(r"%systemroot%\System32\config\systemprofile", Some(root)),
+        Some(std::path::PathBuf::from(
+            r"C:\Windows\System32\config\systemprofile"
+        ))
+    );
+    assert_eq!(expand_system_folders(r"%USERPROFILE%\x", Some(root)), None);
+    assert_eq!(expand_system_folders(r"%SystemDrive%\x", None), None);
+}
+
+/// Replace the staged installer, or with `record` the staged record, by a
+/// symbolic link to a copy of it. `false` when this account may not create
+/// symbolic links.
+#[cfg(windows)]
+fn link_staged(staging: &Staging, record: bool) -> bool {
+    let name = if record {
+        "staged.json".to_owned()
+    } else {
+        staging.read_record().unwrap().asset
+    };
+    let path = staging.dir().join(&name);
+    let real = staging.dir().join(format!("real-{name}"));
+    std::fs::rename(&path, &real).unwrap();
+    if std::os::windows::fs::symlink_file(&real, &path).is_err() {
+        std::fs::rename(&real, &path).unwrap();
+        return false;
+    }
+    true
+}
+
+#[cfg(windows)]
+#[test]
+fn the_elevated_step_reads_no_staged_file_through_a_link() {
+    use ca_update::install::{install_from, Checks, REFUSED};
+    for record in [false, true] {
+        let (_server, _keep, staging, work, install) = elevated_setup();
+        if !link_staged(&staging, record) {
+            eprintln!("symbolic links need a privilege this account lacks");
+            return;
+        }
+        let program = install.path().join("compare-all.exe");
+        let signer = FakeSigner::signed_by(SIGNER);
+        let checks = Checks {
+            signer: &signer,
+            signer_name: SIGNER,
+            running: &running(),
+        };
+        let code = install_from(&staging, work.path(), Some(&program), &checks, &|_| Some(0));
+        assert_eq!(code, REFUSED, "record: {record}");
+    }
+}
+
 /// The helper copy is held from its write until the helper runs from it.
 #[cfg(windows)]
 #[test]
