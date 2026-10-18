@@ -21,8 +21,11 @@
 //! The programs the workspace starts itself go through [`host_command`]: the
 //! time zone read (`date`), the Subversion client (`svn`), `bsdtar` for RAR
 //! archives, and the Open With, system open and file manager commands. The
-//! helper of the native file dialog (`zenity`, without a desktop portal) is
-//! started by the dialog library and does not pass through this module.
+//! helper of the native file dialog (`zenity`, started only when no desktop
+//! portal answers) is started by the dialog library, which offers no hook for
+//! its command, and does not pass through this module: it inherits the
+//! image's variables. Starting it here would replace the portal dialog inside
+//! an image, because the library cannot be told to skip only its own helper.
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
