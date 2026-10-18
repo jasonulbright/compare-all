@@ -18,6 +18,7 @@ pub mod settings;
 use ca_session::SessionKind;
 use ca_text::{LineRange, TextBuffer};
 use ca_ui::command::{Command, MenuView};
+use ca_ui::dialog::{self, DialogMessage, Pick};
 use ca_ui::editor::{Caret, Motion};
 use ca_ui::filter::Visible;
 use ca_ui::find::{self, FindOperation, FindPanel, FindSettings, FindTask, PanelRequest};
@@ -70,6 +71,8 @@ const NO_CONFLICTS: &str = "There are no conflicts to move to";
 const NO_OUTPUT: &str = "This session names no output file";
 /// Why a save command must wait for the current write.
 const WRITING: &str = "Available once the current write finishes";
+/// Why a file panel cannot open while another one is open.
+const PICKING: &str = "A file panel is already open";
 /// What the view says when an edit of the output is asked for while the
 /// editing switch of the session is on.
 const EDITING_OFF: &str = "Editing is turned off for this session";
@@ -104,6 +107,10 @@ const CHANGES_OUTPUT: &[Command] = &[
     Command::Undo,
     Command::Redo,
     Command::SaveFile,
+    Command::SaveFileAs,
+    Command::IncreaseIndent,
+    Command::DecreaseIndent,
+    Command::ToggleOverwrite,
 ];
 /// Width of the display filter control on the toolbar.
 const FILTER_COMBO_WIDTH: f32 = 150.0;
@@ -178,6 +185,12 @@ const HANDLED: &[Command] = &[
     Command::SaveFile,
     Command::SwapSides,
     Command::Reload,
+    Command::Recompare,
+    Command::OpenFile,
+    Command::SaveFileAs,
+    Command::IncreaseIndent,
+    Command::DecreaseIndent,
+    Command::ToggleOverwrite,
     Command::ToggleLineNumbers,
     Command::IncreaseFontSize,
     Command::DecreaseFontSize,
@@ -369,6 +382,12 @@ pub struct MergeView {
     /// The running merge reads the inputs the other way round from the model
     /// it replaces, so its decisions carry over mirrored.
     swapped: bool,
+    /// The file panel that is open, if any.
+    picker: Option<Job<DialogMessage>>,
+    /// The input pane an open panel reads its file into.
+    picker_target: Pane,
+    /// The open panel names the output file rather than an input.
+    picker_saves: bool,
 }
 
 /// A row count as a coordinate. A pane never holds enough rows for the loss to
@@ -585,6 +604,9 @@ impl MergeView {
             pending_clipboard: None,
             paste_requested: false,
             swapped: false,
+            picker: None,
+            picker_target: Pane::Left,
+            picker_saves: false,
         };
         view.start_merge();
         view
@@ -872,6 +894,95 @@ impl MergeView {
                 info
             })
             .collect()
+    }
+
+    /// The input pane Open File reads into: the focused input, or the left
+    /// one while the output or a pane the merge lacks has the focus.
+    fn open_target(&self) -> Pane {
+        match self.focus {
+            Pane::Right => Pane::Right,
+            Pane::Center if !self.paths.is_two_way() => Pane::Center,
+            _ => Pane::Left,
+        }
+    }
+
+    fn open_picker(&mut self) {
+        if self.picker.is_some() || self.save_job.is_some() {
+            return;
+        }
+        self.picker_target = self.open_target();
+        self.picker_saves = false;
+        self.picker = Some(dialog::spawn(Pick::File, Arc::clone(&self.notify)));
+    }
+
+    fn open_save_picker(&mut self) {
+        if self.picker.is_some() || self.save_job.is_some() {
+            return;
+        }
+        self.picker_saves = true;
+        self.picker = Some(dialog::spawn(Pick::SaveFile, Arc::clone(&self.notify)));
+    }
+
+    fn poll_picker(&mut self) {
+        let Some(job) = self.picker.as_mut() else {
+            return;
+        };
+        let messages = job.drain();
+        let finished = job.is_finished();
+        let mut chosen = None;
+        for message in messages {
+            match message {
+                DialogMessage::Chosen(path) => chosen = Some(path),
+                DialogMessage::Dismissed => {}
+                DialogMessage::Failed(reason) => self.message = Some(reason),
+            }
+        }
+        if finished {
+            self.picker = None;
+        }
+        if let Some(path) = chosen {
+            if self.picker_saves {
+                self.save_output_as(path);
+            } else {
+                self.open_into(self.picker_target, path);
+            }
+        }
+    }
+
+    /// Read `path` into the input `pane` and merge again. The output pane
+    /// takes no file this way.
+    pub fn open_into(&mut self, pane: Pane, path: PathBuf) {
+        match pane {
+            Pane::Left => {
+                self.paths.left = path;
+                self.titles.left = None;
+            }
+            Pane::Center => {
+                self.paths.center = Some(path);
+                self.titles.center = None;
+            }
+            Pane::Right => {
+                self.paths.right = path;
+                self.titles.right = None;
+            }
+            Pane::Output => return,
+        }
+        self.start_merge();
+    }
+
+    /// Name `path` as the output file and write the output to it.
+    ///
+    /// The earlier output file's recorded state is dropped, because the new
+    /// name was never read.
+    pub fn save_output_as(&mut self, path: PathBuf) {
+        if self.save_job.is_some() {
+            self.message = Some("A save is still running. Try Save As again.".to_owned());
+            return;
+        }
+        self.paths.output = Some(path);
+        self.titles.output = None;
+        self.output_baseline = Baseline::Unchecked;
+        self.save_output();
     }
 
     fn start_merge(&mut self) {
@@ -2571,6 +2682,7 @@ impl SessionView for MergeView {
     fn tick(&mut self) {
         self.drain_jobs();
         self.poll_find();
+        self.poll_picker();
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, context: &ViewContext) -> Vec<ViewAction> {
@@ -2645,11 +2757,20 @@ impl SessionView for MergeView {
                 | Command::NextConflict
                 | Command::PreviousConflict
                 | Command::SaveFile
+                | Command::SaveFileAs
+                | Command::OpenFile
+                | Command::IncreaseIndent
+                | Command::DecreaseIndent
+                | Command::ToggleOverwrite
                 | Command::Reload
+                | Command::Recompare
                 | Command::ToggleCenterPane
         );
         if !needs_merge || SessionView::accepts(self, command) {
             return None;
+        }
+        if self.picker.is_some() && matches!(command, Command::OpenFile | Command::SaveFileAs) {
+            return Some(PICKING);
         }
         if self.editing_off() && CHANGES_OUTPUT.contains(&command) {
             return Some(EDITING_OFF);
@@ -2673,7 +2794,13 @@ impl SessionView for MergeView {
             Status::Ready if command == Command::SaveFile && self.paths.output.is_none() => {
                 NO_OUTPUT
             }
-            Status::Ready if command == Command::SaveFile && self.save_job.is_some() => WRITING,
+            _ if matches!(
+                command,
+                Command::SaveFile | Command::SaveFileAs | Command::OpenFile
+            ) && self.save_job.is_some() =>
+            {
+                WRITING
+            }
             Status::Running(_) | Status::Ready => NOT_MERGED,
         })
     }
@@ -2721,7 +2848,10 @@ impl SessionView for MergeView {
             | Command::ShowMergeable
             | Command::ShowSame
             | Command::ShowNone
-            | Command::ShowContext => ready,
+            | Command::ShowContext
+            | Command::IncreaseIndent
+            | Command::DecreaseIndent
+            | Command::ToggleOverwrite => ready,
             Command::ToggleConflict => ready && self.conflict_applies(),
             Command::FindNext | Command::FindPrevious => {
                 ready && !self.find.settings.pattern.is_empty()
@@ -2736,8 +2866,10 @@ impl SessionView for MergeView {
             Command::Undo => self.output_pane.buffer().can_undo(),
             Command::Redo => self.output_pane.buffer().can_redo(),
             Command::SaveFile => ready && self.paths.output.is_some() && self.save_job.is_none(),
-            Command::Reload => !self.status.is_running(),
+            Command::Reload | Command::Recompare => !self.status.is_running(),
             Command::SwapSides => ready && self.save_job.is_none(),
+            Command::OpenFile => self.picker.is_none() && self.save_job.is_none(),
+            Command::SaveFileAs => ready && self.save_job.is_none() && self.picker.is_none(),
 
             Command::Thumbnail
             | Command::ToggleLineNumbers
@@ -2812,7 +2944,18 @@ impl SessionView for MergeView {
             Command::Undo => self.replay_output_history(false),
             Command::Redo => self.replay_output_history(true),
             Command::SaveFile => self.save_output(),
-            Command::Reload => self.start_merge(),
+            Command::Reload | Command::Recompare => self.start_merge(),
+            Command::OpenFile => self.open_picker(),
+            Command::SaveFileAs => self.open_save_picker(),
+            Command::IncreaseIndent => {
+                self.output_pane.increase_indent();
+                self.absorb_output_edits();
+            }
+            Command::DecreaseIndent => {
+                self.output_pane.decrease_indent();
+                self.absorb_output_edits();
+            }
+            Command::ToggleOverwrite => self.output_pane.toggle_overwrite(),
             Command::SwapSides => self.swap_sides(),
             Command::Cancel => {
                 self.find_task.cancel();
@@ -2894,6 +3037,9 @@ impl SessionView for MergeView {
     }
 
     fn on_close(&mut self) {
+        if let Some(job) = self.picker.take() {
+            job.cancel();
+        }
         if let Some(job) = self.job.take() {
             job.cancel();
         }
@@ -3044,9 +3190,10 @@ mod tests {
     mod take_order_probes;
     mod two_way_lent_probes;
 
-    use super::{Job, MergeSaveMessage, MergeView, Question, GIVEN_BACK};
-    use crate::model::Resolution;
+    use super::{Job, MergeSaveMessage, MergeView, Question, EDITING_OFF, GIVEN_BACK};
+    use crate::model::{Pane, Resolution};
     use ca_ui::command::Command;
+    use ca_ui::editor::Caret;
     use ca_ui::testing::{context, raw_input};
     use ca_ui::toolbar;
     use ca_ui::view::SessionView;
@@ -5007,7 +5154,16 @@ mod tests {
             .iter()
             .any(|state| state.command == Command::TakeLeft && state.enabled));
         for state in commands {
-            if state.enabled && !matches!(state.command, Command::Reload | Command::SwapSides) {
+            if state.enabled
+                && !matches!(
+                    state.command,
+                    Command::Reload
+                        | Command::Recompare
+                        | Command::SwapSides
+                        | Command::OpenFile
+                        | Command::SaveFileAs
+                )
+            {
                 view.run(state.command);
                 if view.question().is_some() {
                     view.answer(false);
@@ -6439,5 +6595,134 @@ mod tests {
         println!("{tally:?}");
         assert_eq!(tally.cases, SEEDS.len() * CASES);
         assert!(tally.marker_saves > 0 && tally.saves > tally.marker_saves);
+    }
+
+    #[test]
+    fn recompare_reads_the_files_again_in_the_background() {
+        let (mut view, dir) = open("a\nb\nc\n", Some("a\nb\nc\n"), "a\nb\nc\n");
+        run_until_ready(&mut view);
+        assert!(view.accepts(Command::Recompare));
+        std::fs::write(dir.path().join("right.txt"), "a\nb\nchanged\n").unwrap();
+        view.run(Command::Recompare);
+        assert!(!view.is_ready(), "the run read the disk on the caller");
+        assert!(!view.accepts(Command::Recompare));
+        assert_eq!(
+            view.refusal(Command::Recompare),
+            Some("Available once the merge finishes")
+        );
+        run_until_ready(&mut view);
+        assert_eq!(view.output_text(), "a\nb\nchanged\n");
+    }
+
+    #[test]
+    fn increase_and_decrease_indent_change_the_output_in_one_undo_step() {
+        let (mut view, _dir) = open("a\nb\nc\n", Some("a\nb\nc\n"), "a\nb\nc\n");
+        run_until_ready(&mut view);
+        let original = view.output_text();
+        view.output_pane.select_all();
+        assert!(view.accepts(Command::IncreaseIndent));
+        view.run(Command::IncreaseIndent);
+        let indented = view.output_text();
+        assert_ne!(indented, original);
+        assert!(indented
+            .lines()
+            .all(|line| line.starts_with(char::is_whitespace)));
+        assert_output_lines_match_pane(&view);
+        view.run(Command::DecreaseIndent);
+        assert_eq!(view.output_text(), original);
+        view.run(Command::Undo);
+        assert_eq!(view.output_text(), indented);
+        view.run(Command::Undo);
+        assert_eq!(view.output_text(), original);
+        assert_output_lines_match_pane(&view);
+        view.run(Command::Redo);
+        assert_eq!(view.output_text(), indented);
+    }
+
+    #[test]
+    fn the_indent_overwrite_and_save_as_commands_are_refused_with_a_reason() {
+        let (mut view, _dir) = open("a\nb\n", Some("a\nb\n"), "a\nb\n");
+        for command in [
+            Command::IncreaseIndent,
+            Command::DecreaseIndent,
+            Command::ToggleOverwrite,
+            Command::SaveFileAs,
+        ] {
+            assert!(!view.accepts(command), "{command:?} before the merge");
+            assert_eq!(
+                view.refusal(command),
+                Some("Available once the merge finishes")
+            );
+        }
+        run_until_ready(&mut view);
+        view.session_settings.specs.disable_editing = true;
+        for command in [
+            Command::IncreaseIndent,
+            Command::DecreaseIndent,
+            Command::ToggleOverwrite,
+            Command::SaveFileAs,
+        ] {
+            assert!(!view.accepts(command), "{command:?} with editing off");
+            assert_eq!(view.refusal(command), Some(EDITING_OFF));
+        }
+    }
+
+    #[test]
+    fn toggle_overwrite_switches_the_output_editor_mode() {
+        let (mut view, _dir) = open("a\nb\n", Some("a\nb\n"), "a\nb\n");
+        run_until_ready(&mut view);
+        assert!(view.accepts(Command::ToggleOverwrite));
+        assert!(!view.output_pane.is_overwrite());
+        view.run(Command::ToggleOverwrite);
+        assert!(view.output_pane.is_overwrite());
+        view.output_pane.place(Caret::new(0, 0), false);
+        view.output_pane.type_character('X');
+        view.absorb_output_edits();
+        assert_eq!(view.output_text(), "X\nb\n");
+        view.run(Command::ToggleOverwrite);
+        assert!(!view.output_pane.is_overwrite());
+    }
+
+    #[test]
+    fn open_file_reads_into_the_focused_input_and_merges_again() {
+        let (mut view, dir) = open("a\nb\n", Some("a\nb\n"), "a\nb\n");
+        run_until_ready(&mut view);
+        assert!(view.accepts(Command::OpenFile));
+        assert_eq!(view.open_target(), Pane::Left);
+        view.focus = Pane::Right;
+        assert_eq!(view.open_target(), Pane::Right);
+        view.focus = Pane::Center;
+        assert_eq!(view.open_target(), Pane::Center);
+        let other = dir.path().join("other.txt");
+        std::fs::write(&other, "a\nb\nnew\n").unwrap();
+        view.open_into(Pane::Right, other.clone());
+        assert!(!view.is_ready());
+        run_until_ready(&mut view);
+        assert_eq!(view.paths().right, other);
+        assert_eq!(view.output_text(), "a\nb\nnew\n");
+        view.open_into(Pane::Output, other);
+        assert!(view.is_ready(), "the output pane took a file");
+    }
+
+    #[test]
+    fn open_file_in_a_two_way_merge_targets_the_left_input() {
+        let (mut view, _dir) = open("a\n", None, "a\n");
+        run_until_ready(&mut view);
+        view.focus = Pane::Center;
+        assert_eq!(view.open_target(), Pane::Left);
+    }
+
+    #[test]
+    fn save_file_as_names_the_output_and_writes_it() {
+        let (mut view, dir) = open("a\nb\nc\n", Some("a\nb\nc\n"), "a\nb\nX\n");
+        run_until_ready(&mut view);
+        assert!(view.accepts(Command::SaveFileAs));
+        let renamed = dir.path().join("renamed.txt");
+        view.save_output_as(renamed.clone());
+        wait_for_save(&mut view);
+        assert_eq!(view.paths().output.as_deref(), Some(renamed.as_path()));
+        assert_eq!(std::fs::read_to_string(&renamed).unwrap(), "a\nb\nX\n");
+        assert!(!dir.path().join("out.txt").exists());
+        assert!(!view.is_modified());
     }
 }

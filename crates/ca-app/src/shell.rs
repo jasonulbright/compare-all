@@ -329,6 +329,10 @@ const TABLE_VIEW: &[Entry] = &[
         Command::ToggleLineDetails,
         "The active view has no details area",
     ),
+    Entry::Rule,
+    Entry::Run(Command::IncreaseFontSize, "The active view has no editor"),
+    Entry::Run(Command::DecreaseFontSize, "The active view has no editor"),
+    Entry::Run(Command::ResetFontSize, "The active view has no editor"),
 ];
 
 /// The Table Compare Edit menu, with commands that act on the current cell.
@@ -336,6 +340,8 @@ const TABLE_EDIT: &[Entry] = &[
     Entry::Run(Command::Undo, "Nothing to reverse"),
     Entry::Run(Command::Redo, "Nothing to reverse"),
     Entry::Rule,
+    Entry::Run(Command::CopyToRight, EDITABLE),
+    Entry::Run(Command::CopyToLeft, EDITABLE),
     Entry::Run(Command::CopyCellToRight, EDITABLE),
     Entry::Run(Command::CopyCellToLeft, EDITABLE),
     Entry::Run(Command::CopyCellToOtherSide, EDITABLE),
@@ -519,6 +525,10 @@ const MERGE_EDIT: &[Entry] = &[
     Entry::Run(Command::SelectAll, EDITABLE),
     Entry::Run(Command::SelectAllFiles, SELECTABLE),
     Entry::Run(Command::SelectSection, EDITABLE),
+    Entry::Rule,
+    Entry::Run(Command::IncreaseIndent, EDITABLE),
+    Entry::Run(Command::DecreaseIndent, EDITABLE),
+    Entry::Run(Command::ToggleOverwrite, EDITABLE),
 ];
 
 /// The View menu of the merge bar, with the filters a merge selects on.

@@ -17,6 +17,9 @@ use ca_ui::save::{Baseline, CloseChoice, Reread, SaveMessage, SaveOutcome};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+/// Byte ranges of one side's text with the text that replaces each.
+type Splices = Vec<(std::ops::Range<usize>, String)>;
+
 /// A question the view is waiting on an answer to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Prompt {
@@ -252,6 +255,133 @@ impl TableView {
         if let Err(reason) = result {
             self.message = Some(reason);
         }
+    }
+
+    /// The comparison rows a row copy acts on: the selected rows, or the run
+    /// of differing rows the cursor sits in.
+    pub(crate) fn rows_to_copy(&self) -> Vec<usize> {
+        if !self.selected_rows.is_empty() {
+            return self.selected_rows.clone();
+        }
+        let cursor = self.grid.cursor().row;
+        if !self.grid.row_differs(cursor) {
+            return Vec::new();
+        }
+        let mut first = cursor;
+        while first > 0 && self.grid.row_differs(first - 1) {
+            first -= 1;
+        }
+        let mut last = cursor;
+        while last + 1 < self.grid.visual_rows() && self.grid.row_differs(last + 1) {
+            last += 1;
+        }
+        (first..=last)
+            .filter_map(|visual| self.grid.source_row(visual))
+            .collect()
+    }
+
+    /// True when a row copy toward `target` has rows to act on and may write.
+    pub(crate) fn can_copy_rows(&self, target: Side) -> bool {
+        self.cell_editor.is_none()
+            && self.has_comparison()
+            && self.in_step(Side::Left)
+            && self.in_step(Side::Right)
+            && self.write_block(target).is_none()
+            && (!self.selected_rows.is_empty() || self.grid.row_differs(self.grid.cursor().row))
+    }
+
+    /// Copy every cell of the selected rows, or of the current difference
+    /// section, from the other side onto `target` as one undo step.
+    pub(crate) fn copy_rows_to(&mut self, target: Side) {
+        if !self.can_copy_rows(target) {
+            self.message = Some("The rows cannot be copied to that side.".to_owned());
+            return;
+        }
+        let source = match target {
+            Side::Left => Side::Right,
+            Side::Right => Side::Left,
+        };
+        let rows = self.rows_to_copy();
+        let (changes, skipped) = match self.row_changes(source, target, &rows) {
+            Ok(found) => found,
+            Err(reason) => {
+                self.message = Some(reason);
+                return;
+            }
+        };
+        let cell_count = changes.len();
+        if cell_count > 0 {
+            self.side_text_mut(target).replace(changes);
+            self.start_reparse();
+        }
+        self.message = Some(match (cell_count, skipped) {
+            (0, 0) => "The rows already match.".to_owned(),
+            (0, _) => "The rows have no counterpart on the other side.".to_owned(),
+            (_, 0) => format!("Copied {cell_count} cells."),
+            (_, _) => format!("Copied {cell_count} cells. {skipped} rows have no counterpart."),
+        });
+    }
+
+    /// The replacements that make the `target` cells of `rows` equal the
+    /// `source` cells, and the count of rows that exist on one side only.
+    fn row_changes(
+        &self,
+        source: Side,
+        target: Side,
+        rows: &[usize],
+    ) -> Result<(Splices, usize), String> {
+        let (schema, comparison) = self
+            .mapping
+            .as_ref()
+            .ok_or_else(|| "No comparison is loaded.".to_owned())?;
+        let source_data = self
+            .side_data(source)
+            .ok_or_else(|| "No comparison is loaded.".to_owned())?;
+        let target_data = self
+            .side_data(target)
+            .ok_or_else(|| "No comparison is loaded.".to_owned())?;
+        let mut changes = Vec::new();
+        let mut skipped = 0usize;
+        for row in rows {
+            let Some(entry) = comparison.rows.get(*row) else {
+                continue;
+            };
+            let (source_row, target_row) = match source {
+                Side::Left => (entry.pair.left, entry.pair.right),
+                Side::Right => (entry.pair.right, entry.pair.left),
+            };
+            let (Some(source_row), Some(target_row)) = (source_row, target_row) else {
+                skipped += 1;
+                continue;
+            };
+            for column in &schema.columns {
+                let (source_column, target_column) = match source {
+                    Side::Left => (column.left, column.right),
+                    Side::Right => (column.right, column.left),
+                };
+                let (Some(source_column), Some(target_column)) = (source_column, target_column)
+                else {
+                    continue;
+                };
+                let value = source_data
+                    .table
+                    .cell_text(source_row as usize, source_column as usize)
+                    .into_owned();
+                let write = cell_write(
+                    &target_data.table,
+                    &target_data.facts.options,
+                    target_row as usize,
+                    target_column as usize,
+                    &value,
+                )
+                .map_err(|error| format!("The rows cannot be copied: {error}."))?;
+                if target_data.table.source().get(write.range.clone()) != Some(write.text.as_str())
+                {
+                    changes.push((write.range, write.text));
+                }
+            }
+        }
+        Ok((changes, skipped))
     }
 
     /// Put `value` into the current cell of the active side.

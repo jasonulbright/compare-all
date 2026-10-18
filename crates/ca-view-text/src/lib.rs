@@ -127,6 +127,7 @@ const fn command_is_disabled_while_locked(command: Command) -> bool {
         command,
         Command::SwapSides
             | Command::Reload
+            | Command::Recompare
             | Command::SaveFile
             | Command::SaveFileAs
             | Command::SaveBoth
@@ -163,6 +164,7 @@ const HANDLED: &[Command] = &[
     Command::CopyToOtherSide,
     Command::SwapSides,
     Command::Reload,
+    Command::Recompare,
     Command::OpenFile,
     Command::Find,
     Command::FindNext,
@@ -4910,7 +4912,8 @@ impl SessionView for TextView {
             | Command::ToggleLineDetails
             | Command::ToggleLineNumbers
             | Command::ToggleIgnoreUnimportant
-            | Command::Reload => true,
+            | Command::Reload
+            | Command::Recompare => true,
             Command::OpenFile => self.picker.is_none(),
             Command::CopyToOtherSide => {
                 self.rows_current() && !self.pane(self.active.other()).is_read_only()
@@ -5019,7 +5022,7 @@ impl SessionView for TextView {
                 self.font.run(command);
                 self.strip_stale = true;
             }
-            Command::Reload => self.request_reread(Reread::Reload),
+            Command::Reload | Command::Recompare => self.request_reread(Reread::Reload),
             Command::OpenFile => {
                 if self.formatted_compare.is_some() {
                     self.toggle_prettified_compare();
@@ -6443,6 +6446,56 @@ mod tests {
             "the edit's comparison is still due"
         );
         assert!(!view.rediff.is_running());
+    }
+
+    #[test]
+    fn recompare_reads_both_files_again_and_asks_before_dropping_edits() {
+        use super::Side;
+        use ca_ui::command::Command;
+        use ca_ui::save::CloseChoice;
+        use ca_ui::view::SessionView;
+        use std::time::{Duration, Instant};
+
+        let settle = |view: &mut super::TextView| {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while !view.is_settled() && Instant::now() < deadline {
+                view.tick();
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert!(view.is_settled());
+        };
+        let (mut view, _dir) = settled_view("alpha\n");
+        assert!(view.accepts(Command::Recompare));
+        std::fs::write(&view.right_path, "beta\n").unwrap();
+        view.run(Command::Recompare);
+        assert!(!view.is_settled(), "the files were read on the caller");
+        settle(&mut view);
+        assert_eq!(view.pane(Side::Right).buffer().text(), "beta\n");
+
+        view.pane_mut(Side::Left).buffer_mut().insert(0, "x");
+        view.note_edit();
+        std::fs::write(&view.right_path, "gamma\n").unwrap();
+        view.run(Command::Recompare);
+        assert!(
+            view.prompt.is_some(),
+            "edits were dropped without a question"
+        );
+        assert_eq!(view.pane(Side::Right).buffer().text(), "beta\n");
+        view.answer_unsaved(CloseChoice::Discard);
+        settle(&mut view);
+        assert_eq!(view.pane(Side::Right).buffer().text(), "gamma\n");
+        assert_eq!(view.pane(Side::Left).buffer().text(), "alpha\n");
+    }
+
+    #[test]
+    fn recompare_is_refused_with_a_reason_while_the_session_is_locked() {
+        use ca_ui::command::Command;
+        use ca_ui::view::SessionView;
+
+        let (mut view, _dir) = settled_view("alpha\n");
+        view.locked = true;
+        assert!(!view.accepts(Command::Recompare));
+        assert_eq!(view.refusal(Command::Recompare), Some(super::LOCKED));
     }
 
     #[test]

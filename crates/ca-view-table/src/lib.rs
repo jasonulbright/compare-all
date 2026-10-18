@@ -76,6 +76,8 @@ const NOT_COMPARED: &str = "Available once the comparison finishes";
 const CELL_EDITOR_OPEN: &str = "Close the cell editor before copying a cell";
 /// Why no table cell can be copied.
 const NO_CELL: &str = "Select a cell in both files to copy it";
+/// Why a row copy has nothing to copy.
+const NO_ROWS: &str = "Move to a difference or select rows to copy them";
 /// Why a parsed table cell has no safe writer.
 const CELL_NOT_WRITABLE: &str = "This cell cannot be written to the target file";
 /// Why a failed comparison cannot supply a cell.
@@ -114,9 +116,14 @@ const HANDLED: &[Command] = &[
     Command::Redo,
     Command::Cut,
     Command::Copy,
+    Command::CopyToRight,
+    Command::CopyToLeft,
     Command::CopyCellToRight,
     Command::CopyCellToLeft,
     Command::CopyCellToOtherSide,
+    Command::IncreaseFontSize,
+    Command::DecreaseFontSize,
+    Command::ResetFontSize,
     Command::SelectAll,
     Command::Paste,
     Command::Delete,
@@ -813,6 +820,19 @@ impl TableView {
     fn clear_selection(&mut self) {
         self.selected_rows.clear();
         self.selection_side = None;
+    }
+
+    /// Run a row copy or a font size command, reporting whether it was one.
+    fn run_row_copy_or_font(&mut self, command: Command) -> bool {
+        match command {
+            Command::CopyToRight => self.copy_rows_to(Side::Right),
+            Command::CopyToLeft => self.copy_rows_to(Side::Left),
+            Command::IncreaseFontSize | Command::DecreaseFontSize | Command::ResetFontSize => {
+                self.font.run(command);
+            }
+            _ => return false,
+        }
+        true
     }
 
     fn select_all_visible_rows(&mut self) {
@@ -2296,6 +2316,25 @@ impl SessionView for TableView {
 
     fn refusal(&self, command: Command) -> Option<&'static str> {
         let (source, target) = match command {
+            Command::CopyToRight | Command::CopyToLeft => {
+                if self.accepts(command) {
+                    return None;
+                }
+                let target = if command == Command::CopyToRight {
+                    Side::Right
+                } else {
+                    Side::Left
+                };
+                return Some(match self.status {
+                    Status::Running(_) => NOT_COMPARED,
+                    Status::Failed(_) if self.accepts(Command::Recompare) => FAILED,
+                    Status::Failed(_) => FAILED_RELOAD,
+                    Status::Cancelled if self.accepts(Command::Recompare) => STOPPED,
+                    Status::Cancelled => STOPPED_RELOAD,
+                    Status::Ready if self.cell_editor.is_some() => CELL_EDITOR_OPEN,
+                    Status::Ready => self.write_block(target).unwrap_or(NO_ROWS),
+                });
+            }
             Command::CopyCellToRight => (Side::Left, Side::Right),
             Command::CopyCellToLeft => (Side::Right, Side::Left),
             Command::CopyCellToOtherSide => (self.active, self.active.other()),
@@ -2371,6 +2410,9 @@ impl SessionView for TableView {
                     && self.grid.visual_rows() > 0
                     && !self.grid.shown_columns().is_empty()
             }
+            Command::IncreaseFontSize | Command::DecreaseFontSize | Command::ResetFontSize => true,
+            Command::CopyToRight => self.can_copy_rows(Side::Right),
+            Command::CopyToLeft => self.can_copy_rows(Side::Left),
             Command::CopyCellToRight => self.can_copy_cell(Side::Left, Side::Right),
             Command::CopyCellToLeft => self.can_copy_cell(Side::Right, Side::Left),
             Command::CopyCellToOtherSide => self.can_copy_cell(self.active, self.active.other()),
@@ -2435,6 +2477,9 @@ impl SessionView for TableView {
     fn run(&mut self, command: Command) {
         if let Some((source, target)) = copy_cell_sides(command, self.active) {
             self.copy_cell_from_to(source, target);
+            return;
+        }
+        if self.run_row_copy_or_font(command) {
             return;
         }
         match command {
@@ -3215,6 +3260,120 @@ mod tests {
         assert!(!view.accepts(Command::CopyCellToOtherSide));
         assert!(!view.accepts(Command::CopyCellToRight));
         assert_eq!(view.refusal(Command::CopyCellToRight), Some(super::NO_CELL));
+    }
+
+    #[test]
+    fn copy_to_right_and_left_copy_the_current_section_as_one_undo_step() {
+        let (_dir, left, right) = files(
+            "id,name,city\n1,Ann,X\n2,Bob,Y\n3,Cy,Z\n",
+            "id,name,city\n1,Ann,X\n2,Rob,Q\n3,Cy,Z\n",
+        );
+        let ctx = egui::Context::default();
+        let mut view = TableView::new(left, right, &context(), 41);
+        assert!(settle(&mut view, &ctx));
+        view.set_active_side(Side::Left);
+
+        view.grid.set_cursor(Cursor { row: 0, column: 0 });
+        assert!(!view.accepts(Command::CopyToRight));
+        assert!(!view.accepts(Command::CopyToLeft));
+        assert_eq!(view.refusal(Command::CopyToRight), Some(super::NO_ROWS));
+
+        view.grid.set_cursor(Cursor { row: 1, column: 0 });
+        assert!(view.accepts(Command::CopyToRight));
+        view.run(Command::CopyToRight);
+        assert!(settle(&mut view, &ctx));
+        assert_eq!(view.grid.cell_text(1, 1, Side::Right), "Bob");
+        assert_eq!(view.grid.cell_text(1, 2, Side::Right), "Y");
+        assert!(view.is_modified(Side::Right));
+        assert!(!view.is_modified(Side::Left));
+
+        view.set_active_side(Side::Right);
+        view.run(Command::Undo);
+        assert!(settle(&mut view, &ctx));
+        assert_eq!(view.grid.cell_text(1, 1, Side::Right), "Rob");
+        assert_eq!(view.grid.cell_text(1, 2, Side::Right), "Q");
+        assert!(!view.accepts(Command::Undo));
+
+        assert!(view.accepts(Command::CopyToLeft));
+        view.run(Command::CopyToLeft);
+        assert!(settle(&mut view, &ctx));
+        assert_eq!(view.grid.cell_text(1, 1, Side::Left), "Rob");
+        assert_eq!(view.grid.cell_text(1, 2, Side::Left), "Q");
+        view.set_active_side(Side::Left);
+        view.run(Command::Undo);
+        assert!(settle(&mut view, &ctx));
+        assert_eq!(view.grid.cell_text(1, 1, Side::Left), "Bob");
+    }
+
+    #[test]
+    fn copy_to_right_copies_the_selected_rows_as_one_undo_step() {
+        let (_dir, left, right) = files(
+            "id,name\n1,Ann\n2,Bob\n3,Cy\n",
+            "id,name\n1,Xnn\n2,Bob\n3,Zy\n",
+        );
+        let ctx = egui::Context::default();
+        let mut view = TableView::new(left, right, &context(), 42);
+        assert!(settle(&mut view, &ctx));
+        view.set_active_side(Side::Left);
+        view.grid.set_cursor(Cursor { row: 1, column: 0 });
+        assert!(!view.accepts(Command::CopyToRight));
+        view.selected_rows = vec![0, 2];
+        view.selection_side = Some(Side::Left);
+        assert!(view.accepts(Command::CopyToRight));
+        view.run(Command::CopyToRight);
+        assert!(settle(&mut view, &ctx));
+        assert_eq!(view.grid.cell_text(0, 1, Side::Right), "Ann");
+        assert_eq!(view.grid.cell_text(2, 1, Side::Right), "Cy");
+        view.selected_rows.clear();
+        view.set_active_side(Side::Right);
+        view.run(Command::Undo);
+        assert!(settle(&mut view, &ctx));
+        assert_eq!(view.grid.cell_text(0, 1, Side::Right), "Xnn");
+        assert_eq!(view.grid.cell_text(2, 1, Side::Right), "Zy");
+        assert!(!view.accepts(Command::Undo));
+    }
+
+    #[test]
+    fn copy_to_right_is_refused_while_the_target_cannot_be_written() {
+        let (_dir, left, right) = files("id,name\n1,Ann\n", "id,name\n1,Bob\n");
+        let ctx = egui::Context::default();
+        let mut view = TableView::new(left, right, &context(), 43);
+        assert_eq!(
+            view.refusal(Command::CopyToRight),
+            Some(super::NOT_COMPARED)
+        );
+        assert!(settle(&mut view, &ctx));
+        view.grid.set_cursor(Cursor { row: 0, column: 0 });
+        assert!(view.accepts(Command::CopyToRight));
+        view.read_only = true;
+        assert!(!view.accepts(Command::CopyToRight));
+        assert_eq!(
+            view.refusal(Command::CopyToRight),
+            Some("The file is a copy taken out of an archive, so it cannot be edited or saved.")
+        );
+    }
+
+    #[test]
+    fn the_font_size_commands_resize_the_rows_and_reset() {
+        let (_dir, left, right) = files("id,name\n1,Ann\n", "id,name\n1,Bob\n");
+        let mut view = TableView::new(left, right, &context(), 44);
+        for command in [
+            Command::IncreaseFontSize,
+            Command::DecreaseFontSize,
+            Command::ResetFontSize,
+        ] {
+            assert!(view.accepts(command), "{command:?}");
+        }
+        let start = view.font.points();
+        let height = view.row_height();
+        view.run(Command::IncreaseFontSize);
+        assert!(view.font.points() > start);
+        assert!(view.row_height() >= height);
+        view.run(Command::DecreaseFontSize);
+        view.run(Command::DecreaseFontSize);
+        assert!(view.font.points() < start);
+        view.run(Command::ResetFontSize);
+        assert!((view.font.points() - start).abs() < f32::EPSILON);
     }
 
     #[test]

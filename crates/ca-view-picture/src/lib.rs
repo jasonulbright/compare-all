@@ -67,6 +67,7 @@ const HANDLED: &[Command] = &[
     Command::Recompare,
     Command::SwapSides,
     Command::OpenFile,
+    Command::Copy,
     Command::Cancel,
     Command::NextDisplayMode,
     Command::ZoomIn,
@@ -84,6 +85,27 @@ const HANDLED: &[Command] = &[
     Command::ResetOffset,
     Command::ToggleAutoScale,
 ];
+
+/// What the worker that converts a picture for the clipboard posts.
+enum CopyMessage {
+    Ready(egui::ColorImage),
+    Cancelled,
+    Failed(String),
+}
+
+impl ca_ui::worker::Terminal for CopyMessage {
+    fn is_terminal(&self) -> bool {
+        true
+    }
+
+    fn cancelled() -> Self {
+        Self::Cancelled
+    }
+
+    fn panicked(detail: String) -> Self {
+        Self::Failed(detail)
+    }
+}
 
 /// Where a comparison currently stands.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -157,6 +179,12 @@ pub struct PictureView {
     job_id: u64,
     picker: Option<Job<DialogMessage>>,
     picker_target: Target,
+    /// The worker converting the focused picture for the clipboard.
+    copy_job: Option<Job<CopyMessage>>,
+    /// A converted picture waiting for a frame to hand it to the clipboard.
+    pending_image: Option<egui::ColorImage>,
+    /// What the last Copy said, when it could not copy.
+    message: Option<String>,
     scheduler: Scheduler,
     settings: jobs::Settings,
     left_image: Option<SideImage>,
@@ -218,6 +246,9 @@ impl PictureView {
             job_id: 0,
             picker: None,
             picker_target: Target::Left,
+            copy_job: None,
+            pending_image: None,
+            message: None,
             scheduler: Scheduler::new(),
             settings: jobs::Settings::default(),
             left_image: None,
@@ -628,6 +659,64 @@ impl PictureView {
         })
     }
 
+    /// The side whose picture Copy puts on the clipboard: the focused pane
+    /// when it shows one side, otherwise the side the controls name.
+    fn copy_side(&self) -> Side {
+        match self.focused {
+            Pane::Left => Side::Left,
+            Pane::Right => Side::Right,
+            Pane::Difference => self.active_side,
+        }
+    }
+
+    fn copy_image(&self, side: Side) -> Option<&SideImage> {
+        match side {
+            Side::Left => self.left_image.as_ref(),
+            Side::Right => self.right_image.as_ref(),
+        }
+    }
+
+    /// Convert the focused picture on a worker; a later frame hands it to the
+    /// clipboard.
+    fn start_copy(&mut self) {
+        let Some(image) = self
+            .copy_image(self.copy_side())
+            .map(|side| side.image.clone())
+        else {
+            return;
+        };
+        self.message = None;
+        self.copy_job = Some(Job::spawn_notifying(
+            move |emitter, _| {
+                let size = [image.width() as usize, image.height() as usize];
+                emitter.send(CopyMessage::Ready(
+                    egui::ColorImage::from_rgba_unmultiplied(size, image.pixels()),
+                ));
+            },
+            Arc::clone(&self.notify),
+        ));
+    }
+
+    fn drain_copy(&mut self) {
+        let Some(job) = self.copy_job.as_mut() else {
+            return;
+        };
+        let messages = job.drain();
+        let finished = job.is_finished();
+        for message in messages {
+            match message {
+                CopyMessage::Ready(image) => self.pending_image = Some(image),
+                CopyMessage::Cancelled => {}
+                CopyMessage::Failed(detail) => {
+                    self.message = Some(format!("Could not copy the picture: {detail}"));
+                }
+            }
+        }
+        if finished {
+            self.copy_job = None;
+        }
+    }
+
     fn drain_picker(&mut self) {
         let Some(picker) = self.picker.as_mut() else {
             return;
@@ -839,6 +928,7 @@ impl SessionView for PictureView {
         self.start_due();
         self.drain_job();
         self.drain_picker();
+        self.drain_copy();
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, context: &ViewContext) -> Vec<ViewAction> {
@@ -861,6 +951,9 @@ impl SessionView for PictureView {
             self.report_panel(ui);
         });
         self.keyboard(ui);
+        if let Some(image) = self.pending_image.take() {
+            ui.ctx().copy_image(image);
+        }
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show_inside(ui, |ui| {
@@ -873,10 +966,22 @@ impl SessionView for PictureView {
         actions
     }
 
+    fn refusal(&self, command: Command) -> Option<&'static str> {
+        if command != Command::Copy || self.accepts(command) {
+            return None;
+        }
+        Some(if self.copy_job.is_some() {
+            "The picture is being prepared for the clipboard"
+        } else {
+            "The focused pane holds no picture to copy"
+        })
+    }
+
     fn commands(&self) -> Vec<CommandState> {
         ca_ui::view::declare(HANDLED, |command| match command {
             Command::Cancel => self.job.is_some(),
             Command::OpenFile => self.picker.is_none(),
+            Command::Copy => self.copy_image(self.copy_side()).is_some() && self.copy_job.is_none(),
             Command::Recompare => self.left_image.is_some() && self.right_image.is_some(),
             Command::CompareReport => self.is_ready(),
             _ => true,
@@ -890,6 +995,7 @@ impl SessionView for PictureView {
                 Side::Left => Target::Left,
                 Side::Right => Target::Right,
             }),
+            Command::Copy => self.start_copy(),
             Command::Reload => self.adopt_fields(),
             Command::Recompare => self.ask_now(Stage::Compare),
             Command::SwapSides => self.swap_sides(),
@@ -953,6 +1059,9 @@ impl SessionView for PictureView {
     }
 
     fn notice(&self) -> Option<String> {
+        if self.message.is_some() {
+            return self.message.clone();
+        }
         let outcome = self.outcome.as_ref()?;
         let sources = self.sources()?;
         status::fidelity_note(
@@ -2063,6 +2172,93 @@ mod tests {
                 fidelity: Fidelity::default(),
             },
         }
+    }
+
+    fn copy_output_images(view: &mut PictureView) -> Vec<egui::ColorImage> {
+        use ca_ui::view::SessionView;
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while view.pending_image.is_none() && std::time::Instant::now() < deadline {
+            view.tick();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let ctx = egui::Context::default();
+        let output = ctx.run(ca_ui::testing::raw_input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = view.ui(ui, &context());
+            });
+        });
+        output
+            .platform_output
+            .commands
+            .into_iter()
+            .filter_map(|command| match command {
+                egui::OutputCommand::CopyImage(image) => Some(image),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn copy_puts_the_focused_side_picture_on_the_clipboard() {
+        let mut view = PictureView::new(
+            PathBuf::from("left.png"),
+            PathBuf::from("right.png"),
+            &context(),
+            3,
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while view.job.is_some() && std::time::Instant::now() < deadline {
+            ca_ui::view::SessionView::tick(&mut view);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(view.job.is_none());
+        assert!(!view.accepts(super::Command::Copy));
+        assert_eq!(
+            view.refusal(super::Command::Copy),
+            Some("The focused pane holds no picture to copy")
+        );
+        let mut left = source_image(SourceFormat::Png, None);
+        left.image = std::sync::Arc::new(
+            ca_image::RgbaImage::from_pixels(2, 1, vec![10, 20, 30, 255, 40, 50, 60, 128]).unwrap(),
+        );
+        let mut right = source_image(SourceFormat::Png, None);
+        right.image =
+            std::sync::Arc::new(ca_image::RgbaImage::filled(1, 1, [1, 2, 3, 255]).unwrap());
+        view.left_image = Some(left);
+        view.right_image = Some(right);
+
+        view.focused = super::Pane::Left;
+        assert!(view.accepts(super::Command::Copy));
+        view.run(super::Command::Copy);
+        assert!(!view.accepts(super::Command::Copy));
+        assert!(view.refusal(super::Command::Copy).is_some());
+        let copied = copy_output_images(&mut view);
+        assert_eq!(copied.len(), 1);
+        assert_eq!(copied[0].size, [2, 1]);
+        assert_eq!(
+            copied[0].pixels[0],
+            egui::Color32::from_rgba_unmultiplied(10, 20, 30, 255)
+        );
+        assert_eq!(
+            copied[0].pixels[1],
+            egui::Color32::from_rgba_unmultiplied(40, 50, 60, 128)
+        );
+
+        let mut right = source_image(SourceFormat::Png, None);
+        right.image =
+            std::sync::Arc::new(ca_image::RgbaImage::filled(1, 1, [1, 2, 3, 255]).unwrap());
+        view.right_image = Some(right);
+        view.focused = super::Pane::Right;
+        assert!(view.accepts(super::Command::Copy));
+        view.run(super::Command::Copy);
+        let copied = copy_output_images(&mut view);
+        assert_eq!(copied.len(), 1);
+        assert_eq!(copied[0].size, [1, 1]);
+        assert_eq!(
+            copied[0].pixels[0],
+            egui::Color32::from_rgba_unmultiplied(1, 2, 3, 255)
+        );
     }
 
     #[test]

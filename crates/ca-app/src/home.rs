@@ -4,6 +4,7 @@
 use crate::registry;
 use crate::tree::{Branch, HomeModel, Row};
 use ca_session::{SessionId, SessionKind, SessionStore};
+use ca_ui::command::Command;
 use ca_ui::dialog::{self, DialogMessage, Pick, Target};
 use ca_ui::sessions::StoreHandle;
 use ca_ui::view::{OpenRequest, SessionView, ViewAction, ViewContext};
@@ -70,6 +71,8 @@ pub struct HomeView {
     shown_shared: Option<String>,
     /// What the launcher wants the shell to do, shared with the window.
     actions: HomeOutbox,
+    /// The search field takes the keyboard focus on the next frame.
+    focus_search: bool,
 }
 
 impl HomeView {
@@ -92,6 +95,7 @@ impl HomeView {
             shared: None,
             shown_shared: None,
             actions: HomeOutbox::default(),
+            focus_search: false,
         }
     }
 
@@ -407,6 +411,16 @@ impl SessionView for HomeView {
         self.notice.clone()
     }
 
+    fn commands(&self) -> Vec<ca_ui::view::CommandState> {
+        ca_ui::view::declare(&[Command::Find], |_| true)
+    }
+
+    fn run(&mut self, command: Command) {
+        if command == Command::Find {
+            self.focus_search = true;
+        }
+    }
+
     fn on_close(&mut self) {
         if let Some(job) = self.picker.take() {
             job.cancel();
@@ -422,14 +436,26 @@ impl HomeView {
             ui.heading("Saved sessions");
             let mut search = self.model.search().to_owned();
             let width = (ui.available_width() * 0.4).clamp(80.0, 280.0);
-            if ui
-                .add(
-                    egui::TextEdit::singleline(&mut search)
-                        .hint_text("Search")
-                        .desired_width(width),
-                )
-                .changed()
-            {
+            let field = ui.add(
+                egui::TextEdit::singleline(&mut search)
+                    .id(self.id.with("search"))
+                    .hint_text("Search")
+                    .desired_width(width),
+            );
+            if std::mem::take(&mut self.focus_search) {
+                field.request_focus();
+                if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), field.id) {
+                    let end = egui::text::CCursor::new(search.chars().count());
+                    state
+                        .cursor
+                        .set_char_range(Some(egui::text::CCursorRange::two(
+                            egui::text::CCursor::new(0),
+                            end,
+                        )));
+                    state.store(ui.ctx(), field.id);
+                }
+            }
+            if field.changed() {
                 self.model.set_search(search);
             }
             if ca_ui::widgets::inline_button(ui, "New Folder", ca_ui::icons::Icon::NewFolder)
@@ -1019,5 +1045,29 @@ mod tests {
             assert_eq!(*enabled, registry::is_available(kind), "{kind}");
             assert!(!kind.title().is_empty());
         }
+    }
+
+    #[test]
+    fn find_moves_the_keyboard_to_the_search_field_and_select_all_is_refused() {
+        use ca_ui::command::Command;
+        use ca_ui::view::SessionView;
+
+        let dir = tempfile::tempdir().unwrap();
+        let context = ca_ui::testing::context();
+        let mut view =
+            super::HomeView::in_settings_directory(&context, 1, dir.path().to_path_buf());
+        assert!(view.accepts(Command::Find));
+        assert!(!view.accepts(Command::SelectAll));
+        let search = view.id.with("search");
+        let mut probe = ca_ui::testing::probe::Probe::new(800.0, 600.0);
+        probe.idle(&mut |ctx| {
+            ca_ui::testing::probe::draw_view(&mut view, ctx);
+        });
+        assert!(!probe.context().memory(|memory| memory.has_focus(search)));
+        view.run(Command::Find);
+        probe.idle(&mut |ctx| {
+            ca_ui::testing::probe::draw_view(&mut view, ctx);
+        });
+        assert!(probe.context().memory(|memory| memory.has_focus(search)));
     }
 }
