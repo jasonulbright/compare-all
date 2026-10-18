@@ -10,7 +10,9 @@ use crate::manifest::{Manifest, MANIFEST_NAME};
 use crate::mode::InstallMode;
 use crate::net::{is_file_content_type, Transport};
 use crate::signature::SignatureVerifier;
-use crate::staging::{AssetKind, DownloadWarning, StagedRecord, Staging, MAX_ASSET_BYTES};
+use crate::staging::{
+    ApplyClaim, AssetKind, DownloadWarning, StagedRecord, Staging, MAX_ASSET_BYTES,
+};
 use crate::verify::{verify_file, Expected};
 use crate::version::Version;
 use std::sync::atomic::AtomicBool;
@@ -69,6 +71,9 @@ pub enum Outcome {
         /// Its version.
         version: Version,
     },
+    /// A newer release exists and another run of the program is preparing or
+    /// applying an update now; nothing was downloaded.
+    Busy,
     /// A newer release exists and the download failed.
     DownloadFailed {
         /// Its version.
@@ -156,16 +161,16 @@ pub fn run(job: &Job<'_>) -> Result<Outcome, String> {
     if Version::parse(&manifest.version) != Some(latest) {
         return Err("the manifest belongs to another release".to_owned());
     }
-    if job.staging.is_applying() {
-        return Ok(Outcome::Current);
-    }
-    match stage(job, mode, &latest, &manifest) {
+    let Ok(claim) = job.staging.begin_apply() else {
+        return Ok(Outcome::Busy);
+    };
+    match stage(job, &claim, mode, &latest, &manifest) {
         Ok(()) => {
             job.staging.clear_warning();
             Ok(Outcome::Staged { version: latest })
         }
         Err(reason) => {
-            job.staging.clear();
+            job.staging.clear_claimed(&claim);
             let _ = job
                 .staging
                 .write_warning(&DownloadWarning::new(&latest, page.clone()));
@@ -180,6 +185,7 @@ pub fn run(job: &Job<'_>) -> Result<Outcome, String> {
 
 fn stage(
     job: &Job<'_>,
+    claim: &ApplyClaim,
     mode: InstallMode,
     latest: &Version,
     manifest: &Manifest,
@@ -206,7 +212,7 @@ fn stage(
         version: latest,
     };
     let record = StagedRecord::new(latest, name.clone(), asset.sha256.clone(), asset.size);
-    let scratch = job.staging.dir().join("scratch");
+    let scratch = job.staging.scratch_dir();
     let _ = std::fs::remove_dir_all(&scratch);
 
     if job.staging.read_record().as_ref() == Some(&record) {
@@ -217,7 +223,7 @@ fn stage(
             return Ok(());
         }
     }
-    job.staging.clear();
+    job.staging.clear_claimed(claim);
     std::fs::create_dir_all(job.staging.dir()).map_err(|error| error.to_string())?;
     let partial = job.staging.partial_path(&name);
     let url = format!("{}/v{latest}/{name}", job.endpoints.download_base);
@@ -239,7 +245,7 @@ fn stage(
     let _ = std::fs::remove_dir_all(&scratch);
     let _ = std::fs::remove_file(&partial);
     if outcome.is_err() {
-        job.staging.clear();
+        job.staging.clear_claimed(claim);
     }
     outcome
 }

@@ -60,6 +60,9 @@ pub enum Outcome {
     DownloadFailed(Release, String),
     /// The running build is the newest release or newer.
     Current,
+    /// A newer release exists and another run of the program is preparing
+    /// or applying an update now.
+    Busy,
     /// The interval since the last check has not passed; the next check is
     /// due after the time given.
     NotDue(Duration),
@@ -312,6 +315,7 @@ fn fetch(check: &Check, cancel: &Arc<AtomicBool>) -> Result<Outcome, String> {
     };
     Ok(match ca_update::flow::run(&job)? {
         ca_update::flow::Outcome::Current => Outcome::Current,
+        ca_update::flow::Outcome::Busy => Outcome::Busy,
         ca_update::flow::Outcome::Newer { version, page } => {
             Outcome::Newer(Release { version, page })
         }

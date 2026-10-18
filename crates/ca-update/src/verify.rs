@@ -18,7 +18,7 @@ use crate::staging::AssetKind;
 use crate::version::Version;
 use sha2::{Digest, Sha256};
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 const MSI_MAGIC: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
 const ZIP_MAGIC: [u8; 4] = *b"PK\x03\x04";
@@ -217,6 +217,132 @@ pub fn hex(bytes: &[u8]) -> String {
     out
 }
 
+/// One unpacked release file and the SHA-256 of the bytes written to it. The
+/// file stays open until this value is dropped; on Windows that handle shares
+/// reading only, so no other process can change, rename or delete the file,
+/// or rename its folder, between its check and its copy.
+#[derive(Debug)]
+struct HeldFile {
+    name: String,
+    file: std::fs::File,
+    sha256: Vec<u8>,
+}
+
+/// The checked files of a portable archive, held open from their check to
+/// their copy into the program folder.
+#[derive(Debug, Default)]
+pub struct Unpacked {
+    files: Vec<HeldFile>,
+}
+
+impl Unpacked {
+    /// Hold every file of [`PORTABLE_FILES`] that exists in `folder`.
+    ///
+    /// # Errors
+    /// Returns why a file could not be opened or read.
+    pub fn hold_folder(folder: &Path) -> Result<Self, String> {
+        let mut files = Vec::new();
+        for name in PORTABLE_FILES {
+            let path = folder.join(name);
+            if !path.is_file() {
+                continue;
+            }
+            let file = hold(&path).map_err(|error| format!("cannot open {name}: {error}"))?;
+            let sha256 = digest_from_start(&file, &mut std::io::sink())?;
+            files.push(HeldFile {
+                name: name.to_owned(),
+                file,
+                sha256,
+            });
+        }
+        Ok(Self { files })
+    }
+
+    /// The names of the held files, in install order.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        PORTABLE_FILES
+            .iter()
+            .copied()
+            .filter(|name| self.files.iter().any(|held| held.name == *name))
+    }
+
+    /// Copy the held file `name` to `destination`, a new file. The bytes
+    /// copied must be the bytes that were checked.
+    ///
+    /// # Errors
+    /// Returns why the copy failed or the bytes differ.
+    pub fn copy_to(&self, name: &str, destination: &Path) -> Result<(), String> {
+        let held = self
+            .files
+            .iter()
+            .find(|held| held.name == name)
+            .ok_or_else(|| format!("{name} was not checked"))?;
+        let mut out = std::fs::File::create(destination)
+            .map_err(|error| format!("cannot copy {name}: {error}"))?;
+        let copied = digest_from_start(&held.file, &mut out)?;
+        out.sync_all()
+            .map_err(|error| format!("cannot copy {name}: {error}"))?;
+        if copied != held.sha256 {
+            return Err(format!("{name} changed after its check"));
+        }
+        Ok(())
+    }
+
+    fn bytes_of(&self, name: &str) -> Result<Vec<u8>, String> {
+        let held = self
+            .files
+            .iter()
+            .find(|held| held.name == name)
+            .ok_or_else(|| format!("the archive holds no {name}"))?;
+        let mut bytes = Vec::new();
+        let digest = digest_from_start(&held.file, &mut bytes)?;
+        if digest != held.sha256 {
+            return Err(format!("{name} changed after it was unpacked"));
+        }
+        Ok(bytes)
+    }
+}
+
+/// Open `path` for reading so that, on Windows, other processes may only read
+/// it while the handle lives.
+fn hold(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 1;
+        options.share_mode(FILE_SHARE_READ);
+    }
+    options.open(path)
+}
+
+/// Read `file` from its start into `out` and return the SHA-256 of the bytes.
+fn digest_from_start(
+    file: &std::fs::File,
+    out: &mut dyn std::io::Write,
+) -> Result<Vec<u8>, String> {
+    use std::io::Seek;
+    let mut reader = file;
+    reader
+        .seek(std::io::SeekFrom::Start(0))
+        .map_err(|error| error.to_string())?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 64 * 1024];
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .map_err(|error| error.to_string())?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        out.write_all(&buffer[..read])
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(hasher.finalize().to_vec())
+}
+
 /// Check `file` against `expected`. `scratch` is an empty folder the check may
 /// fill; the portable archive is unpacked there to check its program files.
 ///
@@ -228,6 +354,20 @@ pub fn verify_file(
     signer: &dyn SignatureVerifier,
     scratch: &Path,
 ) -> Result<(), String> {
+    verify_and_hold(file, expected, signer, scratch).map(drop)
+}
+
+/// [`verify_file`], keeping the unpacked files of a portable archive held
+/// open for the copy that follows. An installer gives `None`.
+///
+/// # Errors
+/// Returns the first check the file fails.
+pub fn verify_and_hold(
+    file: &Path,
+    expected: &Expected<'_>,
+    signer: &dyn SignatureVerifier,
+    scratch: &Path,
+) -> Result<Option<Unpacked>, String> {
     let size = std::fs::metadata(file)
         .map_err(|error| format!("cannot read the download: {error}"))?
         .len();
@@ -243,23 +383,19 @@ pub fn verify_file(
         return Err("the SHA-256 of the download does not match the release".to_owned());
     }
     match expected.kind {
-        AssetKind::Msi => verify_signer(signer, file, expected.signer),
+        AssetKind::Msi => verify_signer(signer, file, expected.signer).map(|()| None),
         AssetKind::Zip => {
-            let files = extract_release_zip(file, scratch)?;
-            for path in &files {
-                let name = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                if PORTABLE_PROGRAMS.contains(&name.as_str()) {
-                    verify_signer(signer, path, expected.signer)?;
-                } else if is_program_image(path)? {
+            let unpacked = unpack_release_zip(file, scratch)?;
+            for held in &unpacked.files {
+                let name = held.name.as_str();
+                if PORTABLE_PROGRAMS.contains(&name) {
+                    verify_signer(signer, &scratch.join(name), expected.signer)?;
+                } else if unpacked.bytes_of(name)?.starts_with(b"MZ") {
                     return Err(format!("the archive file {name} is a program"));
                 }
             }
             for program in PORTABLE_PROGRAMS {
-                let bytes = std::fs::read(scratch.join(program))
-                    .map_err(|error| format!("cannot read {program}: {error}"))?;
+                let bytes = unpacked.bytes_of(program)?;
                 let inside =
                     embedded_version(&bytes).map_err(|error| format!("{program}: {error}"))?;
                 if inside != *expected.version {
@@ -269,17 +405,27 @@ pub fn verify_file(
                     ));
                 }
             }
-            Ok(())
+            Ok(Some(unpacked))
         }
     }
 }
 
-/// True when the file starts like a Windows program or library.
-fn is_program_image(path: &Path) -> Result<bool, String> {
-    let mut head = [0u8; 2];
-    let mut file = std::fs::File::open(path).map_err(|error| error.to_string())?;
-    let read = file.read(&mut head).map_err(|error| error.to_string())?;
-    Ok(read == 2 && head == *b"MZ")
+/// A writer that keeps the SHA-256 of what passes through it.
+struct Hashing<W> {
+    inner: W,
+    hasher: Sha256,
+}
+
+impl<W: std::io::Write> std::io::Write for Hashing<W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(bytes)?;
+        self.hasher.update(&bytes[..written]);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 fn check_format(file: &Path, kind: AssetKind) -> Result<(), String> {
@@ -308,11 +454,12 @@ fn check_format(file: &Path, kind: AssetKind) -> Result<(), String> {
 /// Unpack a portable archive into `destination`. Only the names of
 /// [`PORTABLE_FILES`] are accepted, each once; a folder, a path, another name,
 /// a name repeated in any letter case, a missing program or an unexpected
-/// number of entries fails the whole archive.
+/// number of entries fails the whole archive. Each file is held open from
+/// the moment it is written.
 ///
 /// # Errors
 /// Returns why the archive is not a release archive.
-pub fn extract_release_zip(zip_path: &Path, destination: &Path) -> Result<Vec<PathBuf>, String> {
+pub fn unpack_release_zip(zip_path: &Path, destination: &Path) -> Result<Unpacked, String> {
     let file = std::fs::File::open(zip_path).map_err(|error| error.to_string())?;
     let mut archive =
         zip::ZipArchive::new(file).map_err(|error| format!("the archive is not valid: {error}"))?;
@@ -320,7 +467,7 @@ pub fn extract_release_zip(zip_path: &Path, destination: &Path) -> Result<Vec<Pa
         return Err("the archive holds too many entries".to_owned());
     }
     std::fs::create_dir_all(destination).map_err(|error| error.to_string())?;
-    let mut written = Vec::new();
+    let mut unpacked = Unpacked::default();
     let mut seen: Vec<String> = Vec::new();
     let mut total = 0u64;
     for index in 0..archive.len() {
@@ -344,24 +491,39 @@ pub fn extract_release_zip(zip_path: &Path, destination: &Path) -> Result<Vec<Pa
             return Err("the archive unpacks to more than allowed".to_owned());
         }
         let target = destination.join(&name);
-        let mut out = std::fs::OpenOptions::new()
+        let out = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&target)
             .map_err(|error| format!("cannot unpack: {error}"))?;
+        let mut out = Hashing {
+            inner: out,
+            hasher: Sha256::new(),
+        };
         let copied = std::io::copy(&mut (&mut entry).take(MAX_UNPACKED_BYTES), &mut out)
             .map_err(|error| format!("cannot unpack: {error}"))?;
         if copied != entry.size() {
             return Err(format!("the archive entry {name:?} has the wrong size"));
         }
-        written.push(target);
+        let written = out.hasher.finalize().to_vec();
+        drop(out.inner);
+        let file = hold(&target).map_err(|error| format!("cannot unpack: {error}"))?;
+        // The file was closed for a moment between the write and the hold.
+        if digest_from_start(&file, &mut std::io::sink())? != written {
+            return Err(format!("{name} changed while it was unpacked"));
+        }
+        unpacked.files.push(HeldFile {
+            name,
+            file,
+            sha256: written,
+        });
     }
     for program in PORTABLE_PROGRAMS {
         if !seen.iter().any(|name| name == program) {
             return Err(format!("the archive holds no {program}"));
         }
     }
-    Ok(written)
+    Ok(unpacked)
 }
 
 #[cfg(test)]

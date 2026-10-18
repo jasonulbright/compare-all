@@ -30,7 +30,7 @@ pub fn pe(sections: &[&[u8]], overlay: &[u8], certificate: Option<&[u8]>) -> Vec
     for (index, data) in sections.iter().enumerate() {
         let start = bytes.len();
         bytes.extend_from_slice(data);
-        while bytes.len() % 0x200 != 0 {
+        while !bytes.len().is_multiple_of(0x200) {
             bytes.push(0);
         }
         let entry = table + index * 40;
@@ -40,7 +40,7 @@ pub fn pe(sections: &[&[u8]], overlay: &[u8], certificate: Option<&[u8]>) -> Vec
     }
     bytes.extend_from_slice(overlay);
     if let Some(certificate) = certificate {
-        while bytes.len() % 8 != 0 {
+        while !bytes.len().is_multiple_of(8) {
             bytes.push(0);
         }
         let start = bytes.len();
@@ -49,7 +49,7 @@ pub fn pe(sections: &[&[u8]], overlay: &[u8], certificate: Option<&[u8]>) -> Vec
         bytes.extend_from_slice(&0x0200u16.to_le_bytes());
         bytes.extend_from_slice(&2u16.to_le_bytes());
         bytes.extend_from_slice(certificate);
-        while bytes.len() % 8 != 0 {
+        while !bytes.len().is_multiple_of(8) {
             bytes.push(0);
         }
         let size = u32::try_from(bytes.len() - start).unwrap();

@@ -1820,6 +1820,11 @@ impl App {
                 Outcome::Current if manual => Some(UpdateNotice::Message(format!(
                     "No newer release exists. This build is {VERSION}."
                 ))),
+                Outcome::Busy if manual => Some(UpdateNotice::Message(
+                    "A newer release exists. Another copy of Compare All is downloading or \
+                     installing an update now. Check again later."
+                        .to_owned(),
+                )),
                 Outcome::Failed(reason) if manual => Some(UpdateNotice::Message(format!(
                     "The update check failed: {reason}"
                 ))),

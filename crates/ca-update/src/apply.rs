@@ -12,7 +12,7 @@ use crate::flow::Endpoints;
 use crate::mode::{detect, InstallMode};
 use crate::signature::SignatureVerifier;
 use crate::staging::{AssetKind, DownloadWarning, StagedRecord, Staging};
-use crate::verify::{verify_file, Expected, PORTABLE_FILES};
+use crate::verify::{verify_and_hold, Expected, Unpacked};
 use crate::version::Version;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -40,11 +40,20 @@ pub fn apply_portable_with(
     fresh: &Path,
     before_each: &dyn Fn(&str) -> std::io::Result<()>,
 ) -> Result<(), String> {
-    let names: Vec<&str> = PORTABLE_FILES
-        .iter()
-        .copied()
-        .filter(|name| fresh.join(name).is_file())
-        .collect();
+    apply_unpacked(target, &Unpacked::hold_folder(fresh)?, before_each)
+}
+
+/// [`apply_portable_with`] for files held open since their check. Each copy
+/// must have the bytes that were checked.
+///
+/// # Errors
+/// As [`apply_portable_with`].
+pub fn apply_unpacked(
+    target: &Path,
+    fresh: &Unpacked,
+    before_each: &dyn Fn(&str) -> std::io::Result<()>,
+) -> Result<(), String> {
+    let names: Vec<&str> = fresh.names().collect();
     let backup = target.join(format!(".update-backup-{}", std::process::id()));
     std::fs::create_dir_all(&backup).map_err(|error| format!("cannot prepare backup: {error}"))?;
     // (name, had an earlier file)
@@ -60,8 +69,7 @@ pub fn apply_portable_with(
             }
             done.push((name, had));
             let incoming = target.join(format!("{name}.new"));
-            std::fs::copy(fresh.join(name), &incoming)
-                .map_err(|error| format!("cannot copy {name}: {error}"))?;
+            fresh.copy_to(name, &incoming)?;
             std::fs::rename(&incoming, &live)
                 .map_err(|error| format!("cannot place {name}: {error}"))?;
         }
@@ -258,7 +266,7 @@ pub fn apply_staged(
     if kind != wanted {
         return Err("the staged file does not fit how the program is installed".to_owned());
     }
-    let scratch = staging.dir().join("scratch");
+    let scratch = staging.scratch_dir();
     let _ = std::fs::remove_dir_all(&scratch);
     let expected = Expected {
         kind,
@@ -268,14 +276,21 @@ pub fn apply_staged(
         version: &version,
     };
     let file = staging.asset_path(&record);
-    let checked = verify_file(&file, &expected, trust.signer, &scratch);
-    let result = checked.and_then(|()| match mode {
-        InstallMode::Installed { machine } => {
-            let log = staging.dir().join("installer.log");
-            install(msi_command(&file, machine, &log))
-        }
-        InstallMode::Portable => apply_portable_with(target_dir, &scratch, before_each),
-    });
+    let result =
+        verify_and_hold(&file, &expected, trust.signer, &scratch).and_then(|held| {
+            match (mode, held) {
+                (InstallMode::Installed { machine }, _) => {
+                    let log = staging.dir().join("installer.log");
+                    install(msi_command(&file, machine, &log))
+                }
+                (InstallMode::Portable, Some(unpacked)) => {
+                    apply_unpacked(target_dir, &unpacked, before_each)
+                }
+                (InstallMode::Portable, None) => {
+                    Err("the staged file is not an archive".to_owned())
+                }
+            }
+        });
     let _ = std::fs::remove_dir_all(&scratch);
     result.map(|()| version)
 }
@@ -292,9 +307,6 @@ fn run_installer(mut command: Command) -> Result<(), String> {
 }
 
 /// The entry point of the helper process. Returns the exit code.
-///
-/// A helper that cannot claim the staged update ends at once and changes
-/// nothing: another helper applies it.
 #[must_use]
 pub fn helper_main(
     arguments: &HelperArguments,
@@ -302,10 +314,45 @@ pub fn helper_main(
     signer_name: &str,
     running: &Version,
 ) -> i32 {
+    helper_main_waiting(arguments, signer, signer_name, running, WAIT_FOR_EXIT)
+}
+
+/// [`helper_main`] that waits at most `wait` for the claim on the staging
+/// folder, which a download in another run of the program or another helper
+/// may hold. A helper that gets no claim, or finds nothing staged once it has
+/// one, changes nothing and reports no failure.
+#[must_use]
+pub fn helper_main_waiting(
+    arguments: &HelperArguments,
+    signer: &dyn SignatureVerifier,
+    signer_name: &str,
+    running: &Version,
+    wait: Duration,
+) -> i32 {
     let staging = Staging::new(arguments.staging.clone());
-    let Ok(claim) = staging.begin_apply() else {
-        return 2;
+    let relaunch = || {
+        if arguments.relaunch {
+            let _ = ca_io::host_command::host_command(&arguments.executable)
+                .args(&arguments.program_arguments)
+                .spawn();
+        }
     };
+    let started = Instant::now();
+    let claim = loop {
+        match staging.begin_apply() {
+            Ok(claim) => break claim,
+            Err(_) if started.elapsed() < wait => std::thread::sleep(Duration::from_millis(250)),
+            Err(_) => {
+                relaunch();
+                return 2;
+            }
+        }
+    };
+    if staging.read_record().is_none() {
+        drop(claim);
+        relaunch();
+        return 2;
+    }
     let endpoints = Endpoints::github();
     let trust = Trust {
         signer,
@@ -336,13 +383,9 @@ pub fn helper_main(
             ));
         }
     }
-    staging.clear();
+    staging.clear_claimed(&claim);
     drop(claim);
-    if arguments.relaunch {
-        let _ = ca_io::host_command::host_command(&arguments.executable)
-            .args(&arguments.program_arguments)
-            .spawn();
-    }
+    relaunch();
     code
 }
 
