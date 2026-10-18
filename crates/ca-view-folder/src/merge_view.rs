@@ -910,6 +910,10 @@ pub struct FolderMergeView {
     overrides: BTreeMap<PathBuf, Resolution>,
     selection: BTreeSet<PathBuf>,
     cursor: Option<usize>,
+    /// The row the cursor was on when the filter hid it, with its index in
+    /// the tree. Read only while `cursor` is empty, so a move continues from
+    /// that row's place.
+    hidden_cursor: Option<(PathBuf, usize)>,
     find: crate::find::NameFind,
     active: Pane,
     stage: Stage,
@@ -989,6 +993,7 @@ impl FolderMergeView {
             overrides: BTreeMap::new(),
             selection: BTreeSet::new(),
             cursor: None,
+            hidden_cursor: None,
             find: crate::find::NameFind::default(),
             active: Pane::Left,
             stage: Stage::Idle,
@@ -1258,6 +1263,7 @@ impl FolderMergeView {
             self.tree = None;
             self.visible.clear();
             self.cursor = None;
+            self.hidden_cursor = None;
             self.status = Status::Running("Waiting for the current merge");
             return;
         }
@@ -1265,6 +1271,7 @@ impl FolderMergeView {
         self.tree = None;
         self.visible.clear();
         self.cursor = None;
+        self.hidden_cursor = None;
         self.status = Status::Running("Scanning");
         let folders = self.folders.clone();
         let output = self.output_folder().map(Path::to_path_buf);
@@ -1454,7 +1461,13 @@ impl FolderMergeView {
 
     /// Lay out the rows the filter shows.
     fn rebuild(&mut self) {
-        let cursor_rel = self.cursor_row().map(|row| row.rel.clone());
+        let cursor_rel = self.cursor_row().map(|row| row.rel.clone()).or_else(|| {
+            self.hidden_cursor
+                .take()
+                .filter(|_| self.cursor.is_none())
+                .map(|(rel, _)| rel)
+        });
+        self.hidden_cursor = None;
         self.visible.clear();
         let Some(tree) = self.tree.clone() else {
             return;
@@ -1480,11 +1493,17 @@ impl FolderMergeView {
             }
         }
         self.visible = (0..tree.rows.len()).filter(|index| shown[*index]).collect();
-        self.cursor = cursor_rel.and_then(|rel| {
-            self.visible
-                .iter()
-                .position(|index| tree.rows[*index].rel == rel)
-        });
+        let Some(rel) = cursor_rel else {
+            self.cursor = None;
+            return;
+        };
+        self.cursor = self
+            .visible
+            .iter()
+            .position(|index| tree.rows[*index].rel == rel);
+        if self.cursor.is_none() {
+            self.hidden_cursor = by_rel.get(rel.as_path()).map(|index| (rel.clone(), *index));
+        }
     }
 
     fn set_filter(&mut self, filter: MergeFilter) {
@@ -1558,11 +1577,19 @@ impl FolderMergeView {
     ) -> Option<usize> {
         let tree = self.tree.as_deref()?;
         let count = self.visible.len();
-        let after = self
-            .cursor
-            .map_or(0, |at| at + usize::from(!inclusive))
-            .min(count);
-        let before = self.cursor.unwrap_or(count).min(count);
+        // `visible` holds tree indices in ascending order, so a hidden row's
+        // place is the count of visible rows above it.
+        let hidden = || {
+            self.hidden_cursor
+                .as_ref()
+                .map(|(_, index)| self.visible.partition_point(|visible| visible < index))
+        };
+        let (after, before) = match (self.cursor, hidden()) {
+            (Some(at), _) => (at + usize::from(!inclusive), at),
+            (None, Some(place)) => (place, place),
+            (None, None) => (0, count),
+        };
+        let (after, before) = (after.min(count), before.min(count));
         let candidates: Box<dyn Iterator<Item = usize>> = match (forward, wrap) {
             (true, false) => Box::new(after..count),
             (true, true) => Box::new((after..count).chain(0..after)),

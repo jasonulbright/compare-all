@@ -539,3 +539,72 @@ fn the_merge_find_bar_controls_are_pressed_by_label() {
     probe::press_view(&mut known, &mut view, "Close Find").unwrap();
     assert!(!view.find_is_open());
 }
+
+fn merge_cursor(view: &FolderMergeView) -> Option<PathBuf> {
+    view.cursor_row().map(|row| row.rel.clone())
+}
+
+/// Put the cursor on `name` with every row shown, then apply `filter`.
+fn hide_merge_cursor(view: &mut FolderMergeView, name: &str, filter: Command) {
+    expect(view, Command::ShowAll);
+    assert!(view.select(Path::new(name)));
+    expect(view, filter);
+    assert!(view.visible_rows().iter().all(|row| row.name != name));
+}
+
+#[test]
+fn merge_moves_continue_from_a_cursor_the_filter_hides() {
+    let dir = tempfile::tempdir().unwrap();
+    for side in ["left", "center", "right", "output", "journals"] {
+        std::fs::create_dir_all(dir.path().join(side)).unwrap();
+    }
+    for name in ["a.txt", "b.txt", "c.txt", "d.txt"] {
+        for side in ["center", "right"] {
+            std::fs::write(dir.path().join(side).join(name), b"base").unwrap();
+        }
+        let left: &[u8] = if matches!(name, "a.txt" | "c.txt") {
+            b"left change"
+        } else {
+            b"base"
+        };
+        std::fs::write(dir.path().join("left").join(name), left).unwrap();
+    }
+    let request = OpenRequest::new(
+        SessionKind::FolderMerge,
+        dir.path().join("left"),
+        dir.path().join("right"),
+    )
+    .with_center(Some(dir.path().join("center")))
+    .with_output(Some(dir.path().join("output")));
+    let mut view = FolderMergeView::with_journal_directory(
+        &request,
+        &context(),
+        4,
+        dir.path().join("journals"),
+    );
+    assert!(wait(|| {
+        view.tick();
+        view.tree().is_some()
+    }));
+    let names: Vec<_> = view
+        .visible_rows()
+        .iter()
+        .map(|row| row.name.clone())
+        .collect();
+    assert_eq!(names, ["a.txt", "b.txt", "c.txt", "d.txt"]);
+
+    hide_merge_cursor(&mut view, "b.txt", Command::ShowDifferences);
+    expect(&mut view, Command::NextDifference);
+    assert_eq!(merge_cursor(&view), Some(PathBuf::from("c.txt")));
+    hide_merge_cursor(&mut view, "b.txt", Command::ShowDifferences);
+    expect(&mut view, Command::PreviousDifference);
+    assert_eq!(merge_cursor(&view), Some(PathBuf::from("a.txt")));
+
+    view.set_find_text("txt");
+    hide_merge_cursor(&mut view, "c.txt", Command::ShowSame);
+    expect(&mut view, Command::FindNext);
+    assert_eq!(merge_cursor(&view), Some(PathBuf::from("d.txt")));
+    hide_merge_cursor(&mut view, "c.txt", Command::ShowSame);
+    expect(&mut view, Command::FindPrevious);
+    assert_eq!(merge_cursor(&view), Some(PathBuf::from("b.txt")));
+}
