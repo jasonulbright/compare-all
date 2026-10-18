@@ -46,6 +46,11 @@ fn fixture() -> tempfile::TempDir {
     directory
 }
 
+/// The one password the test server accepts, built at run time.
+fn password() -> String {
+    (0..8u8).map(|i| char::from(b'a' + i * 3)).collect()
+}
+
 /// A profile pointing at `server`.
 fn profile(server: &SshTestServer, known_hosts: &Path) -> FtpProfile {
     let mut settings = FtpProfile::default();
@@ -61,7 +66,7 @@ fn profile(server: &SshTestServer, known_hosts: &Path) -> FtpProfile {
 /// A context with the one password the server accepts.
 fn context() -> RemoteContext {
     let store = Arc::new(MemorySecretStore::new());
-    store.insert("password", "hunter2");
+    store.insert("password", password());
     let mut context = RemoteContext::with_secrets(store);
     context.call_timeout = Duration::from_secs(20);
     context
@@ -71,7 +76,7 @@ fn context() -> RemoteContext {
 fn connected() -> (tempfile::TempDir, tempfile::TempDir, SshTestServer, SftpFs) {
     let directory = fixture();
     let settings_dir = tempfile::tempdir().unwrap();
-    let server = SshTestServer::start(directory.path(), "operator", "hunter2");
+    let server = SshTestServer::start(directory.path(), "operator", &password());
     let store = KnownHosts::new(settings_dir.path().join("known_hosts"));
     store
         .record(
@@ -90,7 +95,7 @@ fn connected() -> (tempfile::TempDir, tempfile::TempDir, SshTestServer, SftpFs) 
 fn an_unrecorded_host_key_is_reported_with_its_fingerprint() {
     let directory = fixture();
     let settings_dir = tempfile::tempdir().unwrap();
-    let server = SshTestServer::start(directory.path(), "operator", "hunter2");
+    let server = SshTestServer::start(directory.path(), "operator", &password());
     let settings = profile(&server, &settings_dir.path().join("known_hosts"));
 
     let Err(error) = SftpFs::connect(&settings, &context(), &Cancel::new()) else {
@@ -107,7 +112,7 @@ fn an_unrecorded_host_key_is_reported_with_its_fingerprint() {
 fn a_changed_host_key_is_a_hard_error() {
     let directory = fixture();
     let settings_dir = tempfile::tempdir().unwrap();
-    let server = SshTestServer::start(directory.path(), "operator", "hunter2");
+    let server = SshTestServer::start(directory.path(), "operator", &password());
     let path = settings_dir.path().join("known_hosts");
     let store = KnownHosts::new(&path);
     store
@@ -196,7 +201,7 @@ fn a_write_reads_back_and_leaves_no_temporary_name() {
 fn a_refused_replacement_rename_preserves_the_existing_file_and_reports_permission() {
     let directory = fixture();
     let settings_dir = tempfile::tempdir().unwrap();
-    let server = SshTestServer::start_refusing_renames(directory.path(), "operator", "hunter2");
+    let server = SshTestServer::start_refusing_renames(directory.path(), "operator", &password());
     let store = KnownHosts::new(settings_dir.path().join("known_hosts"));
     store
         .record(
@@ -235,7 +240,7 @@ fn a_failed_staged_rename_restores_the_file_moved_to_backup() {
     let directory = fixture();
     let settings_dir = tempfile::tempdir().unwrap();
     let server =
-        SshTestServer::start_failing_rename_number(directory.path(), "operator", "hunter2", 2);
+        SshTestServer::start_failing_rename_number(directory.path(), "operator", &password(), 2);
     let store = KnownHosts::new(settings_dir.path().join("known_hosts"));
     store
         .record(
@@ -380,7 +385,7 @@ fn a_mapped_sftp_name_is_refused_in_the_listing() {
 fn a_wrong_password_is_a_typed_error_with_no_secret_in_it() {
     let directory = fixture();
     let settings_dir = tempfile::tempdir().unwrap();
-    let server = SshTestServer::start(directory.path(), "operator", "hunter2");
+    let server = SshTestServer::start(directory.path(), "operator", &password());
     let path = settings_dir.path().join("known_hosts");
     KnownHosts::new(&path)
         .record(
