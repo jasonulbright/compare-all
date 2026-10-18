@@ -1020,6 +1020,9 @@ pub enum UpdateNotice {
     Ready(crate::update::Release),
     /// A newer release exists and could not be downloaded.
     NotDownloaded(crate::update::Release),
+    /// A newer release was downloaded and could not be installed, for the
+    /// reason given.
+    NotInstalled(crate::update::Release, String),
     /// A newer release is staged for an install the program does not update
     /// by itself (an install for every user).
     Available(crate::update::Release),
@@ -1817,6 +1820,9 @@ impl App {
                 Outcome::EarlierFailure(release) | Outcome::DownloadFailed(release, _) => {
                     Some(UpdateNotice::NotDownloaded(release))
                 }
+                Outcome::NotInstalled(release, reason) => {
+                    Some(UpdateNotice::NotInstalled(release, reason))
+                }
                 Outcome::Current if manual => Some(UpdateNotice::Message(format!(
                     "No newer release exists. This build is {VERSION}."
                 ))),
@@ -1850,6 +1856,7 @@ impl App {
         let Some(
             UpdateNotice::Newer(release)
             | UpdateNotice::NotDownloaded(release)
+            | UpdateNotice::NotInstalled(release, _)
             | UpdateNotice::Available(release),
         ) = self.update.notice.take()
         else {
@@ -1907,6 +1914,17 @@ impl App {
                 UpdateNotice::NotDownloaded(release) => {
                     ui.label(format!(
                         "Version {} is available but could not be downloaded. \
+                         Open the downloads page now?",
+                        release.version
+                    ));
+                    ui.horizontal(|ui| {
+                        visit = ui.button("OK").clicked();
+                        dismiss = ui.button("Cancel").clicked();
+                    });
+                }
+                UpdateNotice::NotInstalled(release, reason) => {
+                    ui.label(format!(
+                        "Version {} could not be installed: {reason}. \
                          Open the downloads page now?",
                         release.version
                     ));

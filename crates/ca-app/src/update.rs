@@ -56,6 +56,9 @@ pub enum Outcome {
     Waiting(Release),
     /// An earlier run could not download this release.
     EarlierFailure(Release),
+    /// An earlier run downloaded this release and could not install it, for
+    /// the reason given.
+    NotInstalled(Release, String),
     /// A newer release exists and the download failed.
     DownloadFailed(Release, String),
     /// The running build is the newest release or newer.
@@ -76,7 +79,10 @@ pub enum Outcome {
 
 impl Terminal for Outcome {
     fn is_terminal(&self) -> bool {
-        !matches!(self, Self::Waiting(_) | Self::EarlierFailure(_))
+        !matches!(
+            self,
+            Self::Waiting(_) | Self::EarlierFailure(_) | Self::NotInstalled(..)
+        )
     }
 
     fn cancelled() -> Self {
@@ -283,10 +289,14 @@ fn pending(check: &Check) -> Vec<Outcome> {
     }
     if let Some(warning) = staging.read_warning() {
         if let Some(version) = warning.parsed_version().filter(|v| *v > check.current) {
-            out.push(Outcome::EarlierFailure(Release {
+            let release = Release {
                 version,
                 page: warning.page,
-            }));
+            };
+            out.push(match staging.read_apply_failure() {
+                Some(reason) => Outcome::NotInstalled(release, reason),
+                None => Outcome::EarlierFailure(release),
+            });
         }
     }
     out

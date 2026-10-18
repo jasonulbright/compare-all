@@ -581,6 +581,50 @@ fn a_manual_check_with_the_option_off_reports_and_downloads_nothing() {
 }
 
 #[test]
+fn a_failed_apply_is_reported_at_the_next_launch_with_the_downloads_page() {
+    let dir = tempfile::tempdir().unwrap();
+    let staging = dir.path().join("stage");
+    let version = next_version();
+    let (server, asked) = release_server(version.to_string(), 404);
+    write_warning(&staging, &server, &version);
+    Staging::new(staging.clone()).write_apply_failure(
+        "cannot place ca.exe: access denied; the earlier files are kept in C:\\p\\.update-backup-7",
+    );
+    check_just_done(dir.path());
+    let mut app = app_in(dir.path());
+    app.update_from(source(
+        &server,
+        &staging,
+        Some(InstallMode::Installed { machine: false }),
+    ));
+    assert!(run_frames(&mut app, |app| app.update_notice().is_some()));
+    let opened = Arc::new(Mutex::new(Vec::new()));
+    app.set_spawner(Arc::new(Recorder(Arc::clone(&opened))));
+    let mut probe = Probe::new(1280.0, 800.0);
+    {
+        let mut run = |ctx: &egui::Context| app.frame(ctx);
+        probe.idle(&mut run);
+        probe.idle(&mut run);
+        let output = probe.frame(Vec::new(), &mut run);
+        let painted = ca_ui::testing::probe::painted_texts(&output).join(" ");
+        assert!(
+            painted.contains(&format!("Version {version} could not be installed")),
+            "{painted}"
+        );
+        assert!(painted.contains(".update-backup-7"), "{painted}");
+        probe.click("OK", &mut run).unwrap();
+        probe.idle(&mut run);
+    }
+    assert!(run_frames(&mut app, |_| !opened.lock().unwrap().is_empty()));
+    assert!(opened.lock().unwrap()[0]
+        .arguments
+        .last()
+        .unwrap()
+        .ends_with(&format!("/tag/v{version}")));
+    assert_eq!(asked.load(Ordering::SeqCst), 0);
+}
+
+#[test]
 fn a_manual_check_while_another_copy_holds_the_staging_folder_does_not_say_current() {
     let dir = tempfile::tempdir().unwrap();
     let staging = dir.path().join("stage");
