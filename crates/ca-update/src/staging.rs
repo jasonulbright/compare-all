@@ -191,10 +191,15 @@ impl Staging {
 
     /// Remove the staged record and every staged file. The warning and the
     /// helper folder stay. While a claim is held, by this process or another,
-    /// nothing is removed: the holder still needs the files.
+    /// nothing is removed: the holder still needs the files. The removal holds
+    /// a claim of its own, so no claim can start while files are removed.
     pub fn clear(&self) {
-        if !self.is_applying() {
+        if !self.dir.is_dir() {
+            return;
+        }
+        if let Ok(claim) = self.begin_apply() {
             self.remove_staged();
+            drop(claim);
         }
     }
 
@@ -531,6 +536,35 @@ mod tests {
         drop(claim);
         staging.clear();
         assert_eq!(staging.read_record(), None);
+    }
+
+    #[test]
+    fn no_claim_starts_while_a_clear_removes_the_staged_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = Staging::new(dir.path().to_path_buf());
+        staged(&staging);
+        for index in 0..3000 {
+            std::fs::write(dir.path().join(format!("{index}.part")), b"1").unwrap();
+        }
+        let count = |dir: &Path| std::fs::read_dir(dir).unwrap().count();
+        let total = count(dir.path());
+        let clearing = {
+            let staging = staging.clone();
+            std::thread::spawn(move || staging.clear())
+        };
+        while count(dir.path()) == total && !clearing.is_finished() {
+            std::thread::yield_now();
+        }
+        let claim = loop {
+            if let Ok(claim) = staging.begin_apply() {
+                break claim;
+            }
+            std::thread::yield_now();
+        };
+        let held = count(dir.path());
+        clearing.join().unwrap();
+        assert_eq!(count(dir.path()), held, "files were removed under a claim");
+        drop(claim);
     }
 
     #[test]
