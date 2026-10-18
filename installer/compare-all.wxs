@@ -53,6 +53,11 @@
     <Feature Id="Application" Title="Compare All" Level="1" AllowAbsent="no" Display="expand">
       <Component Id="MainExecutable" Directory="INSTALLFOLDER" Bitness="always64">
         <File Id="CompareAllExe" Source="$(var.BinDir)\compare-all.exe" KeyPath="yes" />
+        <!--
+          The unused program copy of an interrupted update. During an update
+          it already holds the program name, so this name is free.
+        -->
+        <RemoveFile Id="RemoveStandbyExe" Name="compare-all-standby.exe" On="both" />
       </Component>
       <Component Id="Documents" Directory="INSTALLFOLDER" Bitness="always64">
         <File Id="ReadmeFile" Source="$(var.DocDir)\README.md" KeyPath="yes" />
