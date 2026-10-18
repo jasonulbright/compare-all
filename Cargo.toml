@@ -8,6 +8,7 @@ members = [
     "crates/ca-text",
     "crates/ca-grammar",
     "crates/ca-vfs",
+    "crates/ca-update",
     "crates/ca-table",
     "crates/ca-image",
     "crates/ca-report",
@@ -42,6 +43,7 @@ ca-session = { path = "crates/ca-session" }
 ca-text = { path = "crates/ca-text" }
 ca-grammar = { path = "crates/ca-grammar" }
 ca-vfs = { path = "crates/ca-vfs" }
+ca-update = { path = "crates/ca-update" }
 ca-table = { path = "crates/ca-table" }
 ca-image = { path = "crates/ca-image" }
 ca-report = { path = "crates/ca-report" }
