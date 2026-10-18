@@ -3271,6 +3271,21 @@ mod tests {
         open_with_output(left, center, right, None)
     }
 
+    /// A view whose merge joins changes at most `lines` ancestor lines apart
+    /// into one conflict, whatever the stored default.
+    fn open_separated(
+        left: &str,
+        center: Option<&str>,
+        right: &str,
+        lines: u32,
+    ) -> (MergeView, tempfile::TempDir) {
+        let (mut view, dir) = open(left, center, right);
+        let mut settings = ca_session::settings::TextMergeSettings::default();
+        settings.conflicts.separation_lines = lines;
+        view.apply_settings(&ca_session::settings::SessionSettings::TextMerge(settings));
+        (view, dir)
+    }
+
     fn open_with_output(
         left: &str,
         center: Option<&str>,
