@@ -282,16 +282,7 @@ pub fn spawn_replace_all(
 ) -> Job<FindAllMessage> {
     Job::spawn_notifying(
         move |emitter, cancel| {
-            let found = find_every(&bytes, &request.needle, request.match_case, cancel);
-            let prepared = found.map(|offsets| {
-                PreparedStep::replace_all(
-                    &bytes,
-                    revision,
-                    &offsets,
-                    request.needle.len() as u64,
-                    &request.replacement,
-                )
-            });
+            let prepared = prepare_replace_all(&bytes, revision, &request, cancel, &|| {});
             // Let go of the old side before the reader installs the new one,
             // so the old side is freed at the install, not when this thread
             // happens to exit.
@@ -301,6 +292,29 @@ pub fn spawn_replace_all(
             }
         },
         notify,
+    )
+}
+
+/// The body of a replace all job: scan, then build the step. `probe` runs
+/// before each cancellation check of the build.
+fn prepare_replace_all(
+    bytes: &[u8],
+    revision: u64,
+    request: &ReplaceAll,
+    cancel: &Cancel,
+    probe: &dyn Fn(),
+) -> Option<PreparedStep> {
+    let offsets = find_every(bytes, &request.needle, request.match_case, cancel)?;
+    PreparedStep::replace_all(
+        bytes,
+        revision,
+        &offsets,
+        request.needle.len() as u64,
+        &request.replacement,
+        &|| {
+            probe();
+            cancel.is_cancelled()
+        },
     )
 }
 
@@ -508,6 +522,49 @@ mod tests {
             found
         }));
         assert_eq!(holders.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_replace_all_cancelled_after_the_scan_stops_building_the_step() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let original = b"aX".repeat(100_000);
+        let buffer = crate::edit::ByteBuffer::new(original.clone());
+        let request = super::ReplaceAll {
+            needle: b"X".to_vec(),
+            replacement: b"YY".to_vec(),
+            match_case: true,
+        };
+
+        let checks = AtomicUsize::new(0);
+        let cancel = ca_ui::worker::Cancel::new();
+        let whole = super::prepare_replace_all(
+            buffer.bytes(),
+            buffer.revision(),
+            &request,
+            &cancel,
+            &|| {
+                checks.fetch_add(1, Ordering::SeqCst);
+            },
+        );
+        assert_eq!(whole.map(|step| step.count()), Some(100_000));
+        assert!(checks.load(Ordering::SeqCst) > 2);
+
+        let checks = AtomicUsize::new(0);
+        let cancel = ca_ui::worker::Cancel::new();
+        let stopped = super::prepare_replace_all(
+            buffer.bytes(),
+            buffer.revision(),
+            &request,
+            &cancel,
+            &|| {
+                checks.fetch_add(1, Ordering::SeqCst);
+                cancel.cancel();
+            },
+        );
+        assert!(stopped.is_none());
+        assert_eq!(checks.load(Ordering::SeqCst), 1);
+        assert_eq!(buffer.bytes(), original.as_slice());
+        assert!(!buffer.is_modified());
     }
 
     #[test]

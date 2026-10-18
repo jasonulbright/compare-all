@@ -228,7 +228,10 @@ impl ByteBuffer {
         if self.read_only {
             return 0;
         }
-        let edits = plan_all(&self.bytes, offsets, len, inserted);
+        let Some(edits) = plan_all(&self.bytes, offsets, len, inserted, &mut Pace::endless())
+        else {
+            return 0;
+        };
         let count = edits.len();
         if count > 0 {
             self.commit(edits);
@@ -268,7 +271,10 @@ impl ByteBuffer {
             return;
         }
         count_whole_copy();
-        self.bytes = std::sync::Arc::new(rebuilt(&self.bytes, edits));
+        let Some(bytes) = rebuilt(&self.bytes, edits, &mut Pace::endless()) else {
+            return;
+        };
+        self.bytes = std::sync::Arc::new(bytes);
         self.revision = NEXT_REVISION.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -351,7 +357,9 @@ impl PreparedStep {
     /// Plan the replacement of every `len` byte run at `offsets` in `source`,
     /// the content of revision `revision`, and build the content after it.
     ///
-    /// Offsets are taken as [`ByteBuffer::replace_all`] takes them.
+    /// Offsets are taken as [`ByteBuffer::replace_all`] takes them. `stop` is
+    /// asked at regular intervals of planned edits and copied bytes; once it
+    /// answers true the work ends and `None` is returned.
     #[must_use]
     pub fn replace_all(
         source: &[u8],
@@ -359,14 +367,16 @@ impl PreparedStep {
         offsets: &[u64],
         len: u64,
         inserted: &[u8],
-    ) -> Self {
-        let edits = plan_all(source, offsets, len, inserted);
-        let bytes = std::sync::Arc::new(rebuilt(source, &edits));
-        Self {
+        stop: &dyn Fn() -> bool,
+    ) -> Option<Self> {
+        let mut pace = Pace::new(stop);
+        let edits = plan_all(source, offsets, len, inserted, &mut pace)?;
+        let bytes = std::sync::Arc::new(rebuilt(source, &edits, &mut pace)?);
+        Some(Self {
             revision,
             edits,
             bytes,
-        }
+        })
     }
 
     /// How many runs the step replaces.
@@ -401,14 +411,72 @@ impl ByteBuffer {
     }
 }
 
+/// How many planned edits pass between two questions to the stop check.
+const EDITS_PER_CHECK: usize = 4096;
+/// How many copied bytes pass between two questions to the stop check.
+const BYTES_PER_CHECK: usize = 1 << 20;
+
+/// Asks a stop check after every fixed amount of work, so a cancelled
+/// preparation ends without building the whole output first.
+struct Pace<'a> {
+    stop: &'a dyn Fn() -> bool,
+    edits: usize,
+}
+
+impl<'a> Pace<'a> {
+    fn new(stop: &'a dyn Fn() -> bool) -> Self {
+        Self { stop, edits: 0 }
+    }
+
+    /// A pace whose check never asks the work to end.
+    fn endless() -> Pace<'static> {
+        Pace::new(&never)
+    }
+
+    /// Count one edit; true when the work must end.
+    fn edit(&mut self) -> bool {
+        self.edits += 1;
+        if self.edits < EDITS_PER_CHECK {
+            return false;
+        }
+        self.edits = 0;
+        (self.stop)()
+    }
+
+    /// Append `part` to `out` in fixed-size pieces; false when the work must
+    /// end.
+    fn copy(&mut self, out: &mut Vec<u8>, part: &[u8]) -> bool {
+        for piece in part.chunks(BYTES_PER_CHECK) {
+            out.extend_from_slice(piece);
+            if piece.len() == BYTES_PER_CHECK && (self.stop)() {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+const fn never() -> bool {
+    false
+}
+
 /// The edits replacing every `len` byte run at `offsets`, in ascending order,
 /// with runs that overlap an earlier one or reach past the end left out.
-fn plan_all(bytes: &[u8], offsets: &[u64], len: u64, inserted: &[u8]) -> Vec<Edit> {
+fn plan_all(
+    bytes: &[u8],
+    offsets: &[u64],
+    len: u64,
+    inserted: &[u8],
+    pace: &mut Pace<'_>,
+) -> Option<Vec<Edit>> {
     let mut sorted = offsets.to_vec();
     sorted.sort_unstable();
     let mut edits = Vec::with_capacity(sorted.len());
     let mut free_from = 0u64;
     for at in sorted {
+        if pace.edit() {
+            return None;
+        }
         if at < free_from {
             continue;
         }
@@ -418,7 +486,7 @@ fn plan_all(bytes: &[u8], offsets: &[u64], len: u64, inserted: &[u8]) -> Vec<Edi
         free_from = at.saturating_add(len.max(1));
         edits.push(edit);
     }
-    edits
+    Some(edits)
 }
 
 fn plan_in(bytes: &[u8], at: u64, len: u64, inserted: &[u8]) -> Option<Edit> {
@@ -435,20 +503,27 @@ fn plan_in(bytes: &[u8], at: u64, len: u64, inserted: &[u8]) -> Option<Edit> {
 }
 
 /// `old` with the ascending `edits` applied, in a single pass.
-fn rebuilt(old: &[u8], edits: &[Edit]) -> Vec<u8> {
+fn rebuilt(old: &[u8], edits: &[Edit], pace: &mut Pace<'_>) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(old.len());
     let mut from = 0usize;
     for edit in edits {
+        if pace.edit() {
+            return None;
+        }
         let Ok(at) = usize::try_from(edit.at) else {
             continue;
         };
         let at = at.clamp(from, old.len());
-        out.extend_from_slice(old.get(from..at).unwrap_or_default());
+        if !pace.copy(&mut out, old.get(from..at).unwrap_or_default()) {
+            return None;
+        }
         out.extend_from_slice(&edit.inserted);
         from = at.saturating_add(edit.removed.len()).min(old.len());
     }
-    out.extend_from_slice(old.get(from..).unwrap_or_default());
-    out
+    if !pace.copy(&mut out, old.get(from..).unwrap_or_default()) {
+        return None;
+    }
+    Some(out)
 }
 
 /// The two hexadecimal digits of a byte.
@@ -637,7 +712,10 @@ mod tests {
             &[4, 0, 1, 9],
             2,
             &[7, 7, 7],
+            &|| false,
         );
+        assert!(step.is_some());
+        let Some(step) = step else { return };
         assert_eq!(step.count(), 2);
         let stale = step.clone();
         assert_eq!(bytes.install(step), Some(2));
@@ -649,8 +727,16 @@ mod tests {
 
         let mut locked = ByteBuffer::new(vec![1]);
         locked.set_read_only(true);
-        let step =
-            super::PreparedStep::replace_all(locked.bytes(), locked.revision(), &[0], 1, &[2]);
+        let step = super::PreparedStep::replace_all(
+            locked.bytes(),
+            locked.revision(),
+            &[0],
+            1,
+            &[2],
+            &|| false,
+        );
+        assert!(step.is_some());
+        let Some(step) = step else { return };
         assert_eq!(locked.install(step), Some(0));
         assert_eq!(locked.bytes(), &[1]);
     }
