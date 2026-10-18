@@ -658,11 +658,19 @@ impl Keystroke {
 ///
 /// Ctrl or Command without Alt is a shortcut chord, and some backends deliver
 /// its letter as text beside the key press. Ctrl with Alt is how Windows
-/// reports Alt Gr, and Alt alone composes characters on macOS, so their text is
-/// typed unless a command ran for the key.
+/// reports Alt Gr, so its text is typed unless a command ran for the key.
+/// Alt alone composes characters on macOS; elsewhere it is a menu access
+/// chord, and Windows still delivers its letter as text.
 #[must_use]
 pub const fn chord_types_text(modifiers: egui::Modifiers) -> bool {
-    modifiers.alt || !(modifiers.command || modifiers.ctrl)
+    let control = modifiers.command || modifiers.ctrl;
+    if cfg!(target_os = "macos") {
+        modifiers.alt || !control
+    } else if modifiers.alt {
+        modifiers.ctrl
+    } else {
+        !control
+    }
 }
 
 /// Remove the text events that belong to the key events at `keys`.
@@ -688,6 +696,23 @@ pub fn drop_text_of(events: &mut Vec<egui::Event>, keys: &[usize]) {
             egui::Event::Text(_) => !owner.is_some_and(|key| keys.contains(&key)),
             _ => true,
         }
+    });
+}
+
+/// Remove the text events whose key press is a chord that does not type.
+///
+/// Windows delivers the letter of an Alt menu chord as text, and text fields
+/// insert every text event they read, so this runs before any widget does.
+/// Text with no key event before it in the frame is kept.
+pub fn drop_chord_text(events: &mut Vec<egui::Event>) {
+    let mut typing = true;
+    events.retain(|event| match event {
+        egui::Event::Key { modifiers, .. } => {
+            typing = chord_types_text(*modifiers);
+            true
+        }
+        egui::Event::Text(_) => typing,
+        _ => true,
     });
 }
 
@@ -1319,7 +1344,10 @@ pub fn bindings(view: MenuView) -> Vec<(Keystroke, Command)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{bindings, chord_types_text, drop_text_of, route, Command, Keystroke, MenuView};
+    use super::{
+        bindings, chord_types_text, drop_chord_text, drop_text_of, route, Command, Keystroke,
+        MenuView,
+    };
     use egui::Key;
 
     fn key_event(key: Key, modifiers: egui::Modifiers) -> egui::Event {
@@ -1371,8 +1399,51 @@ mod tests {
         };
         assert!(chord_types_text(with(false, false)));
         assert!(chord_types_text(with(true, true)), "AltGr");
-        assert!(chord_types_text(with(false, true)), "Option");
+        assert_eq!(
+            chord_types_text(with(false, true)),
+            cfg!(target_os = "macos"),
+            "Alt alone types only as macOS Option"
+        );
         assert!(!chord_types_text(with(true, false)));
+    }
+
+    #[test]
+    fn text_of_a_chord_that_does_not_type_is_dropped() {
+        let alt = egui::Modifiers {
+            alt: true,
+            ..egui::Modifiers::NONE
+        };
+        let ctrl = egui::Modifiers {
+            ctrl: true,
+            command: true,
+            ..egui::Modifiers::NONE
+        };
+        let altgr = egui::Modifiers { alt: true, ..ctrl };
+        let mut events = vec![
+            egui::Event::Text("i".to_owned()),
+            key_event(Key::F, alt),
+            egui::Event::Text("f".to_owned()),
+            key_event(Key::C, ctrl),
+            egui::Event::Text("c".to_owned()),
+            key_event(Key::Q, altgr),
+            egui::Event::Text("@".to_owned()),
+            key_event(Key::G, egui::Modifiers::NONE),
+            egui::Event::Text("g".to_owned()),
+        ];
+        drop_chord_text(&mut events);
+        let typed: String = events
+            .iter()
+            .filter_map(|event| match event {
+                egui::Event::Text(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        let expected = if cfg!(target_os = "macos") {
+            "if@g"
+        } else {
+            "i@g"
+        };
+        assert_eq!(typed, expected);
     }
 
     #[test]

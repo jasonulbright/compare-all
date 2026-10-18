@@ -2579,11 +2579,13 @@ impl MergeView {
         if ui.ctx().wants_keyboard_input() {
             return;
         }
-        let events = ui.input(|input| input.events.clone());
+        let (events, held) = ui.input(|input| (input.events.clone(), input.modifiers));
         let touched_caret = !events.is_empty();
         let mut edited = false;
+        let mut typing = ca_ui::command::chord_types_text(held);
         for event in events {
             match event {
+                egui::Event::Text(_) if !typing => {}
                 egui::Event::Text(text) => {
                     for character in text.chars() {
                         self.output_pane.type_character(character);
@@ -2601,10 +2603,15 @@ impl MergeView {
                 }
                 egui::Event::Key {
                     key,
-                    pressed: true,
+                    pressed,
                     modifiers,
                     ..
-                } => edited |= self.key(key, modifiers),
+                } => {
+                    typing = ca_ui::command::chord_types_text(modifiers);
+                    if pressed {
+                        edited |= self.key(key, modifiers);
+                    }
+                }
                 _ => {}
             }
         }
@@ -5776,6 +5783,42 @@ mod tests {
             },
         );
         assert_eq!(view.output_text(), "@abc\n");
+    }
+
+    #[test]
+    fn alt_letter_text_is_typed_into_the_output_only_where_option_composes() {
+        let (mut view, _dir) = open("abc\n", Some("abc\n"), "abc\n");
+        run_until_ready(&mut view);
+        let ctx = egui::Context::default();
+        let alt = egui::Modifiers {
+            alt: true,
+            ..egui::Modifiers::NONE
+        };
+        let _ = ctx.run(
+            ca_ui::testing::event_input(
+                1400.0,
+                800.0,
+                vec![
+                    egui::Event::Key {
+                        key: egui::Key::F,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: alt,
+                    },
+                    egui::Event::Text("f".into()),
+                ],
+            ),
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| view.ui(ui, &context()));
+            },
+        );
+        let expected = if cfg!(target_os = "macos") {
+            "fabc\n"
+        } else {
+            "abc\n"
+        };
+        assert_eq!(view.output_text(), expected);
     }
 
     #[test]

@@ -2581,19 +2581,23 @@ impl HexView {
         // A text field that holds the keyboard reads the same events without
         // consuming them, so the bytes take keys only while the panes hold it.
         let owns_keys = ui.ctx().memory(egui::Memory::focused) == Some(self.body_id());
-        let events = ui.input(|input| input.events.clone());
+        let (events, held) = ui.input(|input| (input.events.clone(), input.modifiers));
         let page = u32::try_from(self.viewport_rows.max(1)).unwrap_or(1);
+        let mut typing = ca_ui::command::chord_types_text(held);
         for event in events {
             match event {
                 egui::Event::Key {
                     key,
-                    pressed: true,
+                    pressed,
                     modifiers,
                     ..
                 } if owns_keys => {
-                    self.handle_key(key, modifiers, page);
+                    typing = ca_ui::command::chord_types_text(modifiers);
+                    if pressed {
+                        self.handle_key(key, modifiers, page);
+                    }
                 }
-                egui::Event::Text(text) if owns_keys => self.handle_text(&text),
+                egui::Event::Text(text) if owns_keys && typing => self.handle_text(&text),
                 egui::Event::Paste(text) if owns_keys => self.paste(&text),
                 egui::Event::MouseWheel { delta, .. } => {
                     self.scroll.scroll_by(
