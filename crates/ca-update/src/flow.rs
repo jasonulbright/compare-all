@@ -203,6 +203,7 @@ fn stage(
         size: asset.size,
         sha256: &asset.sha256,
         signer: job.signer_name,
+        version: latest,
     };
     let record = StagedRecord::new(latest, name.clone(), asset.sha256.clone(), asset.size);
     let scratch = job.staging.dir().join("scratch");

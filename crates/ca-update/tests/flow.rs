@@ -8,7 +8,7 @@ use ca_update::flow::{run, Endpoints, Job, Outcome};
 use ca_update::manifest::{msi_name, zip_name, Manifest, ManifestAsset, MANIFEST_NAME, SCHEMA};
 use ca_update::mode::InstallMode;
 use ca_update::net::{HttpTransport, ProxyConfig};
-use ca_update::signature::SignatureVerifier;
+use ca_update::signature::{SignatureVerifier, SignerFacts};
 use ca_update::staging::Staging;
 use ca_update::verify::hex;
 use ca_update::Version;
@@ -90,9 +90,17 @@ impl FakeSigner {
 }
 
 impl SignatureVerifier for FakeSigner {
-    fn signer_subject(&self, _: &Path) -> Result<String, String> {
-        self.0.lock().unwrap().clone()
+    fn signer_facts(&self, _: &Path) -> Result<SignerFacts, String> {
+        self.0
+            .lock()
+            .unwrap()
+            .clone()
+            .map(|subject| SignerFacts::release(&subject))
     }
+}
+
+fn running() -> Version {
+    Version::parse(CURRENT).unwrap()
 }
 
 fn msi_bytes() -> Vec<u8> {
@@ -408,9 +416,13 @@ fn a_build_without_an_updater_reports_the_newer_release_only() {
     assert_eq!(server.hits.load(Ordering::SeqCst), 1);
 }
 
+fn new_exe() -> Vec<u8> {
+    format!("new exe\0CA-BUILD-VERSION={NEXT}\0").into_bytes()
+}
+
 fn portable_zip() -> Vec<u8> {
     zip_bytes(&[
-        ("compare-all.exe", b"new exe"),
+        ("compare-all.exe", &new_exe()),
         ("ca.exe", b"new ca"),
         ("README.md", b"new readme"),
     ])
@@ -460,6 +472,7 @@ fn a_portable_update_replaces_program_files_and_keeps_settings() {
         signer: &signer,
         signer_name: SIGNER,
         endpoints: &endpoints,
+        running: &running(),
     };
     let version = apply_staged(
         &staging,
@@ -473,7 +486,7 @@ fn a_portable_update_replaces_program_files_and_keeps_settings() {
     assert_eq!(version.to_string(), NEXT);
     assert_eq!(
         std::fs::read(target.path().join("compare-all.exe")).unwrap(),
-        b"new exe"
+        new_exe()
     );
     assert_eq!(
         std::fs::read(target.path().join("ca.exe")).unwrap(),
@@ -540,6 +553,7 @@ fn a_changed_staged_file_is_refused_at_apply_time() {
         signer: &signer,
         signer_name: SIGNER,
         endpoints: &endpoints,
+        running: &running(),
     };
     let result = apply_staged(
         &staging,
@@ -573,6 +587,7 @@ fn a_tampered_record_is_not_applied() {
         signer: &signer,
         signer_name: SIGNER,
         endpoints: &endpoints,
+        running: &running(),
     };
     let result = apply_staged(
         &staging,
@@ -606,46 +621,379 @@ fn an_archive_with_a_path_in_it_is_refused() {
     assert!(matches!(outcome, Outcome::DownloadFailed { .. }));
 }
 
+/// Accepts a file only when its content starts with `SIGNED`.
+struct ContentSigner;
+
+impl SignatureVerifier for ContentSigner {
+    fn signer_facts(&self, file: &Path) -> Result<SignerFacts, String> {
+        let bytes = std::fs::read(file).map_err(|e| e.to_string())?;
+        if bytes.starts_with(b"SIGNED") {
+            Ok(SignerFacts::release(&format!("CN={SIGNER}, C=US")))
+        } else {
+            Err(format!("{} is not signed", file.display()))
+        }
+    }
+}
+
+fn signed_program(version: &str) -> Vec<u8> {
+    format!("SIGNED\0CA-BUILD-VERSION={version}\0").into_bytes()
+}
+
+fn stage_zip_with(
+    server: &Server,
+    staging: &Staging,
+    files: &[(&str, &[u8])],
+) -> Result<Outcome, String> {
+    let zip = zip_bytes(files);
+    let asset = publish(server, &zip_name(NEXT), &zip, "application/zip");
+    publish_manifest(server, vec![asset]);
+    let endpoints = server.endpoints();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let transport = transport();
+    run(&Job {
+        transport: &transport,
+        signer: &ContentSigner,
+        staging,
+        mode: Some(InstallMode::Portable),
+        current: Version::parse(CURRENT).unwrap(),
+        endpoints: &endpoints,
+        signer_name: SIGNER,
+        cancel: &cancel,
+    })
+}
+
 #[test]
-fn the_installer_runs_for_an_installed_copy_with_the_machine_scope() {
+fn an_archive_entry_outside_the_release_file_set_is_refused() {
+    let exe = signed_program(NEXT);
+    let pe = b"MZ\x90\0not signed".to_vec();
+    let cases: Vec<(&str, Vec<u8>)> = vec![
+        ("version.dll.", pe.clone()),
+        ("options.json", b"{\"openWith\":[]}".to_vec()),
+        ("NUL", b"x".to_vec()),
+        ("extra.txt", b"x".to_vec()),
+        ("COMPARE-ALL.EXE", exe.clone()),
+        ("README.md", pe),
+    ];
+    for (name, data) in &cases {
+        let server = Server::start();
+        let (_keep, staging) = staging_dir();
+        let outcome = stage_zip_with(
+            &server,
+            &staging,
+            &[
+                ("compare-all.exe", &exe),
+                ("ca.exe", &exe),
+                (name, data.as_slice()),
+            ],
+        )
+        .unwrap();
+        assert!(
+            matches!(outcome, Outcome::DownloadFailed { .. }),
+            "{name}: {outcome:?}"
+        );
+        assert!(staging.read_record().is_none(), "{name}");
+    }
+}
+
+#[test]
+fn an_older_archive_under_a_newer_version_is_not_applied() {
     let server = Server::start();
     let (_keep, staging) = staging_dir();
+    let exe = signed_program(NEXT);
+    let outcome = stage_zip_with(
+        &server,
+        &staging,
+        &[("compare-all.exe", &exe), ("ca.exe", &exe)],
+    )
+    .unwrap();
+    assert!(matches!(outcome, Outcome::Staged { .. }), "{outcome:?}");
+    let claimed = "2099.01.01.0001";
+    let record = staging.read_record().unwrap();
+    std::fs::rename(
+        staging.asset_path(&record),
+        staging.dir().join(zip_name(claimed)),
+    )
+    .unwrap();
+    let text = std::fs::read_to_string(staging.dir().join("staged.json"))
+        .unwrap()
+        .replace(NEXT, claimed);
+    std::fs::write(staging.dir().join("staged.json"), text).unwrap();
+    assert!(staging.read_record().is_some());
+    let target = program_folder();
+    let endpoints = server.endpoints();
+    let trust = Trust {
+        signer: &ContentSigner,
+        signer_name: SIGNER,
+        endpoints: &endpoints,
+        running: &running(),
+    };
+    let result = apply_staged(
+        &staging,
+        InstallMode::Portable,
+        &trust,
+        &|_| Ok(()),
+        &|_| Ok(()),
+        target.path(),
+    );
+    assert!(result.is_err(), "{result:?}");
+    assert_eq!(
+        std::fs::read(target.path().join("compare-all.exe")).unwrap(),
+        b"old exe"
+    );
+}
+
+#[test]
+fn a_failed_restore_keeps_the_backup_and_reports_it() {
+    let fresh = tempfile::tempdir().unwrap();
+    std::fs::write(fresh.path().join("compare-all.exe"), b"new exe").unwrap();
+    std::fs::write(fresh.path().join("ca.exe"), b"new ca").unwrap();
+    let target = program_folder();
+    let live_ca = target.path().join("ca.exe");
+    // ca.exe installs before compare-all.exe. The failure of compare-all.exe
+    // leaves a folder where ca.exe must be restored, so that restore fails.
+    let result = apply_portable_with(target.path(), fresh.path(), &|name| {
+        if name == "compare-all.exe" {
+            std::fs::remove_file(&live_ca)?;
+            std::fs::create_dir(&live_ca)?;
+            Err(std::io::Error::other("disk full"))
+        } else {
+            Ok(())
+        }
+    });
+    let reason = result.unwrap_err();
+    assert!(reason.contains("restore"), "{reason}");
+    let backups: Vec<_> = std::fs::read_dir(target.path())
+        .unwrap()
+        .flatten()
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with(".update-backup-")
+        })
+        .collect();
+    assert_eq!(backups.len(), 1);
+    assert_eq!(
+        std::fs::read(backups[0].path().join("ca.exe")).unwrap(),
+        b"old ca"
+    );
+    assert!(reason.contains(&backups[0].file_name().to_string_lossy().into_owned()));
+}
+
+#[test]
+fn a_second_apply_cannot_claim_the_same_staged_update() {
+    let (_keep, staging) = staging_dir();
+    let first = staging.begin_apply();
+    assert!(first.is_ok());
+    assert!(staging.begin_apply().is_err());
+    drop(first);
+}
+
+#[test]
+fn a_helper_that_finds_the_apply_claimed_leaves_everything_alone() {
+    let server = Server::start();
+    let (_keep, staging) = staging_dir();
+    stage_portable(&server, &staging);
+    let target = program_folder();
+    let _claim = staging.begin_apply();
+    let arguments = ca_update::apply::HelperArguments {
+        staging: staging.dir().to_path_buf(),
+        executable: target.path().join("compare-all.exe"),
+        relaunch: false,
+        program_arguments: Vec::new(),
+    };
+    let code = ca_update::apply::helper_main(
+        &arguments,
+        &FakeSigner::signed_by(SIGNER),
+        SIGNER,
+        &running(),
+    );
+    assert_ne!(code, 0);
+    assert_eq!(
+        std::fs::read(target.path().join("compare-all.exe")).unwrap(),
+        b"old exe"
+    );
+    assert!(staging.read_record().is_some());
+}
+
+#[test]
+fn the_machine_installer_command_writes_no_log_in_the_user_folder() {
+    let command = ca_update::apply::msi_command(
+        Path::new(r"C:\stage\a.msi"),
+        true,
+        Path::new(r"C:\stage\installer.log"),
+    );
+    let args: Vec<String> = command
+        .get_args()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        !args.iter().any(|a| a.eq_ignore_ascii_case("/L*v")),
+        "{args:?}"
+    );
+    assert!(
+        !args.iter().any(|a| a.contains("installer.log")),
+        "{args:?}"
+    );
+}
+
+/// A server that sends the headers at once and then the body in small pieces.
+fn trickle_server(
+    body: Vec<u8>,
+    piece: usize,
+    pause: Duration,
+    stall_after: Option<usize>,
+) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let body = body.clone();
+            std::thread::spawn(move || {
+                let mut buffer = [0u8; 4096];
+                let _ = stream.read(&mut buffer);
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes());
+                for (index, chunk) in body.chunks(piece).enumerate() {
+                    if stall_after.is_some_and(|n| index >= n) {
+                        std::thread::sleep(Duration::from_secs(30));
+                        return;
+                    }
+                    if stream.write_all(chunk).is_err() {
+                        return;
+                    }
+                    let _ = stream.flush();
+                    std::thread::sleep(pause);
+                }
+            });
+        }
+    });
+    base
+}
+
+#[test]
+fn a_slow_but_steady_download_outlasts_the_document_timeout() {
+    use ca_update::net::Transport;
+    let body = vec![7u8; 4000];
+    let base = trickle_server(body.clone(), 200, Duration::from_millis(150), None);
+    let transport = HttpTransport::new(
+        "compare-all/test".to_owned(),
+        ProxyConfig::direct(),
+        Duration::from_secs(1),
+    )
+    .allowing_plain_http();
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("file.part");
+    let cancel = Arc::new(AtomicBool::new(false));
+    let fetched = transport
+        .download(&format!("{base}/f"), &out, body.len() as u64, &cancel)
+        .unwrap();
+    assert_eq!(fetched.bytes, body.len() as u64);
+    assert_eq!(std::fs::read(&out).unwrap(), body);
+}
+
+#[test]
+fn a_stalled_download_ends_after_the_idle_limit() {
+    use ca_update::net::Transport;
+    let body = vec![7u8; 4000];
+    let base = trickle_server(body.clone(), 200, Duration::from_millis(10), Some(3));
+    let transport = HttpTransport::new(
+        "compare-all/test".to_owned(),
+        ProxyConfig::direct(),
+        Duration::from_secs(1),
+    )
+    .allowing_plain_http();
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("file.part");
+    let cancel = Arc::new(AtomicBool::new(false));
+    let started = std::time::Instant::now();
+    let result = transport.download(&format!("{base}/f"), &out, body.len() as u64, &cancel);
+    assert!(result.is_err());
+    assert!(started.elapsed() < Duration::from_secs(10));
+}
+
+#[test]
+fn the_installer_runs_only_for_an_install_for_one_user() {
+    let server = Server::start();
     let msi = msi_bytes();
     let asset = publish(&server, &msi_name(NEXT), &msi, "application/x-msi");
     publish_manifest(&server, vec![asset]);
-    let mode = InstallMode::Installed { machine: true };
     let signer = FakeSigner::signed_by(SIGNER);
-    assert!(matches!(
-        check(&server, &staging, &signer, Some(mode)).unwrap(),
-        Outcome::Staged { .. }
-    ));
     let endpoints = server.endpoints();
     let trust = Trust {
         signer: &signer,
         signer_name: SIGNER,
         endpoints: &endpoints,
+        running: &running(),
     };
-    let seen = Mutex::new(Vec::new());
+    for machine in [false, true] {
+        let (_keep, staging) = staging_dir();
+        let mode = InstallMode::Installed { machine };
+        assert!(matches!(
+            check(&server, &staging, &signer, Some(mode)).unwrap(),
+            Outcome::Staged { .. }
+        ));
+        let seen = Mutex::new(Vec::new());
+        let target = program_folder();
+        let result = apply_staged(
+            &staging,
+            mode,
+            &trust,
+            &|command| {
+                seen.lock().unwrap().push(
+                    command
+                        .get_args()
+                        .map(|a| a.to_string_lossy().into_owned())
+                        .collect::<Vec<_>>(),
+                );
+                Ok(())
+            },
+            &|_| Ok(()),
+            target.path(),
+        );
+        if machine {
+            assert!(result.is_err());
+            assert!(seen.lock().unwrap().is_empty());
+            continue;
+        }
+        result.unwrap();
+        let args = seen.lock().unwrap()[0].clone();
+        assert_eq!(args[0], "/i");
+        assert!(args.contains(&"/passive".to_owned()));
+        assert!(!args.contains(&"ALLUSERS=1".to_owned()));
+    }
+}
+
+#[test]
+fn a_staged_version_not_newer_than_the_running_build_is_not_applied() {
+    let server = Server::start();
+    let (_keep, staging) = staging_dir();
+    stage_portable(&server, &staging);
     let target = program_folder();
-    apply_staged(
-        &staging,
-        mode,
-        &trust,
-        &|command| {
-            seen.lock().unwrap().push(
-                command
-                    .get_args()
-                    .map(|a| a.to_string_lossy().into_owned())
-                    .collect::<Vec<_>>(),
-            );
-            Ok(())
-        },
-        &|_| Ok(()),
-        target.path(),
-    )
-    .unwrap();
-    let args = seen.lock().unwrap()[0].clone();
-    assert_eq!(args[0], "/i");
-    assert!(args.contains(&"/passive".to_owned()));
-    assert!(args.contains(&"ALLUSERS=1".to_owned()));
+    let signer = FakeSigner::signed_by(SIGNER);
+    let endpoints = server.endpoints();
+    for running in [NEXT, "2026.12.31.0001"] {
+        let trust = Trust {
+            signer: &signer,
+            signer_name: SIGNER,
+            endpoints: &endpoints,
+            running: &Version::parse(running).unwrap(),
+        };
+        let result = apply_staged(
+            &staging,
+            InstallMode::Portable,
+            &trust,
+            &|_| Ok(()),
+            &|_| Ok(()),
+            target.path(),
+        );
+        assert!(result.is_err(), "{running}");
+    }
+    assert_eq!(
+        std::fs::read(target.path().join("compare-all.exe")).unwrap(),
+        b"old exe"
+    );
 }

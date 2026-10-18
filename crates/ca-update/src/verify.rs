@@ -3,11 +3,19 @@
 //! A response with status 200 proves nothing. A file passes only when its size
 //! equals the size in the manifest, it has the format of its kind, its
 //! SHA-256 equals the manifest value, and its Authenticode signer is the
-//! release signer. For the portable archive the signer checks apply to every
-//! program file inside.
+//! release signer.
+//!
+//! The manifest and the SHA-256 come from the same host as the file, so the
+//! signature is the only check an attacker on that path cannot satisfy. The
+//! portable archive is therefore held to a fixed file set compiled into the
+//! program: every program file in it is signer-checked, no other file may be
+//! a program, and the signed `compare-all.exe` must carry the version the
+//! release claims, so an older signed build cannot be staged under a newer
+//! version.
 
 use crate::signature::{verify_signer, SignatureVerifier};
 use crate::staging::AssetKind;
+use crate::version::Version;
 use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -18,6 +26,27 @@ const ZIP_MAGIC: [u8; 4] = *b"PK\x03\x04";
 const MAX_UNPACKED_BYTES: u64 = 1024 * 1024 * 1024;
 /// Most entries a portable archive may hold.
 const MAX_ENTRIES: usize = 64;
+
+/// Every file the portable archive may hold, in install order. Nothing else
+/// is unpacked and nothing else is written into the program folder.
+pub const PORTABLE_FILES: [&str; 6] = [
+    "CHANGELOG.md",
+    "LICENSE",
+    "README.md",
+    "THIRD-PARTY-NOTICES.md",
+    "ca.exe",
+    "compare-all.exe",
+];
+
+/// The program files of the portable archive. Each must be present and signed.
+pub const PORTABLE_PROGRAMS: [&str; 2] = ["ca.exe", "compare-all.exe"];
+
+/// The program whose embedded version must equal the release version.
+pub const MAIN_PROGRAM: &str = "compare-all.exe";
+
+/// Text that precedes the build version inside the program file. The version
+/// ends at a NUL byte.
+pub const VERSION_MARKER: &[u8] = b"CA-BUILD-VERSION=";
 
 /// What the manifest promises about a file.
 #[derive(Debug, Clone)]
@@ -30,6 +59,46 @@ pub struct Expected<'a> {
     pub sha256: &'a str,
     /// Common name of the required signer.
     pub signer: &'a str,
+    /// The release version the file belongs to.
+    pub version: &'a Version,
+}
+
+/// The build version embedded in a program file.
+///
+/// # Errors
+/// Returns why the file carries no single version.
+pub fn embedded_version(bytes: &[u8]) -> Result<Version, String> {
+    let mut found: Option<Version> = None;
+    let mut rest = bytes;
+    while let Some(at) = find(rest, VERSION_MARKER) {
+        let after = &rest[at + VERSION_MARKER.len()..];
+        rest = after;
+        let digits: Vec<u8> = after
+            .iter()
+            .take(32)
+            .take_while(|byte| byte.is_ascii_digit() || **byte == b'.')
+            .copied()
+            .collect();
+        if after.get(digits.len()) != Some(&0) {
+            continue;
+        }
+        let Some(version) = std::str::from_utf8(&digits).ok().and_then(Version::parse) else {
+            continue;
+        };
+        match found {
+            Some(earlier) if earlier != version => {
+                return Err("the program names more than one version".to_owned());
+            }
+            _ => found = Some(version),
+        }
+    }
+    found.ok_or_else(|| "the program names no version".to_owned())
+}
+
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 /// SHA-256 of a file as lowercase hexadecimal.
@@ -90,17 +159,37 @@ pub fn verify_file(
         AssetKind::Msi => verify_signer(signer, file, expected.signer),
         AssetKind::Zip => {
             let files = extract_release_zip(file, scratch)?;
-            for path in files.iter().filter(|path| is_program_file(path)) {
-                verify_signer(signer, path, expected.signer)?;
+            for path in &files {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                if PORTABLE_PROGRAMS.contains(&name.as_str()) {
+                    verify_signer(signer, path, expected.signer)?;
+                } else if is_program_image(path)? {
+                    return Err(format!("the archive file {name} is a program"));
+                }
+            }
+            let main = std::fs::read(scratch.join(MAIN_PROGRAM))
+                .map_err(|error| format!("cannot read {MAIN_PROGRAM}: {error}"))?;
+            let inside = embedded_version(&main)?;
+            if inside != *expected.version {
+                return Err(format!(
+                    "the archive holds version {inside}, the release is {}",
+                    expected.version
+                ));
             }
             Ok(())
         }
     }
 }
 
-fn is_program_file(path: &Path) -> bool {
-    path.extension()
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("exe") || ext.eq_ignore_ascii_case("dll"))
+/// True when the file starts like a Windows program or library.
+fn is_program_image(path: &Path) -> Result<bool, String> {
+    let mut head = [0u8; 2];
+    let mut file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+    let read = file.read(&mut head).map_err(|error| error.to_string())?;
+    Ok(read == 2 && head == *b"MZ")
 }
 
 fn check_format(file: &Path, kind: AssetKind) -> Result<(), String> {
@@ -126,9 +215,10 @@ fn check_format(file: &Path, kind: AssetKind) -> Result<(), String> {
     })
 }
 
-/// Unpack a portable archive into `destination`. Only plain file names are
-/// accepted; a folder, a path or an unexpected number of entries fails the
-/// whole archive.
+/// Unpack a portable archive into `destination`. Only the names of
+/// [`PORTABLE_FILES`] are accepted, each once; a folder, a path, another name,
+/// a name repeated in any letter case, a missing program or an unexpected
+/// number of entries fails the whole archive.
 ///
 /// # Errors
 /// Returns why the archive is not a release archive.
@@ -141,6 +231,7 @@ pub fn extract_release_zip(zip_path: &Path, destination: &Path) -> Result<Vec<Pa
     }
     std::fs::create_dir_all(destination).map_err(|error| error.to_string())?;
     let mut written = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
     let mut total = 0u64;
     for index in 0..archive.len() {
         let mut entry = archive
@@ -150,13 +241,24 @@ pub fn extract_release_zip(zip_path: &Path, destination: &Path) -> Result<Vec<Pa
         if entry.is_dir() || !crate::manifest::is_plain_file_name(&name) {
             return Err(format!("the archive entry {name:?} is not a plain file"));
         }
+        if !PORTABLE_FILES.contains(&name.as_str()) {
+            return Err(format!("the archive entry {name:?} is not a release file"));
+        }
+        let folded = name.to_ascii_lowercase();
+        if seen.contains(&folded) {
+            return Err(format!("the archive holds {name:?} twice"));
+        }
+        seen.push(folded);
         total = total.saturating_add(entry.size());
         if total > MAX_UNPACKED_BYTES {
             return Err("the archive unpacks to more than allowed".to_owned());
         }
         let target = destination.join(&name);
-        let mut out =
-            std::fs::File::create(&target).map_err(|error| format!("cannot unpack: {error}"))?;
+        let mut out = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target)
+            .map_err(|error| format!("cannot unpack: {error}"))?;
         let copied = std::io::copy(&mut (&mut entry).take(MAX_UNPACKED_BYTES), &mut out)
             .map_err(|error| format!("cannot unpack: {error}"))?;
         if copied != entry.size() {
@@ -164,11 +266,38 @@ pub fn extract_release_zip(zip_path: &Path, destination: &Path) -> Result<Vec<Pa
         }
         written.push(target);
     }
-    if !written.iter().any(|path| {
-        path.file_name()
-            .is_some_and(|name| name == "compare-all.exe")
-    }) {
-        return Err("the archive holds no compare-all.exe".to_owned());
+    for program in PORTABLE_PROGRAMS {
+        if !seen.iter().any(|name| name == program) {
+            return Err(format!("the archive holds no {program}"));
+        }
     }
     Ok(written)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_embedded_version_is_read_and_must_be_single() {
+        let version = |text: &str| Version::parse(text).unwrap();
+        assert_eq!(
+            embedded_version(b"MZ..CA-BUILD-VERSION=2026.10.18.0007\0..").unwrap(),
+            version("2026.10.18.0007")
+        );
+        assert_eq!(
+            embedded_version(
+                b"CA-BUILD-VERSION=\x01CA-BUILD-VERSION=2026.10.18.0007\0CA-BUILD-VERSION=2026.10.18.0007\0"
+            )
+            .unwrap(),
+            version("2026.10.18.0007")
+        );
+        assert!(embedded_version(b"MZ no marker").is_err());
+        assert!(embedded_version(b"CA-BUILD-VERSION=2026.10.18.0007").is_err());
+        assert!(embedded_version(
+            b"CA-BUILD-VERSION=2026.10.18.0007\0CA-BUILD-VERSION=2026.01.01.0001\0"
+        )
+        .is_err());
+    }
 }

@@ -14,6 +14,8 @@ use std::time::{Duration, SystemTime};
 const RECORD_FILE: &str = "staged.json";
 const WARNING_FILE: &str = "download-warning.json";
 const APPLYING_FILE: &str = "applying.lock";
+const APPLY_FAILURE_FILE: &str = "apply-failure.txt";
+const MAX_FAILURE_TEXT: usize = 4096;
 /// Folder inside the staging folder that holds copies of the program used as
 /// the apply helper.
 pub const HELPER_FOLDER: &str = "helper";
@@ -194,7 +196,11 @@ impl Staging {
         for entry in entries.flatten() {
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if name == WARNING_FILE || name == HELPER_FOLDER || name == APPLYING_FILE {
+            if name == WARNING_FILE
+                || name == HELPER_FOLDER
+                || name == APPLYING_FILE
+                || name == APPLY_FAILURE_FILE
+            {
                 continue;
             }
             let path = entry.path();
@@ -251,23 +257,69 @@ impl Staging {
         write_json(&self.dir.join(WARNING_FILE), warning)
     }
 
+    /// Keep the reason the last apply failed, one line, replacing any earlier
+    /// one.
+    pub fn write_apply_failure(&self, reason: &str) {
+        let line: String = reason
+            .replace(['\r', '\n'], " ")
+            .chars()
+            .take(MAX_FAILURE_TEXT)
+            .collect();
+        let _ = std::fs::create_dir_all(&self.dir);
+        let _ = ca_io::write_atomic(
+            &self.dir.join(APPLY_FAILURE_FILE),
+            format!("{line}\n").as_bytes(),
+        );
+    }
+
+    /// The reason the last apply failed, if one did.
+    #[must_use]
+    pub fn read_apply_failure(&self) -> Option<String> {
+        let path = self.dir.join(APPLY_FAILURE_FILE);
+        if std::fs::metadata(&path).ok()?.len() > MAX_RECORD_BYTES {
+            return None;
+        }
+        let text = std::fs::read_to_string(path).ok()?;
+        Some(text.trim().chars().take(MAX_FAILURE_TEXT).collect())
+    }
+
     /// Delete the warning.
     pub fn clear_warning(&self) {
         let _ = std::fs::remove_file(self.dir.join(WARNING_FILE));
     }
 
-    /// Mark that an apply runs. A download waits while the mark is fresh.
+    /// Claim the staged update for one apply. A download waits while the
+    /// claim is fresh, and a second claim fails while the first is held.
+    ///
+    /// On Windows the claim is a handle that shares nothing; the system closes
+    /// it when the process ends in any way, so a crashed apply never blocks
+    /// the next one. Elsewhere the claim is a file created only when absent; a
+    /// file older than an hour is taken over.
     ///
     /// # Errors
-    /// Returns why the mark could not be written.
-    pub fn begin_apply(&self) -> Result<(), String> {
+    /// Returns why the update could not be claimed.
+    pub fn begin_apply(&self) -> Result<ApplyClaim, String> {
         std::fs::create_dir_all(&self.dir).map_err(|error| error.to_string())?;
-        std::fs::write(self.dir.join(APPLYING_FILE), b"1").map_err(|error| error.to_string())
-    }
-
-    /// Remove the apply mark.
-    pub fn end_apply(&self) {
-        let _ = std::fs::remove_file(self.dir.join(APPLYING_FILE));
+        let path = self.dir.join(APPLYING_FILE);
+        let file = open_claim(&path).or_else(|error| {
+            if !cfg!(windows) && !self.is_applying() {
+                let _ = std::fs::remove_file(&path);
+                open_claim(&path)
+            } else {
+                Err(error)
+            }
+        });
+        match file {
+            Ok(mut file) => {
+                use std::io::Write;
+                let _ = file.write_all(b"1");
+                Ok(ApplyClaim {
+                    file: Some(file),
+                    path,
+                })
+            }
+            Err(error) => Err(format!("another update is being applied ({error})")),
+        }
     }
 
     /// True while an apply runs.
@@ -281,6 +333,40 @@ impl Staging {
                     .map_or(true, |age| age < APPLY_MARKER_AGE)
             })
     }
+}
+
+/// The exclusive right to apply the staged update. Dropping it releases the
+/// claim.
+#[derive(Debug)]
+pub struct ApplyClaim {
+    file: Option<std::fs::File>,
+    path: PathBuf,
+}
+
+impl Drop for ApplyClaim {
+    fn drop(&mut self) {
+        drop(self.file.take());
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(windows)]
+fn open_claim(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .share_mode(0)
+        .open(path)
+}
+
+#[cfg(not(windows))]
+fn open_claim(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Option<T> {
@@ -344,6 +430,21 @@ mod tests {
         }
         std::fs::write(dir.path().join(RECORD_FILE), b"not json").unwrap();
         assert_eq!(staging.read_record(), None);
+    }
+
+    #[test]
+    fn an_apply_claim_is_exclusive_and_released_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = Staging::new(dir.path().to_path_buf());
+        let claim = staging.begin_apply().unwrap();
+        assert!(staging.is_applying());
+        assert!(staging.begin_apply().is_err());
+        staging.clear();
+        assert!(staging.begin_apply().is_err());
+        drop(claim);
+        assert!(!staging.is_applying());
+        let again = staging.begin_apply().unwrap();
+        drop(again);
     }
 
     #[test]

@@ -229,7 +229,17 @@ fn windows_proxy() -> ProxyConfig {
     ProxyConfig::from_windows_settings(enabled, &server, &list)
 }
 
+/// Lowest transfer rate a download is given time for, in bytes per second.
+/// It sets only the outer limit after which an abandoned transfer thread
+/// ends; a transfer that stops is ended by the idle limit long before.
+const SLOWEST_RATE: u64 = 1024;
+
 /// HTTP over `ureq`, with the platform certificate verifier.
+///
+/// A document must arrive in full within `timeout`. A download must connect
+/// and answer within `timeout`, and then fails only when no byte arrives for
+/// `timeout`, or the file exceeds its size, or the outer limit derived from
+/// the size and [`SLOWEST_RATE`] passes.
 #[derive(Debug, Clone)]
 pub struct HttpTransport {
     user_agent: String,
@@ -250,6 +260,12 @@ impl HttpTransport {
         }
     }
 
+    fn download_limit(&self, max_bytes: u64) -> Duration {
+        self.timeout
+            .saturating_mul(2)
+            .saturating_add(Duration::from_secs(max_bytes / SLOWEST_RATE))
+    }
+
     /// Accept `http://` addresses. For tests against a local server only.
     #[must_use]
     pub fn allowing_plain_http(mut self) -> Self {
@@ -257,7 +273,7 @@ impl HttpTransport {
         self
     }
 
-    fn agent_for(&self, url: &str) -> Result<ureq::Agent, String> {
+    fn agent_for(&self, url: &str, overall: Duration) -> Result<ureq::Agent, String> {
         let host = url
             .split_once("://")
             .map_or("", |(_, rest)| rest)
@@ -279,14 +295,20 @@ impl HttpTransport {
             .tls_config(tls)
             .https_only(!self.allow_plain_http)
             .max_redirects(5)
-            .timeout_global(Some(self.timeout))
+            .timeout_global(Some(overall))
+            .timeout_connect(Some(self.timeout))
+            .timeout_recv_response(Some(self.timeout))
             .user_agent(self.user_agent.clone())
             .build();
         Ok(ureq::Agent::new_with_config(config))
     }
 
-    fn open(&self, url: &str) -> Result<ureq::http::Response<ureq::Body>, String> {
-        self.agent_for(url)?
+    fn open(
+        &self,
+        url: &str,
+        overall: Duration,
+    ) -> Result<ureq::http::Response<ureq::Body>, String> {
+        self.agent_for(url, overall)?
             .get(url)
             .call()
             .map_err(|error| error.to_string())
@@ -302,11 +324,12 @@ impl Transport for HttpTransport {
     ) -> Result<Vec<u8>, String> {
         let this = self.clone();
         let url = url.to_owned();
-        cancellable(cancel, move |flag| {
-            let response = this.open(&url)?;
+        let overall = self.timeout;
+        cancellable(cancel, None, move |flag, progress| {
+            let response = this.open(&url, overall)?;
             let mut reader = response.into_body().into_reader();
             let mut out = Vec::new();
-            copy_limited(&mut reader, &mut out, max_bytes, &flag)?;
+            copy_limited(&mut reader, &mut out, max_bytes, &flag, &progress)?;
             Ok(out)
         })
     }
@@ -321,8 +344,11 @@ impl Transport for HttpTransport {
         let this = self.clone();
         let url = url.to_owned();
         let destination = destination.to_path_buf();
-        cancellable(cancel, move |flag| {
-            let response = this.open(&url)?;
+        let overall = self.download_limit(max_bytes);
+        let idle = Some(self.timeout);
+        cancellable(cancel, idle, move |flag, progress| {
+            let response = this.open(&url, overall)?;
+            progress.touch();
             let content_type = response.body().mime_type().map(str::to_owned);
             if response
                 .body()
@@ -334,7 +360,7 @@ impl Transport for HttpTransport {
             let mut reader = response.into_body().into_reader();
             let mut file = std::fs::File::create(&destination)
                 .map_err(|error| format!("cannot write {}: {error}", destination.display()))?;
-            let bytes = copy_limited(&mut reader, &mut file, max_bytes, &flag)?;
+            let bytes = copy_limited(&mut reader, &mut file, max_bytes, &flag, &progress)?;
             file.flush().map_err(|error| error.to_string())?;
             Ok(Fetched {
                 content_type,
@@ -344,17 +370,47 @@ impl Transport for HttpTransport {
     }
 }
 
-/// Run `work` on its own thread and give up on it when `cancel` is set. A
-/// blocked connect or a silent server cannot be interrupted from outside, so
-/// the abandoned thread ends on its own timeout.
+/// When the transfer thread last received data.
+#[derive(Clone)]
+struct Progress {
+    start: std::time::Instant,
+    last_millis: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl Progress {
+    fn new() -> Self {
+        Self {
+            start: std::time::Instant::now(),
+            last_millis: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
+    fn touch(&self) {
+        let now = u64::try_from(self.start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.last_millis.store(now, Ordering::Relaxed);
+    }
+
+    fn idle(&self) -> Duration {
+        let last = Duration::from_millis(self.last_millis.load(Ordering::Relaxed));
+        self.start.elapsed().saturating_sub(last)
+    }
+}
+
+/// Run `work` on its own thread and give up on it when `cancel` is set, or
+/// when `idle` passes without the work reporting progress. A blocked read
+/// cannot be interrupted from outside, so the abandoned thread ends on its
+/// own outer timeout.
 fn cancellable<T: Send + 'static>(
     cancel: &Arc<AtomicBool>,
-    work: impl FnOnce(Arc<AtomicBool>) -> Result<T, String> + Send + 'static,
+    idle: Option<Duration>,
+    work: impl FnOnce(Arc<AtomicBool>, Progress) -> Result<T, String> + Send + 'static,
 ) -> Result<T, String> {
     let (sender, receiver) = std::sync::mpsc::channel();
     let flag = Arc::clone(cancel);
+    let progress = Progress::new();
+    let reported = progress.clone();
     std::thread::spawn(move || {
-        let _ = sender.send(work(flag));
+        let _ = sender.send(work(flag, reported));
     });
     loop {
         match receiver.recv_timeout(Duration::from_millis(100)) {
@@ -362,6 +418,9 @@ fn cancellable<T: Send + 'static>(
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 if cancel.load(Ordering::Relaxed) {
                     return Err("the transfer was cancelled".to_owned());
+                }
+                if idle.is_some_and(|limit| progress.idle() > limit) {
+                    return Err("the transfer stopped receiving data".to_owned());
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -376,6 +435,7 @@ fn copy_limited(
     writer: &mut dyn Write,
     max_bytes: u64,
     cancel: &Arc<AtomicBool>,
+    progress: &Progress,
 ) -> Result<u64, String> {
     let mut buffer = vec![0u8; 64 * 1024];
     let mut total = 0u64;
@@ -389,6 +449,7 @@ fn copy_limited(
         if read == 0 {
             return Ok(total);
         }
+        progress.touch();
         total += read as u64;
         if total > max_bytes {
             return Err("the response is larger than allowed".to_owned());

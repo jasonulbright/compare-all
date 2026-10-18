@@ -59,15 +59,34 @@ pub fn is_sha256(text: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-/// True for a file name without any folder part.
+/// True for a file name without any folder part that Windows stores under
+/// exactly that name.
+///
+/// Windows drops a trailing dot or space from a name, so `a.dll.` is written
+/// as `a.dll`, and it opens a device for a reserved base name such as `NUL`
+/// or `COM1.txt`. Both are refused.
 #[must_use]
 pub fn is_plain_file_name(name: &str) -> bool {
+    const DEVICES: [&str; 4] = ["CON", "PRN", "AUX", "NUL"];
+    let base = name.split('.').next().unwrap_or_default();
+    let numbered_device = match base.as_bytes() {
+        [a, b, c, digit] => {
+            let prefix = [*a, *b, *c];
+            (prefix.eq_ignore_ascii_case(b"COM") || prefix.eq_ignore_ascii_case(b"LPT"))
+                && digit.is_ascii_digit()
+        }
+        _ => false,
+    };
     !name.is_empty()
-        && name != "."
-        && name != ".."
+        && !name.ends_with('.')
+        && !name.starts_with('.')
         && name
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+        && !DEVICES
+            .iter()
+            .any(|device| base.eq_ignore_ascii_case(device))
+        && !numbered_device
 }
 
 impl Manifest {
@@ -161,5 +180,44 @@ mod tests {
         bad.schema = 2;
         assert!(Manifest::parse(&serde_json::to_vec(&bad).unwrap()).is_err());
         assert!(Manifest::parse(b"<html>").is_err());
+    }
+
+    #[test]
+    fn names_windows_stores_differently_are_not_plain() {
+        for bad in [
+            "",
+            ".",
+            "..",
+            "a.dll.",
+            "a.dll ",
+            ".hidden",
+            "a:b",
+            "C:x.exe",
+            "a\\b",
+            "a/b",
+            "/a",
+            "NUL",
+            "nul.txt",
+            "CON",
+            "Prn.md",
+            "aux",
+            "COM1",
+            "com9.exe",
+            "LPT1.dll",
+            "lpt0",
+            "\u{e9}.exe",
+        ] {
+            assert!(!is_plain_file_name(bad), "{bad:?}");
+        }
+        for good in [
+            "compare-all.exe",
+            "README.md",
+            "THIRD-PARTY-NOTICES.md",
+            "COM10.txt",
+            "console.log",
+            "nullable.txt",
+        ] {
+            assert!(is_plain_file_name(good), "{good:?}");
+        }
     }
 }
