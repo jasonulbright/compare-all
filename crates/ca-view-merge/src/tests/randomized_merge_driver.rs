@@ -1287,7 +1287,7 @@ fn run_case(
 ) {
     let (left, center, right) = gen.inputs();
     let ancestor = (!two_way).then_some(center.as_str());
-    let (mut view, dir) = open(&left, ancestor, &right);
+    let (mut view, dir) = open_driven(&left, ancestor, &right);
     run_until_ready(&mut view);
     let len = 2 + gen.0.pick(MAX_OPS - 1);
     let mut ops: Vec<Op> = Vec::new();
@@ -1744,7 +1744,7 @@ fn run_case(
         }
         let bottom = pane_text(&view);
         if !reset && !flags_changed && bottom == initial {
-            let (mut fresh, _fresh_dir) = open(&left, ancestor, &right);
+            let (mut fresh, _fresh_dir) = open_driven(&left, ancestor, &right);
             run_until_ready(&mut fresh);
             if summary(&fresh) != summary(&view) {
                 local.push((
@@ -1814,6 +1814,18 @@ fn run_case(
                 .or_default()
                 .push((weight, format!("{context}\n      {message}")));
         }
+    }
+}
+
+/// A view over one case. `MERGE_DRIVER_SEPARATION`, a line count, replaces
+/// the stored conflict separation.
+fn open_driven(left: &str, center: Option<&str>, right: &str) -> (MergeView, tempfile::TempDir) {
+    match std::env::var("MERGE_DRIVER_SEPARATION")
+        .ok()
+        .and_then(|lines| lines.trim().parse().ok())
+    {
+        Some(lines) => open_separated(left, center, right, lines),
+        None => open(left, center, right),
     }
 }
 
