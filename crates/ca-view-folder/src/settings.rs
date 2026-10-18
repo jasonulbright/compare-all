@@ -837,9 +837,16 @@ mod tests {
         let options = options_of(&FolderCompareSettings::default());
         assert_eq!(
             options.compare.quick,
-            ca_fs::criteria::QuickTests::default()
+            ca_fs::criteria::QuickTests {
+                tolerance_seconds: 2,
+                ..ca_fs::criteria::QuickTests::default()
+            }
         );
-        assert!(!options.compare.content.enabled);
+        assert!(options.compare.content.enabled);
+        assert_eq!(
+            options.compare.content.method,
+            ca_fs::criteria::ContentMethod::Rules
+        );
     }
 
     /// Every method reads back from its stored form, and a method of another

@@ -842,7 +842,7 @@ fn a_synchronisation_tab_reports_its_settings_and_takes_a_change() {
     let Some(SessionSettings::FolderSync(mut settings)) = sync.settings() else {
         panic!("the synchronisation tab reported no synchronization settings");
     };
-    assert_eq!(settings.sync.method, SyncMethod::UpdateRight);
+    assert_eq!(settings.sync.method, SyncMethod::UpdateBoth);
 
     settings.sync.method = SyncMethod::MirrorToLeft;
     settings.name_filters.exclude_files = vec!["orphan.txt".to_owned()];
@@ -910,7 +910,7 @@ fn a_stored_method_this_build_does_not_know_is_written_back_unchanged() {
     stored.sync.copy_orphans = false;
     sync.apply_settings(&SessionSettings::FolderSync(stored.clone()));
     assert!(tick_until(sync.view_mut(), SessionView::is_ready));
-    assert_eq!(sync.view_mut().sync().method, Method::UpdateRight);
+    assert_eq!(sync.view_mut().sync().method, Method::UpdateBoth);
 
     let Some(SessionSettings::FolderSync(reported)) = sync.settings() else {
         panic!("the synchronisation tab reported no synchronization settings");

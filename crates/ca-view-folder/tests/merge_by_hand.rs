@@ -6,6 +6,8 @@
 #![allow(clippy::disallowed_methods, reason = "test setup writes fixture files")]
 
 use ca_fs::{MergeStatus, Pane, Resolution};
+use ca_session::settings::folder::ContentComparison;
+use ca_session::settings::SessionSettings;
 use ca_session::SessionKind;
 use ca_ui::command::Command;
 use ca_ui::testing::context;
@@ -121,6 +123,7 @@ impl Fixture {
         // call asks the desktop shell for permission and blocks on a dialog.
         view.operation_options_mut().use_recycle_bin = false;
         assert!(poll_until(&mut view, |view| view.tree().is_some()));
+        without_content_comparison(&mut view);
         view
     }
 }
@@ -1341,4 +1344,16 @@ mod probe {
             .unwrap_or_else(|| panic!("no {label} button: {:?}", probe.labels()));
         probe.press_at(button.rect.center(), &mut run(view));
     }
+}
+
+/// The fixtures stamp a copy with a new time but keep its bytes, which only a
+/// comparison without a content test reports as a change.
+fn without_content_comparison(view: &mut FolderMergeView) {
+    let Some(SessionSettings::FolderMerge(mut settings)) = view.settings() else {
+        panic!("a folder merge reports folder merge settings");
+    };
+    settings.comparison.content_comparison = ContentComparison::None;
+    view.apply_settings(&SessionSettings::FolderMerge(settings));
+    assert!(poll_until(view, SessionView::is_ready));
+    assert!(poll_until(view, |view| view.tree().is_some()));
 }

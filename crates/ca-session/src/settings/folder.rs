@@ -226,9 +226,9 @@ settings_group! {
         /// Pair names that match except for their extension.
         align_different_extensions: bool = false,
         /// Pair names that are equivalent under different normalization forms.
-        align_different_normalization: bool = false,
+        align_different_normalization: bool = true,
         /// Content test run at session load.
-        content_comparison: ContentComparison = ContentComparison::None,
+        content_comparison: ContentComparison = ContentComparison::RulesBased,
         /// Run the content test only where the quick tests already disagree.
         skip_content_if_quick_tests_match: bool = true,
         /// Compare version information resources embedded in executables.
@@ -312,7 +312,7 @@ settings_group! {
     /// Direction and scope of a synchronization run.
     SyncSettings / SyncOverride {
         /// Direction and destructiveness of the run.
-        method: SyncMethod = SyncMethod::UpdateRight,
+        method: SyncMethod = SyncMethod::UpdateBoth,
         /// Copy items present on one side only.
         copy_orphans: bool = true,
         /// Delete items the method marks for removal rather than skipping them.

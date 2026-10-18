@@ -20,9 +20,9 @@ pub enum Method {
     /// Copy newer and orphan items from right to left.
     UpdateLeft,
     /// Copy newer and orphan items from left to right.
-    #[default]
     UpdateRight,
     /// Copy newer and orphan items in both directions.
+    #[default]
     UpdateBoth,
     /// Replace every differing item on the left and remove left orphans.
     MirrorToLeft,
