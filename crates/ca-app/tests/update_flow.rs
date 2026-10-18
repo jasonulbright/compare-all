@@ -781,6 +781,38 @@ fn the_program_file_carries_its_version_for_the_updater() {
     );
 }
 
+/// The version information as Windows reads it from the file. The elevation
+/// prompt shows the description as the program name.
+#[cfg(all(windows, target_env = "msvc"))]
+#[test]
+fn the_program_file_names_the_product_and_its_version() {
+    let root = ca_update::system::system_root().unwrap();
+    let output = ca_io::host_command::host_command(
+        root.join(r"System32\WindowsPowerShell\v1.0\powershell.exe"),
+    )
+    .args(["-NoProfile", "-NonInteractive", "-Command"])
+    .arg(
+        "$v=(Get-Item -LiteralPath $env:CA_TARGET).VersionInfo;\
+         $v.FileDescription;$v.ProductName;$v.FileVersion;$v.ProductVersion;\
+         $v.OriginalFilename",
+    )
+    .env("CA_TARGET", env!("CARGO_BIN_EXE_compare-all"))
+    .output()
+    .unwrap();
+    let text = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = text.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        [
+            "Compare All",
+            "Compare All",
+            VERSION,
+            VERSION,
+            "compare-all.exe"
+        ]
+    );
+}
+
 #[test]
 fn an_earlier_failure_is_dropped_once_the_version_is_installed() {
     let dir = tempfile::tempdir().unwrap();
