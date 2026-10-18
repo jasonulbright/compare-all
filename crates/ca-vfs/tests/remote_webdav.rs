@@ -273,12 +273,10 @@ fn a_child_folder_with_the_same_name_as_its_parent_is_listed() {
     let entries = fs
         .list(&VfsPath::parse("docs").unwrap(), &Cancel::new())
         .unwrap();
-    assert!(
-        entries
-            .iter()
-            .any(|entry| entry.name == "docs" && entry.is_dir()),
-        "{entries:?}"
-    );
+    let listed = entries
+        .iter()
+        .any(|entry| entry.name == "docs" && entry.is_dir());
+    assert!(listed, "the child folder named docs is not listed");
 }
 
 #[test]

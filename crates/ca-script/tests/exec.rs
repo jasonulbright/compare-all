@@ -1040,11 +1040,10 @@ fn a_password_that_holds_a_space_a_tab_or_a_slash_reaches_neither_the_log_nor_th
         let text = std::fs::read_to_string(&target).expect("log");
         assert!(text.contains("ftp://alice:***@127.0.0.1:1/pub"), "{text}");
         for part in [password, "hun", "ter", "2@"] {
-            assert!(!text.contains(part), "{part:?} in the log: {text}");
-            assert!(
-                !error.to_string().contains(part),
-                "{part:?} in the error: {error}"
-            );
+            let in_log = text.contains(part);
+            assert!(!in_log, "a password part reached the log");
+            let in_error = error.to_string().contains(part);
+            assert!(!in_error, "a password part reached the error");
         }
     }
 }
@@ -1071,11 +1070,10 @@ fn a_password_after_text_in_brackets_that_is_no_address_reaches_neither_the_log_
         let text = std::fs::read_to_string(&target).expect("log");
         assert!(text.contains(logged), "{text}");
         for part in ["hun", "ter2", "123/"] {
-            assert!(!text.contains(part), "{part:?} in the log: {text}");
-            assert!(
-                !error.to_string().contains(part),
-                "{part:?} in the error: {error}"
-            );
+            let in_log = text.contains(part);
+            assert!(!in_log, "a password part reached the log");
+            let in_error = error.to_string().contains(part);
+            assert!(!in_error, "a password part reached the error");
         }
     }
 }
