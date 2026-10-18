@@ -160,7 +160,27 @@ fn run_desktop(request: &DesktopRequest) -> u8 {
     exit::UNKNOWN_ERROR
 }
 
+const VERSION_MARKER_TEXT: &str = concat!("CA-BUILD-VERSION=", env!("CA_VERSION"), "\0");
+
+/// The build version inside a section of the program file, which the
+/// signature covers. The updater refuses a downloaded copy whose version is
+/// not the version of the release that names it.
+#[used]
+static VERSION_MARKER: [u8; VERSION_MARKER_TEXT.len()] = marker_bytes();
+
+const fn marker_bytes() -> [u8; VERSION_MARKER_TEXT.len()] {
+    let text = VERSION_MARKER_TEXT.as_bytes();
+    let mut out = [0u8; VERSION_MARKER_TEXT.len()];
+    let mut index = 0;
+    while index < text.len() {
+        out[index] = text[index];
+        index += 1;
+    }
+    out
+}
+
 fn main() -> ExitCode {
+    std::hint::black_box(&VERSION_MARKER);
     let code = run_arguments();
     ca_session::SettingsPaths::remove_run_directory();
     code

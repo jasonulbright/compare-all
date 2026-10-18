@@ -9,9 +9,9 @@
 //! signature is the only check an attacker on that path cannot satisfy. The
 //! portable archive is therefore held to a fixed file set compiled into the
 //! program: every program file in it is signer-checked, no other file may be
-//! a program, and the signed `compare-all.exe` must carry the version the
-//! release claims, so an older signed build cannot be staged under a newer
-//! version.
+//! a program, and every signed program must carry the version the release
+//! claims inside its signed sections, so an older signed build cannot be
+//! staged under a newer version.
 
 use crate::signature::{verify_signer, SignatureVerifier};
 use crate::staging::AssetKind;
@@ -38,11 +38,9 @@ pub const PORTABLE_FILES: [&str; 6] = [
     "compare-all.exe",
 ];
 
-/// The program files of the portable archive. Each must be present and signed.
+/// The program files of the portable archive. Each must be present, signed,
+/// and carry the release version.
 pub const PORTABLE_PROGRAMS: [&str; 2] = ["ca.exe", "compare-all.exe"];
-
-/// The program whose embedded version must equal the release version.
-pub const MAIN_PROGRAM: &str = "compare-all.exe";
 
 /// Text that precedes the build version inside the program file. The version
 /// ends at a NUL byte.
@@ -65,10 +63,99 @@ pub struct Expected<'a> {
 
 /// The build version embedded in a program file.
 ///
+/// Only the raw data of the PE sections is searched. The Authenticode hash
+/// does not cover the attribute certificate table, and the system accepts
+/// extra bytes inside it, so a marker there could be added to any old signed
+/// build without breaking its signature.
+///
 /// # Errors
 /// Returns why the file carries no single version.
 pub fn embedded_version(bytes: &[u8]) -> Result<Version, String> {
     let mut found: Option<Version> = None;
+    for section in pe_sections(bytes)? {
+        markers_in(section, &mut found)?;
+    }
+    found.ok_or_else(|| "the program names no version".to_owned())
+}
+
+fn u16_at(bytes: &[u8], at: usize) -> Option<u16> {
+    Some(u16::from_le_bytes([*bytes.get(at)?, *bytes.get(at + 1)?]))
+}
+
+fn u32_at(bytes: &[u8], at: usize) -> Option<u32> {
+    Some(u32::from_le_bytes([
+        *bytes.get(at)?,
+        *bytes.get(at + 1)?,
+        *bytes.get(at + 2)?,
+        *bytes.get(at + 3)?,
+    ]))
+}
+
+fn usize_at(bytes: &[u8], at: usize) -> Option<usize> {
+    usize::try_from(u32_at(bytes, at)?).ok()
+}
+
+/// The raw data of every section of a PE file. A file whose certificate table
+/// does not end the file, or whose sections reach into that table or past the
+/// end of the file, is refused.
+fn pe_sections(bytes: &[u8]) -> Result<Vec<&[u8]>, String> {
+    let bad = || "the program is not a valid Windows program file".to_owned();
+    if bytes.get(..2) != Some(b"MZ".as_slice()) {
+        return Err(bad());
+    }
+    let header = usize_at(bytes, 0x3C).ok_or_else(bad)?;
+    if bytes.get(header..header.checked_add(4).ok_or_else(bad)?) != Some(b"PE\0\0".as_slice()) {
+        return Err(bad());
+    }
+    let coff = header + 4;
+    let count = usize::from(u16_at(bytes, coff + 2).ok_or_else(bad)?);
+    let optional_size = usize::from(u16_at(bytes, coff + 16).ok_or_else(bad)?);
+    let optional = coff + 20;
+    let (directories, directory_count) = match u16_at(bytes, optional).ok_or_else(bad)? {
+        0x10B => (
+            optional + 96,
+            usize_at(bytes, optional + 92).ok_or_else(bad)?,
+        ),
+        0x20B => (
+            optional + 112,
+            usize_at(bytes, optional + 108).ok_or_else(bad)?,
+        ),
+        _ => return Err(bad()),
+    };
+    let certificates_at = if directory_count > 4 {
+        let security = directories + 4 * 8;
+        let start = usize_at(bytes, security).ok_or_else(bad)?;
+        let size = usize_at(bytes, security + 4).ok_or_else(bad)?;
+        if size == 0 {
+            bytes.len()
+        } else if start.checked_add(size) == Some(bytes.len()) {
+            start
+        } else {
+            return Err("the program has data after its signature".to_owned());
+        }
+    } else {
+        bytes.len()
+    };
+    let table = optional + optional_size;
+    let mut sections = Vec::with_capacity(count);
+    for index in 0..count {
+        let entry = table + index * 40;
+        let size = usize_at(bytes, entry + 16).ok_or_else(bad)?;
+        let start = usize_at(bytes, entry + 20).ok_or_else(bad)?;
+        if size == 0 {
+            continue;
+        }
+        let end = start.checked_add(size).ok_or_else(bad)?;
+        if end > certificates_at {
+            return Err(bad());
+        }
+        sections.push(bytes.get(start..end).ok_or_else(bad)?);
+    }
+    Ok(sections)
+}
+
+/// Add each well-formed marker in `bytes` to `found`.
+fn markers_in(bytes: &[u8], found: &mut Option<Version>) -> Result<(), String> {
     let mut rest = bytes;
     while let Some(at) = find(rest, VERSION_MARKER) {
         let after = &rest[at + VERSION_MARKER.len()..];
@@ -86,13 +173,13 @@ pub fn embedded_version(bytes: &[u8]) -> Result<Version, String> {
             continue;
         };
         match found {
-            Some(earlier) if earlier != version => {
+            Some(earlier) if *earlier != version => {
                 return Err("the program names more than one version".to_owned());
             }
-            _ => found = Some(version),
+            _ => *found = Some(version),
         }
     }
-    found.ok_or_else(|| "the program names no version".to_owned())
+    Ok(())
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -170,14 +257,17 @@ pub fn verify_file(
                     return Err(format!("the archive file {name} is a program"));
                 }
             }
-            let main = std::fs::read(scratch.join(MAIN_PROGRAM))
-                .map_err(|error| format!("cannot read {MAIN_PROGRAM}: {error}"))?;
-            let inside = embedded_version(&main)?;
-            if inside != *expected.version {
-                return Err(format!(
-                    "the archive holds version {inside}, the release is {}",
-                    expected.version
-                ));
+            for program in PORTABLE_PROGRAMS {
+                let bytes = std::fs::read(scratch.join(program))
+                    .map_err(|error| format!("cannot read {program}: {error}"))?;
+                let inside =
+                    embedded_version(&bytes).map_err(|error| format!("{program}: {error}"))?;
+                if inside != *expected.version {
+                    return Err(format!(
+                        "the archive holds {program} {inside}, the release is {}",
+                        expected.version
+                    ));
+                }
             }
             Ok(())
         }
@@ -279,25 +369,69 @@ pub fn extract_release_zip(zip_path: &Path, destination: &Path) -> Result<Vec<Pa
 mod tests {
     use super::*;
 
+    #[path = "../../../tests/support/pe.rs"]
+    mod fixture;
+    use fixture::pe;
+
+    fn version(text: &str) -> Version {
+        Version::parse(text).unwrap()
+    }
+
     #[test]
     fn the_embedded_version_is_read_and_must_be_single() {
-        let version = |text: &str| Version::parse(text).unwrap();
         assert_eq!(
-            embedded_version(b"MZ..CA-BUILD-VERSION=2026.10.18.0007\0..").unwrap(),
+            embedded_version(&pe(&[b"..CA-BUILD-VERSION=2026.10.18.0007\0.."], b"", None)).unwrap(),
             version("2026.10.18.0007")
         );
         assert_eq!(
-            embedded_version(
-                b"CA-BUILD-VERSION=\x01CA-BUILD-VERSION=2026.10.18.0007\0CA-BUILD-VERSION=2026.10.18.0007\0"
-            )
+            embedded_version(&pe(
+                &[
+                    b"CA-BUILD-VERSION=\x01CA-BUILD-VERSION=2026.10.18.0007\0",
+                    b"CA-BUILD-VERSION=2026.10.18.0007\0"
+                ],
+                b"",
+                Some(b"signature")
+            ))
             .unwrap(),
             version("2026.10.18.0007")
         );
-        assert!(embedded_version(b"MZ no marker").is_err());
-        assert!(embedded_version(b"CA-BUILD-VERSION=2026.10.18.0007").is_err());
-        assert!(embedded_version(
-            b"CA-BUILD-VERSION=2026.10.18.0007\0CA-BUILD-VERSION=2026.01.01.0001\0"
-        )
+        assert!(embedded_version(&pe(&[b"no marker"], b"", None)).is_err());
+        assert!(embedded_version(&pe(&[b"CA-BUILD-VERSION=2026.10.18.0007x"], b"", None)).is_err());
+        assert!(embedded_version(&pe(
+            &[b"CA-BUILD-VERSION=2026.10.18.0007\0CA-BUILD-VERSION=2026.01.01.0001\0"],
+            b"",
+            None
+        ))
         .is_err());
+        assert!(embedded_version(b"CA-BUILD-VERSION=2026.10.18.0007\0").is_err());
+    }
+
+    #[test]
+    fn a_version_outside_the_signed_sections_is_not_read() {
+        let tag = b"CA-BUILD-VERSION=2099.01.01.0001\0";
+        // A signed build without a marker, with one added to the certificate
+        // table, which the Authenticode hash does not cover.
+        assert!(embedded_version(&pe(&[b"signed code"], b"", Some(tag))).is_err());
+        // A marker of its own wins over one in the certificate table.
+        assert_eq!(
+            embedded_version(&pe(
+                &[b"CA-BUILD-VERSION=2026.10.02.0001\0"],
+                b"",
+                Some(tag)
+            ))
+            .unwrap(),
+            version("2026.10.02.0001")
+        );
+        // Bytes after the last section belong to no section.
+        assert!(embedded_version(&pe(&[b"signed code"], tag, None)).is_err());
+        assert!(embedded_version(&pe(&[b"signed code"], tag, Some(b"signature"))).is_err());
+        // A certificate table that does not end the file.
+        let mut trailing = pe(
+            &[b"CA-BUILD-VERSION=2026.10.02.0001\0"],
+            b"",
+            Some(b"signature"),
+        );
+        trailing.extend_from_slice(tag);
+        assert!(embedded_version(&trailing).is_err());
     }
 }

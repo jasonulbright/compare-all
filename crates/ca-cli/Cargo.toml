@@ -33,6 +33,7 @@ default = ["os-keychain"]
 os-keychain = ["ca-vfs/os-keychain"]
 
 [dev-dependencies]
+ca-update.workspace = true
 tempfile.workspace = true
 
 [lints]
