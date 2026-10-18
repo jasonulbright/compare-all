@@ -2583,21 +2583,19 @@ impl HexView {
         let owns_keys = ui.ctx().memory(egui::Memory::focused) == Some(self.body_id());
         let (events, held) = ui.input(|input| (input.events.clone(), input.modifiers));
         let page = u32::try_from(self.viewport_rows.max(1)).unwrap_or(1);
-        let mut typing = ca_ui::command::chord_types_text(held);
+        let mut gate = ca_ui::command::TextGate::new(held);
         for event in events {
+            let typed = gate.types(&event);
             match event {
                 egui::Event::Key {
                     key,
-                    pressed,
+                    pressed: true,
                     modifiers,
                     ..
                 } if owns_keys => {
-                    typing = ca_ui::command::chord_types_text(modifiers);
-                    if pressed {
-                        self.handle_key(key, modifiers, page);
-                    }
+                    self.handle_key(key, modifiers, page);
                 }
-                egui::Event::Text(text) if owns_keys && typing => self.handle_text(&text),
+                egui::Event::Text(text) if owns_keys && typed => self.handle_text(&text),
                 egui::Event::Paste(text) if owns_keys => self.paste(&text),
                 egui::Event::MouseWheel { delta, .. } => {
                     self.scroll.scroll_by(

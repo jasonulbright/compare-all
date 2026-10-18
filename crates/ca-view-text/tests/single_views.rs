@@ -117,7 +117,7 @@ fn altgr_text_is_typed_in_the_text_editor() {
 }
 
 #[test]
-fn alt_letter_text_is_typed_in_the_text_editor_only_where_option_composes() {
+fn alt_letter_text_is_typed_in_the_text_editor_except_on_windows() {
     let dir = tempfile::tempdir().unwrap();
     let path = write(dir.path(), "notes.txt", "one\n");
     let frames = Frames::new();
@@ -139,10 +139,10 @@ fn alt_letter_text_is_typed_in_the_text_editor_only_where_option_composes() {
             egui::Event::Text("f".to_owned()),
         ],
     );
-    let expected = if cfg!(target_os = "macos") {
-        "fone\n"
-    } else {
+    let expected = if cfg!(target_os = "windows") {
         "one\n"
+    } else {
+        "fone\n"
     };
     assert_eq!(view.pane().buffer().text(), expected);
 }

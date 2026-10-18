@@ -5016,7 +5016,7 @@ mod tests {
     }
 
     #[test]
-    fn alt_letter_text_reaches_a_text_field_only_where_option_composes() {
+    fn alt_letter_text_reaches_a_text_field_except_on_windows() {
         let (_directory, mut app, id, _, _) = app_with_recent_session();
         app.open_saved(&id, &context());
         let ctx = egui::Context::default();
@@ -5049,10 +5049,10 @@ mod tests {
         };
         frame(&mut app, key_and_text(egui::Key::F, alt, "f"));
         let after_alt = name(&app);
-        if cfg!(target_os = "macos") {
-            assert_ne!(after_alt, before, "Option text is typed");
-        } else {
+        if cfg!(target_os = "windows") {
             assert_eq!(after_alt, before, "Alt+F typed into the field");
+        } else {
+            assert_ne!(after_alt, before, "Alt text is typed outside Windows");
         }
         frame(
             &mut app,
