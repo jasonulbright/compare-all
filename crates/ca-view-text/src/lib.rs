@@ -89,6 +89,8 @@ const LEFT_READ_ONLY: &str = "The left pane is read-only";
 const RIGHT_READ_ONLY: &str = "The right pane is read-only";
 /// Why an edit waits when editing is turned off for the session.
 const EDITING_OFF: &str = "Editing is turned off for this session";
+/// Why a command that reads the files again waits on a save or its question.
+const QUESTION_OPEN: &str = "Finish the save and its questions first";
 /// Reason shown on a control that maps rows to lines while the comparison of
 /// an edit is still due.
 const EDIT_NOT_COMPARED: &str = "Available once the edit is compared";
@@ -3220,8 +3222,8 @@ impl TextView {
         if self.locked && action != Reread::Settings {
             return;
         }
-        if self.save_job.is_some() || self.prompt.is_some() {
-            self.message = Some("Finish the save and its questions first.".to_owned());
+        if self.reread_waits() {
+            self.message = Some(format!("{QUESTION_OPEN}."));
             self.pending_settings = None;
             return;
         }
@@ -3230,6 +3232,12 @@ impl TextView {
             return;
         }
         self.reread(action);
+    }
+
+    /// True while a save or one of its questions must finish before the
+    /// files can be read again.
+    const fn reread_waits(&self) -> bool {
+        self.save_job.is_some() || self.prompt.is_some()
     }
 
     /// Carry out a command that reads the files again, dropping every edit.
@@ -4911,9 +4919,8 @@ impl SessionView for TextView {
             | Command::ResetFontSize
             | Command::ToggleLineDetails
             | Command::ToggleLineNumbers
-            | Command::ToggleIgnoreUnimportant
-            | Command::Reload
-            | Command::Recompare => true,
+            | Command::ToggleIgnoreUnimportant => true,
+            Command::Reload | Command::Recompare => !self.reread_waits(),
             Command::OpenFile => self.picker.is_none(),
             Command::CopyToOtherSide => {
                 self.rows_current() && !self.pane(self.active.other()).is_read_only()
@@ -4982,6 +4989,9 @@ impl SessionView for TextView {
         }
         if command == Command::Copy && !self.accepts(command) {
             return Some(self.not_compared_reason());
+        }
+        if matches!(command, Command::Reload | Command::Recompare) {
+            return self.reread_waits().then_some(QUESTION_OPEN);
         }
         let target = match command {
             Command::NextDifference
@@ -6485,6 +6495,23 @@ mod tests {
         settle(&mut view);
         assert_eq!(view.pane(Side::Right).buffer().text(), "gamma\n");
         assert_eq!(view.pane(Side::Left).buffer().text(), "alpha\n");
+    }
+
+    #[test]
+    fn recompare_is_refused_with_a_reason_while_a_question_is_open() {
+        use super::Side;
+        use ca_ui::command::Command;
+        use ca_ui::view::SessionView;
+
+        let (mut view, _dir) = settled_view("alpha\n");
+        view.pane_mut(Side::Left).buffer_mut().insert(0, "x");
+        view.note_edit();
+        view.run(Command::Recompare);
+        assert!(view.prompt.is_some());
+        assert!(!view.accepts(Command::Recompare));
+        assert!(!view.accepts(Command::Reload));
+        assert_eq!(view.refusal(Command::Recompare), Some(super::QUESTION_OPEN));
+        assert_eq!(view.refusal(Command::Reload), Some(super::QUESTION_OPEN));
     }
 
     #[test]
