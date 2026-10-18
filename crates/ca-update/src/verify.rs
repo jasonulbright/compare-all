@@ -540,7 +540,10 @@ pub fn unpack_release_zip(zip_path: &Path, destination: &Path) -> Result<Unpacke
         let mut entry = archive
             .by_index(index)
             .map_err(|error| format!("the archive is not valid: {error}"))?;
-        let name = entry.name().to_owned();
+        let name = entry
+            .name()
+            .map_err(|error| format!("the archive is not valid: {error}"))?
+            .into_owned();
         if entry.is_dir() || !crate::manifest::is_plain_file_name(&name) {
             return Err(format!("the archive entry {name:?} is not a plain file"));
         }
@@ -661,5 +664,61 @@ mod tests {
         );
         trailing.extend_from_slice(tag);
         assert!(embedded_version(&trailing).is_err());
+    }
+
+    fn stored_zip(files: &[(&str, &[u8])]) -> Vec<u8> {
+        use std::io::Write as _;
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        let mut writer = zip::ZipWriter::new(&mut cursor);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        for (name, data) in files {
+            writer.start_file(*name, options).unwrap();
+            writer.write_all(data).unwrap();
+        }
+        writer.finish().unwrap();
+        cursor.into_inner()
+    }
+
+    fn unpack_bytes(bytes: &[u8]) -> Result<Unpacked, String> {
+        let scratch = tempfile::tempdir().unwrap();
+        let archive = scratch.path().join("release.zip");
+        std::fs::write(&archive, bytes).unwrap();
+        unpack_release_zip(&archive, &scratch.path().join("out"))
+    }
+
+    /// Set the stored and unpacked size of the first entry in its local
+    /// header and its central directory record.
+    fn set_declared_sizes(bytes: &mut [u8], size: u32) {
+        for (signature, compressed_at, size_at) in
+            [(&b"PK\x03\x04"[..], 18, 22), (&b"PK\x01\x02"[..], 20, 24)]
+        {
+            let at = bytes
+                .windows(4)
+                .position(|window| window == signature)
+                .unwrap();
+            bytes[at + compressed_at..at + compressed_at + 4].copy_from_slice(&size.to_le_bytes());
+            bytes[at + size_at..at + size_at + 4].copy_from_slice(&size.to_le_bytes());
+        }
+    }
+
+    #[test]
+    fn an_archive_with_the_right_sizes_unpacks() {
+        let bytes = stored_zip(&[("ca.exe", b"AAAAAAAA"), ("compare-all.exe", b"BBBBBBBB")]);
+        assert_eq!(unpack_bytes(&bytes).unwrap().files.len(), 2);
+    }
+
+    #[test]
+    fn an_entry_larger_than_its_declared_size_is_refused() {
+        let mut bytes = stored_zip(&[("ca.exe", b"AAAAAAAA"), ("compare-all.exe", b"BBBBBBBB")]);
+        set_declared_sizes(&mut bytes, 4);
+        assert!(unpack_bytes(&bytes).is_err());
+    }
+
+    #[test]
+    fn an_entry_smaller_than_its_declared_size_is_refused() {
+        let mut bytes = stored_zip(&[("ca.exe", b"AAAAAAAA"), ("compare-all.exe", b"BBBBBBBB")]);
+        set_declared_sizes(&mut bytes, 12);
+        assert!(unpack_bytes(&bytes).is_err());
     }
 }
