@@ -247,7 +247,9 @@ impl ReportDialog {
                     ui.horizontal_wrapped(|ui| {
                         ui.label("Lines of context");
                         ui.add(
-                            egui::DragValue::new(&mut self.settings.context_lines).range(0..=50),
+                            egui::DragValue::new(&mut self.settings.context_lines)
+                                .range(0..=50)
+                                .clamp_existing_to_range(false),
                         );
                     });
                 }

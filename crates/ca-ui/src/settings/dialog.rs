@@ -433,7 +433,13 @@ fn control_count(
 ) -> Option<FieldValue> {
     let mut number = number;
     let response = crate::widgets::sized(ui, field_control_width(ui), |ui| {
-        ui.add(egui::DragValue::new(&mut number).range(0..=field.limit))
+        // A saved value beyond the limit stays until the user edits it; the
+        // default clamp would rewrite it on the first frame.
+        ui.add(
+            egui::DragValue::new(&mut number)
+                .range(0..=field.limit)
+                .clamp_existing_to_range(false),
+        )
     });
     let changed = response.changed();
     describe_field_control(response, field.label, egui::WidgetType::DragValue, reason);
@@ -883,6 +889,39 @@ mod tests {
                 .collect();
             assert_eq!(&drawn, names, "{kind} pages");
         }
+    }
+
+    #[test]
+    fn showing_a_page_keeps_a_saved_count_above_the_field_limit() {
+        use ca_session::settings::text::TextMergeOverride;
+
+        const KEY: &str = "conflicts.separation_lines";
+        let mut saved = TextMergeOverride::default();
+        saved.conflicts.separation_lines = Some(500);
+        let layers = SettingsLayers::new();
+        let mut dialog = SettingsDialog::new(
+            SessionKind::TextMerge,
+            &SessionSettingsOverride::TextMerge(saved),
+            &layers,
+            1,
+        );
+        dialog.active = dialog
+            .tabs()
+            .iter()
+            .position(|tab| tab.fields.iter().any(|field| field.key == KEY))
+            .unwrap();
+        let mut probe = crate::testing::probe::Probe::new(1_280.0, 900.0);
+        for _ in 0..2 {
+            let mut draw = |ctx: &egui::Context| {
+                let _ = dialog.show(ctx, &crate::theme::LIGHT);
+            };
+            let _ = probe.frame(Vec::new(), &mut draw);
+        }
+        assert_eq!(dialog.value(KEY), Some(FieldValue::Count(500)));
+        let SessionSettings::TextMerge(settings) = dialog.accept().settings else {
+            panic!("kind changed");
+        };
+        assert_eq!(settings.conflicts.separation_lines, 500);
     }
 
     #[test]
