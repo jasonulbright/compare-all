@@ -202,6 +202,7 @@ pub fn open_to_other_accounts(path: &Path) -> Result<bool, String> {
 
 /// Separates the paths in the environment of the reader; no file name can
 /// hold it.
+#[cfg(windows)]
 const PATH_SEPARATOR: char = '|';
 
 /// The security descriptors of `paths`, in their order, in the
