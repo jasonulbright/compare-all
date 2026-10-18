@@ -60,14 +60,37 @@ pub const NOT_APPLICABLE: i32 = 0x1000_0004;
 
 /// True when the install folder of `program` and `program` itself are closed
 /// to accounts other than administrators, the system and the installer
-/// service. A descriptor that cannot be read counts as open.
+/// service, and no such account can move the install folder away: every
+/// folder above it, up to the drive root, refuses them deletion, deletion of
+/// a child and changes of its access list or owner. A path with a link in
+/// it, or a descriptor that cannot be read, counts as open.
 #[must_use]
 pub fn install_folder_closed(program: &Path) -> bool {
-    program.parent().is_some_and(|folder| {
-        [folder, program]
+    let Some(resolved) = resolve(program) else {
+        return false;
+    };
+    let fold = |path: &Path| -> Vec<String> {
+        path.components()
+            .map(|part| part.as_os_str().to_string_lossy().to_lowercase())
+            .collect()
+    };
+    if fold(&resolved) != fold(program) {
+        return false;
+    }
+    let Some(folder) = resolved.parent() else {
+        return false;
+    };
+    let mut paths = vec![resolved.as_path(), folder];
+    paths.extend(folder.ancestors().skip(1));
+    let Ok(descriptors) = crate::access::read_sddls(&paths) else {
+        return false;
+    };
+    let (own, above) = descriptors.split_at(descriptors.len().min(2));
+    own.iter()
+        .all(|sddl| !crate::access::sddl_open_to_other_accounts(sddl))
+        && above
             .iter()
-            .all(|path| crate::access::open_to_other_accounts(path) == Ok(false))
-    })
+            .all(|sddl| !crate::access::sddl_open_as_ancestor(sddl))
 }
 
 /// True when the elevated step can set `program` aside in a work folder in
