@@ -151,3 +151,62 @@ fn only_a_folder_merge_compares_contents_by_rules_unless_told_otherwise() {
         assert_eq!(content, expected, "{document}");
     }
 }
+
+#[test]
+fn a_merge_comparison_group_without_a_content_test_compares_by_rules() {
+    for (document, expected) in [
+        (
+            r#"{"kind":"folder-merge","comparison":{"compareSize":false}}"#,
+            ContentComparison::RulesBased,
+        ),
+        (
+            r#"{"kind":"folder-merge","comparison":{}}"#,
+            ContentComparison::RulesBased,
+        ),
+        (
+            r#"{"kind":"folder-merge","comparison":{"compareSize":false,"contentComparison":"none"}}"#,
+            ContentComparison::None,
+        ),
+        (
+            r#"{"kind":"folder-merge","comparison":{"contentComparison":"crc"}}"#,
+            ContentComparison::Crc,
+        ),
+        (
+            r#"{"kind":"folder-compare","comparison":{"compareSize":false}}"#,
+            ContentComparison::None,
+        ),
+        (
+            r#"{"kind":"folder-sync","comparison":{"compareSize":false}}"#,
+            ContentComparison::None,
+        ),
+    ] {
+        let comparison = match serde_json::from_str(document).unwrap() {
+            SessionSettings::FolderCompare(settings) => settings.comparison,
+            SessionSettings::FolderSync(settings) => settings.comparison,
+            SessionSettings::FolderMerge(settings) => settings.comparison,
+            other => panic!("{document} read as {:?}", other.kind()),
+        };
+        assert_eq!(comparison.content_comparison, expected, "{document}");
+    }
+}
+
+#[test]
+fn a_merge_comparison_group_keeps_its_other_saved_fields_and_unknown_fields() {
+    let document = r#"{"kind":"folder-merge","comparison":{"compareSize":false,"timestampToleranceSeconds":0,"futureTest":7}}"#;
+    let SessionSettings::FolderMerge(settings) = serde_json::from_str(document).unwrap() else {
+        panic!("{document} did not read as a folder merge");
+    };
+    assert!(!settings.comparison.compare_size);
+    assert_eq!(settings.comparison.timestamp_tolerance_seconds, 0);
+    assert!(settings.comparison.compare_timestamps);
+    assert_eq!(
+        settings.comparison.unknown.get("futureTest"),
+        Some(&serde_json::json!(7))
+    );
+    let saved = serde_json::to_value(SessionSettings::FolderMerge(settings)).unwrap();
+    assert_eq!(saved["comparison"]["futureTest"], serde_json::json!(7));
+    assert_eq!(
+        saved["comparison"]["contentComparison"],
+        serde_json::json!("rules-based")
+    );
+}

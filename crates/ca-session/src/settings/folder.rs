@@ -372,7 +372,8 @@ settings_composite! {
         /// Sides, ancestor, output and description.
         specs: SpecsSettings => SpecsOverride,
         /// Tests deciding whether a pair counts as changed.
-        comparison: FolderComparisonSettings => FolderComparisonOverride = merge_comparison(),
+        comparison: FolderComparisonSettings => FolderComparisonOverride
+            = merge_comparison(), from "merge_comparison_from_document",
         /// Scanning, expansion, refresh and copy behavior.
         handling: FolderHandlingSettings => FolderHandlingOverride,
         /// Name masks limiting the session's scope.
@@ -391,4 +392,18 @@ fn merge_comparison() -> FolderComparisonSettings {
         content_comparison: ContentComparison::RulesBased,
         ..FolderComparisonSettings::default()
     }
+}
+
+/// Reads a folder merge's comparison group: the fields the document stores,
+/// laid over the merge's starting comparison.
+fn merge_comparison_from_document<'de, D>(
+    deserializer: D,
+) -> Result<FolderComparisonSettings, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let stored = FolderComparisonOverride::deserialize(deserializer)?;
+    let mut comparison = merge_comparison();
+    stored.apply_to(&mut comparison);
+    Ok(comparison)
 }
