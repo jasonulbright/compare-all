@@ -522,22 +522,24 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_folder_of_another_user_is_refused() {
-        use std::os::unix::fs::MetadataExt as _;
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
         let parent = tempfile::tempdir().unwrap();
-        let metadata = std::fs::metadata(parent.path()).unwrap();
+        let folder = parent.path().join("folder");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let metadata = std::fs::metadata(&folder).unwrap();
         let owner = metadata.uid();
         for private in [false, true] {
-            let refused = super::check_folder_metadata(
-                &metadata,
-                owner.wrapping_add(1),
-                parent.path(),
-                private,
-            )
-            .unwrap_err();
+            let refused =
+                super::check_folder_metadata(&metadata, owner.wrapping_add(1), &folder, private)
+                    .unwrap_err();
             assert_eq!(refused.kind(), std::io::ErrorKind::PermissionDenied);
             assert!(refused.to_string().contains("another user"), "{refused}");
+            assert!(
+                super::check_folder_metadata(&metadata, owner, &folder, private).is_ok(),
+                "{private}"
+            );
         }
-        assert!(super::check_folder_metadata(&metadata, owner, parent.path(), true).is_ok());
     }
 
     #[cfg(unix)]
