@@ -345,6 +345,7 @@ pub struct FolderView {
     compared_tree: Option<Box<Node>>,
     expanded: Expanded,
     visible: Vec<bool>,
+    order: navigate::DisplayOrder,
     rows: Vec<FlatRow>,
     filter: DisplayFilter,
     folder_filter: FolderDisplayFilter,
@@ -531,6 +532,7 @@ impl FolderView {
             compared_tree: None,
             expanded: Expanded::new(),
             visible: Vec::new(),
+            order: navigate::DisplayOrder::default(),
             rows: Vec::new(),
             filter: DisplayFilter::ShowAll,
             folder_filter: FolderDisplayFilter::default(),
@@ -1267,6 +1269,7 @@ impl FolderView {
         self.expanded = Expanded::new();
         self.rows.clear();
         self.visible.clear();
+        self.order.clear();
         self.left_count = 0;
         self.right_count = 0;
         self.scan_errors.clear();
@@ -1822,6 +1825,7 @@ impl FolderView {
     fn rebuild(&mut self) {
         self.visible = self.arena.visibility(self.filter, self.folder_filter);
         self.rows = self.arena.flatten(&self.expanded, &self.visible);
+        self.order = navigate::DisplayOrder::of(&self.arena, &self.visible);
         self.scroll
             .clamp(self.viewport_height, self.row_height(), self.rows.len());
         self.rebuild_pending = false;
@@ -3686,7 +3690,8 @@ impl SessionView for FolderView {
             Command::CompareContents | Command::CompareReport => self.compared_tree.is_some(),
             Command::SwapSides => self.status == Status::Ready && idle,
             Command::Reload | Command::Recompare => !self.status.is_running() && idle,
-            Command::NextDifference | Command::PreviousDifference => self.has_difference(),
+            Command::NextDifference => self.has_difference(true),
+            Command::PreviousDifference => self.has_difference(false),
             Command::FindNext | Command::FindPrevious => self.has_name_match(),
             Command::Cancel => self.status.is_running() || self.stage.is_busy(),
             Command::ClearSelection => !self.selection.is_empty(),

@@ -524,7 +524,8 @@ const fn menu_view(view: ToolbarView) -> crate::command::MenuView {
         ToolbarView::Text => MenuView::Text,
         ToolbarView::Folder => MenuView::Folder,
         ToolbarView::Table => MenuView::Table,
-        ToolbarView::Merge | ToolbarView::FolderMerge => MenuView::Merge,
+        ToolbarView::Merge => MenuView::Merge,
+        ToolbarView::FolderMerge => MenuView::FolderMerge,
         _ => MenuView::Other,
     }
 }

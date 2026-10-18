@@ -272,7 +272,8 @@ impl Arena {
         arena
     }
 
-    /// Every node, in pre-order.
+    /// Every node, in the pre-order the scan built. A sort leaves this order
+    /// alone; [`Arena::display_order`] gives the order on screen.
     #[must_use]
     pub fn nodes(&self) -> &[ArenaNode] {
         &self.nodes
@@ -395,23 +396,52 @@ impl Arena {
     #[must_use]
     pub fn flatten(&self, expanded: &Expanded, visible: &[bool]) -> Vec<FlatRow> {
         let mut rows = Vec::new();
+        self.walk(
+            visible,
+            |index| expanded.is_expanded(index),
+            |index, node| {
+                rows.push(FlatRow {
+                    node: index,
+                    depth: node.depth,
+                });
+            },
+        );
+        rows
+    }
+
+    /// The nodes the filters show, in the order their rows paint with every
+    /// folder open. Sorting reorders children in place, so the arena's own
+    /// index order is not the order on screen.
+    #[must_use]
+    pub fn display_order(&self, visible: &[bool]) -> Vec<u32> {
+        let mut order = Vec::new();
+        self.walk(visible, |_| true, |index, _| order.push(index));
+        order
+    }
+
+    /// Visit the shown nodes depth first in row order, descending only into
+    /// the folders `open` names.
+    fn walk(
+        &self,
+        visible: &[bool],
+        open: impl Fn(u32) -> bool,
+        mut visit: impl FnMut(u32, &ArenaNode),
+    ) {
         let mut stack: Vec<u32> = self.roots.iter().rev().copied().collect();
         while let Some(index) = stack.pop() {
             if !visible.get(index as usize).copied().unwrap_or(true) {
                 continue;
             }
-            let node = &self.nodes[index as usize];
-            rows.push(FlatRow {
-                node: index,
-                depth: node.depth,
-            });
-            if node.is_dir && expanded.is_expanded(index) {
+            let Some(node) = self.nodes.get(index as usize) else {
+                continue;
+            };
+            visit(index, node);
+            if node.is_dir && open(index) {
                 for child in node.children.iter().rev() {
                     stack.push(*child);
                 }
             }
         }
-        rows
     }
 
     /// Row totals for the status bar.

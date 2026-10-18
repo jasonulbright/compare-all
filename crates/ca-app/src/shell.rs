@@ -741,7 +741,7 @@ const fn menus_for(view: MenuView) -> &'static [(&'static str, &'static [Entry])
     match view {
         MenuView::Table => TABLE_MENUS,
         MenuView::Folder => FOLDER_MENUS,
-        MenuView::Merge => MERGE_MENUS,
+        MenuView::Merge | MenuView::FolderMerge => MERGE_MENUS,
         MenuView::Registry => REGISTRY_MENUS,
         MenuView::Version | MenuView::Media => RECORDS_MENUS,
         MenuView::Text | MenuView::Other => TEXT_MENUS,
@@ -3213,7 +3213,11 @@ impl App {
                         ui.label(crate::product_title());
                     }
                 });
-                if matches!(view, MenuView::Other | MenuView::Merge) && *name == ACTIONS_AFTER {
+                if matches!(
+                    view,
+                    MenuView::Other | MenuView::Merge | MenuView::FolderMerge
+                ) && *name == ACTIONS_AFTER
+                {
                     self.actions_menu(ui, context);
                 }
             }
@@ -5829,7 +5833,10 @@ mod tests {
                     || listed
                         .iter()
                         .any(|(on, _, known)| *on == bar && *known == state.command)
-                    || (matches!(bar, MenuView::Other | MenuView::Merge) && menu == Menu::Actions);
+                    || (matches!(
+                        bar,
+                        MenuView::Other | MenuView::Merge | MenuView::FolderMerge
+                    ) && menu == Menu::Actions);
                 assert!(
                     reached,
                     "{kind} declares {:?}, which its bar never shows",
@@ -5848,8 +5855,10 @@ mod tests {
     fn a_menu_line_of_the_shared_bar_sits_in_the_menu_its_command_names() {
         for (view, name, command) in listed() {
             // An action command reaches whichever menu the bar puts it in.
-            if !matches!(view, MenuView::Other | MenuView::Merge | MenuView::Registry)
-                || command.menu() == Menu::Actions
+            if !matches!(
+                view,
+                MenuView::Other | MenuView::Merge | MenuView::FolderMerge | MenuView::Registry
+            ) || command.menu() == Menu::Actions
             {
                 continue;
             }

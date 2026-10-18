@@ -4,7 +4,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, missing_docs)]
 
 use ca_session::SessionKind;
-use ca_ui::command::{route, Command, Keystroke, MenuView};
+use ca_ui::command::{route, route_with, Command, Keystroke, MenuView, ShortcutTable};
 use ca_ui::testing::context;
 use ca_ui::testing::probe::{self, Probe};
 use ca_ui::view::{OpenRequest, SessionView};
@@ -168,13 +168,9 @@ fn next_and_previous_difference_walk_the_differences_and_open_folders() {
     ready(&mut view);
     let closed = view.rows().len();
     let mut seen = Vec::new();
-    for _ in 0..8 {
-        expect(&mut view, Command::NextDifference);
-        let at = cursor(&view).unwrap();
-        if seen.last() == Some(&at) {
-            break;
-        }
-        seen.push(at);
+    while view.accepts(Command::NextDifference) && seen.len() < 8 {
+        view.run(Command::NextDifference);
+        seen.push(cursor(&view).unwrap());
     }
     let names: Vec<&str> = seen.iter().map(|rel| rel.to_str().unwrap()).collect();
     assert!(names.contains(&"newer.txt"), "{names:?}");
@@ -293,6 +289,145 @@ fn the_find_bar_controls_are_pressed_by_label() {
     assert!(!view.find_is_open());
     assert_eq!(view.find_text(), "newer");
     assert!(view.accepts(Command::FindNext));
+}
+
+/// Draw `view` for one frame that carries `events`.
+fn type_into(known: &mut Probe, view: &mut impl SessionView, events: Vec<egui::Event>) {
+    let mut run = |ctx: &egui::Context| {
+        let _ = probe::draw_view(view, ctx);
+    };
+    let _ = known.frame(events, &mut run);
+    known.idle(&mut run);
+}
+
+fn enter() -> egui::Event {
+    egui::Event::Key {
+        key: Key::Enter,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::default(),
+    }
+}
+
+#[test]
+fn the_find_field_is_clicked_and_typed_into_by_label() {
+    let fixture = Fixture::new();
+    let mut view = fixture.view();
+    let mut known = Probe::new(WINDOW[0], WINDOW[1]);
+    expect(&mut view, Command::Find);
+    probe::settle(&mut known, &mut view);
+    probe::press_view(&mut known, &mut view, "Find filename").unwrap();
+    type_into(
+        &mut known,
+        &mut view,
+        vec![egui::Event::Text("NEWER".to_owned())],
+    );
+    assert_eq!(view.find_text(), "NEWER");
+    assert_eq!(cursor(&view).unwrap(), Path::new("newer.txt"));
+    type_into(
+        &mut known,
+        &mut view,
+        vec![egui::Event::Text("s".to_owned())],
+    );
+    assert_eq!(view.find_text(), "NEWERs");
+    refused(&view, Command::FindNext);
+    type_into(
+        &mut known,
+        &mut view,
+        vec![egui::Event::Key {
+            key: Key::Backspace,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        }],
+    );
+    assert_eq!(view.find_text(), "NEWER");
+    type_into(&mut known, &mut view, vec![enter()]);
+    assert!(view.accepts(Command::FindNext));
+}
+
+#[test]
+fn the_merge_find_field_is_clicked_and_typed_into_by_label() {
+    let fixture = Fixture::new();
+    let mut view = fixture.merge_view();
+    let mut known = Probe::new(WINDOW[0], WINDOW[1]);
+    expect(&mut view, Command::Find);
+    probe::settle(&mut known, &mut view);
+    probe::press_view(&mut known, &mut view, "Find filename").unwrap();
+    type_into(
+        &mut known,
+        &mut view,
+        vec![egui::Event::Text("ADDED".to_owned())],
+    );
+    assert_eq!(view.find_text(), "ADDED");
+    assert_eq!(
+        view.cursor_row().map(|row| row.name.clone()),
+        Some("added.txt".to_owned())
+    );
+}
+
+#[test]
+fn difference_moves_refuse_a_direction_with_no_target() {
+    let fixture = Fixture::new();
+    let mut view = fixture.view();
+    expect(&mut view, Command::CompareContents);
+    ready(&mut view);
+    expect(&mut view, Command::NextDifference);
+    refused(&view, Command::PreviousDifference);
+    let mut moves = 0;
+    while view.accepts(Command::NextDifference) {
+        view.run(Command::NextDifference);
+        moves += 1;
+        assert!(moves < 16, "Next Difference never ran out of targets");
+    }
+    assert!(moves > 0);
+    refused(&view, Command::NextDifference);
+    expect(&mut view, Command::PreviousDifference);
+}
+
+#[test]
+fn merge_difference_moves_refuse_a_direction_with_no_target() {
+    let fixture = Fixture::new();
+    let mut view = fixture.merge_view();
+    expect(&mut view, Command::NextDifference);
+    refused(&view, Command::PreviousDifference);
+    let mut moves = 0;
+    while view.accepts(Command::NextDifference) {
+        view.run(Command::NextDifference);
+        moves += 1;
+        assert!(moves < 32, "Next Difference never ran out of targets");
+    }
+    refused(&view, Command::NextDifference);
+    if moves > 0 {
+        expect(&mut view, Command::PreviousDifference);
+    }
+}
+
+#[test]
+fn the_merge_view_moves_between_differences_by_key() {
+    let fixture = Fixture::new();
+    let mut view = fixture.merge_view();
+    let table = ShortcutTable::built_in();
+    let bar = view.menu_view();
+    let next = route_with(bar, Keystroke::with_command(Key::N), &table);
+    let previous = route_with(bar, Keystroke::with_command(Key::P), &table);
+    assert_eq!(next, Some(Command::NextDifference));
+    assert_eq!(previous, Some(Command::PreviousDifference));
+    assert_eq!(Command::NextDifference.shortcut_in(bar), Some("Ctrl+N"));
+    assert_eq!(Command::PreviousDifference.shortcut_in(bar), Some("Ctrl+P"));
+    expect(&mut view, Command::NextDifference);
+    assert!(view.cursor_row().is_some());
+
+    assert_eq!(
+        route_with(MenuView::Merge, Keystroke::with_command(Key::N), &table),
+        Some(Command::NextSection)
+    );
+    assert_eq!(
+        route_with(MenuView::Merge, Keystroke::with_command(Key::P), &table),
+        Some(Command::PreviousSection)
+    );
 }
 
 #[test]
