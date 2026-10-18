@@ -225,6 +225,14 @@ impl Terminal for FindAllMessage {
     fn panicked(detail: String) -> Self {
         FindAllMessage::Failed(detail)
     }
+
+    /// A step queued before the cancel arrived is not installed.
+    fn after_cancel(self) -> Self {
+        match self {
+            FindAllMessage::Prepared(..) => FindAllMessage::Cancelled,
+            other => other,
+        }
+    }
 }
 
 /// Every non-overlapping place `needle` starts in `bytes`, scanning forward.
@@ -296,7 +304,10 @@ pub fn spawn_replace_all(
 }
 
 /// The body of a replace all job: scan, then build the step. `probe` runs
-/// before each cancellation check of the build.
+/// before each cancellation check of the build and before the final check.
+///
+/// A small input reaches no check during the build, so the final check is
+/// the only one between a cancel raised after the scan and the send.
 fn prepare_replace_all(
     bytes: &[u8],
     revision: u64,
@@ -305,17 +316,22 @@ fn prepare_replace_all(
     probe: &dyn Fn(),
 ) -> Option<PreparedStep> {
     let offsets = find_every(bytes, &request.needle, request.match_case, cancel)?;
-    PreparedStep::replace_all(
+    let stopped = || {
+        probe();
+        cancel.is_cancelled()
+    };
+    let step = PreparedStep::replace_all(
         bytes,
         revision,
         &offsets,
         request.needle.len() as u64,
         &request.replacement,
-        &|| {
-            probe();
-            cancel.is_cancelled()
-        },
-    )
+        &stopped,
+    )?;
+    if stopped() {
+        return None;
+    }
+    Some(step)
 }
 
 enum Scan {
@@ -565,6 +581,48 @@ mod tests {
         assert_eq!(checks.load(Ordering::SeqCst), 1);
         assert_eq!(buffer.bytes(), original.as_slice());
         assert!(!buffer.is_modified());
+    }
+
+    #[test]
+    fn a_small_replace_all_cancelled_after_the_build_returns_nothing() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let request = super::ReplaceAll {
+            needle: b"X".to_vec(),
+            replacement: b"Y".to_vec(),
+            match_case: true,
+        };
+        let checks = AtomicUsize::new(0);
+        let cancel = ca_ui::worker::Cancel::new();
+        let prepared = super::prepare_replace_all(b"aXbXc", 0, &request, &cancel, &|| {
+            checks.fetch_add(1, Ordering::SeqCst);
+            cancel.cancel();
+        });
+        assert!(prepared.is_none());
+        assert_eq!(checks.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_prepared_step_drained_after_cancel_reads_as_cancelled() {
+        use ca_ui::worker::Terminal as _;
+        let buffer = crate::edit::ByteBuffer::new(b"aX".to_vec());
+        let step = crate::edit::PreparedStep::replace_all(
+            buffer.bytes(),
+            buffer.revision(),
+            &[1],
+            1,
+            b"Y",
+            &|| false,
+        );
+        assert!(step.is_some());
+        let Some(step) = step else { return };
+        assert_eq!(
+            super::FindAllMessage::Prepared(Side::Left, step).after_cancel(),
+            super::FindAllMessage::Cancelled
+        );
+        assert_eq!(
+            super::FindAllMessage::Failed("boom".to_owned()).after_cancel(),
+            super::FindAllMessage::Failed("boom".to_owned())
+        );
     }
 
     #[test]
