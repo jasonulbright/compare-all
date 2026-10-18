@@ -148,7 +148,7 @@ settings_group! {
         same_lines_only: bool = false,
         /// Largest gap, in ancestor lines, that still makes a left change and a
         /// right change one conflict.
-        separation_lines: u32 = 2,
+        separation_lines: u32 = 1,
     }
 }
 

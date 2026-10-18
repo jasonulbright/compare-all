@@ -354,6 +354,7 @@ fn a_column_ruler_is_drawn_in_both_panes_only_when_a_column_is_named() {
 #[test]
 fn the_pane_without_focus_is_darkened_only_when_the_page_says_so() {
     let mut harness = Harness::new("one\n", "one\n");
+    harness.set_options(|options| options.tweaks.dim_inactive_pane_percent = 0);
     harness.frame();
     assert_eq!(harness.view.dimmed_pane(), None);
 
