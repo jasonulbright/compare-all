@@ -832,10 +832,8 @@ fn made_by_edits(view: &MergeView, owned: &Owned) -> HashMap<String, usize> {
 /// After a reload or Swap Sides: a token the output shows more often than
 /// the text before it did, and more often than the inputs show it in the
 /// new merge. A copy an edit made before, `made`, stays next to the copies
-/// of the inputs, so it counts on top of them. A copy whose characters
-/// belong to more than one section after the reload is no copy of a line:
-/// a reload that takes a lender's piece out of a joined line leaves the
-/// pieces around it side by side.
+/// of the inputs, so it counts on top of them, as does a copy of
+/// [`composed_copies`] after the reload.
 fn reload_duplicate(
     view: &MergeView,
     before_counts: &HashMap<String, usize>,
@@ -843,12 +841,7 @@ fn reload_duplicate(
 ) -> Option<String> {
     let allowance = input_allowance(view.model());
     let owned = owned_text(view);
-    let mut composed: HashMap<String, usize> = HashMap::new();
-    for (token, start, end) in token_spans(&owned.text) {
-        if single_owner(&owned.owners[start..end]).is_none() {
-            *composed.entry(token).or_insert(0) += 1;
-        }
-    }
+    let composed = composed_copies(&owned);
     let mut shown: Vec<(String, usize)> = counts(&owned.text).into_iter().collect();
     shown.sort();
     shown.into_iter().find_map(|(token, count)| {
@@ -905,12 +898,30 @@ fn take_all_duplicate(view: &MergeView, owned_before: &Owned) -> Option<String> 
         let shared = count.saturating_sub(owned.get(&token).copied().unwrap_or(0));
         *allowed.entry(token).or_insert(0) += shared;
     }
-    let mut shown: Vec<(String, usize)> = counts(&view.output_text()).into_iter().collect();
+    let owned_after = owned_text(view);
+    for (token, count) in composed_copies(&owned_after) {
+        *allowed.entry(token).or_insert(0) += count;
+    }
+    let mut shown: Vec<(String, usize)> = counts(&owned_after.text).into_iter().collect();
     shown.sort();
     shown.into_iter().find_map(|(token, count)| {
         let allowed = allowed.get(&token).copied().unwrap_or(0);
         (count > allowed).then(|| format!("{token} x{count}, {allowed} allowed"))
     })
+}
+
+/// The copies of each token whose characters belong to more than one
+/// section. Such a copy is no copy of a line: a command that takes a
+/// lender's piece out of a joined line leaves the pieces around it side by
+/// side.
+fn composed_copies(owned: &Owned) -> HashMap<String, usize> {
+    let mut composed = HashMap::new();
+    for (token, start, end) in token_spans(&owned.text) {
+        if single_owner(&owned.owners[start..end]).is_none() {
+            *composed.entry(token).or_insert(0) += 1;
+        }
+    }
+    composed
 }
 
 /// What a line take is to change, read before the take.
@@ -2134,31 +2145,50 @@ fn the_take_all_duplicate_oracle_reports_a_line_shown_twice() {
     );
 }
 
-const PIECES: [&str; 2] = [
+const PIECES: [&str; 3] = [
     "[l1]\n[u2]\n[u3]\n[u4]\n[l5]\n[u6]\n[u7]\n[u8]\n[l9]\n[u10]\n[u11]\n[u12]\n",
     "[c1]\n[u2]\n[u3]\n[u4]\n[c5]\n[u6]\n[u7]\n[u8]\n[c9]\n[u10]\n[u11]\n[u12]\n",
+    "[r1]\n[u2]\n[u3]\n[u4]\n[r5]\n[u6]\n[u7]\n[u8]\n[c9]\n[u10]\n[u11]\n[u12]\n",
 ];
 
-/// s0 holds `[lZ` of s2, with the typed `Z`, and `9]` of s4 on its line.
-/// The left input then changes the line of s2. The reload replaces s2, so
-/// its piece leaves s0, and `[l1` and `9]` end up side by side. The joined
-/// token is in no input and was not shown before, but no section shows a
-/// line twice: the oracle reports nothing. A real second copy of a line
-/// is still a finding.
+/// Each selection `(from, to)` replaced by the typed character, or removed.
+fn edit_selections(view: &mut MergeView, edits: &[((u32, u32), (u32, u32), Option<char>)]) {
+    view.focus = crate::Pane::Output;
+    for &(from, to, typed) in edits {
+        view.output_pane.place(Caret::new(from.0, from.1), false);
+        view.output_pane.place(Caret::new(to.0, to.1), true);
+        match typed {
+            Some(character) => view.output_pane.type_character(character),
+            None => view.output_pane.backspace(),
+        }
+        view.absorb_output_edits();
+    }
+}
+
+fn last_section_shows_u10_twice(view: &mut MergeView) {
+    let last = view.model().sections().len() - 1;
+    let lines = ["[u10]\n", "[u10]\n", "[u11]\n", "[u12]\n"];
+    view.data
+        .model
+        .set_edited(last, lines.iter().map(|line| (*line).to_owned()).collect());
+}
+
+/// s0, s2 and s4 are left changes. Join `[l5]` of s2 to `[l1` of s0, then
+/// select from inside that piece to inside `[l9]` of s4 and type `Z`: s0
+/// holds `[lZ` of s2 and `9]` of s4 on its line. The left input then
+/// changes the line of s2. The reload replaces s2, so its piece leaves s0,
+/// and `[l1` and `9]` end up side by side. The joined token is in no input
+/// and was not shown before, but no section shows a line twice: the oracle
+/// reports nothing. A real second copy of a line is still a finding.
 #[test]
 fn the_reload_duplicate_oracle_accepts_pieces_a_dropped_lender_leaves_side_by_side() {
     for separation in [1, 2] {
         let (mut view, dir) = open_separated(PIECES[0], Some(PIECES[1]), PIECES[1], separation);
         run_until_ready(&mut view);
-        view.focus = crate::Pane::Output;
-        view.output_pane.place(Caret::new(0, 3), false);
-        view.output_pane.place(Caret::new(4, 0), true);
-        view.output_pane.backspace();
-        view.absorb_output_edits();
-        view.output_pane.place(Caret::new(0, 5), false);
-        view.output_pane.place(Caret::new(4, 2), true);
-        view.output_pane.type_character('Z');
-        view.absorb_output_edits();
+        edit_selections(
+            &mut view,
+            &[((0, 3), (4, 0), None), ((0, 5), (4, 2), Some('Z'))],
+        );
         assert_eq!(pane_text(&view), "[l1[lZ9]\n[u10]\n[u11]\n[u12]\n");
         let before = counts(&pane_text(&view));
         let made = made_by_edits(&view, &owned_text(&view));
@@ -2170,18 +2200,48 @@ fn the_reload_duplicate_oracle_accepts_pieces_a_dropped_lender_leaves_side_by_si
         assert_eq!(owned_text(&view).problems, Vec::<String>::new());
         assert_eq!(view.model().lent_record_problems(), Vec::<String>::new());
         assert_eq!(reload_duplicate(&view, &before, &made), None);
-        let last = view.model().sections().len() - 1;
-        view.data.model.set_edited(
-            last,
-            vec![
-                "[u10]\n".to_owned(),
-                "[u10]\n".to_owned(),
-                "[u11]\n".to_owned(),
-                "[u12]\n".to_owned(),
+        last_section_shows_u10_twice(&mut view);
+        assert_eq!(
+            reload_duplicate(&view, &before, &made).as_deref(),
+            Some("[u10] x2, 1 allowed")
+        );
+    }
+}
+
+/// s0 and s2 are conflicts. Type `Q` over `[u2]` of the unchanged s1, join
+/// that line to `[c1` of s0, and remove up to `5]` of s2: s0 holds `Q` of
+/// s1 and `5]` of s2 on its line. Take All Non-Conflicting shows the lines
+/// of s1 again, so its piece leaves s0, and `[c1` and `5]` end up side by
+/// side: no duplicate. A real second copy of a line is still a finding.
+#[test]
+fn the_take_all_duplicate_oracle_accepts_pieces_a_taken_lender_leaves_side_by_side() {
+    for separation in [1, 2] {
+        let (mut view, _dir) = open_separated(PIECES[0], Some(PIECES[1]), PIECES[2], separation);
+        run_until_ready(&mut view);
+        edit_selections(
+            &mut view,
+            &[
+                ((1, 0), (1, 4), Some('Q')),
+                ((0, 3), (1, 0), None),
+                ((0, 4), (3, 2), None),
             ],
         );
         assert_eq!(
-            reload_duplicate(&view, &before, &made).as_deref(),
+            pane_text(&view),
+            "[c1Q5]\n[u6]\n[u7]\n[u8]\n[l9]\n[u10]\n[u11]\n[u12]\n"
+        );
+        let before = owned_text(&view);
+        view.run(Command::TakeAllNonConflicting);
+        assert_eq!(
+            pane_text(&view),
+            "[c15]\n[u2]\n[u3]\n[u4]\n[u6]\n[u7]\n[u8]\n[l9]\n[u10]\n[u11]\n[u12]\n"
+        );
+        assert_eq!(owned_text(&view).problems, Vec::<String>::new());
+        assert_eq!(view.model().lent_record_problems(), Vec::<String>::new());
+        assert_eq!(take_all_duplicate(&view, &before), None);
+        last_section_shows_u10_twice(&mut view);
+        assert_eq!(
+            take_all_duplicate(&view, &before).as_deref(),
             Some("[u10] x2, 1 allowed")
         );
     }
