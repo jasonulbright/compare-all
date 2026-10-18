@@ -55,6 +55,7 @@ const OPERATION_COMPLETE: &str = "Close the completed operation first";
 const OPERATION_OPEN: &str = "Close the open operation first";
 const NO_CENTER: &str = "This merge has no center folder";
 const NO_CONFLICTS: &str = "No visible conflicts are available";
+const NO_FILES: &str = "There are no files to select";
 const NO_TARGET: &str = "Select an item to act on first";
 const NO_COPY_TARGET: &str = "Select an item to copy first";
 /// What the view says when a merge has nothing to write and the output holds
@@ -90,8 +91,13 @@ const EXIT_STEP_UNDONE: i32 = 100;
 const HANDLED: &[Command] = &[
     Command::SwapSides,
     Command::Reload,
+    Command::Recompare,
     Command::CompareReport,
     Command::SelectAll,
+    Command::SelectAllFiles,
+    Command::Find,
+    Command::FindNext,
+    Command::FindPrevious,
     Command::NextDifference,
     Command::PreviousDifference,
     Command::ShowAll,
@@ -899,6 +905,7 @@ pub struct FolderMergeView {
     overrides: BTreeMap<PathBuf, Resolution>,
     selection: BTreeSet<PathBuf>,
     cursor: Option<usize>,
+    find: crate::find::NameFind,
     active: Pane,
     stage: Stage,
     /// The items that wait for a merge by hand, as the last plan or the last
@@ -977,6 +984,7 @@ impl FolderMergeView {
             overrides: BTreeMap::new(),
             selection: BTreeSet::new(),
             cursor: None,
+            find: crate::find::NameFind::default(),
             active: Pane::Left,
             stage: Stage::Idle,
             by_hand: ByHand::default(),
@@ -1033,6 +1041,12 @@ impl FolderMergeView {
     pub fn cursor_row(&self) -> Option<&MergeRow> {
         let index = *self.visible.get(self.cursor?)?;
         self.tree.as_deref()?.rows.get(index)
+    }
+
+    /// The paths of the selected rows.
+    #[must_use]
+    pub const fn selected(&self) -> &BTreeSet<PathBuf> {
+        &self.selection
     }
 
     /// Put the cursor on the visible row at `rel`, and make it the selection.
@@ -1502,15 +1516,29 @@ impl FolderMergeView {
 
     /// Move the cursor to the next or previous visible row that passes `test`.
     fn jump(&mut self, forward: bool, test: impl Fn(&MergeRow) -> bool) {
+        self.jump_from(forward, false, false, test);
+    }
+
+    /// Like [`Self::jump`], optionally wrapping at either end and optionally
+    /// counting the row under the cursor.
+    fn jump_from(
+        &mut self,
+        forward: bool,
+        wrap: bool,
+        inclusive: bool,
+        test: impl Fn(&MergeRow) -> bool,
+    ) {
         let Some(tree) = self.tree.clone() else {
             return;
         };
         let count = self.visible.len();
-        let candidates: Box<dyn Iterator<Item = usize>> = match (forward, self.cursor) {
-            (true, Some(at)) => Box::new(at + 1..count),
-            (true, None) => Box::new(0..count),
-            (false, Some(at)) => Box::new((0..at).rev()),
-            (false, None) => Box::new((0..count).rev()),
+        let after = self.cursor.map_or(0, |at| at + usize::from(!inclusive));
+        let before = self.cursor.unwrap_or(count);
+        let candidates: Box<dyn Iterator<Item = usize>> = match (forward, wrap) {
+            (true, false) => Box::new(after.min(count)..count),
+            (true, true) => Box::new((after.min(count)..count).chain(0..after.min(count))),
+            (false, false) => Box::new((0..before).rev()),
+            (false, true) => Box::new((0..before).rev().chain((before..count).rev())),
         };
         for position in candidates {
             if tree.rows.get(self.visible[position]).is_some_and(&test) {
@@ -1521,6 +1549,62 @@ impl FolderMergeView {
                 }
                 return;
             }
+        }
+    }
+
+    /// True when the search text matches the name of a row the filter shows.
+    fn any_name_match(&self) -> bool {
+        self.tree.as_deref().is_some_and(|tree| {
+            self.visible.iter().any(|index| {
+                tree.rows
+                    .get(*index)
+                    .is_some_and(|row| self.find.matches(&row.name))
+            })
+        })
+    }
+
+    /// Move the cursor to the next or previous name that holds the search
+    /// text, wrapping at either end.
+    fn find_name(&mut self, forward: bool, inclusive: bool) {
+        let find = self.find.clone();
+        self.jump_from(forward, true, inclusive, |row| find.matches(&row.name));
+    }
+
+    /// The text the file name search looks for.
+    #[must_use]
+    pub fn find_text(&self) -> &str {
+        self.find.text()
+    }
+
+    /// True while the file name search bar is on screen.
+    #[must_use]
+    pub const fn find_is_open(&self) -> bool {
+        self.find.is_open()
+    }
+
+    /// Replace the text the file name search looks for.
+    pub fn set_find_text(&mut self, text: &str) {
+        self.find.set_text(text);
+    }
+
+    /// Draw the search bar when it is open and act on what it asked for.
+    fn find_bar(&mut self, ui: &mut egui::Ui) {
+        if !self.find.is_open() {
+            return;
+        }
+        let note =
+            (self.find.has_text() && !self.any_name_match()).then_some(crate::find::NO_MATCH);
+        let id = self.id;
+        let mut request = None;
+        egui::TopBottomPanel::bottom(id.with("find-panel")).show_inside(ui, |ui| {
+            request = crate::find::show(ui, id, &mut self.find, note);
+        });
+        match request {
+            Some(crate::find::Request::Edited) => self.find_name(true, true),
+            Some(crate::find::Request::Next) => self.find_name(true, false),
+            Some(crate::find::Request::Previous) => self.find_name(false, false),
+            Some(crate::find::Request::Close) => self.find.close(),
+            None => {}
         }
     }
 
@@ -1726,6 +1810,13 @@ impl FolderMergeView {
         }
         match command {
             Command::PreviousConflict | Command::NextConflict => NO_CONFLICTS,
+            Command::NextDifference | Command::PreviousDifference => crate::navigate::NO_DIFFERENCE,
+            Command::SelectAllFiles => NO_FILES,
+            Command::Find => crate::find::NO_ITEMS,
+            Command::FindNext | Command::FindPrevious if !self.find.has_text() => {
+                crate::find::NO_TEXT
+            }
+            Command::FindNext | Command::FindPrevious => crate::find::NO_MATCH,
             Command::TakeCenter if !self.has_center() => NO_CENTER,
             Command::TakeLeft | Command::TakeCenter | Command::TakeRight => NO_TARGET,
             Command::MergeFolders | Command::CopyToOutput if self.output_folder().is_none() => {
@@ -2644,6 +2735,7 @@ impl SessionView for FolderMergeView {
         egui::TopBottomPanel::bottom(self.id.with("status")).show_inside(ui, |ui| {
             self.status_line(ui);
         });
+        self.find_bar(ui);
         egui::CentralPanel::default().show_inside(ui, |ui| {
             self.rows_ui(ui, context);
         });
@@ -2653,6 +2745,20 @@ impl SessionView for FolderMergeView {
 
     fn commands(&self) -> Vec<CommandState> {
         view::declare(HANDLED, |command| self.accepts(command))
+    }
+
+    fn refusal(&self, command: Command) -> Option<&'static str> {
+        let covered = matches!(
+            command,
+            Command::Recompare
+                | Command::NextDifference
+                | Command::PreviousDifference
+                | Command::SelectAllFiles
+                | Command::Find
+                | Command::FindNext
+                | Command::FindPrevious
+        );
+        (covered && !self.accepts(command)).then(|| self.toolbar_disabled_reason(command))
     }
 
     fn accepts(&self, command: Command) -> bool {
@@ -2667,11 +2773,15 @@ impl SessionView for FolderMergeView {
             })
         };
         match command {
-            Command::SwapSides | Command::Reload => {
+            Command::SwapSides | Command::Reload | Command::Recompare => {
                 idle && !matches!(self.status, Status::Running(_))
             }
             Command::CompareReport | Command::ToggleIgnoreSameChanges => ready,
-            Command::SelectAll => ready && !self.visible.is_empty(),
+            Command::SelectAll | Command::Find => ready && !self.visible.is_empty(),
+            Command::SelectAllFiles => ready && any(|row| !row.is_dir),
+            Command::FindNext | Command::FindPrevious => {
+                ready && self.find.has_text() && self.any_name_match()
+            }
             Command::NextDifference | Command::PreviousDifference => {
                 ready && any(|row| row.status != MergeStatus::Unchanged)
             }
@@ -2697,8 +2807,20 @@ impl SessionView for FolderMergeView {
                 self.selection.clear();
                 self.restart();
             }
-            Command::Reload => self.restart(),
+            Command::Reload | Command::Recompare => self.restart(),
             Command::CompareReport => self.report.request(),
+            Command::SelectAllFiles => {
+                let rels: Vec<PathBuf> = self
+                    .visible_rows()
+                    .iter()
+                    .filter(|row| !row.is_dir)
+                    .map(|row| row.rel.clone())
+                    .collect();
+                self.selection = rels.into_iter().collect();
+            }
+            Command::Find => self.find.open(),
+            Command::FindNext => self.find_name(true, false),
+            Command::FindPrevious => self.find_name(false, false),
             Command::SelectAll => {
                 let rels: Vec<PathBuf> = self
                     .visible_rows()

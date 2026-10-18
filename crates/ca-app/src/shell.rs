@@ -517,6 +517,7 @@ const MERGE_EDIT: &[Entry] = &[
     Entry::Run(Command::Paste, EDITABLE),
     Entry::Rule,
     Entry::Run(Command::SelectAll, EDITABLE),
+    Entry::Run(Command::SelectAllFiles, SELECTABLE),
     Entry::Run(Command::SelectSection, EDITABLE),
 ];
 
