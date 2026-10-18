@@ -2551,8 +2551,11 @@ impl SettingsPaths {
     /// Base Directory rule requires of that folder.
     ///
     /// The application folder inside it is created or accepted only as a
-    /// folder of the running user, never a link, with access narrowed to that
-    /// user. A runtime folder that is open to others, such as the shared
+    /// folder of the running user, with access narrowed to that user. On a
+    /// Unix host a link there is accepted only when the running user owns it
+    /// and its target is a folder of that user that no one else can open; the
+    /// result then names the resolved target. On a Windows host every link is
+    /// refused. A runtime folder that is open to others, such as the shared
     /// temporary folder, can hold an application folder another user made in
     /// advance, so it is refused before anything inside it is looked at.
     #[must_use]
@@ -2562,9 +2565,7 @@ impl SettingsPaths {
         }
         let runtime = environment.absolute(environment.runtime_directory.as_ref())?;
         ca_io::private::check_private_folder(&runtime).ok()?;
-        let folder = runtime.join(APPLICATION_FOLDER);
-        ca_io::private::create_owned_folder(&folder).ok()?;
-        Some(folder)
+        ca_io::private::create_owned_folder(&runtime.join(APPLICATION_FOLDER)).ok()
     }
 
     /// Chooses between the two directories without reading the environment.
@@ -4051,7 +4052,7 @@ mod tests {
 
     /// The XDG rule: the runtime folder is owned by the user and open to no
     /// one else, and the application folder inside it is a private folder of
-    /// the user, never a link or a file.
+    /// the user or a link to one, never a file.
     #[cfg(unix)]
     #[test]
     fn the_runtime_folder_counts_only_when_it_is_private_to_this_user() {
@@ -4080,12 +4081,19 @@ mod tests {
         fs::remove_file(&application).unwrap();
 
         let elsewhere = TempDir::new().unwrap();
-        set_mode(elsewhere.path(), 0o700);
+        set_mode(elsewhere.path(), 0o755);
         std::os::unix::fs::symlink(elsewhere.path(), &application).unwrap();
         assert_eq!(
             SettingsPaths::runtime_directory_in(&runtime_environment(runtime.path())),
             None,
-            "a link in place of the application folder"
+            "a link to a folder open to others"
+        );
+        assert_eq!(mode_of(elsewhere.path()), 0o755, "the target of a link");
+        set_mode(elsewhere.path(), 0o700);
+        assert_eq!(
+            SettingsPaths::runtime_directory_in(&runtime_environment(runtime.path())),
+            Some(fs::canonicalize(elsewhere.path()).unwrap()),
+            "a link to a private folder of the user names its target"
         );
         fs::remove_file(&application).unwrap();
 

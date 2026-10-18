@@ -117,10 +117,12 @@ impl Journal {
     /// user, as is each journal.
     ///
     /// # Errors
-    /// Propagates the underlying I/O error, and refuses a directory that is a
-    /// link or belongs to another user.
+    /// Propagates the underlying I/O error, and refuses a directory that
+    /// belongs to another user. A link is refused on Windows; on Unix it is
+    /// refused unless the running user owns it and its target is a private
+    /// folder of that user, and then the journal is created in the target.
     pub fn create_in(directory: &Path) -> std::io::Result<Self> {
-        ca_io::private::create_owned_folder(directory)?;
+        let directory = ca_io::private::create_owned_folder(directory)?;
         let stamp = now_unix_seconds();
         let process = std::process::id();
         for attempt in 0..1_000u32 {
