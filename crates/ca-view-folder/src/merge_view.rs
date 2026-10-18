@@ -87,6 +87,11 @@ const EXIT_LEFT_FOR_HAND_NOTHING_WRITTEN: i32 = 101;
 /// fails.
 const EXIT_STEP_UNDONE: i32 = 100;
 
+/// True for a row that Next Difference and Previous Difference stop at.
+fn is_merge_difference(row: &MergeRow) -> bool {
+    row.status != MergeStatus::Unchanged
+}
+
 /// Every command from the shared vocabulary this view answers for.
 const HANDLED: &[Command] = &[
     Command::SwapSides,
@@ -1528,28 +1533,49 @@ impl FolderMergeView {
         inclusive: bool,
         test: impl Fn(&MergeRow) -> bool,
     ) {
-        let Some(tree) = self.tree.clone() else {
+        let Some(position) = self.jump_target(forward, wrap, inclusive, test) else {
             return;
         };
+        self.cursor = Some(position);
+        self.selection.clear();
+        let row = self
+            .tree
+            .as_deref()
+            .zip(self.visible.get(position))
+            .and_then(|(tree, index)| tree.rows.get(*index));
+        if let Some(row) = row {
+            self.selection.insert(row.rel.clone());
+        }
+    }
+
+    /// The visible position [`Self::jump_from`] would move the cursor to.
+    fn jump_target(
+        &self,
+        forward: bool,
+        wrap: bool,
+        inclusive: bool,
+        test: impl Fn(&MergeRow) -> bool,
+    ) -> Option<usize> {
+        let tree = self.tree.as_deref()?;
         let count = self.visible.len();
-        let after = self.cursor.map_or(0, |at| at + usize::from(!inclusive));
-        let before = self.cursor.unwrap_or(count);
+        let after = self
+            .cursor
+            .map_or(0, |at| at + usize::from(!inclusive))
+            .min(count);
+        let before = self.cursor.unwrap_or(count).min(count);
         let candidates: Box<dyn Iterator<Item = usize>> = match (forward, wrap) {
-            (true, false) => Box::new(after.min(count)..count),
-            (true, true) => Box::new((after.min(count)..count).chain(0..after.min(count))),
+            (true, false) => Box::new(after..count),
+            (true, true) => Box::new((after..count).chain(0..after)),
             (false, false) => Box::new((0..before).rev()),
             (false, true) => Box::new((0..before).rev().chain((before..count).rev())),
         };
-        for position in candidates {
-            if tree.rows.get(self.visible[position]).is_some_and(&test) {
-                self.cursor = Some(position);
-                self.selection.clear();
-                if let Some(row) = tree.rows.get(self.visible[position]) {
-                    self.selection.insert(row.rel.clone());
-                }
-                return;
-            }
-        }
+        let mut candidates = candidates;
+        candidates.find(|position| {
+            self.visible
+                .get(*position)
+                .and_then(|index| tree.rows.get(*index))
+                .is_some_and(&test)
+        })
     }
 
     /// True when the search text matches the name of a row the filter shows.
@@ -2715,7 +2741,7 @@ impl SessionView for FolderMergeView {
     }
 
     fn menu_view(&self) -> MenuView {
-        MenuView::Merge
+        MenuView::FolderMerge
     }
 
     fn tick(&mut self) {
@@ -2783,7 +2809,11 @@ impl SessionView for FolderMergeView {
                 ready && self.find.has_text() && self.any_name_match()
             }
             Command::NextDifference | Command::PreviousDifference => {
-                ready && any(|row| row.status != MergeStatus::Unchanged)
+                let forward = command == Command::NextDifference;
+                ready
+                    && self
+                        .jump_target(forward, false, false, is_merge_difference)
+                        .is_some()
             }
             Command::NextConflict | Command::PreviousConflict => {
                 ready && any(|row| row.status.needs_person())
@@ -2829,10 +2859,8 @@ impl SessionView for FolderMergeView {
                     .collect();
                 self.selection = rels.into_iter().collect();
             }
-            Command::NextDifference => self.jump(true, |row| row.status != MergeStatus::Unchanged),
-            Command::PreviousDifference => {
-                self.jump(false, |row| row.status != MergeStatus::Unchanged);
-            }
+            Command::NextDifference => self.jump(true, is_merge_difference),
+            Command::PreviousDifference => self.jump(false, is_merge_difference),
             Command::NextConflict => self.jump(true, |row| row.status.needs_person()),
             Command::PreviousConflict => self.jump(false, |row| row.status.needs_person()),
             Command::ToggleIgnoreSameChanges => {

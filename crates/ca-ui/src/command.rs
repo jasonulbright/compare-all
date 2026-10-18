@@ -49,6 +49,9 @@ pub enum MenuView {
     /// The three way merge bar: the shared bar with the merge's own Edit and
     /// View menus and take keys.
     Merge,
+    /// The folder merge bar: the three way merge bar, with Ctrl+N and Ctrl+P
+    /// moving between differences in place of sections.
+    FolderMerge,
     /// The registry comparison bar: the shared bar with an Edit menu of
     /// registry keys and values.
     Registry,
@@ -131,7 +134,7 @@ commands! {
     CloseTab, "Close Tab", Session, Some("Ctrl+W"), "Close the active tab.";
     SwapSides, "Swap Sides", Session, None, "Exchange the two sides.";
     Reload, "Reload Files", Session, Some("F5"), "Re-read both sides from disk.";
-    Recompare, "Recompare Files", Session, Some("Ctrl+F5"), "Compare again without re-reading.";
+    Recompare, "Recompare Files", Session, Some("Ctrl+F5"), "Read every side from disk again and compare from the start.";
     Back, "Back", Session, None, "Return to the previous pair of folders.";
     Forward, "Forward", Session, None, "Go to the pair of folders the last step came from.";
     BrowseForFolder, "Browse for Folder", Session, None, "Pick a base folder for one side.";
@@ -393,13 +396,14 @@ impl Command {
             (Self::CompareInfo, MenuView::Version) => "Version Compare Info",
             (Self::CompareReport, MenuView::Media) => "Media Compare Report...",
             (Self::CompareInfo, MenuView::Media) => "Media Compare Info",
-            (Self::ToggleLineDetails, MenuView::Text | MenuView::Merge | MenuView::Other) => {
-                "Line Details"
-            }
+            (
+                Self::ToggleLineDetails,
+                MenuView::Text | MenuView::Merge | MenuView::FolderMerge | MenuView::Other,
+            ) => "Line Details",
             (Self::ToggleLineDetails, MenuView::Table) => "Text Details",
             (Self::ToggleLineNumbers, MenuView::Table) => "Row Numbers",
-            (Self::ShowDifferences, MenuView::Merge) => "Show Changes",
-            (Self::ShowSame, MenuView::Merge) => "Show Unchanged",
+            (Self::ShowDifferences, MenuView::Merge | MenuView::FolderMerge) => "Show Changes",
+            (Self::ShowSame, MenuView::Merge | MenuView::FolderMerge) => "Show Unchanged",
             _ => self.label(),
         }
     }
@@ -408,17 +412,21 @@ impl Command {
     #[must_use]
     pub const fn shortcut_in(self, view: MenuView) -> Option<&'static str> {
         match (self, view) {
-            (Self::TakeLeft, MenuView::Merge) => Some("Ctrl+L"),
-            (Self::TakeRight, MenuView::Merge) => Some("Ctrl+R"),
-            (Self::TakeLeftThenRight, MenuView::Merge) => Some("Ctrl+B"),
-            (Self::TakeRightThenLeft, MenuView::Merge) => Some("Ctrl+Shift+B"),
-            (Self::TakeLeftLine, MenuView::Merge) => Some("Ctrl+Shift+L"),
-            (Self::TakeRightLine, MenuView::Merge) => Some("Ctrl+Shift+R"),
-            (Self::NextConflict, MenuView::Merge) => Some("Alt+N"),
-            (Self::PreviousConflict, MenuView::Merge) => Some("Alt+P"),
-            (Self::NextDifference, MenuView::Folder) => Some("Ctrl+N"),
-            (Self::PreviousDifference, MenuView::Folder) => Some("Ctrl+P"),
-            (Self::SelectAllFiles, MenuView::Merge | MenuView::Folder) => Some("Ctrl+Shift+A"),
+            (Self::TakeLeft, MenuView::Merge | MenuView::FolderMerge) => Some("Ctrl+L"),
+            (Self::TakeRight, MenuView::Merge | MenuView::FolderMerge) => Some("Ctrl+R"),
+            (Self::TakeLeftThenRight, MenuView::Merge | MenuView::FolderMerge) => Some("Ctrl+B"),
+            (Self::TakeRightThenLeft, MenuView::Merge | MenuView::FolderMerge) => {
+                Some("Ctrl+Shift+B")
+            }
+            (Self::TakeLeftLine, MenuView::Merge | MenuView::FolderMerge) => Some("Ctrl+Shift+L"),
+            (Self::TakeRightLine, MenuView::Merge | MenuView::FolderMerge) => Some("Ctrl+Shift+R"),
+            (Self::NextConflict, MenuView::Merge | MenuView::FolderMerge) => Some("Alt+N"),
+            (Self::PreviousConflict, MenuView::Merge | MenuView::FolderMerge) => Some("Alt+P"),
+            (Self::NextDifference, MenuView::Folder | MenuView::FolderMerge) => Some("Ctrl+N"),
+            (Self::PreviousDifference, MenuView::Folder | MenuView::FolderMerge) => Some("Ctrl+P"),
+            (Self::SelectAllFiles, MenuView::Merge | MenuView::FolderMerge | MenuView::Folder) => {
+                Some("Ctrl+Shift+A")
+            }
             (Self::RefreshSelection, MenuView::Folder) => Some("Shift+F5"),
             (Self::Rename, MenuView::Folder) => Some("F2"),
             (Self::NewFolder, MenuView::Folder) => Some("Ins"),
@@ -455,8 +463,9 @@ impl Command {
             )
             | (
                 Self::CopyToRight | Self::CopyToLeft | Self::CopyLineToRight | Self::CopyLineToLeft,
-                MenuView::Merge,
-            ) => None,
+                MenuView::Merge | MenuView::FolderMerge,
+            )
+            | (Self::NextSection | Self::PreviousSection, MenuView::FolderMerge) => None,
             _ => self.shortcut_text(),
         }
     }
@@ -561,6 +570,7 @@ impl MenuView {
         MenuView::Table,
         MenuView::Folder,
         MenuView::Merge,
+        MenuView::FolderMerge,
         MenuView::Registry,
         MenuView::Version,
         MenuView::Media,
@@ -575,6 +585,7 @@ impl MenuView {
             MenuView::Table => "table",
             MenuView::Folder => "folder",
             MenuView::Merge => "merge",
+            MenuView::FolderMerge => "folder-merge",
             MenuView::Registry => "registry",
             MenuView::Version => "version",
             MenuView::Media => "media",
@@ -590,6 +601,7 @@ impl MenuView {
             MenuView::Table => "Table comparisons",
             MenuView::Folder => "Folder comparisons",
             MenuView::Merge => "Text merges",
+            MenuView::FolderMerge => "Folder merges",
             MenuView::Registry => "Registry comparisons",
             MenuView::Version => "Version comparisons",
             MenuView::Media => "Media comparisons",
@@ -750,7 +762,25 @@ pub fn route(view: MenuView, stroke: Keystroke) -> Option<Command> {
         | MenuView::Other => text(stroke),
         MenuView::Folder => folder(stroke),
         MenuView::Merge => merge(stroke).or_else(|| text(stroke)),
+        MenuView::FolderMerge => folder_merge(stroke)
+            .or_else(|| merge(stroke))
+            .or_else(|| text(stroke)),
     })
+}
+
+/// The bindings the folder merge bar puts ahead of the merge bar: a folder
+/// merge has no sections, so Ctrl+N and Ctrl+P move between differences as
+/// they do in a folder comparison.
+fn folder_merge(stroke: Keystroke) -> Option<Command> {
+    use egui::Key;
+    if stroke.alt {
+        return None;
+    }
+    match (stroke.command, stroke.shift, stroke.key) {
+        (true, false, Key::N) => Some(Command::NextDifference),
+        (true, false, Key::P) => Some(Command::PreviousDifference),
+        _ => None,
+    }
 }
 
 /// The command a keystroke asks for in `view` under a customized table.
@@ -903,7 +933,7 @@ pub fn bindings(view: MenuView) -> Vec<(Keystroke, Command)> {
         Keystroke::with_command(Key::Minus),
         Keystroke::with_command(Key::Num0),
     ];
-    if view == MenuView::Merge {
+    if matches!(view, MenuView::Merge | MenuView::FolderMerge) {
         strokes.extend([
             Keystroke::with_command(Key::B),
             Keystroke::with_command_shift(Key::B),
@@ -916,6 +946,7 @@ pub fn bindings(view: MenuView) -> Vec<(Keystroke, Command)> {
         MenuView::Text
         | MenuView::Table
         | MenuView::Merge
+        | MenuView::FolderMerge
         | MenuView::Registry
         | MenuView::Version
         | MenuView::Media
@@ -971,6 +1002,39 @@ pub fn bindings(view: MenuView) -> Vec<(Keystroke, Command)> {
 mod tests {
     use super::{bindings, route, Command, Keystroke, MenuView};
     use egui::Key;
+
+    #[test]
+    fn a_folder_merge_moves_between_differences_where_a_text_merge_moves_between_sections() {
+        let stroke = |key| Keystroke::with_command(key);
+        assert_eq!(
+            route(MenuView::FolderMerge, stroke(Key::N)),
+            Some(Command::NextDifference)
+        );
+        assert_eq!(
+            route(MenuView::FolderMerge, stroke(Key::P)),
+            Some(Command::PreviousDifference)
+        );
+        assert_eq!(
+            route(MenuView::Merge, stroke(Key::N)),
+            Some(Command::NextSection)
+        );
+        assert_eq!(
+            route(MenuView::Merge, stroke(Key::P)),
+            Some(Command::PreviousSection)
+        );
+        assert_eq!(
+            route(MenuView::FolderMerge, stroke(Key::L)),
+            Some(Command::TakeLeft)
+        );
+        assert_eq!(
+            Command::NextDifference.shortcut_in(MenuView::FolderMerge),
+            Some("Ctrl+N")
+        );
+        assert_eq!(
+            Command::NextSection.shortcut_in(MenuView::FolderMerge),
+            None
+        );
+    }
 
     #[test]
     fn the_same_stroke_carries_a_different_command_in_each_view() {
@@ -1117,7 +1181,12 @@ mod tests {
     /// Every shortcut a bar prints has to be a stroke that bar routes.
     #[test]
     fn a_printed_shortcut_is_a_stroke_that_view_routes() {
-        for view in [MenuView::Text, MenuView::Folder, MenuView::Merge] {
+        for view in [
+            MenuView::Text,
+            MenuView::Folder,
+            MenuView::Merge,
+            MenuView::FolderMerge,
+        ] {
             let table = bindings(view);
             for command in Command::ALL {
                 let Some(printed) = command.shortcut_in(view) else {
