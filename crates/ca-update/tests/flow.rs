@@ -1350,7 +1350,7 @@ fn the_installer_runs_elevated_only_for_an_install_for_every_user() {
         if machine {
             // The installer starts through an elevation prompt and writes no log.
             let script = args.last().unwrap();
-            assert!(script.contains("-Verb RunAs"), "{script}");
+            assert!(script.contains("Verb='runas'"), "{script}");
             assert!(script.contains("ALLUSERS=1"), "{script}");
             assert!(!args.iter().any(|a| a.contains("/L*v")), "{args:?}");
             continue;
@@ -1414,6 +1414,53 @@ fn the_installer_file_cannot_be_replaced_while_the_installer_runs() {
         );
         assert_eq!(std::fs::read(&msi).unwrap(), msi_bytes());
     }
+}
+
+/// Runs the real elevation script of an install for every user. The program
+/// it elevates does not exist, so the start fails before any prompt, as a
+/// declined or refused prompt does.
+#[cfg(windows)]
+#[test]
+fn an_elevation_that_cannot_start_is_a_declined_elevation() {
+    use ca_update::apply::{installer_result, ELEVATION_DECLINED};
+    let dir = tempfile::tempdir().unwrap();
+    let mut command = ca_update::apply::msi_command(
+        &dir.path().join("a.msi"),
+        true,
+        &dir.path().join("installer.log"),
+    );
+    command.env("CA_MSIEXEC", dir.path().join("missing.exe"));
+    let status = command.status().unwrap();
+    assert_eq!(
+        installer_result(status.code()),
+        Err(ELEVATION_DECLINED.to_owned()),
+        "{status:?}"
+    );
+    // ERROR_FILE_NOT_FOUND from the inner Windows error, not a generic code.
+    assert_eq!(
+        ca_update::apply::elevation_error(status.code()),
+        Some(2),
+        "{status:?}"
+    );
+}
+
+#[test]
+fn every_elevation_that_did_not_happen_keeps_the_update() {
+    use ca_update::apply::{installer_result, ELEVATION_DECLINED};
+    let declined = Err(ELEVATION_DECLINED.to_owned());
+    // Declined prompt, refused by policy, no error code, Cancel in the
+    // installer window.
+    for code in [0x2000_04C7, 0x2000_0005, 0x2000_0000, 1223, 1602] {
+        assert_eq!(installer_result(Some(code)), declined, "{code:#x}");
+    }
+    // A crashed elevated program is a failure.
+    #[allow(clippy::cast_possible_wrap)]
+    let crashed = 0xC000_0005_u32 as i32;
+    for code in [1, 2, 1603, crashed] {
+        assert!(installer_result(Some(code)).is_err(), "{code:#x}");
+        assert_ne!(installer_result(Some(code)), declined, "{code:#x}");
+    }
+    assert_ne!(installer_result(None), declined);
 }
 
 #[test]
