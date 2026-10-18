@@ -2014,9 +2014,88 @@ fn an_install_whose_program_cannot_be_set_aside_does_not_start() {
         4
     );
     drop(claim);
-    assert_eq!(staging.read_record(), Some(record));
+    let kept = staging.read_record().unwrap();
+    assert!(kept.same_file(&record));
+    assert_eq!(kept.put_off, 1);
     assert!(staging.read_warning().is_none());
     assert!(staging.read_apply_failure().is_none());
+}
+
+/// Any account that can read the program file can hold it without delete
+/// sharing, so the elevated step keeps the update at each close. After a
+/// fixed number of such closes the staged update is removed, the warning
+/// with the release page shows, and that release is not downloaded again.
+#[cfg(windows)]
+#[test]
+fn an_update_put_off_at_every_close_ends_in_the_warning() {
+    use ca_update::apply::{finish_apply, installer_result, PUT_OFF_TOO_OFTEN};
+    use ca_update::install::{install_from, Checks, KEPT};
+    use ca_update::staging::PUT_OFF_LIMIT as LIMIT;
+    let (server, _keep, staging, work, install) = elevated_setup();
+    let mode = InstallMode::Installed { machine: true };
+    let program = install.path().join("compare-all.exe");
+    let signer = FakeSigner::signed_by(SIGNER);
+    let checks = Checks {
+        signer: &signer,
+        signer_name: SIGNER,
+        running: &running(),
+    };
+    let held = pin(&program, true);
+    let code = install_from(&staging, work.path(), Some(&program), &checks, &|_| Some(0));
+    drop(held);
+    assert_eq!(code, KEPT);
+    assert_eq!(std::fs::read(&program).unwrap(), b"old exe");
+
+    let endpoints = server.endpoints();
+    for close in 1..=LIMIT {
+        let claim = staging.begin_apply().unwrap();
+        let outcome = installer_result(Some(KEPT)).map(|()| running());
+        let exit = finish_apply(&staging, &claim, &outcome, &endpoints);
+        drop(claim);
+        if close == LIMIT {
+            assert_eq!(exit, 1);
+            break;
+        }
+        assert_eq!(exit, 4, "close {close}");
+        assert_eq!(staging.read_record().unwrap().put_off, close);
+        assert!(staging.read_warning().is_none(), "close {close}");
+        // A scheduled check between closes keeps the staged file and its count.
+        let before = server.hits.load(Ordering::SeqCst);
+        assert!(matches!(
+            check(&server, &staging, &signer, Some(mode)).unwrap(),
+            Outcome::Staged { .. }
+        ));
+        assert_eq!(server.hits.load(Ordering::SeqCst) - before, 2);
+        assert_eq!(staging.read_record().unwrap().put_off, close);
+    }
+    assert!(staging.read_record().is_none());
+    assert_eq!(staging.read_warning().unwrap().version, NEXT);
+    let reason = staging.read_apply_failure().unwrap();
+    assert_eq!(reason, PUT_OFF_TOO_OFTEN);
+
+    // That release is not downloaded again.
+    let before = server.hits.load(Ordering::SeqCst);
+    let outcome = check(&server, &staging, &signer, Some(mode)).unwrap();
+    assert!(
+        matches!(&outcome, Outcome::DownloadFailed { reason: r, .. } if *r == reason),
+        "{outcome:?}"
+    );
+    assert_eq!(server.hits.load(Ordering::SeqCst) - before, 1);
+    assert!(staging.read_warning().is_some());
+
+    // A release other than the one given up is staged with a new count.
+    let other = Version::parse("2026.10.02.0001").unwrap();
+    staging
+        .write_warning(&ca_update::staging::DownloadWarning::new(
+            &other,
+            "https://example.test/other".to_owned(),
+        ))
+        .unwrap();
+    assert!(matches!(
+        check(&server, &staging, &signer, Some(mode)).unwrap(),
+        Outcome::Staged { .. }
+    ));
+    assert_eq!(staging.read_record().unwrap().put_off, 0);
 }
 
 /// One elevated step at a time sets aside, installs and restores; a second

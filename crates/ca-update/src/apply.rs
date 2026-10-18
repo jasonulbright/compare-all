@@ -134,7 +134,7 @@ pub const INSTALLER_BUSY: &str = "another install is in progress";
 /// The reason [`apply_staged`] gives when the elevated step changed nothing
 /// and kept the staged update: it could not set the program file aside, or
 /// another elevated step held the install folder. The update stays for the
-/// next close.
+/// next close, up to [`crate::staging::PUT_OFF_LIMIT`] closes in a row.
 pub const INSTALL_PUT_OFF: &str = "the install for every user was put off";
 
 /// The reason [`apply_staged`] gives when this install cannot apply an
@@ -144,6 +144,13 @@ pub const INSTALL_PUT_OFF: &str = "the install for every user was put off";
 /// again.
 pub const CANNOT_APPLY_HERE: &str =
     "updates cannot be applied to this install automatically; install the release from its page";
+
+/// The reason [`finish_apply`] keeps when the install for every user was put
+/// off at [`crate::staging::PUT_OFF_LIMIT`] closes in a row. The staged
+/// update is removed, the download warning shows, and that release is not
+/// downloaded again.
+pub const PUT_OFF_TOO_OFTEN: &str =
+    "the install for every user was put off at each of the last closes; install the release from its page";
 
 /// `ERROR_INSTALL_ALREADY_RUNNING`.
 const INSTALLER_BUSY_CODE: i32 = 1618;
@@ -466,10 +473,11 @@ fn run_installer(mut command: Command) -> Result<(), String> {
 /// exit code of the helper.
 ///
 /// A declined elevation, a busy installer or an install that was put off
-/// changes nothing: the staged
-/// update stays and is offered again at the next close, with no warning. Any
-/// other failure keeps the reason and the download warning and removes the
-/// staged update.
+/// changes nothing: the staged update stays and is offered again at the next
+/// close, with no warning. An install put off at
+/// [`crate::staging::PUT_OFF_LIMIT`] closes in a row fails with
+/// [`PUT_OFF_TOO_OFTEN`]. Any failure keeps the reason and the download
+/// warning and removes the staged update.
 #[must_use]
 pub fn finish_apply(
     staging: &Staging,
@@ -483,17 +491,28 @@ pub fn finish_apply(
             0
         }
         Err(reason) if reason == ELEVATION_DECLINED => 3,
-        Err(reason) if reason == INSTALLER_BUSY || reason == INSTALL_PUT_OFF => 4,
-        Err(reason) => {
-            staging.write_apply_failure(reason);
-            if let Some(version) = staging.read_record().and_then(|r| r.parsed_version()) {
-                let _ = staging
-                    .write_warning(&DownloadWarning::new(&version, endpoints.page(&version)));
+        Err(reason) if reason == INSTALLER_BUSY => 4,
+        Err(reason) if reason == INSTALL_PUT_OFF => {
+            if staging
+                .count_put_off(claim)
+                .is_some_and(|count| count >= crate::staging::PUT_OFF_LIMIT)
+            {
+                fail_apply(staging, claim, PUT_OFF_TOO_OFTEN, endpoints)
+            } else {
+                4
             }
-            staging.clear_claimed(claim);
-            1
         }
+        Err(reason) => fail_apply(staging, claim, reason, endpoints),
     }
+}
+
+fn fail_apply(staging: &Staging, claim: &ApplyClaim, reason: &str, endpoints: &Endpoints) -> i32 {
+    staging.write_apply_failure(reason);
+    if let Some(version) = staging.read_record().and_then(|r| r.parsed_version()) {
+        let _ = staging.write_warning(&DownloadWarning::new(&version, endpoints.page(&version)));
+    }
+    staging.clear_claimed(claim);
+    1
 }
 
 /// The entry point of the helper process. Returns the exit code.

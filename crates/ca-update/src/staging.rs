@@ -24,6 +24,9 @@ const FORMAT: u32 = 1;
 const MAX_RECORD_BYTES: u64 = 16 * 1024;
 /// Largest release file the updater stages.
 pub const MAX_ASSET_BYTES: u64 = 512 * 1024 * 1024;
+/// How many closes in a row may keep one staged update without installing
+/// it before the update is given up with the download warning.
+pub const PUT_OFF_LIMIT: u32 = 3;
 /// How long a claim file blocks a new claim where no handle can hold it.
 #[cfg(not(windows))]
 const APPLY_MARKER_AGE: Duration = Duration::from_secs(60 * 60);
@@ -63,6 +66,9 @@ pub struct StagedRecord {
     pub size: u64,
     /// True once the download passed every check.
     pub verified: bool,
+    /// How many closes in a row kept this update without installing it.
+    #[serde(default)]
+    pub put_off: u32,
 }
 
 impl StagedRecord {
@@ -76,7 +82,18 @@ impl StagedRecord {
             sha256,
             size,
             verified: true,
+            put_off: 0,
         }
+    }
+
+    /// True when `other` names the same staged file, whatever the count of
+    /// closes that kept it.
+    #[must_use]
+    pub fn same_file(&self, other: &Self) -> bool {
+        Self {
+            put_off: other.put_off,
+            ..self.clone()
+        } == *other
     }
 
     /// The version, when the record is consistent.
@@ -105,6 +122,7 @@ impl StagedRecord {
             && is_sha256(&self.sha256)
             && self.size > 0
             && self.size <= MAX_ASSET_BYTES
+            && self.put_off < PUT_OFF_LIMIT
     }
 }
 
@@ -205,6 +223,20 @@ impl Staging {
     /// Returns why the record could not be written.
     pub fn write_record(&self, record: &StagedRecord) -> Result<(), String> {
         write_json(&self.dir.join(RECORD_FILE), record)
+    }
+
+    /// Count one more close that kept the staged update without installing
+    /// it. Returns the new count, or `None` when no sound record is staged or
+    /// the count could not be kept.
+    #[must_use]
+    pub fn count_put_off(&self, claim: &ApplyClaim) -> Option<u32> {
+        let _ = claim;
+        let mut record = self.read_record()?;
+        record.put_off = record.put_off.saturating_add(1);
+        if record.put_off < PUT_OFF_LIMIT {
+            self.write_record(&record).ok()?;
+        }
+        Some(record.put_off)
     }
 
     /// Remove the staged record and every staged file. The warning and the
@@ -487,6 +519,7 @@ mod tests {
             |r: &mut StagedRecord| r.format = 9,
             |r: &mut StagedRecord| r.version = "latest".to_owned(),
             |r: &mut StagedRecord| r.size = 0,
+            |r: &mut StagedRecord| r.put_off = PUT_OFF_LIMIT,
         ] {
             let mut bad = record.clone();
             tamper(&mut bad);
@@ -496,6 +529,37 @@ mod tests {
         }
         std::fs::write(dir.path().join(RECORD_FILE), b"not json").unwrap();
         assert_eq!(staging.read_record(), None);
+    }
+
+    #[test]
+    fn a_record_without_a_put_off_count_reads_as_never_put_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = Staging::new(dir.path().to_path_buf());
+        let record = StagedRecord::new(
+            &version(),
+            AssetKind::Msi.file_name(&version()),
+            "b".repeat(64),
+            10,
+        );
+        let mut value = serde_json::to_value(&record).unwrap();
+        value.as_object_mut().unwrap().remove("put_off");
+        std::fs::write(
+            dir.path().join(RECORD_FILE),
+            serde_json::to_vec(&value).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(staging.read_record(), Some(record.clone()));
+
+        let claim = staging.begin_apply().unwrap();
+        assert_eq!(staging.count_put_off(&claim), Some(1));
+        let counted = staging.read_record().unwrap();
+        assert_eq!(counted.put_off, 1);
+        assert!(counted.same_file(&record));
+        assert!(record.same_file(&counted));
+        assert_ne!(counted, record);
+        assert_eq!(staging.count_put_off(&claim), Some(2));
+        assert_eq!(staging.count_put_off(&claim), Some(PUT_OFF_LIMIT));
+        drop(claim);
     }
 
     #[test]
