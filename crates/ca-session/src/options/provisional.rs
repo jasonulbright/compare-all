@@ -19,7 +19,7 @@ pub const FOLDER_POINT_SIZE: f32 = 12.0;
 pub const MERGE_INPUT_POINT_SIZE: f32 = 10.5;
 
 /// Matching lines shown around a difference section under Show Context.
-pub const CONTEXT_LINES: u32 = 2;
+pub const CONTEXT_LINES: u32 = 6;
 /// Days between automatic update checks.
 pub const UPDATE_CHECK_DAYS: u32 = 7;
 /// Padding added between text rows.
@@ -27,13 +27,13 @@ pub const EXTRA_LINE_SPACING: u32 = 0;
 /// Column the vertical ruler is drawn at. Zero hides it.
 pub const COLUMN_LINE_AT: u32 = 0;
 /// Percentage the pane without focus is darkened by.
-pub const DIM_INACTIVE_PANE_PERCENT: u32 = 0;
+pub const DIM_INACTIVE_PANE_PERCENT: u32 = 20;
 /// Bytes read per step of a byte for byte comparison.
-pub const BINARY_BUFFER_BYTES: u64 = 65_536;
+pub const BINARY_BUFFER_BYTES: u64 = 4_194_304;
 /// Milliseconds before a hint appears.
 pub const HINT_DELAY_MILLISECONDS: u32 = 500;
 /// Milliseconds a hint stays on screen.
-pub const HINT_DURATION_MILLISECONDS: u32 = 5_000;
+pub const HINT_DURATION_MILLISECONDS: u32 = 2_500;
 /// Milliseconds of idle time after which type ahead search starts a new term.
 pub const INCREMENTAL_SEARCH_RESET_MILLISECONDS: u32 = 1_000;
 

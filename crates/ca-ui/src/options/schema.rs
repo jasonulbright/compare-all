@@ -640,7 +640,7 @@ const TEXT_EDITING_FIELDS: &[OptionField] = &[
         "Show filtered line counts"
     )
     .unavailable(reason::NO_FILTERED_COUNT),
-    count!(text_editing.context_lines, "Number of context lines").with_limit(999),
+    count!(text_editing.context_lines, "Number of context lines").with_limit(99),
 ];
 
 const NEXT_DIFFERENCE_FIELDS: &[OptionField] = &[
