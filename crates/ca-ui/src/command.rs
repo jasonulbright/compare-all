@@ -654,48 +654,212 @@ impl Keystroke {
     }
 }
 
+/// How the windowing backend of a host reports a typed character's modifiers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KeyboardHost {
+    /// Alt Gr arrives with neither Ctrl nor Alt, Ctrl+Alt still types, and an
+    /// Alt menu chord delivers its letter as text.
+    Windows,
+    /// Option composes characters.
+    Mac,
+    /// The text is the symbol the key map gives for the held level, and a key
+    /// map may report Alt Gr as Alt.
+    Xkb,
+}
+
+impl KeyboardHost {
+    const CURRENT: Self = if cfg!(target_os = "windows") {
+        Self::Windows
+    } else if cfg!(target_os = "macos") {
+        Self::Mac
+    } else {
+        Self::Xkb
+    };
+
+    const fn types_text(self, modifiers: egui::Modifiers) -> bool {
+        let control = modifiers.command || modifiers.ctrl;
+        match self {
+            Self::Windows if modifiers.alt => modifiers.ctrl,
+            Self::Windows => !control,
+            Self::Mac | Self::Xkb => modifiers.alt || !control,
+        }
+    }
+}
+
 /// True when text that arrives with a key held under `modifiers` is typing.
 ///
 /// Ctrl or Command without Alt is a shortcut chord, and some backends deliver
 /// its letter as text beside the key press. Ctrl with Alt is how Windows
 /// reports Alt Gr, so its text is typed unless a command ran for the key.
-/// Alt alone composes characters on macOS; elsewhere it is a menu access
-/// chord, and Windows still delivers its letter as text.
+/// Alt alone is a menu access chord only on Windows: it composes characters
+/// on macOS, and some Linux key maps report Alt Gr as Alt.
 #[must_use]
 pub const fn chord_types_text(modifiers: egui::Modifiers) -> bool {
-    let control = modifiers.command || modifiers.ctrl;
-    if cfg!(target_os = "macos") {
-        modifiers.alt || !control
-    } else if modifiers.alt {
-        modifiers.ctrl
-    } else {
-        !control
+    KeyboardHost::CURRENT.types_text(modifiers)
+}
+
+/// True for a key whose press never carries text.
+///
+/// The backend drops control characters and gives navigation and function
+/// keys no text, so text after such a press belongs to an earlier key.
+const fn types_nothing(key: egui::Key) -> bool {
+    use egui::Key;
+    matches!(
+        key,
+        Key::ArrowDown
+            | Key::ArrowLeft
+            | Key::ArrowRight
+            | Key::ArrowUp
+            | Key::Escape
+            | Key::Tab
+            | Key::Backspace
+            | Key::Enter
+            | Key::Insert
+            | Key::Delete
+            | Key::Home
+            | Key::End
+            | Key::PageUp
+            | Key::PageDown
+            | Key::Copy
+            | Key::Cut
+            | Key::Paste
+            | Key::F1
+            | Key::F2
+            | Key::F3
+            | Key::F4
+            | Key::F5
+            | Key::F6
+            | Key::F7
+            | Key::F8
+            | Key::F9
+            | Key::F10
+            | Key::F11
+            | Key::F12
+            | Key::F13
+            | Key::F14
+            | Key::F15
+            | Key::F16
+            | Key::F17
+            | Key::F18
+            | Key::F19
+            | Key::F20
+            | Key::F21
+            | Key::F22
+            | Key::F23
+            | Key::F24
+            | Key::F25
+            | Key::F26
+            | Key::F27
+            | Key::F28
+            | Key::F29
+            | Key::F30
+            | Key::F31
+            | Key::F32
+            | Key::F33
+            | Key::F34
+            | Key::F35
+    )
+}
+
+/// The key and modifiers of `event` when it is a key press.
+const fn press(event: &egui::Event) -> Option<(egui::Key, egui::Modifiers)> {
+    match event {
+        egui::Event::Key {
+            key,
+            pressed: true,
+            modifiers,
+            ..
+        } => Some((*key, *modifiers)),
+        _ => None,
+    }
+}
+
+/// The two key presses a text event may belong to.
+///
+/// The backend delivers a key press and its text as two events, the text right
+/// after the key. When other events come between them, the text belongs to
+/// either the last press before it or the last press of a key that can carry
+/// text; key releases never own text. A text event is typed only when both
+/// candidates allow it, so a press of a key that carries no text, such as an
+/// arrow, does not release the text of an earlier chord. Text after a later
+/// press of a key that can carry text is that key's text: the event stream
+/// carries no link that could pair it with an earlier key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Owners<T> {
+    last_press: T,
+    last_text_key: T,
+}
+
+impl<T: Copy> Owners<T> {
+    const fn both(value: T) -> Self {
+        Self {
+            last_press: value,
+            last_text_key: value,
+        }
+    }
+
+    fn note(&mut self, key: egui::Key, value: T) {
+        self.last_press = value;
+        if !types_nothing(key) {
+            self.last_text_key = value;
+        }
+    }
+}
+
+/// Follows the events of one frame and decides which text events are typed.
+#[derive(Clone, Copy, Debug)]
+pub struct TextGate {
+    host: KeyboardHost,
+    typing: Owners<bool>,
+}
+
+impl TextGate {
+    /// A gate whose text before any key press is typed as `held` decides.
+    #[must_use]
+    pub const fn new(held: egui::Modifiers) -> Self {
+        Self::on(KeyboardHost::CURRENT, held)
+    }
+
+    const fn on(host: KeyboardHost, held: egui::Modifiers) -> Self {
+        Self {
+            host,
+            typing: Owners::both(host.types_text(held)),
+        }
+    }
+
+    /// Notes `event`; true when it is a text event whose text is typed.
+    pub fn types(&mut self, event: &egui::Event) -> bool {
+        if let Some((key, modifiers)) = press(event) {
+            self.typing.note(key, self.host.types_text(modifiers));
+        }
+        matches!(event, egui::Event::Text(_)) && self.typing.last_press && self.typing.last_text_key
+    }
+
+    fn retain_typed(mut self, events: &mut Vec<egui::Event>) {
+        events.retain(|event| self.types(event) || !matches!(event, egui::Event::Text(_)));
     }
 }
 
 /// Remove the text events that belong to the key events at `keys`.
 ///
-/// A backend delivers a key press and the character it types as two events,
-/// the text right after the key. A key that ran a command typed nothing, so
-/// without this an Alt Gr or Option chord bound to a command would also insert
-/// its character into whatever editor reads the frame's events.
+/// A key that ran a command typed nothing, so without this an Alt Gr or Option
+/// chord bound to a command would also insert its character into whatever
+/// editor reads the frame's events.
 pub fn drop_text_of(events: &mut Vec<egui::Event>, keys: &[usize]) {
     if keys.is_empty() {
         return;
     }
-    let mut owner: Option<usize> = None;
+    let mut owners: Owners<Option<usize>> = Owners::both(None);
     let mut index = 0;
     events.retain(|event| {
         let position = index;
         index += 1;
-        match event {
-            egui::Event::Key { .. } => {
-                owner = Some(position);
-                true
-            }
-            egui::Event::Text(_) => !owner.is_some_and(|key| keys.contains(&key)),
-            _ => true,
+        if let Some((key, _)) = press(event) {
+            owners.note(key, Some(position));
         }
+        let ran = |owner: Option<usize>| owner.is_some_and(|key| keys.contains(&key));
+        !matches!(event, egui::Event::Text(_))
+            || !(ran(owners.last_press) || ran(owners.last_text_key))
     });
 }
 
@@ -703,17 +867,9 @@ pub fn drop_text_of(events: &mut Vec<egui::Event>, keys: &[usize]) {
 ///
 /// Windows delivers the letter of an Alt menu chord as text, and text fields
 /// insert every text event they read, so this runs before any widget does.
-/// Text with no key event before it in the frame is kept.
+/// Text with no key press before it in the frame is kept.
 pub fn drop_chord_text(events: &mut Vec<egui::Event>) {
-    let mut typing = true;
-    events.retain(|event| match event {
-        egui::Event::Key { modifiers, .. } => {
-            typing = chord_types_text(*modifiers);
-            true
-        }
-        egui::Event::Text(_) => typing,
-        _ => true,
-    });
+    TextGate::on(KeyboardHost::CURRENT, egui::Modifiers::NONE).retain_typed(events);
 }
 
 impl MenuView {
@@ -1345,8 +1501,8 @@ pub fn bindings(view: MenuView) -> Vec<(Keystroke, Command)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        bindings, chord_types_text, drop_chord_text, drop_text_of, route, Command, Keystroke,
-        MenuView,
+        bindings, chord_types_text, drop_chord_text, drop_text_of, route, Command, KeyboardHost,
+        Keystroke, MenuView, TextGate,
     };
     use egui::Key;
 
@@ -1401,8 +1557,8 @@ mod tests {
         assert!(chord_types_text(with(true, true)), "AltGr");
         assert_eq!(
             chord_types_text(with(false, true)),
-            cfg!(target_os = "macos"),
-            "Alt alone types only as macOS Option"
+            !cfg!(target_os = "windows"),
+            "Alt alone is a menu chord only on Windows"
         );
         assert!(!chord_types_text(with(true, false)));
     }
@@ -1438,12 +1594,135 @@ mod tests {
                 _ => None,
             })
             .collect();
-        let expected = if cfg!(target_os = "macos") {
-            "if@g"
-        } else {
+        let expected = if cfg!(target_os = "windows") {
             "i@g"
+        } else {
+            "if@g"
         };
         assert_eq!(typed, expected);
+    }
+
+    fn typed(events: &[egui::Event]) -> String {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                egui::Event::Text(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn released(key: Key) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: false,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn delayed_text_of_an_alt_chord_stays_with_the_alt_key() {
+        let alt = egui::Modifiers {
+            alt: true,
+            ..egui::Modifiers::NONE
+        };
+        let mut events = vec![
+            key_event(Key::F, alt),
+            key_event(Key::ArrowDown, egui::Modifiers::NONE),
+            released(Key::G),
+            egui::Event::Text("f".to_owned()),
+            key_event(Key::G, egui::Modifiers::NONE),
+            egui::Event::Text("g".to_owned()),
+        ];
+        drop_chord_text(&mut events);
+        let expected = if cfg!(target_os = "windows") {
+            "g"
+        } else {
+            "fg"
+        };
+        assert_eq!(typed(&events), expected);
+    }
+
+    #[test]
+    fn delayed_text_of_a_key_that_ran_a_command_is_dropped() {
+        let mut events = vec![
+            key_event(Key::Q, egui::Modifiers::NONE),
+            released(Key::Q),
+            key_event(Key::Home, egui::Modifiers::NONE),
+            egui::Event::Text("q".to_owned()),
+            key_event(Key::G, egui::Modifiers::NONE),
+            egui::Event::Text("g".to_owned()),
+        ];
+        drop_text_of(&mut events, &[0]);
+        assert_eq!(typed(&events), "g");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_alt_gr_reported_as_alt_types_its_character() {
+        let alt = egui::Modifiers {
+            alt: true,
+            ..egui::Modifiers::NONE
+        };
+        let mut events = vec![key_event(Key::Q, alt), egui::Event::Text("@".to_owned())];
+        drop_chord_text(&mut events);
+        assert_eq!(typed(&events), "@");
+        assert!(chord_types_text(alt));
+    }
+
+    fn typed_on(host: KeyboardHost, events: &[egui::Event]) -> String {
+        let mut gate = TextGate::on(host, egui::Modifiers::NONE);
+        events
+            .iter()
+            .filter(|event| gate.types(event))
+            .filter_map(|event| match event {
+                egui::Event::Text(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn each_host_types_what_its_backend_delivers_for_alt_and_alt_gr() {
+        let alt = egui::Modifiers {
+            alt: true,
+            ..egui::Modifiers::NONE
+        };
+        let ctrl_alt = egui::Modifiers {
+            ctrl: true,
+            command: true,
+            ..alt
+        };
+        let alt_letter = [key_event(Key::F, alt), egui::Event::Text("f".to_owned())];
+        let alt_gr_unmodified = [
+            key_event(Key::Q, egui::Modifiers::NONE),
+            egui::Event::Text("@".to_owned()),
+        ];
+        let alt_gr_as_alt = [key_event(Key::Q, alt), egui::Event::Text("@".to_owned())];
+        let alt_gr_as_ctrl_alt = [
+            key_event(Key::Q, ctrl_alt),
+            egui::Event::Text("@".to_owned()),
+        ];
+        let delayed = [
+            key_event(Key::F, alt),
+            key_event(Key::ArrowDown, egui::Modifiers::NONE),
+            released(Key::G),
+            egui::Event::Text("f".to_owned()),
+        ];
+        for (host, letter) in [
+            (KeyboardHost::Windows, ""),
+            (KeyboardHost::Mac, "f"),
+            (KeyboardHost::Xkb, "f"),
+        ] {
+            assert_eq!(typed_on(host, &alt_letter), letter, "{host:?} Alt+F");
+            assert_eq!(typed_on(host, &delayed), letter, "{host:?} delayed Alt+F");
+            assert_eq!(typed_on(host, &alt_gr_unmodified), "@", "{host:?}");
+            assert_eq!(typed_on(host, &alt_gr_as_ctrl_alt), "@", "{host:?}");
+        }
+        assert_eq!(typed_on(KeyboardHost::Xkb, &alt_gr_as_alt), "@");
+        assert_eq!(typed_on(KeyboardHost::Mac, &alt_gr_as_alt), "@");
     }
 
     #[test]

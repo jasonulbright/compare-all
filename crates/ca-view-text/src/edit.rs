@@ -965,15 +965,16 @@ impl TextEditView {
             return;
         }
         let (events, held) = ui.input(|input| (input.events.clone(), input.modifiers));
-        let mut shortcut = !ca_ui::command::chord_types_text(held);
+        let mut gate = ca_ui::command::TextGate::new(held);
         let page_rows = u32::try_from(self.viewport_rows).unwrap_or(1).max(1);
         let mut edited = false;
         let mut moved = false;
         let mut copied: Option<String> = None;
         for event in events {
+            let typed = gate.types(&event);
             match event {
                 egui::Event::Text(text) => {
-                    if shortcut {
+                    if !typed {
                         continue;
                     }
                     for character in text.chars() {
@@ -994,19 +995,14 @@ impl TextEditView {
                 }
                 egui::Event::Key {
                     key,
-                    pressed,
+                    pressed: true,
                     modifiers,
                     ..
-                } => {
-                    shortcut = !ca_ui::command::chord_types_text(modifiers);
-                    if pressed {
-                        match self.handle_key(key, modifiers, page_rows) {
-                            Some(true) => edited = true,
-                            Some(false) => moved = true,
-                            None => {}
-                        }
-                    }
-                }
+                } => match self.handle_key(key, modifiers, page_rows) {
+                    Some(true) => edited = true,
+                    Some(false) => moved = true,
+                    None => {}
+                },
                 _ => {}
             }
         }

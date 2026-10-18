@@ -2582,10 +2582,11 @@ impl MergeView {
         let (events, held) = ui.input(|input| (input.events.clone(), input.modifiers));
         let touched_caret = !events.is_empty();
         let mut edited = false;
-        let mut typing = ca_ui::command::chord_types_text(held);
+        let mut gate = ca_ui::command::TextGate::new(held);
         for event in events {
+            let typed = gate.types(&event);
             match event {
-                egui::Event::Text(_) if !typing => {}
+                egui::Event::Text(_) if !typed => {}
                 egui::Event::Text(text) => {
                     for character in text.chars() {
                         self.output_pane.type_character(character);
@@ -2603,15 +2604,10 @@ impl MergeView {
                 }
                 egui::Event::Key {
                     key,
-                    pressed,
+                    pressed: true,
                     modifiers,
                     ..
-                } => {
-                    typing = ca_ui::command::chord_types_text(modifiers);
-                    if pressed {
-                        edited |= self.key(key, modifiers);
-                    }
-                }
+                } => edited |= self.key(key, modifiers),
                 _ => {}
             }
         }
@@ -5786,7 +5782,7 @@ mod tests {
     }
 
     #[test]
-    fn alt_letter_text_is_typed_into_the_output_only_where_option_composes() {
+    fn alt_letter_text_is_typed_into_the_output_except_on_windows() {
         let (mut view, _dir) = open("abc\n", Some("abc\n"), "abc\n");
         run_until_ready(&mut view);
         let ctx = egui::Context::default();
@@ -5813,10 +5809,48 @@ mod tests {
                 egui::CentralPanel::default().show(ctx, |ui| view.ui(ui, &context()));
             },
         );
-        let expected = if cfg!(target_os = "macos") {
-            "fabc\n"
-        } else {
+        let expected = if cfg!(target_os = "windows") {
             "abc\n"
+        } else {
+            "fabc\n"
+        };
+        assert_eq!(view.output_text(), expected);
+    }
+
+    #[test]
+    fn delayed_alt_letter_text_stays_with_the_alt_key_in_the_output() {
+        let (mut view, _dir) = open("abc\n", Some("abc\n"), "abc\n");
+        run_until_ready(&mut view);
+        let ctx = egui::Context::default();
+        let key = |key, pressed, modifiers| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers,
+        };
+        let alt = egui::Modifiers {
+            alt: true,
+            ..egui::Modifiers::NONE
+        };
+        let _ = ctx.run(
+            ca_ui::testing::event_input(
+                1400.0,
+                800.0,
+                vec![
+                    key(egui::Key::F, true, alt),
+                    key(egui::Key::G, false, egui::Modifiers::NONE),
+                    egui::Event::Text("f".into()),
+                ],
+            ),
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| view.ui(ui, &context()));
+            },
+        );
+        let expected = if cfg!(target_os = "windows") {
+            "abc\n"
+        } else {
+            "fabc\n"
         };
         assert_eq!(view.output_text(), expected);
     }

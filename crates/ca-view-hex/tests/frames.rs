@@ -269,7 +269,7 @@ fn altgr_text_typed_in_the_character_area_writes_its_byte() {
 }
 
 #[test]
-fn alt_letter_text_writes_a_byte_only_where_option_composes_characters() {
+fn alt_letter_text_writes_a_byte_except_on_windows() {
     let mut harness = Harness::new();
     harness.wait_ready();
     harness.view.place_caret(Side::Left, 5);
@@ -293,10 +293,46 @@ fn alt_letter_text_writes_a_byte_only_where_option_composes_characters() {
             egui::Event::Text("f".to_owned()),
         ],
     ));
-    let expected = if cfg!(target_os = "macos") {
-        Some(b'f')
-    } else {
+    let expected = if cfg!(target_os = "windows") {
         before
+    } else {
+        Some(b'f')
+    };
+    assert_ne!(before, Some(b'f'));
+    assert_eq!(harness.view.buffer(Side::Left).byte(5), expected);
+}
+
+#[test]
+fn delayed_alt_letter_text_stays_with_the_alt_key() {
+    let mut harness = Harness::new();
+    harness.wait_ready();
+    harness.view.place_caret(Side::Left, 5);
+    harness.view.set_area(Area::Chars);
+    let before = harness.view.buffer(Side::Left).byte(5);
+    let key = |key, pressed, modifiers| egui::Event::Key {
+        key,
+        physical_key: None,
+        pressed,
+        repeat: false,
+        modifiers,
+    };
+    let alt = egui::Modifiers {
+        alt: true,
+        ..egui::Modifiers::NONE
+    };
+    harness.frame(event_input(
+        1_280.0,
+        800.0,
+        vec![
+            key(egui::Key::F, true, alt),
+            key(egui::Key::G, false, egui::Modifiers::NONE),
+            egui::Event::Text("f".to_owned()),
+        ],
+    ));
+    let expected = if cfg!(target_os = "windows") {
+        before
+    } else {
+        Some(b'f')
     };
     assert_ne!(before, Some(b'f'));
     assert_eq!(harness.view.buffer(Side::Left).byte(5), expected);

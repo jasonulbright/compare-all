@@ -3962,16 +3962,17 @@ impl TextView {
             return;
         }
         let (events, held) = ui.input(|input| (input.events.clone(), input.modifiers));
-        // The modifiers of the last key press in the frame decide whether its
-        // text is typed, not the frame's own snapshot.
-        let mut shortcut = !ca_ui::command::chord_types_text(held);
+        // The modifiers of the key press that carried each text decide whether
+        // it is typed, not the frame's own snapshot.
+        let mut gate = ca_ui::command::TextGate::new(held);
         let page_rows = u32::try_from(self.viewport_rows).unwrap_or(1).max(1);
         let mut edited = false;
         let mut copied: Option<String> = None;
         for event in events {
+            let typed = gate.types(&event);
             match event {
                 egui::Event::Text(text) => {
-                    if shortcut {
+                    if !typed {
                         continue;
                     }
                     let writable = !self.active_pane().is_read_only();
@@ -3995,16 +3996,13 @@ impl TextView {
                 }
                 egui::Event::Key {
                     key,
-                    pressed,
+                    pressed: true,
                     modifiers,
                     ..
                 } => {
-                    shortcut = !ca_ui::command::chord_types_text(modifiers);
-                    if pressed {
-                        let writable = !self.active_pane().is_read_only();
-                        let changed = self.handle_key(key, modifiers, page_rows);
-                        edited |= writable && changed;
-                    }
+                    let writable = !self.active_pane().is_read_only();
+                    let changed = self.handle_key(key, modifiers, page_rows);
+                    edited |= writable && changed;
                 }
                 _ => {}
             }
