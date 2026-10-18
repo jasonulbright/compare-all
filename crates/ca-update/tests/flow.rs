@@ -888,6 +888,7 @@ fn a_backup_that_cannot_be_moved_back_is_copied_back() {
     drop(pinned);
 }
 
+#[cfg(windows)]
 fn backup_folder(target: &Path) -> std::path::PathBuf {
     std::fs::read_dir(target)
         .unwrap()
