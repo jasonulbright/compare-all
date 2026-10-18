@@ -899,6 +899,7 @@ dependencies = [
  "ca-fs",
  "ca-script",
  "ca-session",
+ "ca-update",
  "ca-vfs",
  "ca-view-merge",
  "clap",

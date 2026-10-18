@@ -15,9 +15,9 @@ const EXIT_DELETE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 const VERSION_MARKER_TEXT: &str = concat!("CA-BUILD-VERSION=", env!("CA_VERSION"), "\0");
 
-/// The build version as signed bytes in the program file. The updater reads
-/// it from a downloaded portable copy and refuses a copy whose version is not
-/// the version of the release that names it.
+/// The build version inside a section of the program file, which the
+/// signature covers. The updater refuses a downloaded copy whose version is
+/// not the version of the release that names it.
 #[used]
 static VERSION_MARKER: [u8; VERSION_MARKER_TEXT.len()] = marker_bytes();
 

@@ -21,6 +21,10 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+#[path = "support/pe.rs"]
+mod fixture;
+use fixture::pe;
+
 const CURRENT: &str = "2026.10.01.0001";
 const NEXT: &str = "2026.10.18.0007";
 const SIGNER: &str = "Jason Ulbright";
@@ -417,13 +421,25 @@ fn a_build_without_an_updater_reports_the_newer_release_only() {
 }
 
 fn new_exe() -> Vec<u8> {
-    format!("new exe\0CA-BUILD-VERSION={NEXT}\0").into_bytes()
+    pe(
+        &[format!("new exe\0CA-BUILD-VERSION={NEXT}\0").as_bytes()],
+        b"",
+        None,
+    )
+}
+
+fn new_ca() -> Vec<u8> {
+    pe(
+        &[format!("new ca\0CA-BUILD-VERSION={NEXT}\0").as_bytes()],
+        b"",
+        None,
+    )
 }
 
 fn portable_zip() -> Vec<u8> {
     zip_bytes(&[
         ("compare-all.exe", &new_exe()),
-        ("ca.exe", b"new ca"),
+        ("ca.exe", &new_ca()),
         ("README.md", b"new readme"),
     ])
 }
@@ -490,7 +506,7 @@ fn a_portable_update_replaces_program_files_and_keeps_settings() {
     );
     assert_eq!(
         std::fs::read(target.path().join("ca.exe")).unwrap(),
-        b"new ca"
+        new_ca()
     );
     assert_eq!(
         std::fs::read(target.path().join("program-state.json")).unwrap(),
@@ -621,13 +637,13 @@ fn an_archive_with_a_path_in_it_is_refused() {
     assert!(matches!(outcome, Outcome::DownloadFailed { .. }));
 }
 
-/// Accepts a file only when its content starts with `SIGNED`.
+/// Accepts a file only when its content holds `SIGNED`.
 struct ContentSigner;
 
 impl SignatureVerifier for ContentSigner {
     fn signer_facts(&self, file: &Path) -> Result<SignerFacts, String> {
         let bytes = std::fs::read(file).map_err(|e| e.to_string())?;
-        if bytes.starts_with(b"SIGNED") {
+        if bytes.windows(6).any(|window| window == b"SIGNED") {
             Ok(SignerFacts::release(&format!("CN={SIGNER}, C=US")))
         } else {
             Err(format!("{} is not signed", file.display()))
@@ -636,7 +652,66 @@ impl SignatureVerifier for ContentSigner {
 }
 
 fn signed_program(version: &str) -> Vec<u8> {
-    format!("SIGNED\0CA-BUILD-VERSION={version}\0").into_bytes()
+    pe(
+        &[format!("SIGNED\0CA-BUILD-VERSION={version}\0").as_bytes()],
+        b"",
+        Some(b"signature"),
+    )
+}
+
+fn marker(version: &str) -> Vec<u8> {
+    format!("CA-BUILD-VERSION={version}\0").into_bytes()
+}
+
+#[test]
+fn a_version_in_the_certificate_table_or_after_the_sections_is_refused() {
+    let ca = signed_program(NEXT);
+    let tag = marker(NEXT);
+    let cases = [
+        pe(&[b"SIGNED old build"], b"", Some(&tag)),
+        pe(&[b"SIGNED old build"], &tag, None),
+        pe(&[b"SIGNED old build"], &tag, Some(b"signature")),
+    ];
+    for (index, exe) in cases.iter().enumerate() {
+        let server = Server::start();
+        let (_keep, staging) = staging_dir();
+        let outcome = stage_zip_with(
+            &server,
+            &staging,
+            &[("compare-all.exe", exe), ("ca.exe", &ca)],
+        )
+        .unwrap();
+        assert!(
+            matches!(outcome, Outcome::DownloadFailed { .. }),
+            "{index}: {outcome:?}"
+        );
+        assert!(staging.read_record().is_none(), "{index}");
+    }
+}
+
+#[test]
+fn every_program_of_the_archive_must_carry_the_release_version() {
+    let exe = signed_program(NEXT);
+    let tag = marker(NEXT);
+    let cases = [
+        signed_program("2026.09.30.0001"),
+        pe(&[b"SIGNED old ca"], b"", Some(b"signature")),
+        pe(&[b"SIGNED old ca"], b"", Some(&tag)),
+    ];
+    for (index, ca) in cases.iter().enumerate() {
+        let server = Server::start();
+        let (_keep, staging) = staging_dir();
+        let outcome = stage_zip_with(
+            &server,
+            &staging,
+            &[("compare-all.exe", &exe), ("ca.exe", ca)],
+        )
+        .unwrap();
+        assert!(
+            matches!(outcome, Outcome::DownloadFailed { .. }),
+            "{index}: {outcome:?}"
+        );
+    }
 }
 
 fn stage_zip_with(
