@@ -1714,7 +1714,7 @@ fn a_release_this_install_cannot_apply_is_not_downloaded_again() {
 #[cfg(windows)]
 #[test]
 fn an_install_folder_open_to_other_accounts_is_refused() {
-    use ca_update::install::{install_folder_closed, install_place_accepted, prepare_work_folder};
+    use ca_update::install::{install_folder_closed, install_place_accepted};
     let open = program_folder();
     let program = open.path().join("compare-all.exe");
     assert!(program.is_file());
@@ -1724,27 +1724,119 @@ fn an_install_folder_open_to_other_accounts_is_refused() {
     assert!(!install_place_accepted(staging.dir(), &program));
 
     // Administrators and the system only, as the program files folder gives.
-    let parent = tempfile::tempdir().unwrap();
-    let closed = prepare_work_folder(parent.path()).unwrap();
-    let program = closed.path().join("compare-all.exe");
+    let closed = ProgramFilesFolder::create();
+    let program = closed.0.join("compare-all.exe");
     std::fs::write(&program, b"old exe").unwrap();
     // The installer service owns the files it writes; a test process may
     // give new files the owner of its account.
-    let status = ca_io::host_command::host_command("icacls")
-        .arg(&program)
-        .args(["/setowner", "*S-1-5-18", "/q"])
-        .stdout(std::process::Stdio::null())
-        .status()
-        .unwrap();
-    assert!(status.success());
+    assert!(icacls(&program, &["/setowner", "*S-1-5-18", "/q"]));
+    assert!(icacls(&closed.0, &["/setowner", "*S-1-5-32-544", "/q"]));
     assert!(install_folder_closed(&program));
     let system = ca_update::system::program_files().unwrap();
     assert!(install_folder_closed(&system.join("Common Files")));
     // A missing program file cannot be read and counts as open.
-    assert!(!install_folder_closed(&closed.path().join("missing.exe")));
-    let path = closed.path().to_path_buf();
-    drop(closed);
-    std::fs::remove_dir_all(path).unwrap();
+    assert!(!install_folder_closed(&closed.0.join("missing.exe")));
+    // A link in the path counts as open, whatever it leads to.
+    let link = open.path().join("link");
+    junction(&link, &closed.0);
+    assert!(link.join("compare-all.exe").is_file());
+    assert!(!install_folder_closed(&link.join("compare-all.exe")));
+    std::fs::remove_dir(&link).unwrap();
+}
+
+/// Run the system `icacls` on `path`; true when it succeeds.
+#[cfg(windows)]
+fn icacls(path: &Path, arguments: &[&str]) -> bool {
+    ca_io::host_command::host_command("icacls")
+        .arg(path)
+        .args(arguments)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// A folder of the test in the program files folder, removed on drop.
+#[cfg(windows)]
+struct ProgramFilesFolder(std::path::PathBuf);
+
+#[cfg(windows)]
+impl ProgramFilesFolder {
+    /// A new folder with the access list an installer gives a folder there:
+    /// full control for administrators and the system, read and run for
+    /// users, owned by administrators.
+    fn create() -> Self {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = ca_update::system::program_files()
+            .unwrap()
+            .join(format!("compare-all-test-{}-{stamp:x}", std::process::id()));
+        std::fs::create_dir(&path).unwrap();
+        let folder = Self(path);
+        assert!(icacls(
+            &folder.0,
+            &[
+                "/inheritance:r",
+                "/grant:r",
+                "*S-1-5-32-544:(OI)(CI)F",
+                "*S-1-5-18:(OI)(CI)F",
+                "*S-1-5-32-545:(OI)(CI)RX",
+                "/q",
+            ],
+        ));
+        folder
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ProgramFilesFolder {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// An account that can rename or delete a folder above the install folder
+/// can move the install folder away and put its own in its place. Adding
+/// entries to such a folder, as the drive root allows every account, moves
+/// nothing.
+#[cfg(windows)]
+#[test]
+fn an_install_folder_below_a_folder_open_to_other_accounts_is_refused() {
+    use ca_update::install::install_folder_closed;
+    let base = ProgramFilesFolder::create();
+    let tools = base.0.join("tools");
+    let folder = tools.join("compare-all");
+    std::fs::create_dir_all(&folder).unwrap();
+    let program = folder.join("compare-all.exe");
+    std::fs::write(&program, b"old exe").unwrap();
+    // The installer service owns what it writes; a test process may give new
+    // objects the owner of its account.
+    assert!(icacls(&base.0, &["/setowner", "*S-1-5-32-544", "/t", "/q"]));
+    assert!(install_folder_closed(&program));
+
+    let users = "*S-1-5-11";
+    let cases = [
+        ("add a folder to the parent", &base.0, "(AD)", true),
+        ("add a file to the parent", &base.0, "(WD)", true),
+        ("delete the parent", &tools, "(DE)", false),
+        ("delete a child of the grandparent", &base.0, "(DC)", false),
+        (
+            "change the access list of the parent",
+            &tools,
+            "(WDAC)",
+            false,
+        ),
+        ("take the grandparent", &base.0, "(WO)", false),
+        ("modify the parent", &tools, "M", false),
+    ];
+    for (name, target, right, closed) in cases {
+        assert!(icacls(target, &["/grant", &format!("{users}:{right}")]));
+        assert_eq!(install_folder_closed(&program), closed, "{name}");
+        assert!(icacls(target, &["/remove:g", users]));
+        assert!(install_folder_closed(&program), "{name}: removed");
+    }
 }
 
 #[test]

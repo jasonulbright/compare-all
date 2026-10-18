@@ -63,6 +63,57 @@ pub fn sddl_open_to_other_accounts(sddl: &str) -> bool {
     })
 }
 
+/// Rights on a folder above the install folder that let an account move the
+/// install folder away: delete the folder, delete a child of it, or change
+/// its access list or owner. Adding files or folders replaces no existing
+/// entry, and the drive root grants that to every account.
+const ANCESTOR_RIGHTS: u32 = 0x0000_0040 // delete child
+    | 0x0001_0000 // delete
+    | 0x0004_0000 // write access list
+    | 0x0008_0000 // write owner
+    | 0x1000_0000; // generic all
+
+/// True when the security descriptor `sddl` of a folder above the install
+/// folder lets an account other than administrators, the system or the
+/// installer service delete it, delete a child of it, or change its access
+/// list or owner. Entries that apply only to new children do not count:
+/// every existing folder below has its own descriptor, which is checked.
+#[must_use]
+pub fn sddl_open_as_ancestor(sddl: &str) -> bool {
+    let Some(owner) = section(sddl, 'O') else {
+        return true;
+    };
+    if !TRUSTED_OWNERS.contains(&owner) {
+        return true;
+    }
+    let Some(dacl) = section(sddl, 'D') else {
+        return true;
+    };
+    if !dacl.contains('(') {
+        return true;
+    }
+    entries(dacl).any(|entry| {
+        let fields: Vec<&str> = entry.split(';').collect();
+        let [kind, flags, rights, _, _, sid, ..] = fields.as_slice() else {
+            return true;
+        };
+        matches!(*kind, "A" | "OA" | "XA" | "ZA")
+            && !inherit_only(flags)
+            && rights_mask(rights) & ANCESTOR_RIGHTS != 0
+            && !TRUSTED_OWNERS.contains(sid)
+            && !OWNER_STAND_INS.contains(sid)
+    })
+}
+
+/// True when the flags field of an entry holds `IO`. A field that is not a
+/// list of two-letter flags counts as not inherit-only.
+fn inherit_only(flags: &str) -> bool {
+    flags.len().is_multiple_of(2)
+        && (0..flags.len())
+            .step_by(2)
+            .any(|at| flags.get(at..at + 2) == Some("IO"))
+}
+
 /// The text of the `O:`, `G:`, `D:` or `S:` part of `sddl`.
 fn section(sddl: &str, tag: char) -> Option<&str> {
     let mut depth = 0_u32;
@@ -145,16 +196,34 @@ fn rights_mask(rights: &str) -> u32 {
 /// # Errors
 /// Returns why the security descriptor could not be read.
 pub fn open_to_other_accounts(path: &Path) -> Result<bool, String> {
-    read_sddl(path).map(|sddl| sddl_open_to_other_accounts(&sddl))
+    let sddl = read_sddls(&[path])?;
+    Ok(sddl.iter().any(|sddl| sddl_open_to_other_accounts(sddl)))
 }
 
-/// Reads the owner and the access list through Windows `PowerShell`, which
-/// gives them in the language-neutral SDDL form. The path comes from the
-/// environment, never from the script text.
+/// Separates the paths in the environment of the reader; no file name can
+/// hold it.
+const PATH_SEPARATOR: char = '|';
+
+/// The security descriptors of `paths`, in their order, in the
+/// language-neutral SDDL form. One Windows `PowerShell` reads them all. The
+/// paths come from the environment, never from the script text.
+///
+/// # Errors
+/// Returns why a descriptor could not be read.
 #[cfg(windows)]
-fn read_sddl(path: &Path) -> Result<String, String> {
+pub fn read_sddls(paths: &[&Path]) -> Result<Vec<String>, String> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let mut list = std::ffi::OsString::new();
+    for (at, path) in paths.iter().enumerate() {
+        if path.to_string_lossy().contains(PATH_SEPARATOR) {
+            return Err(format!("cannot read the access list of {}", path.display()));
+        }
+        if at > 0 {
+            list.push(PATH_SEPARATOR.to_string());
+        }
+        list.push(path.as_os_str());
+    }
     let root = crate::system::system_root()?;
     let shell = root.join("System32").join("WindowsPowerShell").join("v1.0");
     let output = ca_io::host_command::host_command(shell.join("powershell.exe"))
@@ -163,28 +232,42 @@ fn read_sddl(path: &Path) -> Result<String, String> {
             "-NonInteractive",
             "-NoLogo",
             "-Command",
-            "$ErrorActionPreference='Stop';(Get-Acl -LiteralPath $env:CA_PATH).Sddl",
+            "$ErrorActionPreference='Stop';\
+             foreach($p in $env:CA_PATH.Split('|')){(Get-Acl -LiteralPath $p).Sddl}",
         ])
         .env_clear()
         .env("SystemRoot", &root)
         .env("PSModulePath", shell.join("Modules"))
-        .env("CA_PATH", path)
+        .env("CA_PATH", list)
         .current_dir(root.join("System32"))
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .creation_flags(CREATE_NO_WINDOW)
         .output()
         .map_err(|error| format!("cannot read the access list: {error}"))?;
-    let text = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    if output.status.success() && text.starts_with("O:") {
-        Ok(text)
+    let text = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<String> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect();
+    if output.status.success()
+        && lines.len() == paths.len()
+        && lines.iter().all(|line| line.starts_with("O:"))
+    {
+        Ok(lines)
     } else {
-        Err(format!("cannot read the access list of {}", path.display()))
+        Err("cannot read the access lists".to_owned())
     }
 }
 
+/// Other platforms have no install for every user.
+///
+/// # Errors
+/// Always.
 #[cfg(not(windows))]
-fn read_sddl(_: &Path) -> Result<String, String> {
+pub fn read_sddls(_: &[&Path]) -> Result<Vec<String>, String> {
     Err("this platform has no installer for every user".to_owned())
 }
 
@@ -224,6 +307,41 @@ mod tests {
         assert!(open("O:BAG:SY"));
         assert!(open("O:BAD:NO_ACCESS_CONTROL"));
         assert!(open(""));
+    }
+
+    /// The drive root as Windows sets it up: every signed-in account may add
+    /// folders to it, and gets delete and write on new subfolders.
+    const DRIVE_ROOT: &str = "O:S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464\
+        G:S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464D:P\
+        (A;;LC;;;AU)(A;OICIIO;SDGXGWGR;;;AU)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)\
+        (A;OICI;0x1200a9;;;BU)(A;;0x1000a1;;;S-1-15-3-65536-1888954469-739942743)";
+
+    #[test]
+    fn the_drive_root_and_program_files_do_not_open_the_folders_below() {
+        use super::sddl_open_as_ancestor as open_above;
+        assert!(!open_above(DRIVE_ROOT));
+        assert!(!open_above(PROGRAM_FILES_CHILD));
+        assert!(!open_above("O:BAD:(A;;FA;;;BA)(A;;0x6;;;AU)(A;;FW;;;BU)"));
+        // A drive root would open an install folder directly in it.
+        assert!(super::sddl_open_to_other_accounts(DRIVE_ROOT));
+    }
+
+    #[test]
+    fn a_right_to_move_a_folder_away_opens_the_folders_below() {
+        use super::sddl_open_as_ancestor as open_above;
+        for right in ["SD", "DT", "WD", "WO", "GA", "0x1301bf", "0x40"] {
+            assert!(
+                open_above(&format!("O:BAD:(A;;FA;;;BA)(A;;{right};;;AU)")),
+                "{right}"
+            );
+        }
+        assert!(open_above(&format!(
+            "{PROGRAM_FILES_CHILD}(A;ID;0x1301bf;;;AU)"
+        )));
+        assert!(open_above("O:S-1-5-21-1-2-3-1001D:(A;;FA;;;BA)"));
+        assert!(open_above("O:BAD:NO_ACCESS_CONTROL"));
+        assert!(open_above("O:BAD:(A;;FA;;;BA)(A;;QQ;;;BU)"));
+        assert!(!open_above("O:BAD:(A;;FA;;;BA)(A;OICIIO;GA;;;BU)"));
     }
 
     #[test]
