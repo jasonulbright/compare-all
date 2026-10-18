@@ -3385,6 +3385,60 @@ mod tests {
         );
     }
 
+    fn row_statuses(view: &TableView) -> Vec<ca_table::compare::RowStatus> {
+        (0..view.grid.visual_rows())
+            .filter_map(|row| view.grid.row_status(row))
+            .collect()
+    }
+
+    #[test]
+    fn copy_to_right_and_left_copy_a_selection_of_paired_and_one_sided_rows() {
+        use ca_table::compare::RowStatus::{Different, LeftOnly, RightOnly, Same};
+        let left_text = "id,name\n1,Ann\n2,Bob\n3,Cy\n5,Eve\n";
+        let right_text = "id,name\n1,Xnn\n3,Cy\n4,Dee\n5,Eve\n";
+        let (_dir, left, right) = files(left_text, right_text);
+        let ctx = egui::Context::default();
+        let mut view = TableView::new(left, right, &context(), 46);
+        assert!(settle(&mut view, &ctx));
+        let before = vec![Different, LeftOnly, Same, RightOnly, Same];
+        assert_eq!(row_statuses(&view), before);
+
+        view.set_active_side(Side::Left);
+        view.selected_rows = vec![3, 0, 1];
+        view.selection_side = Some(Side::Left);
+        assert!(view.accepts(Command::CopyToRight));
+        view.run(Command::CopyToRight);
+        assert!(settle(&mut view, &ctx));
+        assert_eq!(view.side_text(Side::Right).text(), left_text);
+        assert_eq!(view.side_text(Side::Left).text(), left_text);
+        assert_eq!(row_statuses(&view), vec![Same; 4]);
+
+        view.selected_rows.clear();
+        view.set_active_side(Side::Right);
+        view.run(Command::Undo);
+        assert!(settle(&mut view, &ctx));
+        assert_eq!(view.side_text(Side::Right).text(), right_text);
+        assert_eq!(row_statuses(&view), before);
+        assert!(!view.accepts(Command::Undo));
+
+        view.set_active_side(Side::Right);
+        view.selected_rows = vec![0, 1, 3];
+        view.selection_side = Some(Side::Right);
+        assert!(view.accepts(Command::CopyToLeft));
+        view.run(Command::CopyToLeft);
+        assert!(settle(&mut view, &ctx));
+        assert_eq!(view.side_text(Side::Left).text(), right_text);
+        assert_eq!(row_statuses(&view), vec![Same; 4]);
+
+        view.selected_rows.clear();
+        view.set_active_side(Side::Left);
+        view.run(Command::Undo);
+        assert!(settle(&mut view, &ctx));
+        assert_eq!(view.side_text(Side::Left).text(), left_text);
+        assert_eq!(row_statuses(&view), before);
+        assert!(!view.accepts(Command::Undo));
+    }
+
     #[test]
     fn copy_to_right_is_refused_while_the_target_cannot_be_written() {
         let (_dir, left, right) = files("id,name\n1,Ann\n", "id,name\n1,Bob\n");
