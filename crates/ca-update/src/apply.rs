@@ -122,23 +122,46 @@ fn restore(saved: &Path, live: &Path) -> std::io::Result<()> {
     }
 }
 
-/// The reason [`apply_staged`] gives when the user declined the elevation
-/// prompt of an install for every user, or could not approve it.
-pub const ELEVATION_DECLINED: &str = "the elevation was declined";
+/// The reason [`apply_staged`] gives when the elevation of an install for
+/// every user did not happen: the prompt was declined, could not be
+/// approved, was refused by policy, or the elevated program did not start.
+pub const ELEVATION_DECLINED: &str = "the elevation was declined or failed";
 
-/// Exit code of the elevation script when the prompt was declined
-/// (`ERROR_CANCELLED`).
+/// `ERROR_CANCELLED`, the code of a declined elevation prompt.
 const DECLINED_CODE: i32 = 1223;
+
+/// `ERROR_INSTALL_USEREXIT`: Cancel in the progress window of the installer.
+const INSTALL_CANCELLED_CODE: i32 = 1602;
+
+/// The elevation script ends with this bit set when the elevated program
+/// never started; the low 16 bits then hold the Windows error, or 0 when
+/// none was given. Windows status codes of a crashed process never set it.
+const NOT_STARTED: i32 = 0x2000_0000;
 
 /// Starts `msiexec.exe` (absolute path in `CA_MSIEXEC`) through the standard
 /// elevation prompt, waits for it, and ends with its exit code. The package
 /// path comes from `CA_UPDATE_FILE`, never from the command text.
+///
+/// Windows `PowerShell` 5.1 `Start-Process` replaces the error of a failed
+/// start with one that carries no error code, so the start goes through
+/// `Process.Start` and the error code is read from the inner exception.
 const ELEVATE_SCRIPT: &str = "$ErrorActionPreference='Stop';\
-    try{$p=Microsoft.PowerShell.Management\\Start-Process -FilePath $env:CA_MSIEXEC \
-    -ArgumentList @('/i',('\"'+$env:CA_UPDATE_FILE+'\"'),'/passive','/norestart','ALLUSERS=1') \
-    -Verb RunAs -Wait -PassThru;exit $p.ExitCode}\
-    catch [System.ComponentModel.Win32Exception]{if($_.Exception.NativeErrorCode -eq 1223){exit 1223};exit 1}\
-    catch{exit 1}";
+    try{$i=[Diagnostics.ProcessStartInfo]::new($env:CA_MSIEXEC);\
+    $i.Arguments='/i \"'+$env:CA_UPDATE_FILE+'\" /passive /norestart ALLUSERS=1';\
+    $i.UseShellExecute=$true;$i.Verb='runas';\
+    $p=[Diagnostics.Process]::Start($i)}\
+    catch{$e=$_.Exception;\
+    while($null -ne $e -and $e -isnot [ComponentModel.Win32Exception]){$e=$e.InnerException};\
+    if($null -ne $e){exit (0x20000000 -bor ($e.NativeErrorCode -band 0xFFFF))};exit 0x20000000}\
+    if($null -eq $p){exit 0x20000000};$p.WaitForExit();exit $p.ExitCode";
+
+/// The Windows error of an elevation that never started, from the exit code
+/// of the elevation script; `Some(0)` when the start failed without one.
+#[must_use]
+pub fn elevation_error(code: Option<i32>) -> Option<i32> {
+    code.filter(|code| code & !0xFFFF == NOT_STARTED)
+        .map(|code| code & 0xFFFF)
+}
 
 /// The command that installs `msi` as a major upgrade with a progress window
 /// and no questions. An install for every user starts the installer through
@@ -191,12 +214,15 @@ pub fn msi_command(msi: &Path, machine: bool, log: &Path) -> Command {
 /// What the exit code of an installer command means.
 ///
 /// # Errors
-/// [`ELEVATION_DECLINED`] for a declined elevation prompt; otherwise why the
-/// install failed.
+/// [`ELEVATION_DECLINED`] when the elevation did not happen or the user
+/// cancelled the installer; otherwise why the install failed.
 pub fn installer_result(code: Option<i32>) -> Result<(), String> {
+    if elevation_error(code).is_some() {
+        return Err(ELEVATION_DECLINED.to_owned());
+    }
     match code {
         Some(0 | 1641 | 3010) => Ok(()),
-        Some(DECLINED_CODE) => Err(ELEVATION_DECLINED.to_owned()),
+        Some(DECLINED_CODE | INSTALL_CANCELLED_CODE) => Err(ELEVATION_DECLINED.to_owned()),
         Some(code) => Err(format!("the installer ended with code {code}")),
         None => Err("the installer was stopped".to_owned()),
     }
