@@ -60,8 +60,11 @@ pub enum Outcome {
     DownloadFailed(Release, String),
     /// The running build is the newest release or newer.
     Current,
-    /// The interval since the last check has not passed.
-    NotDue,
+    /// The interval since the last check has not passed; the next check is
+    /// due after the time given.
+    NotDue(Duration),
+    /// Checks are off; only what an earlier run left was reported.
+    Off,
     /// The check failed; the reason is in the log file.
     Failed(String),
     /// The check was stopped.
@@ -156,6 +159,9 @@ pub struct Check {
     pub timeout: Duration,
     /// Report the earlier failure and the staged update before the check.
     pub report_pending: bool,
+    /// Ask the network. False only reports what an earlier run left, and
+    /// removes a staged update, which is then never applied.
+    pub network: bool,
 }
 
 impl Check {
@@ -171,6 +177,7 @@ impl Check {
             forced,
             timeout: TIMEOUT,
             report_pending: false,
+            network: true,
         }
     }
 }
@@ -210,8 +217,12 @@ pub fn parse_release(body: &[u8]) -> Result<Version, String> {
 /// I/O; call it on a worker.
 #[must_use]
 pub fn run(check: &Check, now: SystemTime, cancel: &Arc<AtomicBool>) -> Outcome {
-    if !check.forced && !is_due(read_stamp(&check.state), now, check.days) {
-        return Outcome::NotDue;
+    let last = read_stamp(&check.state);
+    if !check.forced && !is_due(last, now, check.days) {
+        let due = last
+            .and_then(|last| last.checked_add(Duration::from_secs(u64::from(check.days) * DAY)))
+            .unwrap_or(now);
+        return Outcome::NotDue(due.duration_since(now).unwrap_or_default());
     }
     // The attempt is recorded before the request, so a check that fails or
     // hangs still waits one interval before the next one.
@@ -238,14 +249,19 @@ pub fn spawn(check: Check, notify: Arc<dyn Fn() + Send + Sync>) -> Job<Outcome> 
                     emitter.send(pending);
                 }
             }
-            emitter.send(run(&check, SystemTime::now(), &flag));
+            if check.network {
+                emitter.send(run(&check, SystemTime::now(), &flag));
+            } else {
+                emitter.send(Outcome::Off);
+            }
         },
         notify,
     )
 }
 
 /// What an earlier run left: a staged update that waits, or a release that
-/// could not be downloaded. Reads local files only.
+/// could not be downloaded. Reads local files only. With checks off, a staged
+/// update is removed instead of reported.
 fn pending(check: &Check) -> Vec<Outcome> {
     let staging = Staging::new(check.source.staging.clone());
     let mut out = Vec::new();
@@ -253,7 +269,9 @@ fn pending(check: &Check) -> Vec<Outcome> {
         page: check.source.endpoints.page(&version),
         version,
     };
-    if let Some(version) = staging
+    if !check.network {
+        staging.clear();
+    } else if let Some(version) = staging
         .read_record()
         .and_then(|record| record.parsed_version())
         .filter(|version| *version > check.current)
@@ -344,18 +362,21 @@ pub struct ExitHook {
     pub normal_close: AtomicBool,
     /// The close was asked for by "Restart to update".
     pub relaunch: AtomicBool,
+    /// At the close, update checks were on (option and policy) and the copy
+    /// is one the program updates by itself.
+    pub apply_allowed: AtomicBool,
 }
 
-/// After the window ended: when it ended through a normal close and a staged
-/// update waits, start the helper that applies it. A crash or a forced end
-/// leaves `normal_close` unset, so the update stays staged for the next normal
-/// close. Returns true when a helper was started.
+/// After the window ended: when it ended through a normal close, applying is
+/// allowed, and a staged update waits, start the helper that applies it. A
+/// crash or a forced end leaves `normal_close` unset, so the update stays
+/// staged for the next normal close. Returns true when a helper was started.
 pub fn finish_at_exit(
     hook: &ExitHook,
     staging: &Staging,
     start: &dyn Fn(&Staging, bool) -> Result<(), String>,
 ) -> bool {
-    if !hook.normal_close.load(Ordering::SeqCst) {
+    if !hook.normal_close.load(Ordering::SeqCst) || !hook.apply_allowed.load(Ordering::SeqCst) {
         return false;
     }
     let current = Version::parse(crate::VERSION);
@@ -378,6 +399,9 @@ pub fn apply_at_exit(hook: &ExitHook, settings: &Path) -> bool {
     let Ok(executable) = std::env::current_exe() else {
         return false;
     };
+    if !ca_update::apply::applies_automatically(ca_update::mode::detect(&executable)) {
+        return false;
+    }
     let staging = Staging::new(staging_directory(settings));
     finish_at_exit(hook, &staging, &|staging, relaunch| {
         ca_update::apply::spawn_helper(staging, &executable, relaunch, &[])
@@ -419,6 +443,7 @@ mod tests {
             forced: false,
             timeout: Duration::from_secs(10),
             report_pending: false,
+            network: true,
         }
     }
 
@@ -535,7 +560,11 @@ mod tests {
         let now = SystemTime::now();
         assert!(matches!(run(&check, now, &no_cancel()), Outcome::Newer(_)));
         let later = now + Duration::from_secs(DAY);
-        assert_eq!(run(&check, later, &no_cancel()), Outcome::NotDue);
+        assert!(matches!(
+            run(&check, later, &no_cancel()),
+            Outcome::NotDue(wait)
+                if wait <= Duration::from_secs(6 * DAY) && wait > Duration::from_secs(6 * DAY - 2)
+        ));
         assert_eq!(seen.lock().unwrap().len(), 1);
         check.forced = true;
         assert!(matches!(

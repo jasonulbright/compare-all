@@ -13,16 +13,40 @@ use std::sync::Arc;
 /// Longest time the process waits at exit for the copies of closed tabs to go.
 const EXIT_DELETE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
+const VERSION_MARKER_TEXT: &str = concat!("CA-BUILD-VERSION=", env!("CA_VERSION"), "\0");
+
+/// The build version as signed bytes in the program file. The updater reads
+/// it from a downloaded portable copy and refuses a copy whose version is not
+/// the version of the release that names it.
+#[used]
+static VERSION_MARKER: [u8; VERSION_MARKER_TEXT.len()] = marker_bytes();
+
+const fn marker_bytes() -> [u8; VERSION_MARKER_TEXT.len()] {
+    let text = VERSION_MARKER_TEXT.as_bytes();
+    let mut out = [0u8; VERSION_MARKER_TEXT.len()];
+    let mut index = 0;
+    while index < text.len() {
+        out[index] = text[index];
+        index += 1;
+    }
+    out
+}
+
 fn main() -> eframe::Result {
+    std::hint::black_box(&VERSION_MARKER);
     // The update helper is a copy of this program started after the window
     // ended. It opens no window and reads no settings.
     let arguments: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     if let Some(helper) = ca_update::apply::parse_helper_arguments(&arguments) {
+        let Some(running) = ca_update::Version::parse(ca_app::VERSION) else {
+            std::process::exit(1);
+        };
         let verifier = ca_update::signature::system_verifier();
         let code = ca_update::apply::helper_main(
             &helper,
             verifier.as_ref(),
             ca_update::signature::RELEASE_SIGNER,
+            &running,
         );
         std::process::exit(code);
     }
