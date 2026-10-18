@@ -437,36 +437,118 @@ fn a_download_warning_shows_without_a_network_call_when_checks_are_off() {
     }
 }
 
+/// A window whose update checks are off by the option or by the policy, over
+/// a verified staged update, once the launch has reported what it found.
+fn launch_with_checks_off(
+    dir: &Path,
+    staging: &Path,
+    server: &HttpTestServer,
+    by_policy: bool,
+) -> App {
+    let mut app = app_in(dir);
+    app.update_from(source(
+        server,
+        staging,
+        Some(InstallMode::Installed { machine: false }),
+    ));
+    if by_policy {
+        let mut keys = BTreeMap::new();
+        keys.insert(PolicyKey::DisableCheckForUpdates, true);
+        app.set_policies(AdminPolicies::from_keys(&keys));
+    }
+    assert!(run_frames(&mut app, |app| app.options().is_ready()));
+    let mut options = app.options().options_or_default();
+    options.tweaks.check_for_updates = by_policy;
+    app.apply_options(options);
+    app
+}
+
 #[test]
-fn a_staged_update_is_not_applied_when_checks_are_off() {
+fn a_staged_update_with_checks_off_is_offered_and_applied_only_by_the_button() {
+    for by_policy in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = dir.path().join("stage");
+        let version = next_version();
+        let record = stage_fake(&staging, &version);
+        let (server, asked) = release_server(version.to_string(), 404);
+        let started = Mutex::new(Vec::new());
+        let start = |_: &Staging, relaunch: bool| {
+            started.lock().unwrap().push(relaunch);
+            Ok(())
+        };
+
+        // A plain close with checks off applies nothing.
+        let mut app = launch_with_checks_off(dir.path(), &staging, &server, by_policy);
+        let hook = app.update_exit_hook();
+        assert!(
+            run_frames(&mut app, |app| matches!(
+                app.update_notice(),
+                Some(UpdateNotice::Ready(_))
+            )),
+            "policy {by_policy}: {:?}",
+            app.update_notice()
+        );
+        assert_eq!(
+            Staging::new(staging.clone()).read_record(),
+            Some(record.clone())
+        );
+        assert!(staging.join(&record.asset).exists());
+        app.run(Command::Exit, &context());
+        if app.asks_before_closing() {
+            app.answer_exit(true);
+        }
+        assert!(run_frames(&mut app, App::is_closing));
+        assert!(!finish_at_exit(
+            &hook,
+            &Staging::new(staging.clone()),
+            &start
+        ));
+        assert!(started.lock().unwrap().is_empty());
+
+        // The button applies it and starts the program again.
+        let mut app = launch_with_checks_off(dir.path(), &staging, &server, by_policy);
+        let hook = app.update_exit_hook();
+        assert!(run_frames(&mut app, |app| matches!(
+            app.update_notice(),
+            Some(UpdateNotice::Ready(_))
+        )));
+        let mut probe = Probe::new(1280.0, 800.0);
+        {
+            let mut run = |ctx: &egui::Context| app.frame(ctx);
+            probe.idle(&mut run);
+            probe.idle(&mut run);
+            probe.click("Restart to update", &mut run).unwrap();
+            probe.idle(&mut run);
+        }
+        if app.asks_before_closing() {
+            app.answer_exit(true);
+        }
+        assert!(run_frames(&mut app, App::is_closing));
+        assert!(finish_at_exit(
+            &hook,
+            &Staging::new(staging.clone()),
+            &start
+        ));
+        assert_eq!(*started.lock().unwrap(), vec![true]);
+        assert_eq!(asked.load(Ordering::SeqCst), 0, "policy {by_policy}");
+    }
+}
+
+#[test]
+fn a_launch_with_checks_off_leaves_an_update_a_helper_has_claimed() {
     let dir = tempfile::tempdir().unwrap();
     let staging = dir.path().join("stage");
     let version = next_version();
-    stage_fake(&staging, &version);
+    let record = stage_fake(&staging, &version);
     let (server, asked) = release_server(version.to_string(), 404);
-    let mut app = app_in(dir.path());
-    app.update_from(source(
-        &server,
-        &staging,
-        Some(InstallMode::Installed { machine: false }),
-    ));
-    let hook = app.update_exit_hook();
-    assert!(run_frames(&mut app, |app| app.options().is_ready()));
-    let mut options = app.options().options_or_default();
-    options.tweaks.check_for_updates = false;
-    app.apply_options(options);
-    quiet_frames(&mut app, 20);
+    let claim = Staging::new(staging.clone()).begin_apply().unwrap();
+    let mut app = launch_with_checks_off(dir.path(), &staging, &server, false);
     assert!(run_frames(&mut app, |app| !app.is_checking_for_updates()));
-    assert!(!matches!(app.update_notice(), Some(UpdateNotice::Ready(_))));
-    app.restart_to_update();
-    assert!(run_frames(&mut app, App::is_closing));
-    let started = Mutex::new(0);
-    let start = |_: &Staging, _: bool| {
-        *started.lock().unwrap() += 1;
-        Ok(())
-    };
-    assert!(!finish_at_exit(&hook, &Staging::new(staging), &start));
-    assert_eq!(*started.lock().unwrap(), 0);
+    quiet_frames(&mut app, 10);
+    assert!(staging.join(&record.asset).exists());
+    assert!(staging.join("staged.json").exists());
+    drop(claim);
+    assert_eq!(Staging::new(staging).read_record(), Some(record));
     assert_eq!(asked.load(Ordering::SeqCst), 0);
 }
 
