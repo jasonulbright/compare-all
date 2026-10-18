@@ -1,29 +1,32 @@
-//! Asks GitHub Releases whether a newer build exists.
+//! Update checks, downloads and the apply at exit.
 //!
-//! The check runs on a worker, sends one GET request whose only caller header
-//! is the user agent, and never downloads or installs anything. A
-//! failure is written to a log file in the settings directory and is otherwise
-//! silent.
+//! The check runs on a worker. It reads the newest release, and on Windows
+//! downloads, verifies and stages the matching file without a prompt. A check
+//! that fails is silent unless the user asked for it. A staged update is
+//! applied by a helper after the program ends through a normal close; the
+//! launch never applies and never waits on an update.
 
 use ca_ui::worker::{Emitter, Job, Terminal};
-use ca_vfs::cancel::Cancel;
+use ca_update::flow::{Endpoints, Job as FlowJob};
+use ca_update::mode::InstallMode;
+use ca_update::net::{HttpTransport, ProxyConfig};
+use ca_update::staging::Staging;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// The address that names the newest published release.
+pub use ca_update::Version;
+
+/// The address that names the newest release.
 pub const RELEASES_URL: &str =
     "https://api.github.com/repos/jasonulbright/compare-all/releases/latest";
 
-/// The page of one release, before its tag.
-const RELEASE_PAGE: &str = "https://github.com/jasonulbright/compare-all/releases/tag/";
-
 /// How long one check may take before it is given up.
-pub const TIMEOUT: Duration = Duration::from_secs(15);
+pub const TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Most bytes a release document may hold. The document is small; a larger
-/// reply is not one.
-const MAX_BODY: u64 = 1 << 20;
+/// True on platforms where the program downloads and applies updates.
+pub const AUTOMATIC: bool = cfg!(windows);
 
 /// File that holds the time of the last check, in seconds since 1970.
 const STAMP_FILE: &str = "update-check";
@@ -32,42 +35,6 @@ const LOG_FILE: &str = "update.log";
 
 /// Seconds in one day.
 const DAY: u64 = 24 * 60 * 60;
-
-/// A build version: year, month, day and build number.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Version([u32; 4]);
-
-impl Version {
-    /// Parse `YYYY.MM.DD.NNNN`, with or without a leading `v`.
-    ///
-    /// The four parts compare as numbers, so `2026.10.1.1` is newer than
-    /// `2026.9.30.9`.
-    #[must_use]
-    pub fn parse(text: &str) -> Option<Self> {
-        let text = text.trim();
-        let text = text.strip_prefix(['v', 'V']).unwrap_or(text);
-        let mut parts = [0u32; 4];
-        let mut pieces = text.split('.');
-        for part in &mut parts {
-            let piece = pieces.next()?;
-            if piece.is_empty() || !piece.bytes().all(|byte| byte.is_ascii_digit()) {
-                return None;
-            }
-            *part = piece.parse().ok()?;
-        }
-        if pieces.next().is_some() {
-            return None;
-        }
-        Some(Self(parts))
-    }
-}
-
-impl std::fmt::Display for Version {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let [year, month, day, build] = self.0;
-        write!(f, "{year:04}.{month:02}.{day:02}.{build:04}")
-    }
-}
 
 /// A release newer than the running build.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,8 +48,16 @@ pub struct Release {
 /// What one check found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
-    /// A newer release exists.
+    /// A newer release exists that this build does not download.
     Newer(Release),
+    /// A newer release is downloaded, verified and staged.
+    Staged(Release),
+    /// A verified update was staged by an earlier run and still waits.
+    Waiting(Release),
+    /// An earlier run could not download this release.
+    EarlierFailure(Release),
+    /// A newer release exists and the download failed.
+    DownloadFailed(Release, String),
     /// The running build is the newest release or newer.
     Current,
     /// The interval since the last check has not passed.
@@ -95,7 +70,7 @@ pub enum Outcome {
 
 impl Terminal for Outcome {
     fn is_terminal(&self) -> bool {
-        true
+        !matches!(self, Self::Waiting(_) | Self::EarlierFailure(_))
     }
 
     fn cancelled() -> Self {
@@ -107,11 +82,66 @@ impl Terminal for Outcome {
     }
 }
 
+/// Where a window gets releases from and what it does with them.
+#[derive(Debug, Clone)]
+pub struct Source {
+    /// The release locations.
+    pub endpoints: Endpoints,
+    /// How the program was installed. None only reports a newer release.
+    pub mode: Option<InstallMode>,
+    /// The staging folder.
+    pub staging: PathBuf,
+    /// Accept plain HTTP addresses. For tests against a local server.
+    pub allow_plain_http: bool,
+}
+
+impl Source {
+    /// The public releases. Windows downloads and stages; other platforms
+    /// report a newer release only.
+    #[must_use]
+    pub fn published(settings: &Path) -> Self {
+        Self {
+            endpoints: Endpoints::github(),
+            mode: AUTOMATIC
+                .then(|| std::env::current_exe().ok())
+                .flatten()
+                .map(|exe| ca_update::mode::detect(&exe)),
+            staging: staging_directory(settings),
+            allow_plain_http: false,
+        }
+    }
+
+    /// A source that reads the release document at `url` and downloads nothing.
+    #[must_use]
+    pub fn notify_only(url: String, settings: &Path) -> Self {
+        let mut endpoints = Endpoints::github();
+        endpoints.latest = url;
+        Self {
+            endpoints,
+            mode: None,
+            staging: settings.join("updates"),
+            allow_plain_http: true,
+        }
+    }
+}
+
+/// The folder staged updates live in. It sits in the per-user local data
+/// folder, never beside the program, so a portable folder gets no extra files.
+#[must_use]
+pub fn staging_directory(settings: &Path) -> PathBuf {
+    std::env::var_os("LOCALAPPDATA")
+        .filter(|value| !value.is_empty())
+        .map_or_else(
+            || settings.join("updates"),
+            |base| PathBuf::from(base).join("compare-all").join("updates"),
+        )
+}
+
 /// One check to run.
 #[derive(Debug, Clone)]
 pub struct Check {
-    /// The address of the release document.
-    pub url: String,
+    /// Where releases come from.
+    pub source: Source,
     /// The running build.
     pub current: Version,
     /// The value of the user agent header.
@@ -122,22 +152,25 @@ pub struct Check {
     pub days: u32,
     /// Check even when the interval has not passed.
     pub forced: bool,
-    /// How long the request may take.
+    /// How long a request may take.
     pub timeout: Duration,
+    /// Report the earlier failure and the staged update before the check.
+    pub report_pending: bool,
 }
 
 impl Check {
-    /// A check of the published releases against `current`.
+    /// A check of `source` against `current`.
     #[must_use]
-    pub fn published(current: Version, state: PathBuf, days: u32, forced: bool) -> Self {
+    pub fn new(source: Source, current: Version, state: PathBuf, days: u32, forced: bool) -> Self {
         Self {
-            url: RELEASES_URL.to_owned(),
+            source,
             current,
             user_agent: user_agent(&current.to_string()),
             state,
             days,
             forced,
             timeout: TIMEOUT,
+            report_pending: false,
         }
     }
 }
@@ -169,19 +202,14 @@ pub fn is_due(last: Option<SystemTime>, now: SystemTime, days: u32) -> bool {
 ///
 /// Returns why the document is not a release of this application.
 pub fn parse_release(body: &[u8]) -> Result<Version, String> {
-    let value: serde_json::Value =
-        serde_json::from_slice(body).map_err(|error| format!("the reply is not JSON: {error}"))?;
-    let tag = value
-        .get("tag_name")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| "the reply names no tag".to_owned())?;
-    Version::parse(tag).ok_or_else(|| format!("the tag {tag:?} is not a version"))
+    ca_update::flow::parse_release(body)
 }
 
-/// Run `check` now: read the last check time, ask the server, and record the
-/// attempt. Performs network and disk I/O; call it on a worker.
+/// Run `check` now: read the last check time, ask the server, download when
+/// the source allows it, and record the attempt. Performs network and disk
+/// I/O; call it on a worker.
 #[must_use]
-pub fn run(check: &Check, now: SystemTime, cancel: &Cancel) -> Outcome {
+pub fn run(check: &Check, now: SystemTime, cancel: &Arc<AtomicBool>) -> Outcome {
     if !check.forced && !is_due(read_stamp(&check.state), now, check.days) {
         return Outcome::NotDue;
     }
@@ -189,12 +217,8 @@ pub fn run(check: &Check, now: SystemTime, cancel: &Cancel) -> Outcome {
     // hangs still waits one interval before the next one.
     write_stamp(&check.state, now);
     let outcome = match fetch(check, cancel) {
-        Ok(latest) if latest > check.current => Outcome::Newer(Release {
-            version: latest,
-            page: format!("{RELEASE_PAGE}v{latest}"),
-        }),
-        Ok(_) => Outcome::Current,
-        Err(_) if cancel.is_cancelled() => Outcome::Cancelled,
+        Ok(outcome) => outcome,
+        Err(_) if cancel.load(Ordering::SeqCst) => Outcome::Cancelled,
         Err(reason) => Outcome::Failed(reason),
     };
     if let Outcome::Failed(reason) = &outcome {
@@ -207,39 +231,82 @@ pub fn run(check: &Check, now: SystemTime, cancel: &Cancel) -> Outcome {
 pub fn spawn(check: Check, notify: Arc<dyn Fn() + Send + Sync>) -> Job<Outcome> {
     Job::spawn_notifying(
         move |emitter: &Emitter<Outcome>, cancel| {
-            let cancel = Cancel::from_flag(cancel.as_fs().as_flag());
-            emitter.send(run(&check, SystemTime::now(), &cancel));
+            let flag = cancel.as_fs().as_flag();
+            if check.report_pending {
+                Staging::new(check.source.staging.clone()).sweep_helpers();
+                for pending in pending(&check) {
+                    emitter.send(pending);
+                }
+            }
+            emitter.send(run(&check, SystemTime::now(), &flag));
         },
         notify,
     )
 }
 
-/// Ask the server for the newest release.
-fn fetch(check: &Check, cancel: &Cancel) -> Result<Version, String> {
-    use ca_vfs::remote::http::{HttpClient, RequestBody, Url};
-    let url = Url::parse(&check.url).map_err(|error| error.to_string())?;
-    let client = HttpClient::new(
-        &ca_vfs::remote::tls::TlsOptions::default(),
-        None,
-        check.timeout,
-    )
-    .map_err(|error| error.to_string())?;
-    let headers = [("User-Agent".to_owned(), check.user_agent.clone())];
-    let mut response = client
-        .send("GET", &url, &headers, RequestBody::Empty, cancel)
-        .map_err(|error| error.to_string())?;
-    if !response.is_success() {
-        return Err(format!("the server answered {}", response.status));
-    }
-    let limits = ca_vfs::limits::Limits {
-        max_entry_bytes: MAX_BODY,
-        max_archive_bytes: MAX_BODY,
-        ..ca_vfs::limits::Limits::default()
+/// What an earlier run left: a staged update that waits, or a release that
+/// could not be downloaded. Reads local files only.
+fn pending(check: &Check) -> Vec<Outcome> {
+    let staging = Staging::new(check.source.staging.clone());
+    let mut out = Vec::new();
+    let release = |version: Version| Release {
+        page: check.source.endpoints.page(&version),
+        version,
     };
-    let body = response
-        .read_body(&limits, cancel)
-        .map_err(|error| error.to_string())?;
-    parse_release(&body)
+    if let Some(version) = staging
+        .read_record()
+        .and_then(|record| record.parsed_version())
+        .filter(|version| *version > check.current)
+    {
+        out.push(Outcome::Waiting(release(version)));
+    }
+    if let Some(warning) = staging.read_warning() {
+        if let Some(version) = warning.parsed_version().filter(|v| *v > check.current) {
+            out.push(Outcome::EarlierFailure(Release {
+                version,
+                page: warning.page,
+            }));
+        }
+    }
+    out
+}
+
+fn fetch(check: &Check, cancel: &Arc<AtomicBool>) -> Result<Outcome, String> {
+    let staging = Staging::new(check.source.staging.clone());
+    let mut transport = HttpTransport::new(
+        check.user_agent.clone(),
+        ProxyConfig::system(),
+        check.timeout,
+    );
+    if check.source.allow_plain_http {
+        transport = transport.allowing_plain_http();
+    }
+    let signer = ca_update::signature::system_verifier();
+    let job = FlowJob {
+        transport: &transport,
+        signer: signer.as_ref(),
+        staging: &staging,
+        mode: check.source.mode,
+        current: check.current,
+        endpoints: &check.source.endpoints,
+        signer_name: ca_update::signature::RELEASE_SIGNER,
+        cancel,
+    };
+    Ok(match ca_update::flow::run(&job)? {
+        ca_update::flow::Outcome::Current => Outcome::Current,
+        ca_update::flow::Outcome::Newer { version, page } => {
+            Outcome::Newer(Release { version, page })
+        }
+        ca_update::flow::Outcome::Staged { version } => Outcome::Staged(Release {
+            page: check.source.endpoints.page(&version),
+            version,
+        }),
+        ca_update::flow::Outcome::DownloadFailed {
+            version,
+            page,
+            reason,
+        } => Outcome::DownloadFailed(Release { version, page }, reason),
+    })
 }
 
 fn read_stamp(state: &Path) -> Option<SystemTime> {
@@ -270,13 +337,62 @@ fn write_log(state: &Path, now: SystemTime, reason: &str) {
     );
 }
 
+/// What the window tells the process about how it ended.
+#[derive(Debug, Default)]
+pub struct ExitHook {
+    /// The window ended through its normal close path.
+    pub normal_close: AtomicBool,
+    /// The close was asked for by "Restart to update".
+    pub relaunch: AtomicBool,
+}
+
+/// After the window ended: when it ended through a normal close and a staged
+/// update waits, start the helper that applies it. A crash or a forced end
+/// leaves `normal_close` unset, so the update stays staged for the next normal
+/// close. Returns true when a helper was started.
+pub fn finish_at_exit(
+    hook: &ExitHook,
+    staging: &Staging,
+    start: &dyn Fn(&Staging, bool) -> Result<(), String>,
+) -> bool {
+    if !hook.normal_close.load(Ordering::SeqCst) {
+        return false;
+    }
+    let current = Version::parse(crate::VERSION);
+    let newer = staging
+        .read_record()
+        .and_then(|record| record.parsed_version())
+        .is_some_and(|staged| current.is_none_or(|current| staged > current));
+    if !newer {
+        return false;
+    }
+    start(staging, hook.relaunch.load(Ordering::SeqCst)).is_ok()
+}
+
+/// [`finish_at_exit`] with the real helper, for the staging folder of
+/// `settings`. Does nothing off Windows.
+pub fn apply_at_exit(hook: &ExitHook, settings: &Path) -> bool {
+    if !AUTOMATIC {
+        return false;
+    }
+    let Ok(executable) = std::env::current_exe() else {
+        return false;
+    };
+    let staging = Staging::new(staging_directory(settings));
+    finish_at_exit(hook, &staging, &|staging, relaunch| {
+        ca_update::apply::spawn_helper(staging, &executable, relaunch, &[])
+    })
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
-    use super::{is_due, parse_release, run, Check, Outcome, Version, DAY};
-    use ca_vfs::cancel::Cancel;
+    use super::{is_due, parse_release, run, Check, Outcome, Source, Version, DAY};
+    fn no_cancel() -> Arc<AtomicBool> {
+        Arc::new(AtomicBool::new(false))
+    }
     use ca_vfs::testing::http_server::{HttpTestServer, Reply, Request};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant, SystemTime};
 
@@ -289,9 +405,12 @@ mod tests {
 
     fn check(server: &HttpTestServer, state: &std::path::Path) -> Check {
         Check {
-            url: format!(
-                "{}/repos/jasonulbright/compare-all/releases/latest",
-                server.url()
+            source: Source::notify_only(
+                format!(
+                    "{}/repos/jasonulbright/compare-all/releases/latest",
+                    server.url()
+                ),
+                state,
             ),
             current: Version::parse(CURRENT).unwrap(),
             user_agent: super::user_agent(CURRENT),
@@ -299,6 +418,7 @@ mod tests {
             days: 7,
             forced: false,
             timeout: Duration::from_secs(10),
+            report_pending: false,
         }
     }
 
@@ -356,7 +476,7 @@ mod tests {
         let outcome = run(
             &check(&server, state.path()),
             SystemTime::now(),
-            &Cancel::new(),
+            &no_cancel(),
         );
         let Outcome::Newer(found) = outcome else {
             panic!("{outcome:?}");
@@ -380,7 +500,14 @@ mod tests {
         assert_eq!(agents, vec!["compare-all/2026.09.25.0002"]);
         for (name, _) in &request.headers {
             assert!(
-                ["host", "connection", "accept-encoding", "user-agent"].contains(&name.as_str()),
+                [
+                    "host",
+                    "connection",
+                    "accept",
+                    "accept-encoding",
+                    "user-agent"
+                ]
+                .contains(&name.as_str()),
                 "unexpected header {name}"
             );
         }
@@ -394,7 +521,7 @@ mod tests {
             let outcome = run(
                 &check(&server, state.path()),
                 SystemTime::now(),
-                &Cancel::new(),
+                &no_cancel(),
             );
             assert_eq!(outcome, Outcome::Current, "{tag}");
         }
@@ -406,24 +533,18 @@ mod tests {
         let (server, seen) = serving(release("v2026.09.26.0001"));
         let mut check = check(&server, state.path());
         let now = SystemTime::now();
-        assert!(matches!(
-            run(&check, now, &Cancel::new()),
-            Outcome::Newer(_)
-        ));
+        assert!(matches!(run(&check, now, &no_cancel()), Outcome::Newer(_)));
         let later = now + Duration::from_secs(DAY);
-        assert_eq!(run(&check, later, &Cancel::new()), Outcome::NotDue);
+        assert_eq!(run(&check, later, &no_cancel()), Outcome::NotDue);
         assert_eq!(seen.lock().unwrap().len(), 1);
         check.forced = true;
         assert!(matches!(
-            run(&check, later, &Cancel::new()),
+            run(&check, later, &no_cancel()),
             Outcome::Newer(_)
         ));
         check.forced = false;
         let past = now + Duration::from_secs(8 * DAY);
-        assert!(matches!(
-            run(&check, past, &Cancel::new()),
-            Outcome::Newer(_)
-        ));
+        assert!(matches!(run(&check, past, &no_cancel()), Outcome::Newer(_)));
         assert_eq!(seen.lock().unwrap().len(), 3);
     }
 
@@ -439,7 +560,7 @@ mod tests {
             let outcome = run(
                 &check(&server, state.path()),
                 SystemTime::now(),
-                &Cancel::new(),
+                &no_cancel(),
             );
             assert!(matches!(outcome, Outcome::Failed(_)), "{outcome:?}");
             let log = std::fs::read_to_string(state.path().join(super::LOG_FILE)).unwrap();
@@ -455,9 +576,9 @@ mod tests {
         let (server, _) = serving(Vec::new());
         let mut check = check(&server, state.path());
         drop(server);
-        check.url = "http://127.0.0.1:9/releases/latest".to_owned();
+        check.source.endpoints.latest = "http://127.0.0.1:9/releases/latest".to_owned();
         assert!(matches!(
-            run(&check, SystemTime::now(), &Cancel::new()),
+            run(&check, SystemTime::now(), &no_cancel()),
             Outcome::Failed(_)
         ));
     }
@@ -477,11 +598,11 @@ mod tests {
         );
         let mut check = check(&server, state.path());
         check.timeout = Duration::from_secs(30);
-        let cancel = Cancel::new();
-        let stopper = cancel.clone();
+        let cancel = no_cancel();
+        let stopper = Arc::clone(&cancel);
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(200));
-            stopper.cancel();
+            stopper.store(true, Ordering::SeqCst);
         });
         let started = Instant::now();
         let outcome = run(&check, SystemTime::now(), &cancel);

@@ -19,6 +19,7 @@ path = "src/main.rs"
 [dependencies]
 ca-session.workspace = true
 ca-io.workspace = true
+ca-update.workspace = true
 ca-vfs.workspace = true
 ca-ui.workspace = true
 ca-view-folder.workspace = true

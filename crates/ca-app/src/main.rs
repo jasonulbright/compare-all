@@ -14,6 +14,18 @@ use std::sync::Arc;
 const EXIT_DELETE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 fn main() -> eframe::Result {
+    // The update helper is a copy of this program started after the window
+    // ended. It opens no window and reads no settings.
+    let arguments: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    if let Some(helper) = ca_update::apply::parse_helper_arguments(&arguments) {
+        let verifier = ca_update::signature::system_verifier();
+        let code = ca_update::apply::helper_main(
+            &helper,
+            verifier.as_ref(),
+            ca_update::signature::RELEASE_SIGNER,
+        );
+        std::process::exit(code);
+    }
     // A version request is answered before the settings directory is
     // resolved, so it writes nothing and needs no display. On Windows this
     // binary has no console to print to, so the request stays a refused
@@ -52,6 +64,8 @@ fn main() -> eframe::Result {
     // value has to outlive the window that decided it.
     let status = Arc::new(std::sync::atomic::AtomicI32::new(0));
     let reported = Arc::clone(&status);
+    let update_exit = Arc::new(ca_app::update::ExitHook::default());
+    let update_hook = Arc::clone(&update_exit);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size(DEFAULT_WINDOW_SIZE)
@@ -76,6 +90,7 @@ fn main() -> eframe::Result {
             };
             let mut app = App::from_startup(startup, &context);
             app.report_exit_to(reported);
+            app.apply_updates_on_exit(update_hook);
             Ok(Box::new(app))
         }),
     );
@@ -83,6 +98,9 @@ fn main() -> eframe::Result {
     // leaves its copies behind until the sweep of the next start.
     ca_ui::view::wait_for_temporary_deletes(EXIT_DELETE_WAIT);
     ca_session::SettingsPaths::remove_run_directory();
+    // A staged update is applied only after a normal close. A crash or a
+    // forced end leaves it staged for the next normal close.
+    ca_app::update::apply_at_exit(&update_exit, &ca_ui::paths::settings_directory());
     let code = status.load(std::sync::atomic::Ordering::SeqCst);
     if outcome.is_ok() && code != 0 {
         exit(code);

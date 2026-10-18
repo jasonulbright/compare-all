@@ -987,23 +987,39 @@ struct ExplorerState {
 /// The update check of one window.
 #[derive(Default)]
 struct UpdateState {
-    /// The release document asked for. None turns every check off.
-    url: Option<String>,
+    /// Where releases come from. None turns every check off.
+    source: Option<crate::update::Source>,
     /// True once the check at start has been decided.
     started: bool,
+    /// Frames drawn so far. The first check waits for a few, so the window is
+    /// up and answering before any update work starts.
+    frames: u32,
+    /// When the next scheduled check is due while the window stays open.
+    next_check: Option<std::time::Instant>,
     /// The check in flight.
     job: Option<Job<crate::update::Outcome>>,
     /// True when the check in flight was asked for from the Help menu.
     manual: bool,
     /// What the window shows until the user closes it.
     notice: Option<UpdateNotice>,
+    /// What the process reads after the window ends.
+    exit: Arc<crate::update::ExitHook>,
+    /// True while a close started by "Restart to update" runs.
+    restart_on_leave: bool,
 }
+
+/// Frames drawn before the first update check starts.
+const FRAMES_BEFORE_UPDATE_CHECK: u32 = 3;
 
 /// What the update notice shows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpdateNotice {
     /// A newer release exists.
     Newer(crate::update::Release),
+    /// A verified update is staged and waits for a restart.
+    Ready(crate::update::Release),
+    /// A newer release exists and could not be downloaded.
+    NotDownloaded(crate::update::Release),
     /// The answer to a check asked for from the Help menu.
     Message(String),
 }
@@ -1147,7 +1163,7 @@ impl App {
             ca_ui::paths::settings_directory(),
             ca_ui::paths::journal_directory(),
         );
-        app.check_updates_at(crate::update::RELEASES_URL.to_owned());
+        app.update.source = Some(crate::update::Source::published(&app.settings_directory));
         if crate::explorer::AVAILABLE {
             app.manage_explorer_menu_at(crate::explorer::MenuRoot::system());
         }
@@ -1238,7 +1254,26 @@ impl App {
     /// Ask `url` for the newest release. A window built without this call
     /// never checks.
     pub fn check_updates_at(&mut self, url: String) {
-        self.update.url = Some(url);
+        self.update.source = Some(crate::update::Source::notify_only(
+            url,
+            &self.settings_directory,
+        ));
+    }
+
+    /// Use `source` for update checks, downloads and staging.
+    pub fn update_from(&mut self, source: crate::update::Source) {
+        self.update.source = Some(source);
+    }
+
+    /// What the process reads after the window ends to apply a staged update.
+    #[must_use]
+    pub fn update_exit_hook(&self) -> Arc<crate::update::ExitHook> {
+        Arc::clone(&self.update.exit)
+    }
+
+    /// Report the way this window ends through `hook`.
+    pub fn apply_updates_on_exit(&mut self, hook: Arc<crate::update::ExitHook>) {
+        self.update.exit = hook;
     }
 
     /// What the update notice shows, while it is open.
@@ -1591,6 +1626,13 @@ impl App {
     }
 
     fn request_exit(&mut self) {
+        self.update.restart_on_leave = false;
+        self.request_exit_keeping_restart();
+    }
+
+    /// Ask the tabs whether the window may close. The caller decides whether
+    /// the close restarts the program.
+    fn request_exit_keeping_restart(&mut self) {
         self.drop_pending_workspace();
         if self.closing || self.exit_question {
             return;
@@ -1636,17 +1678,43 @@ impl App {
 
     /// Take whatever the started programs reported.
     /// Start the check at start once the options have been read.
-    fn start_update_check(&mut self, notify: &Arc<dyn Fn() + Send + Sync>) {
-        if self.update.started || !self.options.is_ready() {
+    ///
+    /// The check waits for the first frames of the window, so the window is up
+    /// and answering before any update work starts. While the window stays
+    /// open, the next scheduled check starts when the interval has passed.
+    fn start_update_check(&mut self, ctx: &egui::Context, notify: &Arc<dyn Fn() + Send + Sync>) {
+        if self.update.source.is_none() || !self.options.is_ready() {
             return;
         }
-        self.update.started = true;
+        self.update.frames = self.update.frames.saturating_add(1);
+        if self.update.frames < FRAMES_BEFORE_UPDATE_CHECK {
+            ctx.request_repaint();
+            return;
+        }
         let tweaks = &self.resolved.stored.tweaks;
-        if !tweaks.check_for_updates || self.policies.check_for_updates_disabled() {
+        let enabled = tweaks.check_for_updates && !self.policies.check_for_updates_disabled();
+        let days = tweaks.check_for_updates_days;
+        if !self.update.started {
+            self.update.started = true;
+            if enabled {
+                self.spawn_update_check(days, false, true, notify);
+            }
             return;
         }
-        let days = tweaks.check_for_updates_days;
-        self.spawn_update_check(days, false, notify);
+        let Some(at) = self.update.next_check else {
+            return;
+        };
+        if !enabled {
+            self.update.next_check = None;
+            return;
+        }
+        let now = std::time::Instant::now();
+        if now >= at {
+            self.update.next_check = None;
+            self.spawn_update_check(days, false, false, notify);
+        } else {
+            ctx.request_repaint_after((at - now).min(std::time::Duration::from_secs(3600)));
+        }
     }
 
     /// Start a check on a worker, unless one is running.
@@ -1654,22 +1722,35 @@ impl App {
         &mut self,
         days: u32,
         forced: bool,
+        at_launch: bool,
         notify: &Arc<dyn Fn() + Send + Sync>,
     ) {
         if self.update.job.is_some() || self.policies.check_for_updates_disabled() {
             return;
         }
-        let Some(url) = self.update.url.clone() else {
+        let Some(source) = self.update.source.clone() else {
             return;
         };
         let Some(current) = crate::update::Version::parse(VERSION) else {
             return;
         };
-        let mut check =
-            crate::update::Check::published(current, self.settings_directory.clone(), days, forced);
-        check.url = url;
+        let mut check = crate::update::Check::new(
+            source,
+            current,
+            self.settings_directory.clone(),
+            days,
+            forced,
+        );
+        check.report_pending = at_launch;
         self.update.manual = forced;
         self.update.job = Some(crate::update::spawn(check, Arc::clone(notify)));
+    }
+
+    /// Close the window, apply the staged update once the process has ended,
+    /// and start the program again.
+    pub fn restart_to_update(&mut self) {
+        self.update.restart_on_leave = true;
+        self.request_exit_keeping_restart();
     }
 
     /// Take what the update check found.
@@ -1687,6 +1768,12 @@ impl App {
         for outcome in outcomes {
             let notice = match outcome {
                 Outcome::Newer(release) => Some(UpdateNotice::Newer(release)),
+                Outcome::Staged(release) | Outcome::Waiting(release) => {
+                    Some(UpdateNotice::Ready(release))
+                }
+                Outcome::EarlierFailure(release) | Outcome::DownloadFailed(release, _) => {
+                    Some(UpdateNotice::NotDownloaded(release))
+                }
                 Outcome::Current if manual => Some(UpdateNotice::Message(format!(
                     "No newer release exists. This build is {VERSION}."
                 ))),
@@ -1701,14 +1788,31 @@ impl App {
         }
         if finished {
             self.update.job = None;
+            let days = self.resolved.stored.tweaks.check_for_updates_days;
+            if days > 0 && self.update.source.is_some() {
+                self.update.next_check = Some(
+                    std::time::Instant::now()
+                        + std::time::Duration::from_secs(u64::from(days) * 24 * 60 * 60),
+                );
+            }
         }
     }
 
     /// Open the page of the release the notice names in the browser.
     pub fn open_release_page(&mut self, notify: &Arc<dyn Fn() + Send + Sync>) {
-        let Some(UpdateNotice::Newer(release)) = self.update.notice.take() else {
+        let Some(UpdateNotice::Newer(release) | UpdateNotice::NotDownloaded(release)) =
+            self.update.notice.take()
+        else {
             return;
         };
+        let trusted = self
+            .update
+            .source
+            .as_ref()
+            .is_some_and(|source| release.page.starts_with(&source.endpoints.page_base));
+        if !trusted {
+            return;
+        }
         self.launches.push(ca_ui::launch::open_url_with_system(
             &release.page,
             Arc::clone(&self.spawner),
@@ -1723,6 +1827,8 @@ impl App {
         };
         let mut open = true;
         let mut visit = false;
+        let mut restart = false;
+        let mut dismiss = false;
         egui::Window::new("Check for Updates")
             .id(egui::Id::new("update-notice"))
             .anchor(egui::Align2::RIGHT_BOTTOM, [-12.0, -12.0])
@@ -1741,13 +1847,34 @@ impl App {
                     });
                     visit = ui.button("Open Release Page").clicked();
                 }
+                UpdateNotice::Ready(release) => {
+                    ui.label(format!(
+                        "Compare All {} is ready. It installs when this window closes.",
+                        release.version
+                    ));
+                    restart = ui.button("Restart to update").clicked();
+                }
+                UpdateNotice::NotDownloaded(release) => {
+                    ui.label(format!(
+                        "Version {} is available but could not be downloaded. \
+                         Open the downloads page now?",
+                        release.version
+                    ));
+                    ui.horizontal(|ui| {
+                        visit = ui.button("OK").clicked();
+                        dismiss = ui.button("Cancel").clicked();
+                    });
+                }
                 UpdateNotice::Message(text) => {
                     widgets::notice_current(ui, ca_ui::icons::Icon::Info, 24.0, text);
                 }
             });
-        if visit {
+        if restart {
+            self.update.notice = None;
+            self.restart_to_update();
+        } else if visit {
             self.open_release_page(&context.notify);
-        } else if !open {
+        } else if dismiss || !open {
             self.update.notice = None;
         }
     }
@@ -2892,7 +3019,7 @@ impl App {
             Command::Options | Command::RestoreFactoryDefaults => self.options.is_ready(),
             Command::Profiles => !self.policies.remote_profiles_disabled(),
             Command::CheckForUpdates => {
-                self.update.url.is_some()
+                self.update.source.is_some()
                     && self.update.job.is_none()
                     && !self.policies.check_for_updates_disabled()
             }
@@ -2996,7 +3123,7 @@ impl App {
                     context,
                 );
             }
-            Command::CheckForUpdates => self.spawn_update_check(0, true, &context.notify),
+            Command::CheckForUpdates => self.spawn_update_check(0, true, false, &context.notify),
             Command::CompareFilesUsing => {}
             Command::Explorer => self.reveal_active_item(context),
             Command::CompareParentFolders => {
@@ -3549,7 +3676,7 @@ impl App {
         self.poll_recovery();
         self.poll_store();
         self.poll_launches();
-        self.start_update_check(&context.notify);
+        self.start_update_check(ctx, &context.notify);
         self.poll_update();
         self.start_explorer_read(&context.notify);
         self.poll_explorer();
@@ -3638,6 +3765,16 @@ impl eframe::App for App {
         let _ = frame;
         self.frame(ctx);
         if self.closing {
+            // The window ends through its own close path, after every
+            // question the tabs asked. A Cancel never reaches this line.
+            self.update.exit.relaunch.store(
+                self.update.restart_on_leave,
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            self.update
+                .exit
+                .normal_close
+                .store(true, std::sync::atomic::Ordering::SeqCst);
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
