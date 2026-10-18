@@ -138,17 +138,19 @@ const INSTALL_CANCELLED_CODE: i32 = 1602;
 /// none was given. Windows status codes of a crashed process never set it.
 const NOT_STARTED: i32 = 0x2000_0000;
 
-/// Starts `msiexec.exe` (absolute path in `CA_MSIEXEC`) through the standard
-/// elevation prompt, waits for it, and ends with its exit code. The package
-/// path comes from `CA_UPDATE_FILE`, never from the command text.
+/// Starts the installed program (absolute path in `CA_PROGRAM`) through the
+/// standard elevation prompt with the install argument and the staging
+/// folder (`CA_UPDATE_DIR`), waits for it, and ends with its exit code. The
+/// paths come from the environment, never from the script text.
 ///
 /// Windows `PowerShell` 5.1 `Start-Process` replaces the error of a failed
 /// start with one that carries no error code, so the start goes through
 /// `Process.Start` and the error code is read from the inner exception.
 const ELEVATE_SCRIPT: &str = "$ErrorActionPreference='Stop';\
-    try{$i=[Diagnostics.ProcessStartInfo]::new($env:CA_MSIEXEC);\
-    $i.Arguments='/i \"'+$env:CA_UPDATE_FILE+'\" /passive /norestart ALLUSERS=1';\
+    try{$i=[Diagnostics.ProcessStartInfo]::new($env:CA_PROGRAM);\
+    $i.Arguments='--install-update \"'+$env:CA_UPDATE_DIR.TrimEnd('\\')+'\"';\
     $i.UseShellExecute=$true;$i.Verb='runas';\
+    $i.WorkingDirectory=$env:SystemRoot+'\\System32';\
     $p=[Diagnostics.Process]::Start($i)}\
     catch{$e=$_.Exception;\
     while($null -ne $e -and $e -isnot [ComponentModel.Win32Exception]){$e=$e.InnerException};\
@@ -163,51 +165,55 @@ pub fn elevation_error(code: Option<i32>) -> Option<i32> {
         .map(|code| code & 0xFFFF)
 }
 
-/// The command that installs `msi` as a major upgrade with a progress window
-/// and no questions. An install for every user starts the installer through
-/// the standard elevation prompt and writes no log: the folder a log could go
-/// to is writable by the user, and the installer runs with system rights.
+/// The command that installs `msi` for one user as a major upgrade with a
+/// progress window, no questions and a log at `log`.
 #[must_use]
-pub fn msi_command(msi: &Path, machine: bool, log: &Path) -> Command {
+pub fn msi_command(msi: &Path, log: &Path) -> Command {
     let root = crate::system::system_root().unwrap_or_else(|_| PathBuf::from(r"C:\Windows"));
-    let msiexec = root.join("System32").join("msiexec.exe");
-    if machine {
-        let shell = root.join("System32").join("WindowsPowerShell").join("v1.0");
-        let mut command = ca_io::host_command::host_command(shell.join("powershell.exe"));
-        command
-            .args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-NoLogo",
-                "-Command",
-                ELEVATE_SCRIPT,
-            ])
-            .env_clear()
-            .env("SystemRoot", &root)
-            .env("PSModulePath", shell.join("Modules"))
-            .current_dir(root.join("System32"));
-        // The elevation prompt expands %SystemDrive% for its caches; unset,
-        // the text is used as a folder name below the working folder.
-        if let Some(std::path::Component::Prefix(drive)) = root.components().next() {
-            command.env("SystemDrive", drive.as_os_str());
-        }
-        command
-            .env("CA_MSIEXEC", &msiexec)
-            .env("CA_UPDATE_FILE", msi);
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            command.creation_flags(CREATE_NO_WINDOW);
-        }
-        return command;
-    }
-    let mut command = ca_io::host_command::host_command(msiexec);
+    let mut command = ca_io::host_command::host_command(root.join("System32").join("msiexec.exe"));
     command
         .arg("/i")
         .arg(msi)
         .args(["/passive", "/norestart", "/L*v"])
         .arg(log);
+    command
+}
+
+/// The command that updates an install for every user: it starts `program`,
+/// the installed program, through the standard elevation prompt to install
+/// the update staged in `staging`. The prompt names that signed program. It
+/// writes no log.
+#[must_use]
+pub fn elevate_command(program: &Path, staging: &Path) -> Command {
+    let root = crate::system::system_root().unwrap_or_else(|_| PathBuf::from(r"C:\Windows"));
+    let shell = root.join("System32").join("WindowsPowerShell").join("v1.0");
+    let mut command = ca_io::host_command::host_command(shell.join("powershell.exe"));
+    command
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-NoLogo",
+            "-Command",
+            ELEVATE_SCRIPT,
+        ])
+        .env_clear()
+        .env("SystemRoot", &root)
+        .env("PSModulePath", shell.join("Modules"))
+        .current_dir(root.join("System32"));
+    // The elevation prompt expands %SystemDrive% for its caches; unset, the
+    // text is used as a folder name below the working folder.
+    if let Some(std::path::Component::Prefix(drive)) = root.components().next() {
+        command.env("SystemDrive", drive.as_os_str());
+    }
+    command
+        .env("CA_PROGRAM", program)
+        .env("CA_UPDATE_DIR", staging);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
     command
 }
 
@@ -223,6 +229,12 @@ pub fn installer_result(code: Option<i32>) -> Result<(), String> {
     match code {
         Some(0 | 1641 | 3010) => Ok(()),
         Some(DECLINED_CODE | INSTALL_CANCELLED_CODE) => Err(ELEVATION_DECLINED.to_owned()),
+        Some(crate::install::REFUSED) => {
+            Err("the installer failed its check before the install for every user".to_owned())
+        }
+        Some(crate::install::NOT_PREPARED) => {
+            Err("the install for every user could not be prepared".to_owned())
+        }
         Some(code) => Err(format!("the installer ended with code {code}")),
         None => Err("the installer was stopped".to_owned()),
     }
@@ -338,7 +350,9 @@ pub struct Trust<'a> {
 /// Apply the staged update. Returns the version installed.
 ///
 /// An installer stays open with writing, renaming and deleting refused from
-/// before its final check until the installer has ended.
+/// before its check until the installer has ended. An install for every user
+/// starts the installed program elevated, which installs from a copy of its
+/// own (see [`crate::install`]); `target_dir` is the install folder.
 ///
 /// # Errors
 /// Returns why the update was not applied. The caller leaves the installed
@@ -393,9 +407,12 @@ pub fn apply_staged(
     let result =
         verify_and_hold(&file, &expected, trust.signer, &scratch).and_then(|held| {
             match (mode, held) {
-                (InstallMode::Installed { machine }, _) => {
-                    let log = staging.dir().join("installer.log");
-                    install(msi_command(&file, machine, &log))
+                (InstallMode::Installed { machine: true }, _) => install(elevate_command(
+                    &target_dir.join(crate::install::PROGRAM_NAME),
+                    staging.dir(),
+                )),
+                (InstallMode::Installed { machine: false }, _) => {
+                    install(msi_command(&file, &staging.dir().join("installer.log")))
                 }
                 (InstallMode::Portable, Some(unpacked)) => {
                     apply_unpacked(target_dir, &unpacked, before_each)

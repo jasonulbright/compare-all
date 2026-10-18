@@ -37,6 +37,24 @@ fn main() -> eframe::Result {
     // The update helper is a copy of this program started after the window
     // ended. It opens no window and reads no settings.
     let arguments: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    // The elevated step of an update of an install for every user, started by
+    // the helper through the elevation prompt. It opens no window and reads
+    // no settings.
+    if let Some(staging) = ca_update::install::parse_install_arguments(&arguments) {
+        let Some(running) = ca_update::Version::parse(ca_app::VERSION) else {
+            std::process::exit(ca_update::install::NOT_PREPARED);
+        };
+        let verifier = ca_update::signature::system_verifier();
+        let code = ca_update::install::install_main(
+            &staging,
+            &ca_update::install::Checks {
+                signer: verifier.as_ref(),
+                signer_name: ca_update::signature::RELEASE_SIGNER,
+                running: &running,
+            },
+        );
+        std::process::exit(code);
+    }
     if let Some(helper) = ca_update::apply::parse_helper_arguments(&arguments) {
         let Some(running) = ca_update::Version::parse(ca_app::VERSION) else {
             std::process::exit(1);

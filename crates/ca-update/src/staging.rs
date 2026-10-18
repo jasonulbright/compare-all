@@ -181,6 +181,19 @@ impl Staging {
         }
     }
 
+    /// The staged record, if one exists and is structurally sound. Unlike
+    /// [`Staging::read_record`] it changes nothing in the folder, for a reader
+    /// that must not write there.
+    #[must_use]
+    pub fn peek_record(&self) -> Option<StagedRecord> {
+        let path = self.dir.join(RECORD_FILE);
+        if std::fs::metadata(&path).ok()?.len() > MAX_RECORD_BYTES {
+            return None;
+        }
+        let record: StagedRecord = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+        record.is_consistent().then_some(record)
+    }
+
     /// Keep `record`.
     ///
     /// # Errors
