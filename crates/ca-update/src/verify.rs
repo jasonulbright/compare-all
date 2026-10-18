@@ -596,13 +596,15 @@ pub fn unpack_release_zip(zip_path: &Path, destination: &Path) -> Result<Unpacke
 }
 
 #[cfg(test)]
+#[path = "../tests/support/pe.rs"]
+mod fixture;
+
+#[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
-    #[path = "../../../tests/support/pe.rs"]
-    mod fixture;
-    use fixture::pe;
+    use super::fixture::pe;
 
     fn version(text: &str) -> Version {
         Version::parse(text).unwrap()
