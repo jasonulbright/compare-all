@@ -387,9 +387,18 @@ pub fn set_aside_observed(
         return Err(link_failure_code(&error));
     }
     after_step();
-    // The copy is created in the install folder, so it gets the access list
-    // of that folder.
-    if copy_flushed(program, &standby).is_err() {
+    // A token may make its account the owner of new objects, and an owner
+    // can change the access list from an unelevated process. The copy is
+    // written in the work folder, where an owner may only read, and moves to
+    // the install folder only once administrators own it; it then takes the
+    // access list of the install folder.
+    let fresh = work.join(STANDBY_NAME);
+    let prepared = copy_flushed(program, &fresh).is_ok()
+        && own_by_administrators(&fresh).is_ok()
+        && std::fs::rename(&fresh, &standby).is_ok()
+        && inherit_access_list(&standby).is_ok();
+    if !prepared {
+        let _ = std::fs::remove_file(&fresh);
         let _ = std::fs::remove_file(&standby);
         let _ = std::fs::remove_file(&moved);
         return Err(KEPT);
@@ -725,8 +734,9 @@ fn hold_lock(path: &Path) -> std::io::Result<std::fs::File> {
 fn restrict_to_administrators(folder: &Path) -> Result<(), String> {
     // An owner has implicit rights to change the access list. Without an
     // explicit owner, the owner is whatever the token gives new objects,
-    // which policy can set to the account of the administrator.
-    icacls(folder, &["/setowner", "*S-1-5-32-544", "/q"])?;
+    // which policy can set to the account of the administrator. The owner
+    // rights entry limits the owner of each new child to reading it.
+    own_by_administrators(folder)?;
     icacls(
         folder,
         &[
@@ -734,19 +744,32 @@ fn restrict_to_administrators(folder: &Path) -> Result<(), String> {
             "/grant:r",
             "*S-1-5-32-544:(OI)(CI)F",
             "*S-1-5-18:(OI)(CI)F",
+            "*S-1-3-4:(OI)(CI)(IO)R",
             "/q",
         ],
     )
 }
 
+/// Make administrators the owner of `path`.
 #[cfg(windows)]
-fn icacls(folder: &Path, arguments: &[&str]) -> Result<(), String> {
+fn own_by_administrators(path: &Path) -> Result<(), String> {
+    icacls(path, &["/setowner", "*S-1-5-32-544", "/q"])
+}
+
+/// Replace the access list of `path` by the one its folder gives.
+#[cfg(windows)]
+fn inherit_access_list(path: &Path) -> Result<(), String> {
+    icacls(path, &["/reset", "/q"])
+}
+
+#[cfg(windows)]
+fn icacls(path: &Path, arguments: &[&str]) -> Result<(), String> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let root = crate::system::system_root()?;
     let system = root.join("System32");
     let status = ca_io::host_command::host_command(system.join("icacls.exe"))
-        .arg(folder)
+        .arg(path)
         .args(arguments)
         .env_clear()
         .env("SystemRoot", &root)
@@ -756,16 +779,26 @@ fn icacls(folder: &Path, arguments: &[&str]) -> Result<(), String> {
         .stderr(std::process::Stdio::null())
         .creation_flags(CREATE_NO_WINDOW)
         .status()
-        .map_err(|error| format!("cannot restrict the work folder: {error}"))?;
+        .map_err(|error| format!("cannot set the access list: {error}"))?;
     if status.success() {
         Ok(())
     } else {
-        Err("cannot restrict the work folder".to_owned())
+        Err(format!("cannot set the access list of {}", path.display()))
     }
 }
 
 #[cfg(not(windows))]
 fn restrict_to_administrators(_: &Path) -> Result<(), String> {
+    Err("this platform has no installer for every user".to_owned())
+}
+
+#[cfg(not(windows))]
+fn own_by_administrators(_: &Path) -> Result<(), String> {
+    Err("this platform has no installer for every user".to_owned())
+}
+
+#[cfg(not(windows))]
+fn inherit_access_list(_: &Path) -> Result<(), String> {
     Err("this platform has no installer for every user".to_owned())
 }
 
