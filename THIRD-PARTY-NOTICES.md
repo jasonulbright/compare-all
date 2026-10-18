@@ -3844,7 +3844,7 @@ DEALINGS IN THE SOFTWARE.
 
 ## MIT License (MIT)
 
-Used by: `rustls 0.23.45`
+Used by: `rustls 0.23.46`
 
 ```text
 Copyright (c) 2016 Joseph Birr-Pixton <jpixton@gmail.com>
