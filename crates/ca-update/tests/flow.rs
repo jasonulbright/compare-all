@@ -1185,6 +1185,29 @@ fn a_stalled_download_ends_after_the_idle_limit() {
 }
 
 #[test]
+fn a_trickling_download_ends_at_the_download_deadline() {
+    use ca_update::net::Transport;
+    // One byte each 100 ms never reaches the idle limit.
+    let body = vec![7u8; 600];
+    let base = trickle_server(body.clone(), 1, Duration::from_millis(100), None);
+    let transport = HttpTransport::new(
+        "compare-all/test".to_owned(),
+        ProxyConfig::direct(),
+        Duration::from_secs(1),
+    )
+    .with_download_deadline(Duration::from_secs(3))
+    .allowing_plain_http();
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("file.part");
+    let cancel = Arc::new(AtomicBool::new(false));
+    let started = std::time::Instant::now();
+    let result = transport.download(&format!("{base}/f"), &out, 512 * 1024 * 1024, &cancel);
+    let waited = started.elapsed();
+    assert!(result.is_err(), "{result:?}");
+    assert!(waited < Duration::from_secs(20), "{waited:?}");
+}
+
+#[test]
 fn a_stalled_download_closes_its_connection_after_the_idle_limit() {
     use ca_update::net::Transport;
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
