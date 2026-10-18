@@ -1788,6 +1788,34 @@ fn the_elevated_program_needs_its_own_argument_and_one_folder() {
     );
 }
 
+/// The helper copy is held from its write until the helper runs from it.
+#[cfg(windows)]
+#[test]
+fn the_helper_copy_cannot_be_replaced_before_it_starts() {
+    let root = ca_update::system::system_root().unwrap();
+    let source = root.join("System32").join("where.exe");
+    let dir = tempfile::tempdir().unwrap();
+    let copy = dir.path().join("helper.exe");
+    std::fs::write(&copy, b"left from an earlier run").unwrap();
+    let held = ca_update::verify::copy_held(&source, &copy).unwrap();
+    assert_eq!(
+        std::fs::read(&copy).unwrap(),
+        std::fs::read(&source).unwrap()
+    );
+    assert!(std::fs::write(&copy, b"other program").is_err());
+    assert!(std::fs::rename(&copy, dir.path().join("moved.exe")).is_err());
+    assert!(std::fs::remove_file(&copy).is_err());
+    // The system starts a program from the held copy.
+    let status = ca_io::host_command::host_command(&copy)
+        .arg("/?")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.code().is_some());
+    drop(held);
+}
+
 /// The access list of `folder` in the system's text form.
 #[cfg(windows)]
 fn access_list(folder: &Path) -> String {

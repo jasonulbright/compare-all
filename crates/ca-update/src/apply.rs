@@ -260,7 +260,9 @@ fn wait_until_free(executable: &Path, limit: Duration) -> Result<(), String> {
     }
 }
 
-/// Start the helper from a copy of the running program.
+/// Start the helper from a copy of the running program. The copy stays held
+/// against writing, renaming and deleting from its write until the helper
+/// runs from it, so the program that starts is the program that was copied.
 ///
 /// # Errors
 /// Returns why the helper could not be started. The staged update is then
@@ -273,7 +275,7 @@ pub fn spawn_helper(
 ) -> Result<(), String> {
     let folder = staging.helper_dir()?;
     let copy = folder.join(format!("compare-all-update-{}.exe", std::process::id()));
-    std::fs::copy(executable, &copy)
+    let held = crate::verify::copy_held(executable, &copy)
         .map_err(|error| format!("cannot copy the program: {error}"))?;
     let mut command = ca_io::host_command::host_command(&copy);
     command
@@ -295,6 +297,7 @@ pub fn spawn_helper(
     let mut child = command
         .spawn()
         .map_err(|error| format!("cannot start the update: {error}"))?;
+    drop(held);
     // The writing end of the helper's input stays open until this process
     // ends; the helper of an install for every user waits for that end.
     std::mem::forget(child.stdin.take());
