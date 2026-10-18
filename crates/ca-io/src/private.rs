@@ -8,7 +8,10 @@ use std::path::{Path, PathBuf};
 ///
 /// Missing parents are created with default permissions. An existing link is
 /// refused, so a link planted at `folder` cannot send the contents elsewhere.
-/// On Unix every check and the narrowing act on the opened folder, so a swap
+/// On Unix a link is accepted when its target is a folder of the running user
+/// that no group and no other user can open, and the target is left as it is.
+/// Windows cannot read the owner or the access list of a target without
+/// unsafe code, so a link or junction is always refused there. On Unix every check and the narrowing act on the opened folder, so a swap
 /// of the path after the open changes nothing.
 ///
 /// # Errors
@@ -111,7 +114,7 @@ fn adopt_folder(folder: &Path, between: impl FnOnce()) -> io::Result<()> {
             return if std::fs::symlink_metadata(folder)
                 .is_ok_and(|metadata| metadata.file_type().is_symlink())
             {
-                Err(link_refused(folder))
+                accept_linked_folder(folder)
             } else {
                 Err(error)
             };
@@ -123,6 +126,22 @@ fn adopt_folder(folder: &Path, between: impl FnOnce()) -> io::Result<()> {
         handle.set_permissions(std::fs::Permissions::from_mode(0o700))?;
     }
     Ok(())
+}
+
+/// Accept the link at `folder` only when its target is a private folder of
+/// the running user. The target is not changed.
+#[cfg(unix)]
+fn accept_linked_folder(folder: &Path) -> io::Result<()> {
+    let handle = open_folder(folder, true).map_err(|_| link_refused(folder))?;
+    check_handle(&handle, folder, true).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "{} is a link to a folder that is not private to you",
+                folder.display()
+            ),
+        )
+    })
 }
 
 /// Check that `folder` is a folder and, on Unix, that the running user owns
@@ -235,6 +254,53 @@ mod tests {
         std::os::unix::fs::symlink(&target, &link).unwrap();
         let error = create_owned_folder(&link).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_to_a_private_folder_of_the_user_is_accepted() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let parent = tempfile::tempdir().unwrap();
+        let target = parent.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let link = parent.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        create_owned_folder(&link).unwrap();
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_to_anything_else_is_refused() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let parent = tempfile::tempdir().unwrap();
+        let open = parent.path().join("open");
+        std::fs::create_dir(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let file = parent.path().join("file");
+        std::fs::write(&file, b"x").unwrap();
+        let cases = [
+            ("open", open),
+            ("file", file),
+            ("missing", parent.path().join("missing")),
+        ];
+        for (name, target) in cases {
+            let link = parent.path().join(format!("link-{name}"));
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            let error = create_owned_folder(&link).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied, "{name}");
+        }
+        let mode = std::fs::metadata(parent.path().join("open"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o755,
+            "the target of a refused link is left alone"
+        );
     }
 
     #[cfg(unix)]
