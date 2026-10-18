@@ -1990,9 +1990,18 @@ fn run_as(program: &Path) -> std::process::Child {
         .unwrap()
 }
 
+/// True when `path` cannot be opened for writing for 3 s. A file scanner
+/// holds a new file for a short time after it is written or renamed.
 #[cfg(windows)]
 fn in_use(path: &Path) -> bool {
-    std::fs::OpenOptions::new().write(true).open(path).is_err()
+    let started = std::time::Instant::now();
+    while std::fs::OpenOptions::new().write(true).open(path).is_err() {
+        if started.elapsed() >= Duration::from_secs(3) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    false
 }
 
 /// The running program file is set aside before the installer runs. An
@@ -2015,7 +2024,10 @@ fn the_install_folder_keeps_a_program_file_the_installer_can_replace() {
         std::fs::remove_file(&program).unwrap();
         let mut child = run_as(&program);
         let original = std::fs::read(&program).unwrap();
-        assert!(in_use(&program));
+        assert!(std::fs::OpenOptions::new()
+            .write(true)
+            .open(&program)
+            .is_err());
         // (the program file has the original bytes, the file is in use)
         let state = || {
             (
