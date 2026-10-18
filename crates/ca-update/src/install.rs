@@ -96,7 +96,8 @@ pub fn install_folder_closed(program: &Path) -> bool {
 /// True when the elevated step can set `program` aside in a work folder in
 /// `work_parent`: the install folder is on the volume of `work_parent`,
 /// which a second name of the program file needs, and it is closed to other
-/// accounts.
+/// accounts. A volume without access lists, such as FAT, gives every object
+/// the owner Everyone and no access list, so it fails the closed check.
 #[must_use]
 pub fn install_folder_usable(program: &Path, work_parent: &Path) -> bool {
     program
