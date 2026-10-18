@@ -1000,3 +1000,29 @@ fn the_account_home_is_read_from_a_password_line() {
     assert_eq!(super::home_of(database, 4242), None);
     assert_eq!(super::home_of(b"nohome:x:7:7:::/bin/sh\n", 7), None);
 }
+
+#[test]
+fn a_user_list_that_begins_with_the_oldest_adds_of_sharun_loses_them() {
+    let root = "/tmp/.mount_comparOIliDD";
+    for (name, user, kept) in [
+        ("XDG_DATA_DIRS", "/etc:/x", "/x"),
+        (
+            "GBM_BACKENDS_PATH",
+            "/run/opengl-driver/lib/gbm:/opt/gbm",
+            "/opt/gbm",
+        ),
+    ] {
+        let from_user = sharun_start(&host_session(&[(name, user)]), root, HOST_VENDOR_FOLDERS);
+        let from_rest = sharun_start(&host_session(&[(name, kept)]), root, HOST_VENDOR_FOLDERS);
+        assert_eq!(
+            from_user.get(OsStr::new(name)),
+            from_rest.get(OsStr::new(name)),
+            "{name}: the two starts cannot be told apart"
+        );
+        assert_eq!(
+            clean(&from_user).get(OsStr::new(name)),
+            Some(&OsString::from(kept)),
+            "{name}"
+        );
+    }
+}

@@ -169,9 +169,18 @@ enum Added {
 
 /// The adds of sharun to each list it builds, in the order it makes them, in
 /// groups it makes all or none of. Each add prepends the folder unless the
-/// value already holds it, so the user's own value is the tail behind the
-/// added folders. The lists mirror what the deployment tool adds; a mismatch
-/// leaves an added folder in a host child's environment.
+/// value already holds it.
+///
+/// The undo reads the added folders off the front of the value, so it is exact
+/// only when the value that sharun received does not begin with its oldest
+/// adds. A user value that begins with them in order (`XDG_DATA_DIRS=/etc:/x`)
+/// gives the same string as the value without them (`/x`), and the child gets
+/// the shorter list. Two cases leave sharun's folders in the child: a folder
+/// from `SHARUN_MESA_PATH`, which sharun adds in front of the image entry
+/// and the undo does not model, and a `HOME` that changed after sharun ran,
+/// which changes the `.local/share` entry. The lists mirror what the
+/// deployment tool adds; a mismatch leaves an added folder in a host child's
+/// environment.
 const BUILT_LISTS: &[(&str, &[&[Added]])] = &[
     (
         "XDG_DATA_DIRS",
