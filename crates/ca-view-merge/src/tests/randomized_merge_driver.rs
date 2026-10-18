@@ -832,17 +832,28 @@ fn made_by_edits(view: &MergeView, owned: &Owned) -> HashMap<String, usize> {
 /// After a reload or Swap Sides: a token the output shows more often than
 /// the text before it did, and more often than the inputs show it in the
 /// new merge. A copy an edit made before, `made`, stays next to the copies
-/// of the inputs, so it counts on top of them.
+/// of the inputs, so it counts on top of them. A copy whose characters
+/// belong to more than one section after the reload is no copy of a line:
+/// a reload that takes a lender's piece out of a joined line leaves the
+/// pieces around it side by side.
 fn reload_duplicate(
     view: &MergeView,
     before_counts: &HashMap<String, usize>,
     made: &HashMap<String, usize>,
 ) -> Option<String> {
     let allowance = input_allowance(view.model());
-    let mut shown: Vec<(String, usize)> = counts(&view.output_text()).into_iter().collect();
+    let owned = owned_text(view);
+    let mut composed: HashMap<String, usize> = HashMap::new();
+    for (token, start, end) in token_spans(&owned.text) {
+        if single_owner(&owned.owners[start..end]).is_none() {
+            *composed.entry(token).or_insert(0) += 1;
+        }
+    }
+    let mut shown: Vec<(String, usize)> = counts(&owned.text).into_iter().collect();
     shown.sort();
     shown.into_iter().find_map(|(token, count)| {
-        let made = made.get(&token).copied().unwrap_or(0);
+        let composed = composed.get(&token).copied().unwrap_or(0);
+        let made = made.get(&token).copied().unwrap_or(0).max(composed);
         let before = before_counts.get(&token).copied().unwrap_or(0);
         let allowed = allowance
             .get(&token)
@@ -2121,4 +2132,57 @@ fn the_take_all_duplicate_oracle_reports_a_line_shown_twice() {
         take_all_duplicate(&view, &before).as_deref(),
         Some("[c] x2, 1 allowed")
     );
+}
+
+const PIECES: [&str; 2] = [
+    "[l1]\n[u2]\n[u3]\n[u4]\n[l5]\n[u6]\n[u7]\n[u8]\n[l9]\n[u10]\n[u11]\n[u12]\n",
+    "[c1]\n[u2]\n[u3]\n[u4]\n[c5]\n[u6]\n[u7]\n[u8]\n[c9]\n[u10]\n[u11]\n[u12]\n",
+];
+
+/// s0 holds `[lZ` of s2, with the typed `Z`, and `9]` of s4 on its line.
+/// The left input then changes the line of s2. The reload replaces s2, so
+/// its piece leaves s0, and `[l1` and `9]` end up side by side. The joined
+/// token is in no input and was not shown before, but no section shows a
+/// line twice: the oracle reports nothing. A real second copy of a line
+/// is still a finding.
+#[test]
+fn the_reload_duplicate_oracle_accepts_pieces_a_dropped_lender_leaves_side_by_side() {
+    for separation in [1, 2] {
+        let (mut view, dir) = open_separated(PIECES[0], Some(PIECES[1]), PIECES[1], separation);
+        run_until_ready(&mut view);
+        view.focus = crate::Pane::Output;
+        view.output_pane.place(Caret::new(0, 3), false);
+        view.output_pane.place(Caret::new(4, 0), true);
+        view.output_pane.backspace();
+        view.absorb_output_edits();
+        view.output_pane.place(Caret::new(0, 5), false);
+        view.output_pane.place(Caret::new(4, 2), true);
+        view.output_pane.type_character('Z');
+        view.absorb_output_edits();
+        assert_eq!(pane_text(&view), "[l1[lZ9]\n[u10]\n[u11]\n[u12]\n");
+        let before = counts(&pane_text(&view));
+        let made = made_by_edits(&view, &owned_text(&view));
+        let changed = PIECES[0].replace("[l5]", "[d5]");
+        std::fs::write(dir.path().join("left.txt"), changed).unwrap();
+        view.run(Command::Reload);
+        run_until_ready(&mut view);
+        assert_eq!(pane_text(&view), "[l19]\n[d5]\n[u10]\n[u11]\n[u12]\n");
+        assert_eq!(owned_text(&view).problems, Vec::<String>::new());
+        assert_eq!(view.model().lent_record_problems(), Vec::<String>::new());
+        assert_eq!(reload_duplicate(&view, &before, &made), None);
+        let last = view.model().sections().len() - 1;
+        view.data.model.set_edited(
+            last,
+            vec![
+                "[u10]\n".to_owned(),
+                "[u10]\n".to_owned(),
+                "[u11]\n".to_owned(),
+                "[u12]\n".to_owned(),
+            ],
+        );
+        assert_eq!(
+            reload_duplicate(&view, &before, &made).as_deref(),
+            Some("[u10] x2, 1 allowed")
+        );
+    }
 }
