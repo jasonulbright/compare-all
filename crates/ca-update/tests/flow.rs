@@ -2065,11 +2065,15 @@ fn the_work_folder_is_open_to_administrators_and_the_system_only() {
     assert!(!left.exists());
     assert!(other.exists());
 
-    let work = prepare_work_folder(parent.path()).unwrap();
-    assert_eq!(
-        work.file_name().unwrap().to_string_lossy(),
-        format!("{WORK_FOLDER_PREFIX}{}", std::process::id())
-    );
+    let held = prepare_work_folder(parent.path()).unwrap();
+    let work = held.path().to_path_buf();
+    assert!(work
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .starts_with(&format!("{WORK_FOLDER_PREFIX}{}-", std::process::id())));
+    // Owned by Administrators whatever owner the token gives new objects.
+    assert_eq!(owner_of(&work), "O:BA");
     let acl = access_list(&work);
     let dacl = acl
         .split("D:")
@@ -2090,5 +2094,46 @@ fn the_work_folder_is_open_to_administrators_and_the_system_only() {
         .status()
         .unwrap();
     assert!(status.success());
+    drop(held);
     std::fs::remove_dir_all(&work).unwrap();
+}
+
+/// The owner of `path` in the system's text form.
+#[cfg(windows)]
+fn owner_of(path: &Path) -> String {
+    let root = ca_update::system::system_root().unwrap();
+    let output = ca_io::host_command::host_command(
+        root.join(r"System32\WindowsPowerShell\v1.0\powershell.exe"),
+    )
+    .args(["-NoProfile", "-NonInteractive", "-Command"])
+    .arg("(Get-Acl -LiteralPath $env:CA_TARGET).GetSecurityDescriptorSddlForm('Owner')")
+    .env("CA_TARGET", path)
+    .output()
+    .unwrap();
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+#[cfg(windows)]
+#[test]
+fn a_sweep_removes_only_the_work_folders_of_ended_steps() {
+    use ca_update::install::{prepare_work_folder, sweep_work_folders, WORK_FOLDER_PREFIX};
+    let parent = tempfile::tempdir().unwrap();
+    let first = prepare_work_folder(parent.path()).unwrap();
+    let second = prepare_work_folder(parent.path()).unwrap();
+    assert_ne!(first.path(), second.path());
+    std::fs::write(first.path().join("copy.msi"), b"in use").unwrap();
+    std::fs::write(second.path().join("copy.msi"), b"in use").unwrap();
+    // A folder without a lock: left by a step that ended before it held one.
+    let stale = parent.path().join(format!("{WORK_FOLDER_PREFIX}1"));
+    std::fs::create_dir(&stale).unwrap();
+    std::fs::write(stale.join("old.msi"), b"old").unwrap();
+    sweep_work_folders(parent.path());
+    assert!(first.path().join("copy.msi").exists());
+    assert!(second.path().join("copy.msi").exists());
+    assert!(!stale.exists());
+    let ended = first.path().to_path_buf();
+    drop(first);
+    sweep_work_folders(parent.path());
+    assert!(!ended.exists());
+    assert!(second.path().join("copy.msi").exists());
 }

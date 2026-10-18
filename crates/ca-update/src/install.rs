@@ -170,13 +170,15 @@ pub fn install_main(staging: &Path, checks: &Checks<'_>) -> i32 {
     };
     let code = install_from(
         &Staging::new(staging),
-        &work,
+        work.path(),
         Some(&program),
         checks,
         &run_installer,
     );
-    if std::fs::remove_dir_all(&work).is_err() {
-        remove_after_exit(&work);
+    let path = work.path().to_path_buf();
+    drop(work);
+    if std::fs::remove_dir_all(&path).is_err() {
+        remove_after_exit(&path);
     }
     code
 }
@@ -372,41 +374,110 @@ fn run_installer(mut command: Command) -> Option<i32> {
     command.status().ok().and_then(|status| status.code())
 }
 
-/// Create the work folder of this process in `parent` and give it an access
-/// list of its own: full control for administrators and the system, no
-/// inherited entries, so no other account can open or change it.
+/// The file each elevated step keeps open in its work folder while it runs.
+const LOCK_NAME: &str = "running.lock";
+
+/// The work folder of one elevated step. While this value lives, the lock
+/// file in the folder stays open without delete sharing, so a sweep by
+/// another elevated step cannot remove it and leaves the folder alone.
+#[derive(Debug)]
+pub struct WorkFolder {
+    path: PathBuf,
+    _lock: std::fs::File,
+}
+
+impl WorkFolder {
+    /// The folder.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// Create a work folder of its own in `parent`, hold its lock file, make
+/// administrators its owner and give it an access list of its own: full
+/// control for administrators and the system, no inherited entries, so no
+/// other account can open or change it.
+///
+/// A sweep by another elevated step can remove a new folder before its lock
+/// is held; the creation then starts again under another name.
 ///
 /// # Errors
 /// Returns why the folder could not be created or restricted; the folder is
 /// then removed.
-pub fn prepare_work_folder(parent: &Path) -> Result<PathBuf, String> {
-    let work = parent.join(format!("{WORK_FOLDER_PREFIX}{}", std::process::id()));
-    if work.exists() {
-        std::fs::remove_dir_all(&work).map_err(|error| error.to_string())?;
+pub fn prepare_work_folder(parent: &Path) -> Result<WorkFolder, String> {
+    const ATTEMPTS: u32 = 8;
+    let mut reason = String::from("cannot create the work folder");
+    for attempt in 0..ATTEMPTS {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_nanos());
+        let path = parent.join(format!(
+            "{WORK_FOLDER_PREFIX}{}-{stamp:x}{attempt}",
+            std::process::id()
+        ));
+        if let Err(error) = std::fs::create_dir(&path) {
+            reason = error.to_string();
+            continue;
+        }
+        let lock = match hold_lock(&path.join(LOCK_NAME)) {
+            Ok(lock) => lock,
+            Err(error) => {
+                reason = error.to_string();
+                let _ = std::fs::remove_dir_all(&path);
+                continue;
+            }
+        };
+        if let Err(error) = restrict_to_administrators(&path) {
+            drop(lock);
+            let _ = std::fs::remove_dir_all(&path);
+            return Err(error);
+        }
+        return Ok(WorkFolder { path, _lock: lock });
     }
-    std::fs::create_dir(&work).map_err(|error| error.to_string())?;
-    if let Err(error) = restrict_to_administrators(&work) {
-        let _ = std::fs::remove_dir_all(&work);
-        return Err(error);
+    Err(reason)
+}
+
+/// Create the lock file at `path` and keep it open with only read sharing.
+fn hold_lock(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 1;
+        options.share_mode(FILE_SHARE_READ);
     }
-    Ok(work)
+    options.open(path)
 }
 
 #[cfg(windows)]
 fn restrict_to_administrators(folder: &Path) -> Result<(), String> {
+    // An owner has implicit rights to change the access list. Without an
+    // explicit owner, the owner is whatever the token gives new objects,
+    // which policy can set to the account of the administrator.
+    icacls(folder, &["/setowner", "*S-1-5-32-544", "/q"])?;
+    icacls(
+        folder,
+        &[
+            "/inheritance:r",
+            "/grant:r",
+            "*S-1-5-32-544:(OI)(CI)F",
+            "*S-1-5-18:(OI)(CI)F",
+            "/q",
+        ],
+    )
+}
+
+#[cfg(windows)]
+fn icacls(folder: &Path, arguments: &[&str]) -> Result<(), String> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let root = crate::system::system_root()?;
     let system = root.join("System32");
     let status = ca_io::host_command::host_command(system.join("icacls.exe"))
         .arg(folder)
-        .args([
-            "/inheritance:r",
-            "/grant:r",
-            "*S-1-5-32-544:(OI)(CI)F",
-            "*S-1-5-18:(OI)(CI)F",
-            "/q",
-        ])
+        .args(arguments)
         .env_clear()
         .env("SystemRoot", &root)
         .current_dir(&system)
@@ -428,17 +499,25 @@ fn restrict_to_administrators(_: &Path) -> Result<(), String> {
     Err("this platform has no installer for every user".to_owned())
 }
 
-/// Remove the work folders that earlier elevated steps left in `parent`.
-/// Folders still in use stay.
+/// Remove the work folders of elevated steps that have ended. A folder
+/// whose lock file cannot be removed belongs to a step that still runs and
+/// stays; a folder without a lock file is left from a step that ended.
 pub fn sweep_work_folders(parent: &Path) {
     let Ok(entries) = std::fs::read_dir(parent) else {
         return;
     };
     for entry in entries.flatten() {
         let name = entry.file_name();
-        if name.to_string_lossy().starts_with(WORK_FOLDER_PREFIX)
-            && entry.file_type().is_ok_and(|kind| kind.is_dir())
+        if !name.to_string_lossy().starts_with(WORK_FOLDER_PREFIX)
+            || !entry.file_type().is_ok_and(|kind| kind.is_dir())
         {
+            continue;
+        }
+        let ended = match std::fs::remove_file(entry.path().join(LOCK_NAME)) {
+            Ok(()) => true,
+            Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+        };
+        if ended {
             let _ = std::fs::remove_dir_all(entry.path());
         }
     }
