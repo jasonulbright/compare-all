@@ -418,7 +418,7 @@ impl Command {
             (Self::PreviousConflict, MenuView::Merge) => Some("Alt+P"),
             (Self::NextDifference, MenuView::Folder) => Some("Ctrl+N"),
             (Self::PreviousDifference, MenuView::Folder) => Some("Ctrl+P"),
-            (Self::SelectAllFiles, MenuView::Folder) => Some("Ctrl+Shift+A"),
+            (Self::SelectAllFiles, MenuView::Merge | MenuView::Folder) => Some("Ctrl+Shift+A"),
             (Self::RefreshSelection, MenuView::Folder) => Some("Shift+F5"),
             (Self::Rename, MenuView::Folder) => Some("F2"),
             (Self::NewFolder, MenuView::Folder) => Some("Ins"),
@@ -850,6 +850,7 @@ fn merge(stroke: Keystroke) -> Option<Command> {
         (true, true, Key::B) => Some(Command::TakeRightThenLeft),
         (true, true, Key::L) => Some(Command::TakeLeftLine),
         (true, true, Key::R) => Some(Command::TakeRightLine),
+        (true, true, Key::A) => Some(Command::SelectAllFiles),
         _ => None,
     }
 }
@@ -906,6 +907,7 @@ pub fn bindings(view: MenuView) -> Vec<(Keystroke, Command)> {
         strokes.extend([
             Keystroke::with_command(Key::B),
             Keystroke::with_command_shift(Key::B),
+            Keystroke::with_command_shift(Key::A),
             Keystroke::with_alt(Key::N),
             Keystroke::with_alt(Key::P),
         ]);

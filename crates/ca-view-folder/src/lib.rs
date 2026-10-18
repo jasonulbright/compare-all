@@ -7,9 +7,10 @@
 //! the disk that was not shown first.
 
 pub mod dialogs;
-
+pub mod find;
 pub mod jobs;
 pub mod merge_view;
+mod navigate;
 pub mod operations;
 pub mod opjobs;
 
@@ -95,6 +96,8 @@ const NOTHING_TO_COPY: &str = "Select the items to copy first";
 const NO_ITEMS_TO_COPY: &str = "There is nothing to copy";
 /// Why no copy can happen when filters hide all comparison rows.
 const FILTER_HIDES_ITEMS: &str = "The current filters hide every item";
+/// Why a read of the folders waits for the scan or operation that is open.
+const READ_BUSY: &str = "Available once the current scan or operation finishes";
 /// Why a folder operation waits for its scan.
 const SCAN_NOT_READY: &str = "Available once the folder scan finishes";
 /// Why a copy or operation waits after the scan failed.
@@ -123,6 +126,12 @@ const HANDLED: &[Command] = &[
     Command::CompareContents,
     Command::SwapSides,
     Command::Reload,
+    Command::Recompare,
+    Command::NextDifference,
+    Command::PreviousDifference,
+    Command::Find,
+    Command::FindNext,
+    Command::FindPrevious,
     Command::Cancel,
     Command::SelectAll,
     Command::SelectAllFiles,
@@ -340,6 +349,7 @@ pub struct FolderView {
     filter: DisplayFilter,
     folder_filter: FolderDisplayFilter,
     name_filter: String,
+    find: find::NameFind,
     /// The session's settings, which the scan and the comparison options are
     /// derived from.
     session_settings: ca_session::settings::FolderCompareSettings,
@@ -525,6 +535,7 @@ impl FolderView {
             filter: DisplayFilter::ShowAll,
             folder_filter: FolderDisplayFilter::default(),
             name_filter: String::new(),
+            find: find::NameFind::default(),
             session_settings: ca_session::settings::FolderCompareSettings::default(),
             confirmations: ca_session::options::FileOperationOptions::default(),
             backups: None,
@@ -932,6 +943,23 @@ impl FolderView {
     #[must_use]
     pub fn rows(&self) -> &[FlatRow] {
         &self.rows
+    }
+
+    /// The text the file name search looks for.
+    #[must_use]
+    pub fn find_text(&self) -> &str {
+        self.find.text()
+    }
+
+    /// True while the file name search bar is on screen.
+    #[must_use]
+    pub const fn find_is_open(&self) -> bool {
+        self.find.is_open()
+    }
+
+    /// Replace the text the file name search looks for.
+    pub fn set_find_text(&mut self, text: &str) {
+        self.find.set_text(text);
     }
 
     /// The settings of the session this view shows, as they now stand.
@@ -3599,6 +3627,7 @@ impl SessionView for FolderView {
                 self.preview_grid(ui);
             });
         }
+        self.find_bar(ui);
         if self.show_errors {
             egui::TopBottomPanel::bottom(self.id.with("errors-panel")).show_inside(ui, |ui| {
                 self.errors_panel(ui);
@@ -3627,6 +3656,14 @@ impl SessionView for FolderView {
 
     fn refusal(&self, command: Command) -> Option<&'static str> {
         match command {
+            Command::NextDifference | Command::PreviousDifference if !self.accepts(command) => {
+                Some(navigate::NO_DIFFERENCE)
+            }
+            Command::Reload | Command::Recompare if !self.accepts(command) => Some(READ_BUSY),
+            Command::Find if !self.accepts(command) => self.find_refusal(false),
+            Command::FindNext | Command::FindPrevious if !self.accepts(command) => {
+                self.find_refusal(true)
+            }
             Command::CopyToRight | Command::CopyToLeft | Command::CopyToOtherSide
                 if !self.accepts(command) =>
             {
@@ -3645,10 +3682,12 @@ impl SessionView for FolderView {
     fn accepts(&self, command: Command) -> bool {
         let idle = matches!(self.stage, Stage::Idle);
         match command {
-            Command::ExpandAll | Command::CollapseAll => !self.arena.is_empty(),
+            Command::ExpandAll | Command::CollapseAll | Command::Find => !self.arena.is_empty(),
             Command::CompareContents | Command::CompareReport => self.compared_tree.is_some(),
             Command::SwapSides => self.status == Status::Ready && idle,
-            Command::Reload => !self.status.is_running() && idle,
+            Command::Reload | Command::Recompare => !self.status.is_running() && idle,
+            Command::NextDifference | Command::PreviousDifference => self.has_difference(),
+            Command::FindNext | Command::FindPrevious => self.has_name_match(),
             Command::Cancel => self.status.is_running() || self.stage.is_busy(),
             Command::ClearSelection => !self.selection.is_empty(),
             Command::CopyToRight | Command::CopyToLeft => idle && !self.selection.is_empty(),
@@ -3680,7 +3719,12 @@ impl SessionView for FolderView {
             Command::CompareContents => self.start_content_comparison(),
             Command::CompareReport => self.report.request(),
             Command::Cancel => self.request_stop(),
-            Command::Reload => self.restart(),
+            Command::Reload | Command::Recompare => self.restart(),
+            Command::NextDifference => self.step_difference(true),
+            Command::PreviousDifference => self.step_difference(false),
+            Command::Find => self.find.open(),
+            Command::FindNext => self.step_name(true, false),
+            Command::FindPrevious => self.step_name(false, false),
             Command::ClearSelection => self.selection.clear(),
             Command::CopyToRight => self.copy_to(Side::Right),
             Command::CopyToLeft => self.copy_to(Side::Left),
