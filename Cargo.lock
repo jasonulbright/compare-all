@@ -7169,6 +7169,7 @@ dependencies = [
  "anyhow",
  "ico",
  "resvg",
+ "serde",
  "serde_json",
  "sha2",
  "tempfile",

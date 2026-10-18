@@ -3757,6 +3757,22 @@ impl App {
                 self.load_workspace(&name, &context);
             }
         }
+        self.publish_close();
+    }
+
+    /// Tell the process that the window ends through its own close path, after
+    /// every question the tabs asked. A Cancel never sets `closing`.
+    fn publish_close(&self) {
+        if !self.closing {
+            return;
+        }
+        let exit = &self.update.exit;
+        exit.relaunch.store(
+            self.update.restart_on_leave,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        exit.normal_close
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -3765,16 +3781,6 @@ impl eframe::App for App {
         let _ = frame;
         self.frame(ctx);
         if self.closing {
-            // The window ends through its own close path, after every
-            // question the tabs asked. A Cancel never reaches this line.
-            self.update.exit.relaunch.store(
-                self.update.restart_on_leave,
-                std::sync::atomic::Ordering::SeqCst,
-            );
-            self.update
-                .exit
-                .normal_close
-                .store(true, std::sync::atomic::Ordering::SeqCst);
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }

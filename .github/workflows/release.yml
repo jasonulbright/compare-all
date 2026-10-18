@@ -149,6 +149,9 @@ jobs:
           }
           Remove-Item -Recurse "dist/$name"
 
+      - name: Write the update manifest
+        run: cargo xtask update-manifest dist
+
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: windows
@@ -292,6 +295,9 @@ jobs:
           name: appimage-catalog-check
           path: ${{ runner.temp }}/appimage-catalog-check
           if-no-files-found: ignore
+      - uses: dtolnay/rust-toolchain@9376cdc5a5e25b16da71af47712785cf06b0d6d4 # 1.94.1
+      - name: Check the update manifest against the uploaded files
+        run: cargo xtask update-manifest --check dist
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
