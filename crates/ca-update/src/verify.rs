@@ -321,6 +321,36 @@ pub fn hold_read_only(path: &Path) -> std::io::Result<std::fs::File> {
     options.open(path)
 }
 
+/// Copy `source` to `destination`, replacing a file left there, and return
+/// the copy held open as [`hold_read_only`] holds it. The held copy must
+/// have the bytes read from `source`: it is closed for a moment between the
+/// write and the hold.
+///
+/// # Errors
+/// Returns why the copy failed or changed before it was held.
+pub fn copy_held(source: &Path, destination: &Path) -> Result<std::fs::File, String> {
+    let _ = std::fs::remove_file(destination);
+    let mut input = std::fs::File::open(source).map_err(|error| error.to_string())?;
+    let output = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)
+        .map_err(|error| error.to_string())?;
+    let mut out = Hashing {
+        inner: output,
+        hasher: Sha256::new(),
+    };
+    std::io::copy(&mut input, &mut out).map_err(|error| error.to_string())?;
+    out.inner.sync_all().map_err(|error| error.to_string())?;
+    let written = out.hasher.finalize().to_vec();
+    drop(out.inner);
+    let held = hold_read_only(destination).map_err(|error| error.to_string())?;
+    if digest_from_start(&held, &mut std::io::sink())? != written {
+        return Err("the copy changed before it was held".to_owned());
+    }
+    Ok(held)
+}
+
 /// Read `file` from its start into `out` and return the SHA-256 of the bytes.
 fn digest_from_start(
     file: &std::fs::File,
