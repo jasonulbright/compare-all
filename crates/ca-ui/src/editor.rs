@@ -763,28 +763,37 @@ impl Pane {
     }
 
     /// Delete from the caret back to the first column.
-    pub fn delete_to_line_start(&mut self) {
+    ///
+    /// Returns true when the text changed.
+    pub fn delete_to_line_start(&mut self) -> bool {
         if self.read_only || self.caret.index == 0 {
-            return;
+            return false;
         }
         let end = self.char_of(self.caret);
         let start = self.buffer.line_to_char(self.caret.line);
         self.buffer.delete(start..end);
         self.caret = Caret::new(self.caret.line, 0);
         self.anchor = self.caret;
+        self.goal_column = None;
+        true
     }
 
     /// Delete from the caret to the end of the line, terminator excluded.
-    pub fn delete_to_line_end(&mut self) {
+    ///
+    /// Returns true when the text changed.
+    pub fn delete_to_line_end(&mut self) -> bool {
         if self.read_only {
-            return;
+            return false;
         }
         let start = self.char_of(self.caret);
         let end = self.char_of(Caret::new(self.caret.line, self.line_len(self.caret.line)));
-        if end > start {
-            self.buffer.delete(start..end);
-        }
         self.anchor = self.caret;
+        self.goal_column = None;
+        if end <= start {
+            return false;
+        }
+        self.buffer.delete(start..end);
+        true
     }
 
     /// Indent every touched line by one level, as one undo group.

@@ -744,7 +744,7 @@ const fn menus_for(view: MenuView) -> &'static [(&'static str, &'static [Entry])
         MenuView::Merge | MenuView::FolderMerge => MERGE_MENUS,
         MenuView::Registry => REGISTRY_MENUS,
         MenuView::Version | MenuView::Media => RECORDS_MENUS,
-        MenuView::Text | MenuView::Other => TEXT_MENUS,
+        MenuView::Text | MenuView::Hex | MenuView::Other => TEXT_MENUS,
     }
 }
 
@@ -839,11 +839,17 @@ const fn more_severe(kept: i32, code: i32) -> i32 {
     }
 }
 
+/// The commands that change which tab is active.
+const TAB_COMMANDS: &[Command] = &[Command::TabNext, Command::TabPrevious, Command::SessionHome];
+
 /// Commands the window answers for rather than the active view.
 const SHELL_OWNED: &[Command] = &[
     Command::ShowNone,
     Command::NewTab,
     Command::CloseTab,
+    Command::TabNext,
+    Command::TabPrevious,
+    Command::SessionHome,
     Command::Exit,
     Command::NewSession,
     Command::OpenSession,
@@ -1346,6 +1352,21 @@ impl App {
         view.watch(Arc::clone(&self.startup_notice));
         view.share_actions(std::rc::Rc::clone(&self.home_outbox));
         self.push(Box::new(view));
+    }
+
+    /// Activate the neighbouring tab, wrapping at either end, or the launcher
+    /// tab, opening one when none is open.
+    fn switch_tab(&mut self, command: Command, context: &ViewContext) {
+        let count = self.tabs.len();
+        match command {
+            Command::TabNext if count > 1 => self.active = (self.active + 1) % count,
+            Command::TabPrevious if count > 1 => self.active = (self.active + count - 1) % count,
+            Command::SessionHome => match self.tabs.iter().position(|tab| tab.is_launcher()) {
+                Some(index) => self.active = index,
+                None => self.open_home(context),
+            },
+            _ => {}
+        }
     }
 
     /// The stored session document this window reads.
@@ -2861,7 +2882,10 @@ impl App {
             | Command::OpenSession
             | Command::EditTextFile
             | Command::ViewPatch => true,
-            Command::CloseTab | Command::ClearSession => !self.tabs.is_empty(),
+            Command::CloseTab | Command::ClearSession | Command::SessionHome => {
+                !self.tabs.is_empty()
+            }
+            Command::TabNext | Command::TabPrevious => self.tabs.len() > 1,
             Command::LoadWorkspace
             | Command::SaveWorkspaceAs
             | Command::ExportSettings
@@ -2900,6 +2924,7 @@ impl App {
         match command {
             Command::NewTab | Command::NewSession | Command::OpenSession => self.open_home(context),
             Command::CloseTab => self.close_tab(self.active),
+            tab if TAB_COMMANDS.contains(&tab) => self.switch_tab(tab, context),
             Command::Exit => self.request_exit(),
             Command::SaveSession => self.save_session(),
             Command::SaveSessionAs => {
@@ -4861,6 +4886,89 @@ mod tests {
         assert!(!app.accepts(Command::NextDifference));
     }
 
+    fn key_frame(app: &mut App, key: egui::Key, modifiers: egui::Modifiers) {
+        let mut input = raw_input();
+        input.events = vec![egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }];
+        let _ = egui::Context::default().run(input, |ctx| app.frame(ctx));
+    }
+
+    fn open_edit_tab(app: &mut App, context: &ViewContext) {
+        app.open_kind(
+            &SessionKind::TextEdit,
+            std::path::PathBuf::new(),
+            std::path::PathBuf::new(),
+            context,
+        );
+    }
+
+    #[test]
+    fn next_and_previous_tab_wrap_at_both_ends() {
+        let context = context();
+        let (_settings, mut app) = empty_app();
+        assert!(!app.accepts(Command::TabNext));
+        app.open_home(&context);
+        assert!(!app.accepts(Command::TabNext), "one tab has no neighbour");
+        open_edit_tab(&mut app, &context);
+        open_edit_tab(&mut app, &context);
+        assert_eq!(app.active, 2);
+        assert!(app.accepts(Command::TabNext));
+        app.run(Command::TabNext, &context);
+        assert_eq!(app.active, 0);
+        app.run(Command::TabPrevious, &context);
+        assert_eq!(app.active, 2);
+        app.run(Command::TabPrevious, &context);
+        assert_eq!(app.active, 1);
+    }
+
+    #[test]
+    fn ctrl_tab_and_ctrl_shift_tab_switch_the_tab_from_the_keyboard() {
+        let context = context();
+        let (_settings, mut app) = empty_app();
+        app.open_home(&context);
+        open_edit_tab(&mut app, &context);
+        open_edit_tab(&mut app, &context);
+        let ctrl = egui::Modifiers {
+            ctrl: true,
+            command: true,
+            ..egui::Modifiers::NONE
+        };
+        key_frame(&mut app, egui::Key::Tab, ctrl);
+        assert_eq!(app.active, 0);
+        let ctrl_shift = egui::Modifiers {
+            shift: true,
+            ..ctrl
+        };
+        key_frame(&mut app, egui::Key::Tab, ctrl_shift);
+        assert_eq!(app.active, 2);
+    }
+
+    #[test]
+    fn session_home_shows_the_launcher_or_opens_one() {
+        let context = context();
+        let (_settings, mut app) = empty_app();
+        open_edit_tab(&mut app, &context);
+        assert_eq!(app.tab_count(), 1);
+        assert!(!app.tabs[0].is_launcher());
+        app.run(Command::SessionHome, &context);
+        assert_eq!(app.tab_count(), 2, "no launcher was open");
+        assert!(app.tabs[app.active].is_launcher());
+        open_edit_tab(&mut app, &context);
+        assert_eq!(app.active, 2);
+        let alt = egui::Modifiers {
+            alt: true,
+            ..egui::Modifiers::NONE
+        };
+        key_frame(&mut app, egui::Key::Home, alt);
+        assert_eq!(app.tab_count(), 3, "the open launcher is reused");
+        assert_eq!(app.active, 1);
+    }
+
     #[test]
     fn a_command_line_pair_opens_the_matching_view() {
         let (_settings, app) = started_app(
@@ -5564,8 +5672,8 @@ mod tests {
                 "---",
                 "Select Differences",
                 "Clear Selection",
-                "Copy to Right",
-                "Copy to Left",
+                "Copy to Right	Ctrl+R",
+                "Copy to Left	Ctrl+L",
             ],
         ),
         (
@@ -5733,8 +5841,8 @@ mod tests {
             "Copy Cell to Left",
             "Copy Cell to Other Side",
         ] {
-            assert!(table_edit.iter().any(|line| line == label));
-            assert!(!text_edit.iter().any(|line| line == label));
+            assert!(table_edit.iter().any(|line| line.starts_with(label)));
+            assert!(!text_edit.iter().any(|line| line.starts_with(label)));
         }
     }
 

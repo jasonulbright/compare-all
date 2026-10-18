@@ -156,6 +156,8 @@ const HANDLED: &[Command] = &[
     Command::NextSection,
     Command::PreviousSection,
     Command::NextDifference,
+    Command::NextExistingLine,
+    Command::PreviousExistingLine,
     Command::PreviousDifference,
     Command::Undo,
     Command::Redo,
@@ -2626,6 +2628,10 @@ impl MergeView {
     }
 
     fn key(&mut self, key: egui::Key, modifiers: egui::Modifiers) -> bool {
+        // Alt and Shift+Delete name commands, not text edits or caret moves.
+        if modifiers.alt || (modifiers.shift && key == egui::Key::Delete) {
+            return false;
+        }
         let extend = modifiers.shift;
         match key {
             egui::Key::ArrowLeft => self.output_pane.move_caret(Motion::Left, extend),
@@ -2839,6 +2845,8 @@ impl SessionView for MergeView {
             | Command::PreviousSection
             | Command::NextDifference
             | Command::PreviousDifference
+            | Command::NextExistingLine
+            | Command::PreviousExistingLine
             | Command::SelectAll
             | Command::SelectSection
             | Command::Copy
@@ -2946,6 +2954,8 @@ impl SessionView for MergeView {
                 }
                 self.go_to_section(self.data.model.next_conflict(self.current));
             }
+            Command::NextExistingLine => self.step_existing(true),
+            Command::PreviousExistingLine => self.step_existing(false),
             Command::NextSection | Command::NextDifference => self.navigate_difference(true),
             Command::PreviousSection | Command::PreviousDifference => {
                 self.navigate_difference(false);
@@ -3112,6 +3122,33 @@ impl MergeView {
         };
         let target = self.initial_navigation_target(target, current_matches);
         self.go_to_section(target);
+    }
+
+    /// Move to the nearest shown row after or before the current one that
+    /// carries a line in the focused pane, skipping the gap rows.
+    fn step_existing(&mut self, forward: bool) {
+        let pane = self.focus;
+        let model = &self.data.model;
+        let holds = |position: usize| {
+            let row = self.visible.row_at(position)?;
+            model
+                .rows()
+                .get(row)?
+                .line(pane, model.output_line_for_row(row))
+                .map(|_| row)
+        };
+        let count = self.visible.len();
+        let here = self.visible.position_of(self.row);
+        let found = match (forward, here) {
+            (true, Some(at)) => (at + 1..count).find_map(holds),
+            (true, None) => (0..count).find_map(holds),
+            (false, Some(at)) => (0..at).rev().find_map(holds),
+            (false, None) => (0..count).rev().find_map(holds),
+        };
+        if let Some(row) = found {
+            self.place_on_row(row, pane);
+            self.show_row(row);
+        }
     }
 
     fn navigate_difference(&mut self, forward: bool) {
@@ -5294,6 +5331,25 @@ mod tests {
         assert_eq!(view.output_text(), "a\nb1\nc\n");
         assert_eq!(view.output_pane.buffer().text(), view.output_text());
         assert!(view.is_modified());
+    }
+
+    #[test]
+    fn existing_line_commands_skip_the_gap_rows_of_the_focused_pane() {
+        let (mut view, _dir) = open("a\nL1\nL2\nc\n", Some("a\nb1\nb2\nc\n"), "a\nR1\nc\n");
+        run_until_ready(&mut view);
+        assert!(view.accepts(Command::NextExistingLine));
+        assert!(view.accepts(Command::PreviousExistingLine));
+        view.place_on_row(1, super::Pane::Right);
+        view.run(Command::NextExistingLine);
+        assert_eq!(view.current_row(), 3, "the right pane has a gap on row 2");
+        view.run(Command::PreviousExistingLine);
+        assert_eq!(view.current_row(), 1);
+        view.place_on_row(1, super::Pane::Left);
+        view.run(Command::NextExistingLine);
+        assert_eq!(view.current_row(), 2);
+        view.place_on_row(3, super::Pane::Left);
+        view.run(Command::NextExistingLine);
+        assert_eq!(view.current_row(), 3, "no row lies below the last");
     }
 
     #[test]

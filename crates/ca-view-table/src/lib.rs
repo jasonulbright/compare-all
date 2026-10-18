@@ -108,6 +108,8 @@ const HANDLED: &[Command] = &[
     Command::PreviousDifference,
     Command::NextSection,
     Command::PreviousSection,
+    Command::NextExistingLine,
+    Command::PreviousExistingLine,
     Command::Reload,
     Command::Recompare,
     Command::SwapSides,
@@ -923,6 +925,38 @@ impl TableView {
         }
     }
 
+    /// Move to the nearest row after or before the cursor that exists on the
+    /// active side, skipping the rows only the other side holds.
+    fn step_existing(&mut self, forward: bool) {
+        let side = self.active;
+        let from = self.grid.cursor().row;
+        let rows = self.grid.visual_rows();
+        let holds = |row: &usize| {
+            !matches!(
+                (self.grid.row_status(*row), side),
+                (Some(RowStatus::LeftOnly), Side::Right) | (Some(RowStatus::RightOnly), Side::Left)
+            )
+        };
+        let found = if forward {
+            (from.saturating_add(1)..rows).find(holds)
+        } else {
+            (0..from.min(rows)).rev().find(holds)
+        };
+        self.go_to_row(found);
+    }
+
+    /// Put the cursor on `row` in its current column and show it, where
+    /// there is a row.
+    fn go_to_row(&mut self, row: Option<usize>) {
+        if let Some(row) = row {
+            self.set_grid_cursor(Cursor {
+                row,
+                column: self.grid.cursor().column,
+            });
+            self.reveal_cursor();
+        }
+    }
+
     /// Move to the previous differing row.
     pub fn go_to_previous_difference(&mut self) {
         let Some(from) = self.grid.cursor().row.checked_sub(1) else {
@@ -1699,8 +1733,11 @@ impl TableView {
                     .iter()
                     .filter_map(|event| match event {
                         egui::Event::Key {
-                            key, pressed: true, ..
-                        } => Some(*key),
+                            key,
+                            pressed: true,
+                            modifiers,
+                            ..
+                        } if !modifiers.alt => Some(*key),
                         _ => None,
                     })
                     .collect::<Vec<_>>()
@@ -2426,6 +2463,8 @@ impl SessionView for TableView {
             | Command::PreviousDifference
             | Command::NextSection
             | Command::PreviousSection
+            | Command::NextExistingLine
+            | Command::PreviousExistingLine
             | Command::SelectAll => ready && self.grid.visual_rows() > 0,
             Command::Reload | Command::SwapSides => {
                 !self.status.is_running() && !self.clipboard_request_pending()
@@ -2511,23 +2550,15 @@ impl SessionView for TableView {
             Command::ResizeColumnsToFit => self.fit_requested = true,
             Command::NextDifference => self.go_to_next_difference(),
             Command::PreviousDifference => self.go_to_previous_difference(),
+            Command::NextExistingLine => self.step_existing(true),
+            Command::PreviousExistingLine => self.step_existing(false),
             Command::NextSection => {
-                if let Some(row) = self.grid.next_section(self.grid.cursor().row) {
-                    self.set_grid_cursor(Cursor {
-                        row,
-                        column: self.grid.cursor().column,
-                    });
-                    self.reveal_cursor();
-                }
+                let row = self.grid.next_section(self.grid.cursor().row);
+                self.go_to_row(row);
             }
             Command::PreviousSection => {
-                if let Some(row) = self.grid.previous_section(self.grid.cursor().row) {
-                    self.set_grid_cursor(Cursor {
-                        row,
-                        column: self.grid.cursor().column,
-                    });
-                    self.reveal_cursor();
-                }
+                let row = self.grid.previous_section(self.grid.cursor().row);
+                self.go_to_row(row);
             }
             Command::Reload => self.request_reread(ca_ui::save::Reread::Reload),
             Command::Recompare => self.recompare(),
@@ -2775,6 +2806,36 @@ mod tests {
         );
         view.set_source(source);
         view
+    }
+
+    #[test]
+    fn next_and_previous_existing_line_skip_the_rows_only_the_other_side_holds() {
+        let source = FakeSource::new(
+            &[
+                RowStatus::Same,
+                RowStatus::LeftOnly,
+                RowStatus::RightOnly,
+                RowStatus::RightOnly,
+                RowStatus::Same,
+            ],
+            2,
+        );
+        let mut view = view_over(Arc::new(source));
+        assert!(view.accepts(Command::NextExistingLine));
+        assert!(view.accepts(Command::PreviousExistingLine));
+        assert_eq!(view.active, Side::Left);
+        let row = |view: &TableView| view.grid.cursor().row;
+        view.run(Command::NextExistingLine);
+        assert_eq!(row(&view), 1);
+        view.run(Command::NextExistingLine);
+        assert_eq!(row(&view), 4, "the right-only rows are skipped");
+        view.run(Command::NextExistingLine);
+        assert_eq!(row(&view), 4);
+        view.run(Command::PreviousExistingLine);
+        assert_eq!(row(&view), 1);
+        view.active = Side::Right;
+        view.run(Command::NextExistingLine);
+        assert_eq!(row(&view), 2, "the left-only row is skipped on the right");
     }
 
     #[test]

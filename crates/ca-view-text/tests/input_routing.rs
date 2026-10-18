@@ -371,3 +371,110 @@ fn typing_in_a_read_only_view_does_not_start_a_comparison() {
     assert_eq!(harness.text(Side::Right), RIGHT);
     assert!(harness.view.is_settled());
 }
+
+fn ctrl_shift() -> egui::Modifiers {
+    egui::Modifiers {
+        command: true,
+        ctrl: true,
+        shift: true,
+        ..egui::Modifiers::default()
+    }
+}
+
+#[test]
+fn ctrl_shift_backspace_deletes_to_the_start_of_the_line() {
+    let mut harness = Harness::named("txt", "alpha beta gamma\n", "alpha beta gamma\n");
+    harness.press(egui::Key::End, egui::Modifiers::default());
+    harness.press(egui::Key::ArrowLeft, egui::Modifiers::default());
+    harness.press(egui::Key::Backspace, ctrl_shift());
+    assert_eq!(harness.text(Side::Left), "a\n");
+    assert_eq!(harness.text(Side::Right), "alpha beta gamma\n");
+    harness.press(egui::Key::Backspace, ctrl_shift());
+    assert_eq!(
+        harness.text(Side::Left),
+        "a\n",
+        "nothing lies before the caret"
+    );
+}
+
+#[test]
+fn ctrl_shift_delete_deletes_to_the_end_of_the_line() {
+    let mut harness = Harness::named(
+        "txt",
+        "alpha beta gamma\nsecond\n",
+        "alpha beta gamma\nsecond\n",
+    );
+    for _ in 0..6 {
+        harness.press(egui::Key::ArrowRight, egui::Modifiers::default());
+    }
+    harness.press(egui::Key::Delete, ctrl_shift());
+    assert_eq!(harness.text(Side::Left), "alpha \nsecond\n");
+    assert_eq!(harness.text(Side::Right), "alpha beta gamma\nsecond\n");
+}
+
+#[test]
+fn ctrl_backspace_still_deletes_one_word() {
+    let mut harness = Harness::named("txt", "alpha beta\n", "alpha beta\n");
+    harness.press(egui::Key::End, egui::Modifiers::default());
+    let command = egui::Modifiers {
+        command: true,
+        ctrl: true,
+        ..egui::Modifiers::default()
+    };
+    harness.press(egui::Key::Backspace, command);
+    assert_eq!(harness.text(Side::Left), "alpha \n");
+}
+
+#[test]
+fn alt_down_and_alt_up_skip_the_gap_rows_of_the_active_pane() {
+    let mut harness = Harness::new(LEFT, RIGHT);
+    let alt = egui::Modifiers {
+        alt: true,
+        ..egui::Modifiers::default()
+    };
+    // Row three is a gap on the left: the left lines are rows 0, 1, 2 and 4.
+    harness.click(harness.row_point(300.0, 2));
+    assert_eq!(harness.view.active_side(), Side::Left);
+    assert_eq!(harness.view.pane(Side::Left).caret().line, 2);
+    harness.press(egui::Key::ArrowDown, alt);
+    assert_eq!(harness.view.pane(Side::Left).caret().line, 3);
+    assert_eq!(harness.view.current_row(), 4);
+    harness.press(egui::Key::ArrowUp, alt);
+    assert_eq!(harness.view.pane(Side::Left).caret().line, 2);
+    assert_eq!(harness.view.current_row(), 2);
+    assert_eq!(harness.text(Side::Left), LEFT, "an alt press never edits");
+}
+
+#[test]
+fn alt_down_visits_every_row_where_the_active_pane_has_no_gap() {
+    let mut harness = Harness::new(LEFT, RIGHT);
+    let alt = egui::Modifiers {
+        alt: true,
+        ..egui::Modifiers::default()
+    };
+    let split = harness.view.pane_split_x();
+    harness.click(harness.row_point(split + 120.0, 2));
+    assert_eq!(harness.view.active_side(), Side::Right);
+    harness.press(egui::Key::ArrowDown, alt);
+    assert_eq!(harness.view.current_row(), 3);
+    harness.press(egui::Key::ArrowDown, alt);
+    assert_eq!(harness.view.current_row(), 4);
+    harness.press(egui::Key::ArrowDown, alt);
+    assert_eq!(harness.view.current_row(), 4, "no row lies below the last");
+}
+
+#[test]
+fn alt_backspace_undoes_and_never_deletes_a_character() {
+    let mut harness = Harness::named("txt", "alpha\n", "alpha\n");
+    harness.press(egui::Key::End, egui::Modifiers::default());
+    harness.type_text("Z");
+    assert_eq!(harness.text(Side::Left), "alphaZ\n");
+    harness.press(
+        egui::Key::Backspace,
+        egui::Modifiers {
+            alt: true,
+            ..egui::Modifiers::default()
+        },
+    );
+    assert_eq!(harness.text(Side::Left), "alpha\n");
+}
