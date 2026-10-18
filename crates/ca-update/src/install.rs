@@ -166,9 +166,6 @@ pub fn install_main(staging: &Path, checks: &Checks<'_>) -> i32 {
     if detect(&program) != (InstallMode::Installed { machine: true }) {
         return NOT_PREPARED;
     }
-    let Some(staging) = accepted_staging(staging, &crate::system::profile_folders()) else {
-        return REFUSED;
-    };
     let Ok(parent) = crate::system::program_files() else {
         return NOT_PREPARED;
     };
@@ -177,7 +174,11 @@ pub fn install_main(staging: &Path, checks: &Checks<'_>) -> i32 {
     let Some(_install_lock) = hold_install_lock(&parent, INSTALL_LOCK_WAIT) else {
         return KEPT;
     };
+    let _ = remove_stale_standby(&program);
     sweep_work_folders(&parent);
+    let Some(staging) = accepted_staging(staging, &crate::system::profile_folders()) else {
+        return REFUSED;
+    };
     let Ok(work) = prepare_work_folder(&parent) else {
         return NOT_PREPARED;
     };
@@ -705,5 +706,15 @@ mod tests {
         let code = super::UPGRADE_CODE.trim_matches(['{', '}']);
         assert!(source.contains(&format!("UpgradeCode=\"{code}\"")));
         assert!(source.contains(&format!("Name=\"{}\"", super::PRODUCT_NAME)));
+    }
+
+    #[test]
+    fn the_installer_removes_an_unused_program_copy() {
+        let source = include_str!("../../../installer/compare-all.wxs");
+        let entry = format!(
+            "<RemoveFile Id=\"RemoveStandbyExe\" Name=\"{}\" On=\"both\" />",
+            super::STANDBY_NAME
+        );
+        assert!(source.contains(&entry));
     }
 }
