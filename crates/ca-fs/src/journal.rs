@@ -522,6 +522,17 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn a_journal_folder_below_a_file_holds_nothing_and_takes_no_journal() {
+        let parent = tempfile::tempdir().unwrap();
+        let blocked = parent.path().join("blocked");
+        std::fs::write(&blocked, b"not a folder").unwrap();
+        let directory = blocked.join("journals");
+        assert_eq!(super::journal_folder(&directory).unwrap(), None);
+        assert!(Journal::create_in(&directory).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn a_journal_folder_that_leads_elsewhere_later_is_refused() {
         use std::os::unix::fs::PermissionsExt as _;
         let parent = tempfile::tempdir().unwrap();
