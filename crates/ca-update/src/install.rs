@@ -47,6 +47,10 @@ pub const REFUSED: i32 = 0x1000_0001;
 /// Exit code: the elevated step could not prepare or start the install.
 pub const NOT_PREPARED: i32 = 0x1000_0002;
 
+/// Exit code: the elevated step changed nothing and did not start the
+/// installer; the staged update stays for a later close.
+pub const KEPT: i32 = 0x1000_0003;
+
 /// What the copy of the installer must match.
 pub struct Checks<'a> {
     /// The Authenticode verifier.
@@ -153,7 +157,7 @@ fn is_inside(path: &Path, folder: &Path) -> bool {
 }
 
 /// The entry point of the elevated program. Returns the exit code: the code
-/// of the installer, [`REFUSED`] or [`NOT_PREPARED`].
+/// of the installer, [`REFUSED`], [`NOT_PREPARED`] or [`KEPT`].
 #[must_use]
 pub fn install_main(staging: &Path, checks: &Checks<'_>) -> i32 {
     let Ok(program) = std::env::current_exe() else {
@@ -189,10 +193,11 @@ pub fn install_main(staging: &Path, checks: &Checks<'_>) -> i32 {
 
 /// Copy the staged installer of `staging` into `work`, check the copy and run
 /// the command from [`installer_command`] through `run`. `program`, when
-/// given, is the running program file: it is moved into `work` while the
-/// installer runs and an unused copy takes its place, so the installer finds
-/// no program file in use, and it is moved back when the install fails.
-/// Returns the exit code of the installer, [`REFUSED`] or [`NOT_PREPARED`].
+/// given, is the running program file: it keeps only a name in `work` while
+/// the installer runs and an unused copy takes its place, so the installer
+/// finds no program file in use, and it goes back when the install fails.
+/// Returns the exit code of the installer, [`REFUSED`], [`NOT_PREPARED`] or
+/// [`KEPT`] when the program file cannot be set aside.
 #[must_use]
 pub fn install_from(
     staging: &Staging,
@@ -233,7 +238,17 @@ pub fn install_from(
         let _ = std::fs::remove_file(&copy);
         return REFUSED;
     }
-    let aside = program.and_then(|program| set_aside(program, work).map(|moved| (program, moved)));
+    let aside = match program {
+        Some(program) => {
+            let Some(moved) = set_aside(program, work) else {
+                drop(held);
+                let _ = std::fs::remove_file(&copy);
+                return KEPT;
+            };
+            Some((program, moved))
+        }
+        None => None,
+    };
     let code = run(installer_command(&copy));
     drop(held);
     let _ = std::fs::remove_file(&copy);
@@ -246,32 +261,61 @@ pub fn install_from(
     code.unwrap_or(NOT_PREPARED)
 }
 
-/// Move the running `program` into `work` and put an unused copy of it in
-/// its place. Returns where the running file went, or `None` when the
-/// program file stays where it is.
+/// Give the running `program` a second name in `work` and put an unused
+/// copy of it under the program name. Returns the name in `work`, which is
+/// then the only name of the running file, or `None` when the program file
+/// is as it was.
 ///
-/// The copy is written and flushed in the install folder, so it gets the
-/// access list of that folder, before the running file moves. Between the
-/// two renames that follow, no write happens, so an interruption at any
-/// other point leaves a complete program file under the program name.
+/// The program name is replaced by one rename and never removed, so an
+/// interruption at any step leaves a complete program file under it.
 fn set_aside(program: &Path, work: &Path) -> Option<PathBuf> {
+    set_aside_observed(program, work, &|| {})
+}
+
+/// [`set_aside`] that calls `after_step` after each change on the disk.
+pub fn set_aside_observed(program: &Path, work: &Path, after_step: &dyn Fn()) -> Option<PathBuf> {
     let standby = program.parent()?.join(STANDBY_NAME);
-    let _ = std::fs::remove_file(&standby);
-    if copy_flushed(program, &standby).is_err() {
-        let _ = std::fs::remove_file(&standby);
+    if !remove_standby(&standby) {
         return None;
     }
     let moved = work.join(ASIDE_NAME);
-    if std::fs::rename(program, &moved).is_err() {
-        let _ = std::fs::remove_file(&standby);
+    // Windows refuses to replace the last name of a running program file;
+    // with a second name the replace only removes a link.
+    if std::fs::hard_link(program, &moved).is_err() {
         return None;
     }
+    after_step();
+    // The copy is created in the install folder, so it gets the access list
+    // of that folder.
+    if copy_flushed(program, &standby).is_err() {
+        let _ = std::fs::remove_file(&standby);
+        let _ = std::fs::remove_file(&moved);
+        return None;
+    }
+    after_step();
     if std::fs::rename(&standby, program).is_err() {
-        let _ = std::fs::rename(&moved, program);
         let _ = std::fs::remove_file(&standby);
+        let _ = std::fs::remove_file(&moved);
         return None;
     }
+    after_step();
     Some(moved)
+}
+
+/// Remove the unused program copy that an interrupted step left in the
+/// install folder of `program`. False when one is there and stays.
+#[must_use]
+pub fn remove_stale_standby(program: &Path) -> bool {
+    program
+        .parent()
+        .is_some_and(|folder| remove_standby(&folder.join(STANDBY_NAME)))
+}
+
+fn remove_standby(standby: &Path) -> bool {
+    match std::fs::remove_file(standby) {
+        Ok(()) => true,
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+    }
 }
 
 /// Copy `source` to `destination`, a new file, and flush it to the disk.

@@ -1867,6 +1867,75 @@ fn the_install_folder_keeps_a_program_file_the_installer_can_replace() {
     }
 }
 
+/// An interruption at any step of the set-aside leaves the complete program
+/// file under its name.
+#[cfg(windows)]
+#[test]
+fn setting_the_running_program_aside_never_leaves_its_name_empty() {
+    let install = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let program = install.path().join("compare-all.exe");
+    let mut child = run_as(&program);
+    let original = std::fs::read(&program).unwrap();
+    let seen = Mutex::new(Vec::new());
+    let moved = ca_update::install::set_aside_observed(&program, work.path(), &|| {
+        seen.lock()
+            .unwrap()
+            .push(std::fs::read(&program).is_ok_and(|bytes| bytes == original));
+    });
+    let after = std::fs::read(&program).is_ok_and(|bytes| bytes == original);
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(moved.is_some());
+    let seen = seen.into_inner().unwrap();
+    assert!(!seen.is_empty());
+    assert!(seen.iter().all(|present| *present), "{seen:?}");
+    assert!(after);
+    assert!(!in_use(&program));
+}
+
+/// When the program file cannot be set aside, the installer does not start
+/// and the staged update stays without a warning.
+#[test]
+fn an_install_whose_program_cannot_be_set_aside_does_not_start() {
+    use ca_update::apply::{finish_apply, installer_result};
+    use ca_update::install::{install_from, Checks, KEPT};
+    let (server, _keep, staging, work, install) = elevated_setup();
+    let program = install.path().join("compare-all.exe");
+    // A folder under the name of the unused copy cannot be removed or
+    // replaced by a file.
+    let blocker = install.path().join("compare-all-standby.exe");
+    std::fs::create_dir(&blocker).unwrap();
+    std::fs::write(blocker.join("held"), b"x").unwrap();
+    let signer = FakeSigner::signed_by(SIGNER);
+    let checks = Checks {
+        signer: &signer,
+        signer_name: SIGNER,
+        running: &running(),
+    };
+    let started = AtomicBool::new(false);
+    let code = install_from(&staging, work.path(), Some(&program), &checks, &|_| {
+        started.store(true, Ordering::SeqCst);
+        Some(0)
+    });
+    assert_eq!(code, KEPT);
+    assert!(!started.load(Ordering::SeqCst));
+    assert_eq!(std::fs::read(&program).unwrap(), b"old exe");
+    assert_eq!(std::fs::read_dir(work.path()).unwrap().count(), 0);
+
+    let record = staging.read_record().unwrap();
+    let claim = staging.begin_apply().unwrap();
+    let outcome = installer_result(Some(code)).map(|()| running());
+    assert_eq!(
+        finish_apply(&staging, &claim, &outcome, &server.endpoints()),
+        4
+    );
+    drop(claim);
+    assert_eq!(staging.read_record(), Some(record));
+    assert!(staging.read_warning().is_none());
+    assert!(staging.read_apply_failure().is_none());
+}
+
 fn flip_a_byte(staging: &Staging) {
     let path = staging.asset_path(&staging.read_record().unwrap());
     let mut bytes = std::fs::read(&path).unwrap();
