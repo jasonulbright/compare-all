@@ -67,6 +67,9 @@ const SCROLLBAR: f32 = 12.0;
 const DEFAULT_FONT_SIZE: f32 = 10.5;
 /// Row height as a multiple of the display font size.
 const ROW_HEIGHT_RATIO: f32 = 1.45;
+/// Greatest context line count the toolbar offers, the same as the Text
+/// Editing page offers.
+const CONTEXT_LINES_LIMIT: u32 = 99;
 /// What the message panel says when navigation reaches the end.
 const LAST_DIFFERENCE: &str = "No further difference in that direction.";
 /// Width of the copy arrow column at the left edge of each pane's gutter.
@@ -301,6 +304,9 @@ pub struct TextView {
     data: TextData,
     filter: DisplayFilter,
     context_lines: u32,
+    /// The context line count the options last stated. The toolbar count
+    /// stays until the options state a different one.
+    followed_context_lines: Option<u32>,
     visible: Visible,
     caret: usize,
     /// The row a move made current, held while the text is unchanged and both
@@ -617,7 +623,8 @@ impl TextView {
             status: Status::Running("Starting"),
             data: TextData::default(),
             filter: DisplayFilter::All,
-            context_lines: 2,
+            context_lines: ca_session::options::TextEditingOptions::default().context_lines,
+            followed_context_lines: None,
             visible: Visible::All(0),
             caret: 0,
             anchor: None,
@@ -1387,6 +1394,7 @@ impl TextView {
             DisplayFilter::Context(_) => DisplayFilter::Context(self.context_lines),
             other => other,
         };
+        self.filter = filter;
         self.visible = self.data.model.visible(filter);
         self.strip_stale = true;
         self.scroll
@@ -1416,6 +1424,16 @@ impl TextView {
         self.line_spacing = options.extra_line_spacing();
         self.navigation = options.stored.next_difference.clone();
         self.find_from_word = options.stored.text_editing.find_uses_current_word;
+        let context_lines = options.stored.text_editing.context_lines;
+        if self.followed_context_lines != Some(context_lines) {
+            self.followed_context_lines = Some(context_lines);
+            if context_lines != self.context_lines {
+                self.context_lines = context_lines;
+                if matches!(self.filter, DisplayFilter::Context(_)) {
+                    self.refilter();
+                }
+            }
+        }
         self.syntax_on_differences = options
             .stored
             .tweaks
@@ -2530,7 +2548,11 @@ impl TextView {
                         filter = option;
                     }
                     if matches!(filter, DisplayFilter::Context(_)) {
-                        ui.add(egui::DragValue::new(&mut lines).range(0..=50));
+                        ui.add(
+                            egui::DragValue::new(&mut lines)
+                                .range(0..=CONTEXT_LINES_LIMIT)
+                                .clamp_existing_to_range(false),
+                        );
                     }
                 }
                 "minor" => {

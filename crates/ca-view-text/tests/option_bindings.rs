@@ -391,3 +391,24 @@ fn a_difference_line_keeps_its_syntax_colors_only_when_the_tweak_says_so() {
         "{plain_colors:?} {colored_colors:?}"
     );
 }
+
+#[test]
+fn show_context_uses_the_line_count_the_text_editing_page_states() {
+    use ca_view_text::model::DisplayFilter;
+
+    let mut harness = Harness::new("a\nb\nc\nD\n", "a\nb\nc\nX\n");
+    harness.view.run(Command::ShowContext);
+    harness.frame();
+    assert_eq!(harness.view.filter(), DisplayFilter::Context(6));
+
+    harness.set_options(|options| options.text_editing.context_lines = 1);
+    harness.frame();
+    assert_eq!(harness.view.filter(), DisplayFilter::Context(1));
+
+    let mut saved = Harness::configured("a\nb\nc\nD\n", "a\nb\nc\nX\n", |options| {
+        options.text_editing.context_lines = 3;
+    });
+    saved.view.run(Command::ShowContext);
+    saved.frame();
+    assert_eq!(saved.view.filter(), DisplayFilter::Context(3));
+}
