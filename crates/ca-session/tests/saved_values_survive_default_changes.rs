@@ -1,15 +1,17 @@
 //! A value a user saved keeps its meaning when a default changes: only a field
 //! absent from the document takes the current default.
 
-#![allow(clippy::unwrap_used, missing_docs)]
+#![allow(clippy::unwrap_used, clippy::panic, missing_docs)]
 
 use ca_session::options::ProgramOptions;
 use ca_session::settings::binary::HexComparisonSettings;
 use ca_session::settings::folder::{
-    ContentComparison, FolderComparisonSettings, SyncMethod, SyncSettings,
+    ContentComparison, FolderCompareSettings, FolderComparisonSettings, FolderMergeSettings,
+    FolderSyncSettings, SyncMethod, SyncSettings,
 };
 use ca_session::settings::table::RowSettings;
 use ca_session::settings::text::{TextAlignmentSettings, TextConflictSettings};
+use ca_session::settings::SessionSettings;
 
 #[test]
 fn saved_session_values_equal_to_a_former_default_load_unchanged() {
@@ -44,7 +46,7 @@ fn a_session_field_absent_from_the_document_takes_the_current_default() {
     let comparison: FolderComparisonSettings = serde_json::from_str("{}").unwrap();
     assert_eq!(comparison.timestamp_tolerance_seconds, 2);
     assert!(comparison.align_different_normalization);
-    assert_eq!(comparison.content_comparison, ContentComparison::RulesBased);
+    assert_eq!(comparison.content_comparison, ContentComparison::None);
 
     let sync: SyncSettings = serde_json::from_str("{}").unwrap();
     assert_eq!(sync.method, SyncMethod::UpdateBoth);
@@ -106,4 +108,40 @@ fn an_option_absent_from_the_document_takes_the_current_default() {
             .automatically_reload_unless_changes_are_discarded
     );
     assert!(options.tweaks.escape_closes_file_views);
+}
+
+#[test]
+fn only_a_folder_merge_compares_contents_by_rules_unless_told_otherwise() {
+    assert_eq!(
+        FolderCompareSettings::default()
+            .comparison
+            .content_comparison,
+        ContentComparison::None
+    );
+    assert_eq!(
+        FolderSyncSettings::default().comparison.content_comparison,
+        ContentComparison::None
+    );
+    assert_eq!(
+        FolderMergeSettings::default().comparison.content_comparison,
+        ContentComparison::RulesBased
+    );
+
+    for (document, expected) in [
+        (r#"{"kind":"folder-compare"}"#, ContentComparison::None),
+        (r#"{"kind":"folder-sync"}"#, ContentComparison::None),
+        (r#"{"kind":"folder-merge"}"#, ContentComparison::RulesBased),
+        (
+            r#"{"kind":"folder-merge","comparison":{"contentComparison":"none"}}"#,
+            ContentComparison::None,
+        ),
+    ] {
+        let content = match serde_json::from_str(document).unwrap() {
+            SessionSettings::FolderCompare(settings) => settings.comparison.content_comparison,
+            SessionSettings::FolderSync(settings) => settings.comparison.content_comparison,
+            SessionSettings::FolderMerge(settings) => settings.comparison.content_comparison,
+            other => panic!("{document} read as {:?}", other.kind()),
+        };
+        assert_eq!(content, expected, "{document}");
+    }
 }
