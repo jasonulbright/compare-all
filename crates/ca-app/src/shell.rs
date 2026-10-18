@@ -740,7 +740,7 @@ const HELP: &[Entry] = &[
 const fn menus_for(view: MenuView) -> &'static [(&'static str, &'static [Entry])] {
     match view {
         MenuView::Table => TABLE_MENUS,
-        MenuView::Folder => FOLDER_MENUS,
+        MenuView::Folder | MenuView::FolderSync => FOLDER_MENUS,
         MenuView::Merge | MenuView::FolderMerge => MERGE_MENUS,
         MenuView::Registry => REGISTRY_MENUS,
         MenuView::Version | MenuView::Media => RECORDS_MENUS,
@@ -2881,10 +2881,9 @@ impl App {
             | Command::NewSession
             | Command::OpenSession
             | Command::EditTextFile
-            | Command::ViewPatch => true,
-            Command::CloseTab | Command::ClearSession | Command::SessionHome => {
-                !self.tabs.is_empty()
-            }
+            | Command::ViewPatch
+            | Command::SessionHome => true,
+            Command::CloseTab | Command::ClearSession => !self.tabs.is_empty(),
             Command::TabNext | Command::TabPrevious => self.tabs.len() > 1,
             Command::LoadWorkspace
             | Command::SaveWorkspaceAs
@@ -3031,43 +3030,30 @@ impl App {
     }
 
     fn keyboard(&mut self, ctx: &egui::Context, context: &ViewContext) {
-        let strokes: Vec<Keystroke> = ctx.input(|input| {
-            input
-                .events
-                .iter()
-                .filter_map(|event| match event {
-                    egui::Event::Key {
-                        key,
-                        pressed: true,
-                        modifiers,
-                        ..
-                    } => Some(Keystroke {
-                        key: *key,
-                        command: modifiers.command,
-                        shift: modifiers.shift,
-                        alt: modifiers.alt,
-                    }),
-                    _ => None,
-                })
-                .collect()
-        });
+        let strokes = ctx.input(|input| Keystroke::pressed_in(&input.events));
         let view = self.menu_view();
         let table = self.resolved.shortcuts.clone();
         let escape_closes = self.resolved.stored.tweaks.escape_closes_file_views;
-        for stroke in strokes {
+        let mut ran = Vec::new();
+        for (index, stroke) in strokes {
             if escape_closes
                 && stroke == Keystroke::plain(egui::Key::Escape)
-                && view != MenuView::Folder
+                && view.folder_bar() != MenuView::Folder
                 && self.accepts(Command::CloseTab)
             {
                 self.run(Command::CloseTab, context);
+                ran.push(index);
                 continue;
             }
             if let Some(command) = command::route_with(view, stroke, &table) {
                 if self.accepts(command) {
                     self.run(command, context);
+                    ran.push(index);
                 }
             }
+        }
+        if !ran.is_empty() {
+            ctx.input_mut(|input| command::drop_text_of(&mut input.events, &ran));
         }
     }
 
@@ -4967,6 +4953,65 @@ mod tests {
         key_frame(&mut app, egui::Key::Home, alt);
         assert_eq!(app.tab_count(), 3, "the open launcher is reused");
         assert_eq!(app.active, 1);
+    }
+
+    #[test]
+    fn alt_home_opens_the_launcher_when_no_tab_is_open() {
+        let (_settings, mut app) = empty_app();
+        assert_eq!(app.tab_count(), 0);
+        let alt = egui::Modifiers {
+            alt: true,
+            ..egui::Modifiers::NONE
+        };
+        key_frame(&mut app, egui::Key::Home, alt);
+        assert_eq!(app.tab_count(), 1);
+        assert!(app.tabs[app.active].is_launcher());
+    }
+
+    fn events_frame(app: &mut App, events: Vec<egui::Event>) {
+        let mut input = raw_input();
+        input.events = events;
+        let _ = egui::Context::default().run(input, |ctx| app.frame(ctx));
+    }
+
+    fn key_and_text(key: egui::Key, modifiers: egui::Modifiers, text: &str) -> Vec<egui::Event> {
+        vec![
+            egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            },
+            egui::Event::Text(text.to_owned()),
+        ]
+    }
+
+    #[test]
+    fn altgr_text_reaches_the_editor_and_a_chord_that_ran_a_command_types_nothing() {
+        let context = context();
+        let (_settings, mut app) = empty_app();
+        open_edit_tab(&mut app, &context);
+        let altgr = egui::Modifiers {
+            alt: true,
+            ctrl: true,
+            command: true,
+            ..egui::Modifiers::NONE
+        };
+        events_frame(&mut app, key_and_text(egui::Key::Q, altgr, "@"));
+        assert!(
+            app.tabs[0].holds_unwritten_edits(),
+            "the AltGr character was not typed"
+        );
+        let alt = egui::Modifiers {
+            alt: true,
+            ..egui::Modifiers::NONE
+        };
+        events_frame(&mut app, key_and_text(egui::Key::Backspace, alt, "x"));
+        assert!(
+            !app.tabs[0].holds_unwritten_edits(),
+            "Alt+Backspace undoes the typing and its text is not typed"
+        );
     }
 
     #[test]

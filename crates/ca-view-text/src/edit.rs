@@ -965,7 +965,7 @@ impl TextEditView {
             return;
         }
         let (events, held) = ui.input(|input| (input.events.clone(), input.modifiers));
-        let mut shortcut = held.command || held.ctrl || held.alt;
+        let mut shortcut = !ca_ui::command::chord_types_text(held);
         let page_rows = u32::try_from(self.viewport_rows).unwrap_or(1).max(1);
         let mut edited = false;
         let mut moved = false;
@@ -998,7 +998,7 @@ impl TextEditView {
                     modifiers,
                     ..
                 } => {
-                    shortcut = modifiers.command || modifiers.ctrl || modifiers.alt;
+                    shortcut = !ca_ui::command::chord_types_text(modifiers);
                     if pressed {
                         match self.handle_key(key, modifiers, page_rows) {
                             Some(true) => edited = true,

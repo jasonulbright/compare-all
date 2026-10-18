@@ -3445,7 +3445,7 @@ impl SessionView for FolderSyncView {
     }
 
     fn menu_view(&self) -> ca_ui::command::MenuView {
-        self.view.menu_view()
+        ca_ui::command::MenuView::FolderSync
     }
 
     fn title(&self) -> String {

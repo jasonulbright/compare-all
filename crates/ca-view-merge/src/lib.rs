@@ -5746,6 +5746,39 @@ mod tests {
     }
 
     #[test]
+    fn altgr_text_is_typed_into_the_output() {
+        let (mut view, _dir) = open("abc\n", Some("abc\n"), "abc\n");
+        run_until_ready(&mut view);
+        let ctx = egui::Context::default();
+        let altgr = egui::Modifiers {
+            alt: true,
+            ctrl: true,
+            command: true,
+            ..egui::Modifiers::NONE
+        };
+        let _ = ctx.run(
+            ca_ui::testing::event_input(
+                1400.0,
+                800.0,
+                vec![
+                    egui::Event::Key {
+                        key: egui::Key::Q,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: altgr,
+                    },
+                    egui::Event::Text("@".into()),
+                ],
+            ),
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| view.ui(ui, &context()));
+            },
+        );
+        assert_eq!(view.output_text(), "@abc\n");
+    }
+
+    #[test]
     fn clicking_the_row_space_above_or_below_an_output_glyph_places_the_caret_at_it() {
         let text = "0123456789".repeat(9);
         for spacing in [0, 6] {

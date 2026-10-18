@@ -239,6 +239,35 @@ fn a_character_typed_in_the_character_area_writes_its_byte() {
     assert_eq!(harness.view.buffer(Side::Left).byte(5), Some(b'Z'));
 }
 
+#[test]
+fn altgr_text_typed_in_the_character_area_writes_its_byte() {
+    let mut harness = Harness::new();
+    harness.wait_ready();
+    harness.view.place_caret(Side::Left, 5);
+    harness.view.set_area(Area::Chars);
+    let altgr = egui::Modifiers {
+        alt: true,
+        ctrl: true,
+        command: true,
+        ..egui::Modifiers::NONE
+    };
+    harness.frame(event_input(
+        1_280.0,
+        800.0,
+        vec![
+            egui::Event::Key {
+                key: egui::Key::Q,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: altgr,
+            },
+            egui::Event::Text("@".to_owned()),
+        ],
+    ));
+    assert_eq!(harness.view.buffer(Side::Left).byte(5), Some(b'@'));
+}
+
 /// A text field that holds the keyboard takes what is typed, and the bytes
 /// stay as they are.
 #[test]

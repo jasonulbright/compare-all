@@ -89,6 +89,34 @@ fn typing_and_saving_writes_the_file() {
 }
 
 #[test]
+fn altgr_text_is_typed_in_the_text_editor() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write(dir.path(), "notes.txt", "one\n");
+    let frames = Frames::new();
+    let mut view = editor(&frames, path);
+    let altgr = egui::Modifiers {
+        alt: true,
+        ctrl: true,
+        command: true,
+        ..egui::Modifiers::NONE
+    };
+    frames.frame(
+        &mut view,
+        vec![
+            egui::Event::Key {
+                key: egui::Key::Q,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: altgr,
+            },
+            egui::Event::Text("@".to_owned()),
+        ],
+    );
+    assert_eq!(view.pane().buffer().text(), "@one\n");
+}
+
+#[test]
 fn a_click_far_along_a_plain_line_types_at_the_glyph_painted_under_it() {
     let line = "0123456789".repeat(9);
     let dir = tempfile::tempdir().unwrap();

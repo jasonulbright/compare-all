@@ -100,33 +100,17 @@ impl Harness {
         let view = &mut self.view;
         let context = &self.context;
         let _ = self.ctx.run(raw_input(events), |ctx| {
-            let strokes: Vec<Keystroke> = ctx.input(|input| {
-                input
-                    .events
-                    .iter()
-                    .filter_map(|event| match event {
-                        egui::Event::Key {
-                            key,
-                            pressed: true,
-                            modifiers,
-                            ..
-                        } => Some(Keystroke {
-                            key: *key,
-                            command: modifiers.command,
-                            shift: modifiers.shift,
-                            alt: modifiers.alt,
-                        }),
-                        _ => None,
-                    })
-                    .collect()
-            });
-            for stroke in strokes {
+            let strokes = ctx.input(|input| Keystroke::pressed_in(&input.events));
+            let mut ran = Vec::new();
+            for (index, stroke) in strokes {
                 if let Some(found) = command::route(ca_ui::command::MenuView::Text, stroke) {
                     if view.accepts(found) {
                         view.run(found);
+                        ran.push(index);
                     }
                 }
             }
+            ctx.input_mut(|input| command::drop_text_of(&mut input.events, &ran));
             egui::CentralPanel::default().show(ctx, |ui| {
                 view.ui(ui, context);
             });
@@ -413,6 +397,22 @@ fn ctrl_shift_delete_deletes_to_the_end_of_the_line() {
 }
 
 #[test]
+fn ctrl_shift_backspace_with_a_selection_deletes_the_selection() {
+    let mut harness = Harness::named("txt", "abcdef\n", "abcdef\n");
+    let shift = egui::Modifiers {
+        shift: true,
+        ..egui::Modifiers::default()
+    };
+    for _ in 0..3 {
+        harness.press(egui::Key::ArrowRight, egui::Modifiers::default());
+    }
+    harness.press(egui::Key::ArrowLeft, shift);
+    harness.press(egui::Key::ArrowLeft, shift);
+    harness.press(egui::Key::Backspace, ctrl_shift());
+    assert_eq!(harness.text(Side::Left), "adef\n");
+}
+
+#[test]
 fn ctrl_backspace_still_deletes_one_word() {
     let mut harness = Harness::named("txt", "alpha beta\n", "alpha beta\n");
     harness.press(egui::Key::End, egui::Modifiers::default());
@@ -477,4 +477,62 @@ fn alt_backspace_undoes_and_never_deletes_a_character() {
         },
     );
     assert_eq!(harness.text(Side::Left), "alpha\n");
+}
+
+fn key_with_text(key: egui::Key, modifiers: egui::Modifiers, text: &str) -> Vec<egui::Event> {
+    vec![
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        },
+        egui::Event::Text(text.to_owned()),
+    ]
+}
+
+/// Alt Gr as a Windows backend reports it: Ctrl and Alt held on the key press.
+const ALTGR: egui::Modifiers = egui::Modifiers {
+    alt: true,
+    ctrl: true,
+    shift: false,
+    mac_cmd: false,
+    command: true,
+};
+
+#[test]
+fn altgr_text_is_typed_when_no_command_takes_the_chord() {
+    let mut harness = Harness::named("txt", "alpha\n", "alpha\n");
+    harness.press(egui::Key::End, egui::Modifiers::default());
+    harness.frame(key_with_text(egui::Key::Q, ALTGR, "@"));
+    assert_eq!(harness.text(Side::Left), "alpha@\n");
+    harness.frame(key_with_text(egui::Key::E, ALTGR, "\u{20ac}"));
+    assert_eq!(harness.text(Side::Left), "alpha@\u{20ac}\n");
+}
+
+#[test]
+fn ctrl_letter_text_is_never_typed() {
+    let mut harness = Harness::named("txt", "alpha\n", "alpha\n");
+    harness.press(egui::Key::End, egui::Modifiers::default());
+    let ctrl = egui::Modifiers {
+        ctrl: true,
+        command: true,
+        ..egui::Modifiers::default()
+    };
+    harness.frame(key_with_text(egui::Key::Q, ctrl, "q"));
+    assert_eq!(harness.text(Side::Left), "alpha\n");
+}
+
+#[test]
+fn the_text_of_a_chord_that_ran_a_command_is_not_typed() {
+    let mut harness = Harness::new(LEFT, RIGHT);
+    harness.click(harness.row_point(300.0, 2));
+    let alt = egui::Modifiers {
+        alt: true,
+        ..egui::Modifiers::default()
+    };
+    harness.frame(key_with_text(egui::Key::ArrowDown, alt, "x"));
+    assert_eq!(harness.view.current_row(), 4, "the existing-line move ran");
+    assert_eq!(harness.text(Side::Left), LEFT);
 }
