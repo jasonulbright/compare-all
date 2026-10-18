@@ -11,8 +11,8 @@
 use crate::flow::Endpoints;
 use crate::mode::{detect, InstallMode};
 use crate::signature::SignatureVerifier;
-use crate::staging::{AssetKind, DownloadWarning, StagedRecord, Staging};
-use crate::verify::{verify_and_hold, Expected, Unpacked};
+use crate::staging::{ApplyClaim, AssetKind, DownloadWarning, StagedRecord, Staging};
+use crate::verify::{hold_read_only, verify_and_hold, Expected, Unpacked};
 use crate::version::Version;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -122,20 +122,84 @@ fn restore(saved: &Path, live: &Path) -> std::io::Result<()> {
     }
 }
 
+/// The reason [`apply_staged`] gives when the user declined the elevation
+/// prompt of an install for every user, or could not approve it.
+pub const ELEVATION_DECLINED: &str = "the elevation was declined";
+
+/// Exit code of the elevation script when the prompt was declined
+/// (`ERROR_CANCELLED`).
+const DECLINED_CODE: i32 = 1223;
+
+/// Starts `msiexec.exe` (absolute path in `CA_MSIEXEC`) through the standard
+/// elevation prompt, waits for it, and ends with its exit code. The package
+/// path comes from `CA_UPDATE_FILE`, never from the command text.
+const ELEVATE_SCRIPT: &str = "$ErrorActionPreference='Stop';\
+    try{$p=Microsoft.PowerShell.Management\\Start-Process -FilePath $env:CA_MSIEXEC \
+    -ArgumentList @('/i',('\"'+$env:CA_UPDATE_FILE+'\"'),'/passive','/norestart','ALLUSERS=1') \
+    -Verb RunAs -Wait -PassThru;exit $p.ExitCode}\
+    catch [System.ComponentModel.Win32Exception]{if($_.Exception.NativeErrorCode -eq 1223){exit 1223};exit 1}\
+    catch{exit 1}";
+
 /// The command that installs `msi` as a major upgrade with a progress window
-/// and no questions. A machine install writes no log: the folder a log could
-/// go to is writable by the user, and the installer runs with system rights.
+/// and no questions. An install for every user starts the installer through
+/// the standard elevation prompt and writes no log: the folder a log could go
+/// to is writable by the user, and the installer runs with system rights.
 #[must_use]
 pub fn msi_command(msi: &Path, machine: bool, log: &Path) -> Command {
     let root = crate::system::system_root().unwrap_or_else(|_| PathBuf::from(r"C:\Windows"));
-    let mut command = ca_io::host_command::host_command(root.join("System32").join("msiexec.exe"));
-    command.arg("/i").arg(msi).args(["/passive", "/norestart"]);
+    let msiexec = root.join("System32").join("msiexec.exe");
     if machine {
-        command.arg("ALLUSERS=1");
-    } else {
-        command.arg("/L*v").arg(log);
+        let shell = root.join("System32").join("WindowsPowerShell").join("v1.0");
+        let mut command = ca_io::host_command::host_command(shell.join("powershell.exe"));
+        command
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-NoLogo",
+                "-Command",
+                ELEVATE_SCRIPT,
+            ])
+            .env_clear()
+            .env("SystemRoot", &root)
+            .env("PSModulePath", shell.join("Modules"))
+            .current_dir(root.join("System32"));
+        // The elevation prompt expands %SystemDrive% for its caches; unset,
+        // the text is used as a folder name below the working folder.
+        if let Some(std::path::Component::Prefix(drive)) = root.components().next() {
+            command.env("SystemDrive", drive.as_os_str());
+        }
+        command
+            .env("CA_MSIEXEC", &msiexec)
+            .env("CA_UPDATE_FILE", msi);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            command.creation_flags(CREATE_NO_WINDOW);
+        }
+        return command;
     }
+    let mut command = ca_io::host_command::host_command(msiexec);
     command
+        .arg("/i")
+        .arg(msi)
+        .args(["/passive", "/norestart", "/L*v"])
+        .arg(log);
+    command
+}
+
+/// What the exit code of an installer command means.
+///
+/// # Errors
+/// [`ELEVATION_DECLINED`] for a declined elevation prompt; otherwise why the
+/// install failed.
+pub fn installer_result(code: Option<i32>) -> Result<(), String> {
+    match code {
+        Some(0 | 1641 | 3010) => Ok(()),
+        Some(DECLINED_CODE) => Err(ELEVATION_DECLINED.to_owned()),
+        Some(code) => Err(format!("the installer ended with code {code}")),
+        None => Err("the installer was stopped".to_owned()),
+    }
 }
 
 /// Wait until `executable` can be opened for writing, which is when no process
@@ -181,7 +245,7 @@ pub fn spawn_helper(
         .arg(if relaunch { "1" } else { "0" })
         .arg("--")
         .args(arguments)
-        .stdin(std::process::Stdio::null())
+        .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     #[cfg(windows)]
@@ -190,10 +254,13 @@ pub fn spawn_helper(
         // DETACHED_PROCESS | CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
         command.creation_flags(0x0000_0008 | 0x0800_0000 | 0x0000_0200);
     }
-    command
+    let mut child = command
         .spawn()
-        .map(drop)
-        .map_err(|error| format!("cannot start the update: {error}"))
+        .map_err(|error| format!("cannot start the update: {error}"))?;
+    // The writing end of the helper's input stays open until this process
+    // ends; the helper of an install for every user waits for that end.
+    std::mem::forget(child.stdin.take());
+    Ok(())
 }
 
 /// Parsed helper arguments.
@@ -242,16 +309,10 @@ pub struct Trust<'a> {
     pub running: &'a Version,
 }
 
-/// True when the program applies a staged update of a copy installed this
-/// way. An install for every user is never applied by the program: that
-/// needs an elevated installer, and the update is offered as a download page
-/// instead.
-#[must_use]
-pub const fn applies_automatically(mode: InstallMode) -> bool {
-    !matches!(mode, InstallMode::Installed { machine: true })
-}
-
 /// Apply the staged update. Returns the version installed.
+///
+/// An installer stays open with writing, renaming and deleting refused from
+/// before its final check until the installer has ended.
 ///
 /// # Errors
 /// Returns why the update was not applied. The caller leaves the installed
@@ -264,9 +325,6 @@ pub fn apply_staged(
     before_each: &dyn Fn(&str) -> std::io::Result<()>,
     target_dir: &Path,
 ) -> Result<Version, String> {
-    if !applies_automatically(mode) {
-        return Err("an install for every user is not updated by the program".to_owned());
-    }
     let record = staging
         .read_record()
         .ok_or("no valid staged update exists")?;
@@ -299,6 +357,13 @@ pub fn apply_staged(
         version: &version,
     };
     let file = staging.asset_path(&record);
+    let _installer = match kind {
+        AssetKind::Msi => Some(
+            hold_read_only(&file)
+                .map_err(|error| format!("cannot open the staged installer: {error}"))?,
+        ),
+        AssetKind::Zip => None,
+    };
     let result =
         verify_and_hold(&file, &expected, trust.signer, &scratch).and_then(|held| {
             match (mode, held) {
@@ -322,10 +387,37 @@ fn run_installer(mut command: Command) -> Result<(), String> {
     let status = command
         .status()
         .map_err(|error| format!("cannot start the installer: {error}"))?;
-    match status.code() {
-        Some(0 | 1641 | 3010) => Ok(()),
-        Some(code) => Err(format!("the installer ended with code {code}")),
-        None => Err("the installer was stopped".to_owned()),
+    installer_result(status.code())
+}
+
+/// Record what one apply did and release the staging folder. Returns the
+/// exit code of the helper.
+///
+/// A declined elevation changes nothing: the staged update stays and is
+/// offered again at the next close, with no warning. Any other failure keeps
+/// the reason and the download warning and removes the staged update.
+#[must_use]
+pub fn finish_apply(
+    staging: &Staging,
+    claim: &ApplyClaim,
+    outcome: &Result<Version, String>,
+    endpoints: &Endpoints,
+) -> i32 {
+    match outcome {
+        Ok(_) => {
+            staging.clear_claimed(claim);
+            0
+        }
+        Err(reason) if reason == ELEVATION_DECLINED => 3,
+        Err(reason) => {
+            staging.write_apply_failure(reason);
+            if let Some(version) = staging.read_record().and_then(|r| r.parsed_version()) {
+                let _ = staging
+                    .write_warning(&DownloadWarning::new(&version, endpoints.page(&version)));
+            }
+            staging.clear_claimed(claim);
+            1
+        }
     }
 }
 
@@ -388,25 +480,31 @@ pub fn helper_main_waiting(
         .executable
         .parent()
         .map_or_else(PathBuf::new, Path::to_path_buf);
-    let outcome = wait_until_free(&arguments.executable, WAIT_FOR_EXIT)
-        .and_then(|()| apply_staged(&staging, mode, &trust, &run_installer, &|_| Ok(()), &target));
-    let code = match &outcome {
-        Ok(_) => 0,
-        Err(_) => 1,
+    let ended = match mode {
+        InstallMode::Installed { machine: true } => wait_for_parent(WAIT_FOR_EXIT),
+        _ => wait_until_free(&arguments.executable, WAIT_FOR_EXIT),
     };
-    if let Err(reason) = &outcome {
-        staging.write_apply_failure(reason);
-        if let Some(version) = staging.read_record().and_then(|r| r.parsed_version()) {
-            let _ = staging.write_warning(&DownloadWarning::new(
-                &version,
-                trust.endpoints.page(&version),
-            ));
-        }
-    }
-    staging.clear_claimed(&claim);
+    let outcome = ended
+        .and_then(|()| apply_staged(&staging, mode, &trust, &run_installer, &|_| Ok(()), &target));
+    let code = finish_apply(&staging, &claim, &outcome, &endpoints);
     drop(claim);
     relaunch();
     code
+}
+
+/// Wait until the program that started the helper has ended. A user without
+/// rights cannot open a program file of an install for every user for
+/// writing, so the end is seen on standard input instead: the program keeps
+/// the writing end of that pipe open until it ends.
+fn wait_for_parent(limit: Duration) -> Result<(), String> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
+        let _ = sender.send(());
+    });
+    receiver
+        .recv_timeout(limit)
+        .map_err(|_| "the program did not end".to_owned())
 }
 
 /// True when a verified staged update waits.

@@ -247,7 +247,8 @@ impl Unpacked {
             if !path.is_file() {
                 continue;
             }
-            let file = hold(&path).map_err(|error| format!("cannot open {name}: {error}"))?;
+            let file =
+                hold_read_only(&path).map_err(|error| format!("cannot open {name}: {error}"))?;
             let sha256 = digest_from_start(&file, &mut std::io::sink())?;
             files.push(HeldFile {
                 name: name.to_owned(),
@@ -304,8 +305,11 @@ impl Unpacked {
 }
 
 /// Open `path` for reading so that, on Windows, other processes may only read
-/// it while the handle lives.
-fn hold(path: &Path) -> std::io::Result<std::fs::File> {
+/// it while the handle lives: writing, renaming and deleting it fail.
+///
+/// # Errors
+/// Returns why the file could not be opened.
+pub fn hold_read_only(path: &Path) -> std::io::Result<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(windows)]
@@ -507,7 +511,7 @@ pub fn unpack_release_zip(zip_path: &Path, destination: &Path) -> Result<Unpacke
         }
         let written = out.hasher.finalize().to_vec();
         drop(out.inner);
-        let file = hold(&target).map_err(|error| format!("cannot unpack: {error}"))?;
+        let file = hold_read_only(&target).map_err(|error| format!("cannot unpack: {error}"))?;
         // The file was closed for a moment between the write and the hold.
         if digest_from_start(&file, &mut std::io::sink())? != written {
             return Err(format!("{name} changed while it was unpacked"));

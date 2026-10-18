@@ -411,9 +411,6 @@ pub fn apply_at_exit(hook: &ExitHook, settings: &Path) -> bool {
     let Ok(executable) = std::env::current_exe() else {
         return false;
     };
-    if !ca_update::apply::applies_automatically(ca_update::mode::detect(&executable)) {
-        return false;
-    }
     let staging = Staging::new(staging_directory(settings));
     finish_at_exit(hook, &staging, &|staging, relaunch| {
         ca_update::apply::spawn_helper(staging, &executable, relaunch, &[])

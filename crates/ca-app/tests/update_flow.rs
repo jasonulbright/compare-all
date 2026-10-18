@@ -595,57 +595,53 @@ fn a_launch_with_checks_off_leaves_an_update_a_helper_has_claimed() {
 }
 
 #[test]
-fn a_per_machine_install_never_starts_the_installer_and_offers_the_downloads_page() {
-    let dir = tempfile::tempdir().unwrap();
-    let staging = dir.path().join("stage");
-    let version = next_version();
-    stage_fake(&staging, &version);
-    check_just_done(dir.path());
-    let (server, _) = release_server(version.to_string(), 404);
-    let mut app = app_in(dir.path());
-    app.update_from(source(
-        &server,
-        &staging,
-        Some(InstallMode::Installed { machine: true }),
-    ));
-    let hook = app.update_exit_hook();
-    assert!(run_frames(&mut app, |app| app.update_notice().is_some()));
-    assert_eq!(
-        app.update_notice(),
-        Some(&UpdateNotice::Available(ca_app::update::Release {
-            version,
-            page: format!("{}/tag/v{version}", server.url()),
-        }))
-    );
-    let opened = Arc::new(Mutex::new(Vec::new()));
-    app.set_spawner(Arc::new(Recorder(Arc::clone(&opened))));
-    let mut probe = Probe::new(1280.0, 800.0);
-    {
-        let mut run = |ctx: &egui::Context| app.frame(ctx);
-        probe.idle(&mut run);
-        probe.idle(&mut run);
-        let text = format!("Version {version} is available. Open the downloads page now?");
-        let output = probe.frame(Vec::new(), &mut run);
-        let painted = ca_ui::testing::probe::painted_texts(&output);
-        assert!(painted.contains(&text), "{painted:?}");
-        probe.click("OK", &mut run).unwrap();
-        probe.idle(&mut run);
+fn an_install_for_every_user_offers_restart_to_update_and_applies_at_close() {
+    for restart in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = dir.path().join("stage");
+        let version = next_version();
+        stage_fake(&staging, &version);
+        check_just_done(dir.path());
+        let (server, _) = release_server(version.to_string(), 404);
+        let mut app = app_in(dir.path());
+        app.update_from(source(
+            &server,
+            &staging,
+            Some(InstallMode::Installed { machine: true }),
+        ));
+        let hook = app.update_exit_hook();
+        assert!(run_frames(&mut app, |app| matches!(
+            app.update_notice(),
+            Some(UpdateNotice::Ready(_))
+        )));
+        let mut probe = Probe::new(1280.0, 800.0);
+        {
+            let mut run = |ctx: &egui::Context| app.frame(ctx);
+            probe.idle(&mut run);
+            probe.idle(&mut run);
+            let output = probe.frame(Vec::new(), &mut run);
+            let painted = ca_ui::testing::probe::painted_texts(&output).join(" ");
+            assert!(!painted.contains("downloads page"), "{painted}");
+            if restart {
+                probe.click("Restart to update", &mut run).unwrap();
+                probe.idle(&mut run);
+            }
+        }
+        if !restart {
+            app.run(Command::Exit, &context());
+        }
+        if app.asks_before_closing() {
+            app.answer_exit(true);
+        }
+        assert!(run_frames(&mut app, App::is_closing));
+        let started = Mutex::new(Vec::new());
+        let start = |_: &Staging, relaunch: bool| {
+            started.lock().unwrap().push(relaunch);
+            Ok(())
+        };
+        assert!(finish_at_exit(&hook, &Staging::new(staging), &start));
+        assert_eq!(*started.lock().unwrap(), vec![restart]);
     }
-    assert!(run_frames(&mut app, |_| !opened.lock().unwrap().is_empty()));
-    assert!(opened.lock().unwrap()[0]
-        .arguments
-        .last()
-        .unwrap()
-        .ends_with(&format!("/tag/v{version}")));
-    app.restart_to_update();
-    assert!(run_frames(&mut app, App::is_closing));
-    let started = Mutex::new(0);
-    let start = |_: &Staging, _: bool| {
-        *started.lock().unwrap() += 1;
-        Ok(())
-    };
-    assert!(!finish_at_exit(&hook, &Staging::new(staging), &start));
-    assert_eq!(*started.lock().unwrap(), 0);
 }
 
 #[test]

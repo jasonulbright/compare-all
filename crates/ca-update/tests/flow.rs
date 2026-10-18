@@ -1224,7 +1224,7 @@ fn a_stalled_download_closes_its_connection_after_the_idle_limit() {
 }
 
 #[test]
-fn the_installer_runs_only_for_an_install_for_one_user() {
+fn the_installer_runs_elevated_only_for_an_install_for_every_user() {
     let server = Server::start();
     let msi = msi_bytes();
     let asset = publish(&server, &msi_name(NEXT), &msi, "application/x-msi");
@@ -1262,17 +1262,122 @@ fn the_installer_runs_only_for_an_install_for_one_user() {
             &|_| Ok(()),
             target.path(),
         );
-        if machine {
-            assert!(result.is_err());
-            assert!(seen.lock().unwrap().is_empty());
-            continue;
-        }
         result.unwrap();
         let args = seen.lock().unwrap()[0].clone();
+        if machine {
+            // The installer starts through an elevation prompt and writes no log.
+            let script = args.last().unwrap();
+            assert!(script.contains("-Verb RunAs"), "{script}");
+            assert!(script.contains("ALLUSERS=1"), "{script}");
+            assert!(!args.iter().any(|a| a.contains("/L*v")), "{args:?}");
+            continue;
+        }
         assert_eq!(args[0], "/i");
         assert!(args.contains(&"/passive".to_owned()));
         assert!(!args.contains(&"ALLUSERS=1".to_owned()));
     }
+}
+
+fn stage_installer(server: &Server, mode: InstallMode) -> (tempfile::TempDir, Staging) {
+    let msi = msi_bytes();
+    let asset = publish(server, &msi_name(NEXT), &msi, "application/x-msi");
+    publish_manifest(server, vec![asset]);
+    let (keep, staging) = staging_dir();
+    assert!(matches!(
+        check(server, &staging, &FakeSigner::signed_by(SIGNER), Some(mode)).unwrap(),
+        Outcome::Staged { .. }
+    ));
+    (keep, staging)
+}
+
+#[cfg(windows)]
+#[test]
+fn the_installer_file_cannot_be_replaced_while_the_installer_runs() {
+    let server = Server::start();
+    let signer = FakeSigner::signed_by(SIGNER);
+    let endpoints = server.endpoints();
+    let trust = Trust {
+        signer: &signer,
+        signer_name: SIGNER,
+        endpoints: &endpoints,
+        running: &running(),
+    };
+    for machine in [false, true] {
+        let mode = InstallMode::Installed { machine };
+        let (_keep, staging) = stage_installer(&server, mode);
+        let msi = staging.asset_path(&staging.read_record().unwrap());
+        let attempts = Mutex::new(Vec::new());
+        let target = program_folder();
+        let result = apply_staged(
+            &staging,
+            mode,
+            &trust,
+            &|_| {
+                let mut seen = attempts.lock().unwrap();
+                seen.push(std::fs::write(&msi, b"other installer").is_ok());
+                seen.push(std::fs::rename(&msi, msi.with_extension("old")).is_ok());
+                seen.push(std::fs::remove_file(&msi).is_ok());
+                seen.push(std::fs::read(&msi).is_ok());
+                Ok(())
+            },
+            &|_| Ok(()),
+            target.path(),
+        );
+        assert!(result.is_ok(), "machine {machine}: {result:?}");
+        assert_eq!(
+            *attempts.lock().unwrap(),
+            vec![false, false, false, true],
+            "machine {machine}"
+        );
+        assert_eq!(std::fs::read(&msi).unwrap(), msi_bytes());
+    }
+}
+
+#[test]
+fn a_declined_elevation_keeps_the_staged_update_without_a_warning() {
+    use ca_update::apply::{finish_apply, installer_result, ELEVATION_DECLINED};
+    assert_eq!(
+        installer_result(Some(1223)),
+        Err(ELEVATION_DECLINED.to_owned())
+    );
+    assert_eq!(installer_result(Some(0)), Ok(()));
+    assert!(installer_result(Some(1603)).is_err());
+    let server = Server::start();
+    let mode = InstallMode::Installed { machine: true };
+    let (_keep, staging) = stage_installer(&server, mode);
+    let record = staging.read_record().unwrap();
+    let signer = FakeSigner::signed_by(SIGNER);
+    let endpoints = server.endpoints();
+    let trust = Trust {
+        signer: &signer,
+        signer_name: SIGNER,
+        endpoints: &endpoints,
+        running: &running(),
+    };
+    let claim = staging.begin_apply().unwrap();
+    let target = program_folder();
+    let outcome = apply_staged(
+        &staging,
+        mode,
+        &trust,
+        &|_| installer_result(Some(1223)),
+        &|_| Ok(()),
+        target.path(),
+    );
+    assert_eq!(finish_apply(&staging, &claim, &outcome, &endpoints), 3);
+    drop(claim);
+    assert_eq!(staging.read_record(), Some(record.clone()));
+    assert!(staging.asset_path(&record).exists());
+    assert!(staging.read_warning().is_none());
+    assert!(staging.read_apply_failure().is_none());
+
+    // Any other failure removes the staged update and warns.
+    let claim = staging.begin_apply().unwrap();
+    let failed: Result<Version, String> = Err("the installer ended with code 1603".to_owned());
+    assert_eq!(finish_apply(&staging, &claim, &failed, &endpoints), 1);
+    drop(claim);
+    assert!(staging.read_record().is_none());
+    assert!(staging.read_warning().is_some());
 }
 
 #[test]
