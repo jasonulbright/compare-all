@@ -117,6 +117,37 @@ fn altgr_text_is_typed_in_the_text_editor() {
 }
 
 #[test]
+fn alt_letter_text_is_typed_in_the_text_editor_only_where_option_composes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write(dir.path(), "notes.txt", "one\n");
+    let frames = Frames::new();
+    let mut view = editor(&frames, path);
+    let alt = egui::Modifiers {
+        alt: true,
+        ..egui::Modifiers::NONE
+    };
+    frames.frame(
+        &mut view,
+        vec![
+            egui::Event::Key {
+                key: egui::Key::F,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: alt,
+            },
+            egui::Event::Text("f".to_owned()),
+        ],
+    );
+    let expected = if cfg!(target_os = "macos") {
+        "fone\n"
+    } else {
+        "one\n"
+    };
+    assert_eq!(view.pane().buffer().text(), expected);
+}
+
+#[test]
 fn a_click_far_along_a_plain_line_types_at_the_glyph_painted_under_it() {
     let line = "0123456789".repeat(9);
     let dir = tempfile::tempdir().unwrap();

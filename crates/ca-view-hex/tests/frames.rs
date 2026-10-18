@@ -268,6 +268,40 @@ fn altgr_text_typed_in_the_character_area_writes_its_byte() {
     assert_eq!(harness.view.buffer(Side::Left).byte(5), Some(b'@'));
 }
 
+#[test]
+fn alt_letter_text_writes_a_byte_only_where_option_composes_characters() {
+    let mut harness = Harness::new();
+    harness.wait_ready();
+    harness.view.place_caret(Side::Left, 5);
+    harness.view.set_area(Area::Chars);
+    let before = harness.view.buffer(Side::Left).byte(5);
+    let alt = egui::Modifiers {
+        alt: true,
+        ..egui::Modifiers::NONE
+    };
+    harness.frame(event_input(
+        1_280.0,
+        800.0,
+        vec![
+            egui::Event::Key {
+                key: egui::Key::F,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: alt,
+            },
+            egui::Event::Text("f".to_owned()),
+        ],
+    ));
+    let expected = if cfg!(target_os = "macos") {
+        Some(b'f')
+    } else {
+        before
+    };
+    assert_ne!(before, Some(b'f'));
+    assert_eq!(harness.view.buffer(Side::Left).byte(5), expected);
+}
+
 /// A text field that holds the keyboard takes what is typed, and the bytes
 /// stay as they are.
 #[test]

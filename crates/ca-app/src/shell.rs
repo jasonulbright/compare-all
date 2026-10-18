@@ -3572,6 +3572,7 @@ impl App {
             .get(self.active)
             .map(|tab| tab.commands())
             .unwrap_or_default();
+        ctx.input_mut(|input| command::drop_chord_text(&mut input.events));
         let naming = self.session_save.is_some();
         if naming {
             self.draw_session_save(ctx);
@@ -5012,6 +5013,52 @@ mod tests {
             !app.tabs[0].holds_unwritten_edits(),
             "Alt+Backspace undoes the typing and its text is not typed"
         );
+    }
+
+    #[test]
+    fn alt_letter_text_reaches_a_text_field_only_where_option_composes() {
+        let (_directory, mut app, id, _, _) = app_with_recent_session();
+        app.open_saved(&id, &context());
+        let ctx = egui::Context::default();
+        let frame = |app: &mut App, events| {
+            let _ = ctx.run(ca_ui::testing::event_input(1280.0, 800.0, events), |ctx| {
+                app.frame(ctx);
+            });
+        };
+        assert!(ca_ui::testing::wait_until(
+            std::time::Duration::from_secs(10),
+            || {
+                frame(&mut app, Vec::new());
+                app.active_is_ready()
+            }
+        ));
+        app.run(Command::SaveSessionAs, &context());
+        frame(&mut app, Vec::new());
+        frame(&mut app, Vec::new());
+        let name = |app: &App| {
+            app.session_save
+                .as_ref()
+                .map(|dialog| dialog.name.clone())
+                .unwrap_or_default()
+        };
+        let before = name(&app);
+        assert!(!before.is_empty());
+        let alt = egui::Modifiers {
+            alt: true,
+            ..egui::Modifiers::NONE
+        };
+        frame(&mut app, key_and_text(egui::Key::F, alt, "f"));
+        let after_alt = name(&app);
+        if cfg!(target_os = "macos") {
+            assert_ne!(after_alt, before, "Option text is typed");
+        } else {
+            assert_eq!(after_alt, before, "Alt+F typed into the field");
+        }
+        frame(
+            &mut app,
+            key_and_text(egui::Key::G, egui::Modifiers::NONE, "g"),
+        );
+        assert!(name(&app).contains('g'), "plain typing reaches the field");
     }
 
     #[test]

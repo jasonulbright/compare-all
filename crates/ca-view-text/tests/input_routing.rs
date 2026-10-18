@@ -512,6 +512,25 @@ fn altgr_text_is_typed_when_no_command_takes_the_chord() {
 }
 
 #[test]
+fn alt_letter_text_is_typed_only_where_option_composes_characters() {
+    let mut harness = Harness::named("txt", "alpha\n", "alpha\n");
+    harness.press(egui::Key::End, egui::Modifiers::default());
+    let alt = egui::Modifiers {
+        alt: true,
+        ..egui::Modifiers::NONE
+    };
+    harness.frame(key_with_text(egui::Key::F, alt, "f"));
+    let alt_shift = egui::Modifiers { shift: true, ..alt };
+    harness.frame(key_with_text(egui::Key::F, alt_shift, "F"));
+    let expected = if cfg!(target_os = "macos") {
+        "alphafF\n"
+    } else {
+        "alpha\n"
+    };
+    assert_eq!(harness.text(Side::Left), expected);
+}
+
+#[test]
 fn ctrl_letter_text_is_never_typed() {
     let mut harness = Harness::named("txt", "alpha\n", "alpha\n");
     harness.press(egui::Key::End, egui::Modifiers::default());
