@@ -991,8 +991,11 @@ struct Returning {
 /// Equal leading and trailing runs pair first. Between them, items that
 /// occur once in each part anchor the pairing, the longest run of anchors
 /// in the same order on both sides is kept, and each gap between kept
-/// anchors pairs the same way. Items that only repeat inside a gap with
-/// no anchor stay unpaired.
+/// anchors pairs the same way. A part with no such anchor falls back to
+/// items that occur equally often on both sides of it, the n-th occurrence
+/// in old with the n-th in new, kept the same way. Items whose counts
+/// differ in a part without anchors stay unpaired, because which
+/// occurrence changed is unknown.
 fn align<T: Eq + std::hash::Hash>(old: &[T], new: &[T]) -> Vec<(usize, usize)> {
     let mut pairs = Vec::new();
     let mut parts = vec![(0..old.len(), 0..new.len())];
@@ -1013,25 +1016,35 @@ fn align<T: Eq + std::hash::Hash>(old: &[T], new: &[T]) -> Vec<(usize, usize)> {
         if olds.is_empty() || news.is_empty() {
             continue;
         }
-        // (count in old, count in new, index in old)
-        let mut seen: HashMap<&T, (usize, usize, usize)> = HashMap::new();
+        // (indices in old, count in new)
+        let mut seen: HashMap<&T, (Vec<usize>, usize)> = HashMap::new();
         for index in olds.clone() {
-            let entry = seen.entry(&old[index]).or_insert((0, 0, index));
-            entry.0 += 1;
+            seen.entry(&old[index]).or_default().0.push(index);
         }
         for index in news.clone() {
             if let Some(entry) = seen.get_mut(&new[index]) {
                 entry.1 += 1;
             }
         }
-        let anchors: Vec<(usize, usize)> = news
-            .clone()
-            .filter_map(|index| {
-                let (in_old, in_new, at) = *seen.get(&new[index])?;
-                (in_old == 1 && in_new == 1).then_some((at, index))
-            })
-            .collect();
-        let anchors = increasing_run(&anchors);
+        let matched = |repeated: bool| -> Vec<(usize, usize)> {
+            let mut taken: HashMap<&T, usize> = HashMap::new();
+            news.clone()
+                .filter_map(|index| {
+                    let (at, in_new) = seen.get(&new[index])?;
+                    if at.len() != *in_new || (!repeated && *in_new != 1) {
+                        return None;
+                    }
+                    let rank = taken.entry(&new[index]).or_insert(0);
+                    let pair = (*at.get(*rank)?, index);
+                    *rank += 1;
+                    Some(pair)
+                })
+                .collect()
+        };
+        let mut anchors = increasing_run(&matched(false));
+        if anchors.is_empty() {
+            anchors = increasing_run(&matched(true));
+        }
         if anchors.is_empty() {
             continue;
         }
@@ -3215,6 +3228,37 @@ mod tests {
         assert_eq!(second.totals().edited, 1);
     }
 
+    /// Every section repeats, so no section is unique on both sides, and the
+    /// reload adds changes before and after them. The take and the edit stay
+    /// on the sections they were made on.
+    #[test]
+    fn a_reload_around_repeated_sections_keeps_their_decisions() {
+        let block = "u\nv\nw\n";
+        let old = |middle: &str| format!("{block}{middle}\n{block}{middle}\n{block}");
+        let new = |end: &str, middle: &str| {
+            format!("{end}\n{block}{middle}\n{block}{middle}\n{block}{end}\n")
+        };
+        let mut first = model(&old("L"), &old("b"), &old("R"));
+        let conflicts: Vec<usize> = first
+            .sections()
+            .iter()
+            .enumerate()
+            .filter(|(_, section)| section.is_unresolved_conflict())
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(conflicts.len(), 2);
+        first.set_edited(conflicts[0], vec!["X\n".to_owned()]);
+        first.set_resolution(conflicts[1], Resolution::Left);
+        let mut second = model(&new("N", "L"), &new("n", "b"), &new("n", "R"));
+        second.carry_over(&first);
+        assert_eq!(
+            second.output_text(),
+            "N\nu\nv\nw\nX\nu\nv\nw\nL\nu\nv\nw\nN\n"
+        );
+        assert_eq!(second.totals().conflicts_remaining, 0);
+        assert_eq!(second.totals().edited, 1);
+    }
+
     /// The first of two alike sections is decided, then a reload changes its
     /// left text. The decision is dropped; the second section, alike to the
     /// first before the reload, keeps its own state.
@@ -3245,7 +3289,15 @@ mod tests {
             super::align(&["p", "a", "q", "a", "r"], &["p", "a", "r", "q", "a", "s"]),
             vec![(0, 0), (1, 1), (2, 3), (3, 4)]
         );
-        assert_eq!(super::align(&["a", "a"], &["b", "a", "a", "b"]), Vec::new());
+        assert_eq!(
+            super::align(&["a", "a"], &["b", "a", "a", "b"]),
+            vec![(0, 1), (1, 2)]
+        );
+        assert_eq!(
+            super::align(&["a", "b", "a", "b"], &["b", "a", "b", "a"]),
+            vec![(0, 1), (1, 2), (2, 3)]
+        );
+        assert_eq!(super::align(&["a", "a"], &["b", "a", "b"]), Vec::new());
         assert_eq!(super::align::<&str>(&[], &["a"]), Vec::new());
     }
 
