@@ -294,7 +294,7 @@ pub fn install_from(
     if let Some((program, moved)) = aside {
         if !matches!(code, Some(0 | 1641 | 3010)) {
             // Replaces the unused copy; a running file may be renamed.
-            let _ = std::fs::rename(&moved, program);
+            let _ = rename_retrying(&moved, program);
         }
     }
     code.unwrap_or(NOT_PREPARED)
@@ -332,13 +332,30 @@ pub fn set_aside_observed(program: &Path, work: &Path, after_step: &dyn Fn()) ->
         return None;
     }
     after_step();
-    if std::fs::rename(&standby, program).is_err() {
+    if rename_retrying(&standby, program).is_err() {
         let _ = std::fs::remove_file(&standby);
         let _ = std::fs::remove_file(&moved);
         return None;
     }
     after_step();
     Some(moved)
+}
+
+/// Rename `from` over `to`. A file scanner opens a new program file for a
+/// short time without delete sharing; that refusal is waited out.
+fn rename_retrying(from: &Path, to: &Path) -> std::io::Result<()> {
+    const ATTEMPTS: u32 = 30;
+    let mut attempt = 1;
+    loop {
+        match std::fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(_) if attempt < ATTEMPTS => {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 /// Remove the unused program copy that an interrupted step left in the
