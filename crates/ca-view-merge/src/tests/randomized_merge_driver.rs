@@ -841,7 +841,7 @@ fn reload_duplicate(
 ) -> Option<String> {
     let allowance = input_allowance(view.model());
     let owned = owned_text(view);
-    let composed = composed_copies(&owned);
+    let composed = composed_copies(&owned, &input_tokens(view.model()));
     let mut shown: Vec<(String, usize)> = counts(&owned.text).into_iter().collect();
     shown.sort();
     shown.into_iter().find_map(|(token, count)| {
@@ -899,7 +899,7 @@ fn take_all_duplicate(view: &MergeView, owned_before: &Owned) -> Option<String> 
         *allowed.entry(token).or_insert(0) += shared;
     }
     let owned_after = owned_text(view);
-    for (token, count) in composed_copies(&owned_after) {
+    for (token, count) in composed_copies(&owned_after, &input_tokens(model)) {
         *allowed.entry(token).or_insert(0) += count;
     }
     let mut shown: Vec<(String, usize)> = counts(&owned_after.text).into_iter().collect();
@@ -910,14 +910,28 @@ fn take_all_duplicate(view: &MergeView, owned_before: &Owned) -> Option<String> 
     })
 }
 
+/// Every token a side of any section of the merge shows.
+fn input_tokens(model: &crate::model::MergeModel) -> HashSet<String> {
+    let mut found = HashSet::new();
+    for index in 0..model.sections().len() {
+        for one in [Resolution::Left, Resolution::Center, Resolution::Right] {
+            if let Some(lines) = selected_input_lines(model, index, one) {
+                found.extend(tokens(&lines.concat()));
+            }
+        }
+    }
+    found
+}
+
 /// The copies of each token whose characters belong to more than one
-/// section. Such a copy is no copy of a line: a command that takes a
-/// lender's piece out of a joined line leaves the pieces around it side by
-/// side.
-fn composed_copies(owned: &Owned) -> HashMap<String, usize> {
+/// section and whose text is no line of an input. Such a copy is a join of
+/// pieces: a command that takes a lender's piece out of a joined line leaves
+/// the pieces around it side by side. A copy of an input line is never
+/// excused, whoever owns its characters.
+fn composed_copies(owned: &Owned, input_lines: &HashSet<String>) -> HashMap<String, usize> {
     let mut composed = HashMap::new();
     for (token, start, end) in token_spans(&owned.text) {
-        if single_owner(&owned.owners[start..end]).is_none() {
+        if single_owner(&owned.owners[start..end]).is_none() && !input_lines.contains(&token) {
             *composed.entry(token).or_insert(0) += 1;
         }
     }
@@ -2143,6 +2157,25 @@ fn the_take_all_duplicate_oracle_reports_a_line_shown_twice() {
         take_all_duplicate(&view, &before).as_deref(),
         Some("[c] x2, 1 allowed")
     );
+}
+
+/// A second `[u10]` whose own characters belong to two sections is a copy
+/// of an input line and gets no allowance; a join `[l323]` that is no input
+/// line does.
+#[test]
+fn a_line_assembled_from_two_sections_is_no_composed_copy() {
+    let (mut view, _dir) = open_separated(PIECES[0], Some(PIECES[1]), PIECES[1], 1);
+    run_until_ready(&mut view);
+    let input_lines = input_tokens(view.model());
+    assert!(input_lines.contains("[u10]"));
+    let owned = Owned {
+        text: "[u10][u10][l323]".to_owned(),
+        owners: [vec![1; 5], vec![1; 2], vec![2; 3], vec![1; 3], vec![2; 3]].concat(),
+        problems: Vec::new(),
+    };
+    let composed = composed_copies(&owned, &input_lines);
+    assert_eq!(composed.get("[u10]"), None);
+    assert_eq!(composed.get("[l323]"), Some(&1));
 }
 
 const PIECES: [&str; 3] = [
