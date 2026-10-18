@@ -10,7 +10,7 @@ use crate::jobs::{self, Stage};
 use crate::model::{Cursor, Side};
 use crate::search::{self, CellMatcher, ReplaceMessage, Scope, SearchMessage};
 use crate::{Status, TableView};
-use ca_table::write::{cell_write, is_writable};
+use ca_table::write::{cell_write, is_writable, record_text};
 use ca_text::TextBuffer;
 use ca_ui::save::text::SaveConsent;
 use ca_ui::save::{Baseline, CloseChoice, Reread, SaveMessage, SaveOutcome};
@@ -19,6 +19,44 @@ use std::sync::Arc;
 
 /// Byte ranges of one side's text with the text that replaces each.
 type Splices = Vec<(std::ops::Range<usize>, String)>;
+
+/// What a row copy changes on the target side.
+#[derive(Default)]
+struct RowCopy {
+    changes: Splices,
+    cells: usize,
+    added: usize,
+    removed: usize,
+}
+
+/// The line terminator `text` uses first, or a line feed when it has none.
+fn line_ending(text: &str) -> &'static str {
+    match text.find(['\n', '\r']) {
+        Some(at) if text.get(at..at + 2) == Some("\r\n") => "\r\n",
+        Some(at) if text.get(at..=at) == Some("\r") => "\r",
+        _ => "\n",
+    }
+}
+
+/// Join splices that start at the same offset into one.
+///
+/// `SideText::replace` drops a splice that starts at or inside an earlier
+/// one, so an insertion and an edit at the same offset must reach it as a
+/// single splice. Insertions keep their order and go first.
+fn merge_at_same_start(mut changes: Splices) -> Splices {
+    changes.sort_by_key(|(range, _)| (range.start, range.end > range.start));
+    let mut merged: Splices = Vec::with_capacity(changes.len());
+    for (range, text) in changes {
+        match merged.last_mut() {
+            Some((last, last_text)) if last.start == range.start && last.end == last.start => {
+                last.end = range.end;
+                last_text.push_str(&text);
+            }
+            _ => merged.push((range, text)),
+        }
+    }
+    merged
+}
 
 /// A question the view is waiting on an answer to.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -301,35 +339,35 @@ impl TableView {
             Side::Left => Side::Right,
             Side::Right => Side::Left,
         };
-        let rows = self.rows_to_copy();
-        let (changes, skipped) = match self.row_changes(source, target, &rows) {
+        let mut rows = self.rows_to_copy();
+        rows.sort_unstable();
+        rows.dedup();
+        let copy = match self.row_changes(source, target, &rows) {
             Ok(found) => found,
             Err(reason) => {
                 self.message = Some(reason);
                 return;
             }
         };
-        let cell_count = changes.len();
-        if cell_count > 0 {
-            self.side_text_mut(target).replace(changes);
+        if !copy.changes.is_empty() {
+            self.side_text_mut(target).replace(copy.changes);
             self.start_reparse();
         }
-        self.message = Some(match (cell_count, skipped) {
-            (0, 0) => "The rows already match.".to_owned(),
-            (0, _) => "The rows have no counterpart on the other side.".to_owned(),
-            (_, 0) => format!("Copied {cell_count} cells."),
-            (_, _) => format!("Copied {cell_count} cells. {skipped} rows have no counterpart."),
+        self.message = Some(match (copy.cells, copy.added, copy.removed) {
+            (0, 0, 0) => "The rows already match.".to_owned(),
+            (cells, 0, 0) => format!("Copied {cells} cells."),
+            (cells, added, removed) => {
+                format!("Copied {cells} cells, added {added} rows and removed {removed} rows.")
+            }
         });
     }
 
-    /// The replacements that make the `target` cells of `rows` equal the
-    /// `source` cells, and the count of rows that exist on one side only.
-    fn row_changes(
-        &self,
-        source: Side,
-        target: Side,
-        rows: &[usize],
-    ) -> Result<(Splices, usize), String> {
+    /// The replacements that make the `target` side of `rows` equal the
+    /// `source` side: changed cells are rewritten, a row on the source side
+    /// only is inserted, and a row on the target side only is removed.
+    ///
+    /// `rows` must be ascending, so rows inserted at one place keep their order.
+    fn row_changes(&self, source: Side, target: Side, rows: &[usize]) -> Result<RowCopy, String> {
         let (schema, comparison) = self
             .mapping
             .as_ref()
@@ -340,48 +378,95 @@ impl TableView {
         let target_data = self
             .side_data(target)
             .ok_or_else(|| "No comparison is loaded.".to_owned())?;
-        let mut changes = Vec::new();
-        let mut skipped = 0usize;
-        for row in rows {
-            let Some(entry) = comparison.rows.get(*row) else {
-                continue;
-            };
-            let (source_row, target_row) = match source {
+        let target_table = &target_data.table;
+        let target_text = target_table.source();
+        let options = &target_data.facts.options;
+        let ending = line_ending(target_text);
+        let side_rows = |index: usize| {
+            comparison.rows.get(index).map(|entry| match source {
                 Side::Left => (entry.pair.left, entry.pair.right),
                 Side::Right => (entry.pair.right, entry.pair.left),
-            };
-            let (Some(source_row), Some(target_row)) = (source_row, target_row) else {
-                skipped += 1;
-                continue;
-            };
-            for column in &schema.columns {
-                let (source_column, target_column) = match source {
-                    Side::Left => (column.left, column.right),
-                    Side::Right => (column.right, column.left),
-                };
-                let (Some(source_column), Some(target_column)) = (source_column, target_column)
-                else {
-                    continue;
-                };
-                let value = source_data
-                    .table
-                    .cell_text(source_row as usize, source_column as usize)
-                    .into_owned();
-                let write = cell_write(
-                    &target_data.table,
-                    &target_data.facts.options,
-                    target_row as usize,
-                    target_column as usize,
-                    &value,
-                )
-                .map_err(|error| format!("The rows cannot be copied: {error}."))?;
-                if target_data.table.source().get(write.range.clone()) != Some(write.text.as_str())
-                {
-                    changes.push((write.range, write.text));
+            })
+        };
+        let column_pairs: Vec<(u32, u32)> = schema
+            .columns
+            .iter()
+            .filter_map(|column| match source {
+                Side::Left => column.left.zip(column.right),
+                Side::Right => column.right.zip(column.left),
+            })
+            .collect();
+        let source_cell = |row: u32, column: u32| {
+            source_data
+                .table
+                .cell_text(row as usize, column as usize)
+                .into_owned()
+        };
+        let mut copy = RowCopy::default();
+        for row in rows {
+            match side_rows(*row) {
+                Some((Some(source_row), Some(target_row))) => {
+                    for (source_column, target_column) in &column_pairs {
+                        let value = source_cell(source_row, *source_column);
+                        let write = cell_write(
+                            target_table,
+                            options,
+                            target_row as usize,
+                            *target_column as usize,
+                            &value,
+                        )
+                        .map_err(|error| format!("The rows cannot be copied: {error}."))?;
+                        if target_text.get(write.range.clone()) != Some(write.text.as_str()) {
+                            copy.changes.push((write.range, write.text));
+                            copy.cells += 1;
+                        }
+                    }
                 }
+                Some((Some(source_row), None)) => {
+                    let values: Vec<String> = (0..target_table.column_count())
+                        .map(|target_column| {
+                            column_pairs
+                                .iter()
+                                .find(|(_, column)| *column as usize == target_column)
+                                .map(|(column, _)| source_cell(source_row, *column))
+                                .unwrap_or_default()
+                        })
+                        .collect();
+                    let record = record_text(options, &values)
+                        .map_err(|error| format!("The rows cannot be copied: {error}."))?;
+                    let anchor = (row + 1..comparison.rows.len())
+                        .find_map(|later| side_rows(later).and_then(|(_, target)| target))
+                        .and_then(|later| target_table.row_source_range(later as usize));
+                    let (at, text) = match anchor {
+                        Some(range) => (range.start as usize, format!("{record}{ending}")),
+                        None if target_text.is_empty() || target_text.ends_with(['\n', '\r']) => {
+                            (target_text.len(), format!("{record}{ending}"))
+                        }
+                        None => (target_text.len(), format!("{ending}{record}")),
+                    };
+                    copy.changes.push((at..at, text));
+                    copy.added += 1;
+                }
+                Some((None, Some(target_row))) => {
+                    let Some(range) = target_table.row_source_range(target_row as usize) else {
+                        continue;
+                    };
+                    let end = range.end as usize;
+                    let rest = target_text.get(end..).unwrap_or_default();
+                    let terminator = if rest.starts_with("\r\n") {
+                        2
+                    } else {
+                        usize::from(rest.starts_with(['\n', '\r']))
+                    };
+                    copy.changes
+                        .push((range.start as usize..end + terminator, String::new()));
+                    copy.removed += 1;
+                }
+                Some((None, None)) | None => {}
             }
         }
-        Ok((changes, skipped))
+        copy.changes = merge_at_same_start(std::mem::take(&mut copy.changes));
+        Ok(copy)
     }
 
     /// Put `value` into the current cell of the active side.

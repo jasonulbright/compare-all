@@ -3334,6 +3334,58 @@ mod tests {
     }
 
     #[test]
+    fn copy_to_right_and_left_insert_and_remove_one_sided_rows() {
+        let (_dir, left, right) = files(
+            "id,name\n1,Ann\n2,Bob\n3,Cy\n",
+            "id,name\n1,Ann\n3,Cy\n4,Dee\n",
+        );
+        let ctx = egui::Context::default();
+        let mut view = TableView::new(left, right, &context(), 45);
+        assert!(settle(&mut view, &ctx));
+        view.set_active_side(Side::Left);
+
+        view.grid.set_cursor(Cursor { row: 1, column: 0 });
+        assert!(view.accepts(Command::CopyToRight));
+        view.run(Command::CopyToRight);
+        assert!(settle(&mut view, &ctx));
+        assert_eq!(
+            view.side_text(Side::Right).text(),
+            "id,name\n1,Ann\n2,Bob\n3,Cy\n4,Dee\n"
+        );
+
+        view.set_active_side(Side::Right);
+        view.run(Command::Undo);
+        assert!(settle(&mut view, &ctx));
+        assert_eq!(
+            view.side_text(Side::Right).text(),
+            "id,name\n1,Ann\n3,Cy\n4,Dee\n"
+        );
+
+        let last = view.grid.visual_rows() - 1;
+        view.grid.set_cursor(Cursor {
+            row: last,
+            column: 0,
+        });
+        assert!(view.accepts(Command::CopyToRight));
+        view.run(Command::CopyToRight);
+        assert!(settle(&mut view, &ctx));
+        assert_eq!(view.side_text(Side::Right).text(), "id,name\n1,Ann\n3,Cy\n");
+
+        view.run(Command::Undo);
+        assert!(settle(&mut view, &ctx));
+        view.grid.set_cursor(Cursor {
+            row: last,
+            column: 0,
+        });
+        view.run(Command::CopyToLeft);
+        assert!(settle(&mut view, &ctx));
+        assert_eq!(
+            view.side_text(Side::Left).text(),
+            "id,name\n1,Ann\n2,Bob\n3,Cy\n4,Dee\n"
+        );
+    }
+
+    #[test]
     fn copy_to_right_is_refused_while_the_target_cannot_be_written() {
         let (_dir, left, right) = files("id,name\n1,Ann\n", "id,name\n1,Bob\n");
         let ctx = egui::Context::default();

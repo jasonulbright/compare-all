@@ -144,10 +144,105 @@ pub fn cell_write(
     }
 }
 
+/// The text of one new record holding `values`, without a line terminator.
+///
+/// # Errors
+///
+/// Returns [`WriteError`] when the syntax cannot carry one of the values.
+pub fn record_text(options: &ParseOptions, values: &[String]) -> Result<String, WriteError> {
+    match &options.syntax {
+        FieldSyntax::Delimited {
+            delimiters,
+            text_qualifier,
+            consecutive_delimiters_as_one,
+            surrounding_whitespace_is_delimiter,
+            ..
+        } => {
+            let separator = match (delimiters.first(), values.len()) {
+                (Some(separator), _) => *separator,
+                (None, 0 | 1) => ',',
+                (None, _) => return Err(WriteError::Unsupported),
+            };
+            let mut text = String::new();
+            for (index, value) in values.iter().enumerate() {
+                if index > 0 {
+                    text.push(separator);
+                }
+                let unsafe_bare = value.contains(['\n', '\r'])
+                    || value.chars().any(|ch| delimiters.contains(&ch))
+                    || text_qualifier.is_some_and(|quote| value.contains(quote))
+                    || (*surrounding_whitespace_is_delimiter && value.trim() != value)
+                    || (*consecutive_delimiters_as_one && value.is_empty())
+                    || (values.len() == 1 && value.is_empty());
+                if !unsafe_bare {
+                    text.push_str(value);
+                    continue;
+                }
+                let quote = text_qualifier.ok_or(WriteError::NeedsQualifier)?;
+                text.push(quote);
+                for ch in value.chars() {
+                    text.push(ch);
+                    if ch == quote {
+                        text.push(quote);
+                    }
+                }
+                text.push(quote);
+            }
+            Ok(text)
+        }
+        FieldSyntax::Fixed { column_widths, .. } => {
+            let mut text = String::new();
+            for (index, value) in values.iter().enumerate() {
+                if value.contains(['\n', '\r']) {
+                    return Err(WriteError::LineBreak);
+                }
+                text.push_str(value);
+                let last = index + 1 == values.len();
+                if let Some(width) = column_widths.get(index) {
+                    let width = *width as usize;
+                    let length = value.chars().count();
+                    if length > width {
+                        return Err(WriteError::TooWide { width });
+                    }
+                    if !last {
+                        text.extend(std::iter::repeat_n(' ', width - length));
+                    }
+                }
+            }
+            Ok(text)
+        }
+        _ => Err(WriteError::Unsupported),
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::{cell_write, is_writable, WriteError};
+    use super::{cell_write, is_writable, record_text, WriteError};
+
+    #[test]
+    fn a_new_record_reads_back_as_its_values() {
+        let options = csv();
+        let values = vec!["a".to_owned(), "x,y".to_owned(), String::new()];
+        let record = record_text(&options, &values).unwrap();
+        assert_eq!(record, "a,\"x,y\",");
+        let table = parse(&format!("{record}\n"), &options).unwrap();
+        for (column, value) in values.iter().enumerate() {
+            assert_eq!(table.cell_text(0, column), value.as_str());
+        }
+        let fixed = ParseOptions {
+            first_line_contains: crate::parse::FirstLineContains::CellData,
+            ..ParseOptions::fixed_width([3, 2])
+        };
+        assert_eq!(
+            record_text(&fixed, &["ab".to_owned(), "c".to_owned()]).unwrap(),
+            "ab c"
+        );
+        assert_eq!(
+            record_text(&fixed, &["abcd".to_owned(), "c".to_owned()]),
+            Err(WriteError::TooWide { width: 3 })
+        );
+    }
     use crate::parse::{parse, FieldSyntax, ParseOptions};
 
     fn written(
