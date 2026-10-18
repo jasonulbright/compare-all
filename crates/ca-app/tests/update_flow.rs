@@ -164,8 +164,8 @@ fn no_call_is_made_when_the_option_is_off() {
     options.tweaks.check_for_updates = false;
     app.apply_options(options);
     quiet_frames(&mut app, 40);
+    assert!(run_frames(&mut app, App::launch_update_check_done));
     assert_eq!(asked.load(Ordering::SeqCst), 0);
-    assert!(!app.is_checking_for_updates());
 }
 
 #[test]
@@ -267,6 +267,7 @@ fn a_launch_with_a_verified_staged_update_starts_normally_and_does_not_apply_it(
         app.update_notice(),
         Some(UpdateNotice::Ready(_))
     )));
+    assert!(run_frames(&mut app, App::launch_update_check_done));
     quiet_frames(&mut app, 20);
 
     let staged = Staging::new(staging.clone());
@@ -547,6 +548,7 @@ fn the_policy_shows_no_update_notice_and_applies_nothing_but_keeps_the_staged_fi
     Staging::new(staging.clone()).write_apply_failure("cannot place ca.exe");
     let mut app = launch_with_checks_off(dir.path(), &staging, &server, true);
     let hook = app.update_exit_hook();
+    assert!(run_frames(&mut app, App::launch_update_check_done));
     quiet_frames(&mut app, 30);
     assert!(!app.is_checking_for_updates());
     assert_eq!(app.update_notice(), None);
@@ -585,7 +587,7 @@ fn a_launch_with_checks_off_leaves_an_update_a_helper_has_claimed() {
     let (server, asked) = release_server(version.to_string(), 404);
     let claim = Staging::new(staging.clone()).begin_apply().unwrap();
     let mut app = launch_with_checks_off(dir.path(), &staging, &server, false);
-    assert!(run_frames(&mut app, |app| !app.is_checking_for_updates()));
+    assert!(run_frames(&mut app, App::launch_update_check_done));
     quiet_frames(&mut app, 10);
     assert!(staging.join(&record.asset).exists());
     assert!(staging.join("staged.json").exists());
@@ -688,9 +690,10 @@ fn a_manual_check_with_the_option_off_reports_and_downloads_nothing() {
     let mut options = app.options().options_or_default();
     options.tweaks.check_for_updates = false;
     app.apply_options(options);
-    assert!(run_frames(&mut app, |app| !app.is_checking_for_updates()));
+    assert!(run_frames(&mut app, App::launch_update_check_done));
     quiet_frames(&mut app, 5);
     assert_eq!(asked.load(Ordering::SeqCst), 0);
+    assert!(app.accepts(Command::CheckForUpdates));
     app.run(Command::CheckForUpdates, &context());
     assert!(run_frames(&mut app, |app| matches!(
         app.update_notice(),
@@ -758,8 +761,9 @@ fn a_manual_check_while_another_copy_holds_the_staging_folder_does_not_say_curre
     ));
     check_just_done(dir.path());
     assert!(run_frames(&mut app, |app| app.options().is_ready()));
-    assert!(run_frames(&mut app, |app| !app.is_checking_for_updates()));
+    assert!(run_frames(&mut app, App::launch_update_check_done));
     quiet_frames(&mut app, 5);
+    assert!(app.accepts(Command::CheckForUpdates));
     app.run(Command::CheckForUpdates, &context());
     assert!(run_frames(&mut app, |app| matches!(
         app.update_notice(),
@@ -826,8 +830,8 @@ fn an_earlier_failure_is_dropped_once_the_version_is_installed() {
         .unwrap();
     let mut app = app_in(dir.path());
     app.update_from(source(&server, &staging_path, None));
+    assert!(run_frames(&mut app, App::launch_update_check_done));
     quiet_frames(&mut app, 30);
     assert!(app.update_notice().is_none());
-    assert!(run_frames(&mut app, |app| !app.is_checking_for_updates()));
     assert!(Staging::new(staging_path).read_warning().is_none());
 }

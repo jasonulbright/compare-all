@@ -1291,6 +1291,12 @@ impl App {
         self.update.job.is_some()
     }
 
+    /// True once the check at start has been decided and no check runs.
+    #[must_use]
+    pub fn launch_update_check_done(&self) -> bool {
+        self.update.started && self.update.job.is_none()
+    }
+
     /// How long until the next scheduled check while the window stays open.
     #[must_use]
     pub fn next_update_check_in(&self) -> Option<std::time::Duration> {

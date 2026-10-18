@@ -1990,18 +1990,53 @@ fn run_as(program: &Path) -> std::process::Child {
         .unwrap()
 }
 
-/// True when `path` cannot be opened for writing for 3 s. A file scanner
-/// holds a new file for a short time after it is written or renamed.
+/// True when a write-open of `path` gives a sharing or lock violation for
+/// 3 s. A file scanner holds a new file for a short time after it is written
+/// or renamed. Any other open error, such as a denied write, fails the test.
 #[cfg(windows)]
 fn in_use(path: &Path) -> bool {
+    const SHARING_VIOLATION: i32 = 32;
+    const LOCK_VIOLATION: i32 = 33;
     let started = std::time::Instant::now();
-    while std::fs::OpenOptions::new().write(true).open(path).is_err() {
-        if started.elapsed() >= Duration::from_secs(3) {
-            return true;
+    loop {
+        match std::fs::OpenOptions::new().write(true).open(path) {
+            Ok(_) => return false,
+            Err(error)
+                if matches!(
+                    error.raw_os_error(),
+                    Some(SHARING_VIOLATION | LOCK_VIOLATION)
+                ) =>
+            {
+                if started.elapsed() >= Duration::from_secs(3) {
+                    return true;
+                }
+            }
+            Err(error) => panic!("write-open of {} failed: {error}", path.display()),
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    false
+}
+
+#[cfg(windows)]
+#[test]
+fn a_read_only_file_is_not_counted_as_in_use() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("read-only.exe");
+    std::fs::write(&path, b"bytes").unwrap();
+    let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+    permissions.set_readonly(true);
+    std::fs::set_permissions(&path, permissions.clone()).unwrap();
+    let started = std::time::Instant::now();
+    let result = std::panic::catch_unwind(|| in_use(&path));
+    #[allow(clippy::permissions_set_readonly_false)]
+    permissions.set_readonly(false);
+    std::fs::set_permissions(&path, permissions).unwrap();
+    let message = result
+        .expect_err("a denied write counts as in use")
+        .downcast::<String>()
+        .unwrap();
+    assert!(message.contains("write-open of"), "{message}");
+    assert!(started.elapsed() < Duration::from_secs(3));
 }
 
 /// The running program file is set aside before the installer runs. An
