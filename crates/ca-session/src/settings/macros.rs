@@ -128,23 +128,27 @@ macro_rules! settings_group {
 /// Both generated types carry an `unknown` map at their own level, so a group
 /// a newer build added beside the known ones is preserved as well as an unknown
 /// field inside a known group.
+///
+/// A group written `field: Type => Override = expression` starts from that
+/// expression instead of the group's own default, for a kind whose defaults
+/// differ from the other kinds sharing the group. A group absent from a
+/// document takes the same value, through the container-level serde default.
 macro_rules! settings_composite {
     (
         $(#[$group_doc:meta])*
         $name:ident / $override_name:ident {
             $(
                 $(#[$field_doc:meta])*
-                $field:ident : $ty:ty => $override_ty:ty
+                $field:ident : $ty:ty => $override_ty:ty $(= $default:expr)?
             ),* $(,)?
         }
     ) => {
         $(#[$group_doc])*
-        #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+        #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
         #[serde(rename_all = "camelCase", default)]
         pub struct $name {
             $(
                 $(#[$field_doc])*
-                #[serde(default)]
                 pub $field: $ty,
             )*
             /// Groups written by another build, preserved verbatim.
@@ -153,6 +157,19 @@ macro_rules! settings_composite {
                 skip_serializing_if = "std::collections::BTreeMap::is_empty"
             )]
             pub unknown: std::collections::BTreeMap<String, serde_json::Value>,
+        }
+
+        impl Default for $name {
+            fn default() -> Self {
+                Self {
+                    $(
+                        $field: crate::settings::macros::composite_field_default!(
+                            $($default)?
+                        ),
+                    )*
+                    unknown: std::collections::BTreeMap::new(),
+                }
+            }
         }
 
         $(#[$group_doc])*
@@ -247,5 +264,17 @@ where
     T::deserialize(deserializer).map(Some)
 }
 
+/// The starting value of one group in a composite: the stated expression, or
+/// the group's own default when none is stated.
+macro_rules! composite_field_default {
+    () => {
+        Default::default()
+    };
+    ($default:expr) => {
+        $default
+    };
+}
+
+pub(crate) use composite_field_default;
 pub(crate) use settings_composite;
 pub(crate) use settings_group;

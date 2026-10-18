@@ -507,7 +507,9 @@ pub fn merge_options_of(settings: &ca_session::settings::FolderMergeSettings) ->
     clippy::field_reassign_with_default
 )]
 mod tests {
-    use super::{attributes_from, content_method, options_of, quick_tests};
+    use super::{
+        attributes_from, content_method, merge_options_of, options_of, quick_tests, sync_options_of,
+    };
     use ca_fs::criteria::ContentMethod;
     use ca_fs::filter::CaseSensitivity;
     use ca_session::settings::folder::{ContentComparison, FolderComparisonSettings};
@@ -842,9 +844,18 @@ mod tests {
                 ..ca_fs::criteria::QuickTests::default()
             }
         );
-        assert!(options.compare.content.enabled);
+        assert!(!options.compare.content.enabled);
+        assert!(
+            !sync_options_of(&ca_session::settings::FolderSyncSettings::default())
+                .compare
+                .content
+                .enabled
+        );
+
+        let merge = merge_options_of(&ca_session::settings::FolderMergeSettings::default());
+        assert!(merge.compare.content.enabled);
         assert_eq!(
-            options.compare.content.method,
+            merge.compare.content.method,
             ca_fs::criteria::ContentMethod::Rules
         );
     }

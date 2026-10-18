@@ -228,7 +228,7 @@ settings_group! {
         /// Pair names that are equivalent under different normalization forms.
         align_different_normalization: bool = true,
         /// Content test run at session load.
-        content_comparison: ContentComparison = ContentComparison::RulesBased,
+        content_comparison: ContentComparison = ContentComparison::None,
         /// Run the content test only where the quick tests already disagree.
         skip_content_if_quick_tests_match: bool = true,
         /// Compare version information resources embedded in executables.
@@ -372,7 +372,7 @@ settings_composite! {
         /// Sides, ancestor, output and description.
         specs: SpecsSettings => SpecsOverride,
         /// Tests deciding whether a pair counts as changed.
-        comparison: FolderComparisonSettings => FolderComparisonOverride,
+        comparison: FolderComparisonSettings => FolderComparisonOverride = merge_comparison(),
         /// Scanning, expansion, refresh and copy behavior.
         handling: FolderHandlingSettings => FolderHandlingOverride,
         /// Name masks limiting the session's scope.
@@ -381,5 +381,14 @@ settings_composite! {
         other_filters: OtherFilterSettings => OtherFilterOverride,
         /// Destination of the merged result.
         merge: MergeOutputSettings => MergeOutputOverride,
+    }
+}
+
+/// The comparison a folder merge starts from: the shared defaults with a
+/// content test by file format rules.
+fn merge_comparison() -> FolderComparisonSettings {
+    FolderComparisonSettings {
+        content_comparison: ContentComparison::RulesBased,
+        ..FolderComparisonSettings::default()
     }
 }
