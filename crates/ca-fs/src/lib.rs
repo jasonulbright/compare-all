@@ -47,8 +47,8 @@ pub use filter::{
     FilterTime, Mask, NameFilters, OtherFilter, OtherFilters, UnixFileType,
 };
 pub use journal::{
-    read_records, recover, recover_all, retire, sweep, Journal, JournalRecord, JournalWriter,
-    Recovery, KEEP_TROUBLED_DAYS,
+    journal_folder, read_records, recover, recover_all, retire, sweep, Journal, JournalRecord,
+    JournalWriter, Recovery, KEEP_TROUBLED_DAYS,
 };
 pub use ops::exec::{
     execute, AbortOnError, ConflictDecision, ContinueOnError, Decision, Drift, ErrorPolicy,
