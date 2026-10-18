@@ -1022,6 +1022,66 @@ fn a_helper_that_finds_the_apply_claimed_leaves_everything_alone() {
 }
 
 #[test]
+fn a_helper_that_applies_nothing_does_not_start_the_program() {
+    let server = Server::start();
+    let target = program_folder();
+    let starts = AtomicUsize::new(0);
+    let run = |staging: &Staging| {
+        let arguments = ca_update::apply::HelperArguments {
+            staging: staging.dir().to_path_buf(),
+            executable: target.path().join("compare-all.exe"),
+            relaunch: true,
+            program_arguments: Vec::new(),
+        };
+        ca_update::apply::helper_main_with(
+            &arguments,
+            &FakeSigner::signed_by(SIGNER),
+            SIGNER,
+            &running(),
+            Duration::from_millis(300),
+            &|| {
+                starts.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+    };
+    // Another helper holds the claim.
+    let (_keep, staging) = staging_dir();
+    stage_portable(&server, &staging);
+    let claim = staging.begin_apply().unwrap();
+    assert_ne!(run(&staging), 0);
+    drop(claim);
+    assert_eq!(starts.load(Ordering::SeqCst), 0);
+    // Another helper applied the update and cleared it.
+    let (_keep, empty) = staging_dir();
+    assert_ne!(run(&empty), 0);
+    assert_eq!(starts.load(Ordering::SeqCst), 0);
+    // This helper applies the update.
+    assert_eq!(run(&staging), 0);
+    assert_eq!(starts.load(Ordering::SeqCst), 1);
+    // The end of the program is not seen.
+    let (_keep, other) = staging_dir();
+    stage_portable(&server, &other);
+    let arguments = ca_update::apply::HelperArguments {
+        staging: other.dir().to_path_buf(),
+        executable: target.path().join("missing").join("compare-all.exe"),
+        relaunch: true,
+        program_arguments: Vec::new(),
+    };
+    let code = ca_update::apply::helper_main_with(
+        &arguments,
+        &FakeSigner::signed_by(SIGNER),
+        SIGNER,
+        &running(),
+        Duration::from_millis(300),
+        &|| {
+            starts.fetch_add(1, Ordering::SeqCst);
+        },
+    );
+    assert_ne!(code, 0);
+    assert_eq!(starts.load(Ordering::SeqCst), 1);
+}
+
+#[test]
 fn a_program_file_changed_between_its_check_and_its_copy_is_not_installed() {
     let server = Server::start();
     let (_keep, staging) = staging_dir();
