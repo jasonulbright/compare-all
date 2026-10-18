@@ -12,6 +12,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use ureq::unversioned::transport::Connector as _;
 
 /// Content types a release file may arrive with.
 const FILE_CONTENT_TYPES: &[&str] = &[
@@ -273,7 +274,12 @@ impl HttpTransport {
         self
     }
 
-    fn agent_for(&self, url: &str, overall: Duration) -> Result<ureq::Agent, String> {
+    fn agent_for(
+        &self,
+        url: &str,
+        overall: Duration,
+        idle: Option<Duration>,
+    ) -> Result<ureq::Agent, String> {
         let host = url
             .split_once("://")
             .map_or("", |(_, rest)| rest)
@@ -300,15 +306,23 @@ impl HttpTransport {
             .timeout_recv_response(Some(self.timeout))
             .user_agent(self.user_agent.clone())
             .build();
-        Ok(ureq::Agent::new_with_config(config))
+        Ok(match idle {
+            Some(idle) => ureq::Agent::with_parts(
+                config,
+                ureq::unversioned::transport::DefaultConnector::new().chain(IdleLimit(idle)),
+                ureq::unversioned::resolver::DefaultResolver::default(),
+            ),
+            None => ureq::Agent::new_with_config(config),
+        })
     }
 
     fn open(
         &self,
         url: &str,
         overall: Duration,
+        idle: Option<Duration>,
     ) -> Result<ureq::http::Response<ureq::Body>, String> {
-        self.agent_for(url, overall)?
+        self.agent_for(url, overall, idle)?
             .get(url)
             .call()
             .map_err(|error| error.to_string())
@@ -326,7 +340,7 @@ impl Transport for HttpTransport {
         let url = url.to_owned();
         let overall = self.timeout;
         cancellable(cancel, None, move |flag, progress| {
-            let response = this.open(&url, overall)?;
+            let response = this.open(&url, overall, None)?;
             let mut reader = response.into_body().into_reader();
             let mut out = Vec::new();
             copy_limited(&mut reader, &mut out, max_bytes, &flag, &progress)?;
@@ -347,7 +361,7 @@ impl Transport for HttpTransport {
         let overall = self.download_limit(max_bytes);
         let idle = Some(self.timeout);
         cancellable(cancel, idle, move |flag, progress| {
-            let response = this.open(&url, overall)?;
+            let response = this.open(&url, overall, idle)?;
             progress.touch();
             let content_type = response.body().mime_type().map(str::to_owned);
             if response
@@ -397,16 +411,18 @@ impl Progress {
 }
 
 /// Run `work` on its own thread and give up on it when `cancel` is set, or
-/// when `idle` passes without the work reporting progress. A blocked read
-/// cannot be interrupted from outside, so the abandoned thread ends on its
-/// own outer timeout.
+/// when `idle` passes without the work reporting progress. Giving up sets the
+/// flag the work reads between reads. A read that blocks is not interrupted
+/// from outside; a download agent limits each wait for data to `idle`, so
+/// the abandoned thread ends and closes its connection shortly after.
 fn cancellable<T: Send + 'static>(
     cancel: &Arc<AtomicBool>,
     idle: Option<Duration>,
     work: impl FnOnce(Arc<AtomicBool>, Progress) -> Result<T, String> + Send + 'static,
 ) -> Result<T, String> {
     let (sender, receiver) = std::sync::mpsc::channel();
-    let flag = Arc::clone(cancel);
+    let stop = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&stop);
     let progress = Progress::new();
     let reported = progress.clone();
     std::thread::spawn(move || {
@@ -417,9 +433,11 @@ fn cancellable<T: Send + 'static>(
             Ok(result) => return result,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 if cancel.load(Ordering::Relaxed) {
+                    stop.store(true, Ordering::Relaxed);
                     return Err("the transfer was cancelled".to_owned());
                 }
                 if idle.is_some_and(|limit| progress.idle() > limit) {
+                    stop.store(true, Ordering::Relaxed);
                     return Err("the transfer stopped receiving data".to_owned());
                 }
             }
@@ -427,6 +445,72 @@ fn cancellable<T: Send + 'static>(
                 return Err("the transfer ended without a result".to_owned());
             }
         }
+    }
+}
+
+/// The last link of a download connection: every wait for data, from the
+/// handshake to the last body byte, ends after the idle limit at most.
+#[derive(Debug)]
+struct IdleLimit(Duration);
+
+impl ureq::unversioned::transport::Connector<Box<dyn ureq::unversioned::transport::Transport>>
+    for IdleLimit
+{
+    type Out = IdleTransport;
+
+    fn connect(
+        &self,
+        _: &ureq::unversioned::transport::ConnectionDetails,
+        chained: Option<Box<dyn ureq::unversioned::transport::Transport>>,
+    ) -> Result<Option<Self::Out>, ureq::Error> {
+        Ok(chained.map(|inner| IdleTransport {
+            inner,
+            idle: self.0,
+        }))
+    }
+}
+
+#[derive(Debug)]
+struct IdleTransport {
+    inner: Box<dyn ureq::unversioned::transport::Transport>,
+    idle: Duration,
+}
+
+impl ureq::unversioned::transport::Transport for IdleTransport {
+    fn buffers(&mut self) -> &mut dyn ureq::unversioned::transport::Buffers {
+        self.inner.buffers()
+    }
+
+    fn transmit_output(
+        &mut self,
+        amount: usize,
+        timeout: ureq::unversioned::transport::NextTimeout,
+    ) -> Result<(), ureq::Error> {
+        self.inner.transmit_output(amount, timeout)
+    }
+
+    fn await_input(
+        &mut self,
+        timeout: ureq::unversioned::transport::NextTimeout,
+    ) -> Result<bool, ureq::Error> {
+        let idle = ureq::unversioned::transport::time::Duration::from(self.idle);
+        let capped = if idle < timeout.after {
+            ureq::unversioned::transport::NextTimeout {
+                after: idle,
+                reason: timeout.reason,
+            }
+        } else {
+            timeout
+        };
+        self.inner.await_input(capped)
+    }
+
+    fn is_open(&mut self) -> bool {
+        self.inner.is_open()
+    }
+
+    fn is_tls(&self) -> bool {
+        self.inner.is_tls()
     }
 }
 
