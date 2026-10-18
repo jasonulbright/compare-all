@@ -2069,6 +2069,36 @@ fn setting_the_running_program_aside_never_leaves_its_name_empty() {
     assert!(!in_use(&program));
 }
 
+/// The unused copy that takes the program name belongs to administrators
+/// whatever owner the token gives new objects, so an unelevated process of
+/// the administrator cannot change it; its access list is the one the
+/// install folder gives.
+#[cfg(windows)]
+#[test]
+fn the_unused_program_copy_belongs_to_administrators() {
+    let install = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let program = install.path().join("compare-all.exe");
+    std::fs::write(&program, b"old exe").unwrap();
+    assert!(icacls(&program, &["/setowner", "*S-1-5-18", "/q"]));
+    let moved = ca_update::install::set_aside_observed(&program, work.path(), &|| {}).unwrap();
+    assert_eq!(std::fs::read(&program).unwrap(), b"old exe");
+    assert_eq!(owner_of(&moved), "O:SY");
+    assert_eq!(owner_of(&program), "O:BA");
+    let sddl = ca_update::access::read_sddls(&[program.as_path()]).unwrap();
+    let dacl = sddl[0].split("D:").nth(1).unwrap();
+    let entries: Vec<&str> = dacl
+        .split('(')
+        .skip(1)
+        .map(|entry| entry.trim_end_matches(')'))
+        .collect();
+    assert!(!entries.is_empty(), "{dacl}");
+    for entry in entries {
+        let flags = entry.split(';').nth(1).unwrap();
+        assert!(flags.contains("ID"), "{dacl}");
+    }
+}
+
 /// When the program file cannot be set aside, the installer does not start
 /// and the staged update stays without a warning.
 #[test]
@@ -2590,11 +2620,16 @@ fn the_work_folder_is_open_to_administrators_and_the_system_only() {
         .unwrap_or_default()
         .trim_end_matches(['\r', '\n', '\0', ' ']);
     // Protected, with no inherited entry: full control for Administrators
-    // (BA) and SYSTEM (SY), for the folder, its files and its subfolders.
+    // (BA) and SYSTEM (SY), for the folder, its files and its subfolders;
+    // the owner of a file or folder in it (OW) may only read it.
     assert!(dacl.starts_with("PAI("), "{acl}");
     let mut entries: Vec<&str> = dacl["PAI".len()..].split_inclusive(')').collect();
     entries.sort_unstable();
-    assert_eq!(entries, ["(A;OICI;FA;;;BA)", "(A;OICI;FA;;;SY)"], "{acl}");
+    assert_eq!(
+        entries,
+        ["(A;OICI;FA;;;BA)", "(A;OICI;FA;;;SY)", "(A;OICIIO;FR;;;OW)"],
+        "{acl}"
+    );
     // The owner can still reset the list, which the clean-up needs.
     let status = ca_io::host_command::host_command("icacls")
         .arg(&work)
