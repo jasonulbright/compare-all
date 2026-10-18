@@ -410,7 +410,10 @@ fn a_wrong_password_is_a_typed_error_with_no_secret_in_it() {
     let Err(error) = SftpFs::connect(&settings, &context, &Cancel::new()) else {
         panic!("the wrong password must not log in");
     };
-    assert!(matches!(error, VfsError::AuthFailed { .. }), "{error}");
+    assert!(
+        matches!(error, VfsError::AuthFailed { .. }),
+        "the wrong password did not fail as an authentication error"
+    );
     let in_error = error.to_string().contains(&wrong);
     assert!(!in_error, "the password reached the error");
 }

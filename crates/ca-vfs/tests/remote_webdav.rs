@@ -460,7 +460,10 @@ fn a_refused_account_is_a_typed_error_with_no_secret_in_it() {
     let Err(error) = WebDavFs::connect(&settings, &context(), &Cancel::new()) else {
         panic!("a refused account must not connect");
     };
-    assert!(matches!(error, VfsError::AuthFailed { .. }), "{error}");
+    assert!(
+        matches!(error, VfsError::AuthFailed { .. }),
+        "the refused account did not fail as an authentication error"
+    );
     let in_error = error.to_string().contains(&password());
     assert!(!in_error, "the password reached the error");
     let _ = directory;
