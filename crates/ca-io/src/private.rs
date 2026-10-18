@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 ///
 /// Missing parents are created with default permissions. An existing link is
 /// refused, so a link planted at `folder` cannot send the contents elsewhere.
+/// On Unix every check and the narrowing act on the opened folder, so a swap
+/// of the path after the open changes nothing.
 ///
 /// # Errors
 /// Returns an error when the folder cannot be created, is a link, is not a
@@ -33,20 +35,92 @@ pub fn create_owned_folder(folder: &Path) -> io::Result<()> {
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
         Err(error) => return Err(error),
     }
-    if std::fs::symlink_metadata(folder)?.file_type().is_symlink() {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!("{} is a link", folder.display()),
-        ));
-    }
-    check_owned_folder(folder)?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt as _;
-        let mode = std::fs::metadata(folder)?.permissions().mode();
-        if mode & 0o077 != 0 {
-            std::fs::set_permissions(folder, std::fs::Permissions::from_mode(0o700))?;
+        adopt_folder(folder, || {})
+    }
+    #[cfg(not(unix))]
+    {
+        if std::fs::symlink_metadata(folder)?.file_type().is_symlink() {
+            return Err(link_refused(folder));
         }
+        check_owned_folder(folder)
+    }
+}
+
+fn link_refused(folder: &Path) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!("{} is a link", folder.display()),
+    )
+}
+
+/// Open `folder` as a folder. With `follow` false a link at `folder` is not
+/// followed and the open fails.
+#[cfg(unix)]
+fn open_folder(folder: &Path, follow: bool) -> io::Result<std::fs::File> {
+    use rustix::fs::{openat, Mode, OFlags, CWD};
+    let mut flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+    if !follow {
+        flags |= OFlags::NOFOLLOW;
+    }
+    Ok(std::fs::File::from(openat(
+        CWD,
+        folder,
+        flags,
+        Mode::empty(),
+    )?))
+}
+
+/// Check the opened folder `handle`, which was opened from `folder`: it must
+/// belong to the running user and, when `private`, be closed to others.
+#[cfg(unix)]
+fn check_handle(handle: &std::fs::File, folder: &Path, private: bool) -> io::Result<()> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    let metadata = handle.metadata()?;
+    if !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotADirectory,
+            format!("{} is not a folder", folder.display()),
+        ));
+    }
+    if metadata.uid() != rustix::process::geteuid().as_raw() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} belongs to another user", folder.display()),
+        ));
+    }
+    if private && metadata.permissions().mode() & 0o077 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} is open to other users", folder.display()),
+        ));
+    }
+    Ok(())
+}
+
+/// Check the folder at `folder` as a folder of the running user and narrow it
+/// to that user, all on the opened folder. `between` runs after the open and
+/// before the first check.
+#[cfg(unix)]
+fn adopt_folder(folder: &Path, between: impl FnOnce()) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let handle = match open_folder(folder, false) {
+        Ok(handle) => handle,
+        Err(error) => {
+            return if std::fs::symlink_metadata(folder)
+                .is_ok_and(|metadata| metadata.file_type().is_symlink())
+            {
+                Err(link_refused(folder))
+            } else {
+                Err(error)
+            };
+        }
+    };
+    between();
+    check_handle(&handle, folder, false)?;
+    if handle.metadata()?.permissions().mode() & 0o077 != 0 {
+        handle.set_permissions(std::fs::Permissions::from_mode(0o700))?;
     }
     Ok(())
 }
@@ -54,51 +128,46 @@ pub fn create_owned_folder(folder: &Path) -> io::Result<()> {
 /// Check that `folder` is a folder and, on Unix, that the running user owns
 /// it.
 ///
-/// A link is followed, so a link to a folder of another user is refused.
+/// A link is followed, so a link to a folder of another user is refused. On
+/// Unix the checks act on the opened folder.
 ///
 /// # Errors
 /// Returns an error when the folder cannot be read, is not a folder, or
 /// belongs to another user.
 pub fn check_owned_folder(folder: &Path) -> io::Result<()> {
-    let metadata = std::fs::metadata(folder)?;
-    if !metadata.is_dir() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotADirectory,
-            format!("{} is not a folder", folder.display()),
-        ));
-    }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::MetadataExt as _;
-        if metadata.uid() != rustix::process::geteuid().as_raw() {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!("{} belongs to another user", folder.display()),
-            ));
+        check_handle(&open_folder(folder, true)?, folder, false)
+    }
+    #[cfg(not(unix))]
+    {
+        if std::fs::metadata(folder)?.is_dir() {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::NotADirectory,
+                format!("{} is not a folder", folder.display()),
+            ))
         }
     }
-    Ok(())
 }
 
 /// Check that `folder` is a folder the running user owns and, on Unix, that
-/// no group and no other user has any access to it.
+/// no group and no other user has any access to it. On Unix the checks act on
+/// the opened folder.
 ///
 /// # Errors
 /// Returns an error when the folder cannot be read, is not a folder, belongs
 /// to another user, or is open to others.
 pub fn check_private_folder(folder: &Path) -> io::Result<()> {
-    check_owned_folder(folder)?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt as _;
-        if std::fs::metadata(folder)?.permissions().mode() & 0o077 != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!("{} is open to other users", folder.display()),
-            ));
-        }
+        check_handle(&open_folder(folder, true)?, folder, true)
     }
-    Ok(())
+    #[cfg(not(unix))]
+    {
+        check_owned_folder(folder)
+    }
 }
 
 /// True when a new file can be created in `folder`.
@@ -166,6 +235,28 @@ mod tests {
         std::os::unix::fs::symlink(&target, &link).unwrap();
         let error = create_owned_folder(&link).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_swap_of_the_path_after_the_open_does_not_change_another_folder() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let parent = tempfile::tempdir().unwrap();
+        let folder = parent.path().join("folder");
+        let other = parent.path().join("other");
+        let moved = parent.path().join("moved");
+        for path in [&folder, &other] {
+            std::fs::create_dir(path).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        super::adopt_folder(&folder, || {
+            std::fs::rename(&folder, &moved).unwrap();
+            std::os::unix::fs::symlink(&other, &folder).unwrap();
+        })
+        .unwrap();
+        let mode = |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode();
+        assert_eq!(mode(&moved) & 0o777, 0o700);
+        assert_eq!(mode(&other) & 0o777, 0o755);
     }
 
     #[cfg(unix)]
