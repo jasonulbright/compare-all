@@ -9,6 +9,7 @@ use crate::manifest::{is_plain_file_name, is_sha256, msi_name, zip_name};
 use crate::version::Version;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+#[cfg(not(windows))]
 use std::time::{Duration, SystemTime};
 
 const RECORD_FILE: &str = "staged.json";
@@ -23,7 +24,8 @@ const FORMAT: u32 = 1;
 const MAX_RECORD_BYTES: u64 = 16 * 1024;
 /// Largest release file the updater stages.
 pub const MAX_ASSET_BYTES: u64 = 512 * 1024 * 1024;
-/// How long an apply marker blocks a new download.
+/// How long a claim file blocks a new claim where no handle can hold it.
+#[cfg(not(windows))]
 const APPLY_MARKER_AGE: Duration = Duration::from_secs(60 * 60);
 
 /// Which file of a release is staged.
@@ -188,8 +190,27 @@ impl Staging {
     }
 
     /// Remove the staged record and every staged file. The warning and the
-    /// helper folder stay.
+    /// helper folder stay. While a claim is held, by this process or another,
+    /// nothing is removed: the holder still needs the files.
     pub fn clear(&self) {
+        if !self.is_applying() {
+            self.remove_staged();
+        }
+    }
+
+    /// [`Staging::clear`] for the holder of `claim`.
+    pub fn clear_claimed(&self, claim: &ApplyClaim) {
+        let _ = claim;
+        self.remove_staged();
+    }
+
+    /// A scratch folder that belongs to this process only.
+    #[must_use]
+    pub fn scratch_dir(&self) -> PathBuf {
+        self.dir.join(format!("scratch-{}", std::process::id()))
+    }
+
+    fn remove_staged(&self) {
         let Ok(entries) = std::fs::read_dir(&self.dir) else {
             return;
         };
@@ -288,8 +309,8 @@ impl Staging {
         let _ = std::fs::remove_file(self.dir.join(WARNING_FILE));
     }
 
-    /// Claim the staged update for one apply. A download waits while the
-    /// claim is fresh, and a second claim fails while the first is held.
+    /// Claim the staging folder for one download or one apply. A second claim
+    /// fails while the first is held.
     ///
     /// On Windows the claim is a handle that shares nothing; the system closes
     /// it when the process ends in any way, so a crashed apply never blocks
@@ -322,17 +343,37 @@ impl Staging {
         }
     }
 
-    /// True while an apply runs.
+    /// True while a claim is held, by this process or another.
     #[must_use]
     pub fn is_applying(&self) -> bool {
-        std::fs::metadata(self.dir.join(APPLYING_FILE))
-            .and_then(|meta| meta.modified())
-            .is_ok_and(|time| {
-                SystemTime::now()
-                    .duration_since(time)
-                    .map_or(true, |age| age < APPLY_MARKER_AGE)
-            })
+        claim_is_held(&self.dir.join(APPLYING_FILE))
     }
+}
+
+/// On Windows a held claim is a handle that shares nothing, so any other open
+/// fails with a sharing violation; a file left by a process that ended opens
+/// and counts as free whatever its time.
+#[cfg(windows)]
+fn claim_is_held(path: &Path) -> bool {
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    match std::fs::OpenOptions::new().read(true).open(path) {
+        Ok(_) => false,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => error.raw_os_error() == Some(ERROR_SHARING_VIOLATION),
+    }
+}
+
+/// Elsewhere a claim file younger than [`APPLY_MARKER_AGE`] is held. A time
+/// in the future comes from a changed clock or a planted file and is stale.
+#[cfg(not(windows))]
+fn claim_is_held(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .is_ok_and(|time| {
+            SystemTime::now()
+                .duration_since(time)
+                .is_ok_and(|age| age < APPLY_MARKER_AGE)
+        })
 }
 
 /// The exclusive right to apply the staged update. Dropping it releases the
@@ -395,6 +436,7 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use std::time::{Duration, SystemTime};
 
     fn version() -> Version {
         Version::parse("2026.10.18.0007").unwrap()
@@ -461,5 +503,47 @@ mod tests {
         staging.clear();
         assert!(staging.read_warning().is_some());
         assert!(!dir.path().join("x.part").exists());
+    }
+
+    fn staged(staging: &Staging) -> StagedRecord {
+        let record = StagedRecord::new(
+            &version(),
+            AssetKind::Zip.file_name(&version()),
+            "b".repeat(64),
+            10,
+        );
+        std::fs::create_dir_all(staging.dir()).unwrap();
+        std::fs::write(staging.asset_path(&record), b"0123456789").unwrap();
+        staging.write_record(&record).unwrap();
+        record
+    }
+
+    #[test]
+    fn a_clear_while_the_update_is_claimed_keeps_the_staged_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = Staging::new(dir.path().to_path_buf());
+        let record = staged(&staging);
+        let claim = staging.begin_apply().unwrap();
+        staging.clear();
+        assert_eq!(staging.read_record(), Some(record.clone()));
+        assert!(staging.asset_path(&record).exists());
+        drop(claim);
+        staging.clear();
+        assert_eq!(staging.read_record(), None);
+    }
+
+    #[test]
+    fn a_claim_file_with_a_future_time_is_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = Staging::new(dir.path().to_path_buf());
+        let path = dir.path().join(APPLYING_FILE);
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_modified(SystemTime::now() + Duration::from_secs(24 * 60 * 60))
+            .unwrap();
+        drop(file);
+        assert!(!staging.is_applying());
+        let claim = staging.begin_apply().unwrap();
+        assert!(staging.is_applying());
+        drop(claim);
     }
 }

@@ -876,11 +876,12 @@ fn a_helper_that_finds_the_apply_claimed_leaves_everything_alone() {
         relaunch: false,
         program_arguments: Vec::new(),
     };
-    let code = ca_update::apply::helper_main(
+    let code = ca_update::apply::helper_main_waiting(
         &arguments,
         &FakeSigner::signed_by(SIGNER),
         SIGNER,
         &running(),
+        Duration::from_millis(500),
     );
     assert_ne!(code, 0);
     assert_eq!(
@@ -888,6 +889,69 @@ fn a_helper_that_finds_the_apply_claimed_leaves_everything_alone() {
         b"old exe"
     );
     assert!(staging.read_record().is_some());
+}
+
+#[test]
+fn a_program_file_changed_between_its_check_and_its_copy_is_not_installed() {
+    let server = Server::start();
+    let (_keep, staging) = staging_dir();
+    stage_portable(&server, &staging);
+    let target = program_folder();
+    let signer = FakeSigner::signed_by(SIGNER);
+    let endpoints = server.endpoints();
+    let trust = Trust {
+        signer: &signer,
+        signer_name: SIGNER,
+        endpoints: &endpoints,
+        running: &running(),
+    };
+    let swapped = b"MZ unverified program".to_vec();
+    let staging_folder = staging.dir().to_path_buf();
+    // Another process of the same user replaces the checked file in the
+    // scratch folder after the check and before the copy.
+    let swap = |_: &str| {
+        for entry in std::fs::read_dir(&staging_folder).unwrap().flatten() {
+            if entry.file_name().to_string_lossy().starts_with("scratch") {
+                let _ = std::fs::write(entry.path().join("compare-all.exe"), &swapped);
+            }
+        }
+        Ok(())
+    };
+    let _ = apply_staged(
+        &staging,
+        InstallMode::Portable,
+        &trust,
+        &|_| Ok(()),
+        &swap,
+        target.path(),
+    );
+    let installed = std::fs::read(target.path().join("compare-all.exe")).unwrap();
+    assert_ne!(installed, swapped);
+    assert!(installed == new_exe() || installed == b"old exe");
+}
+
+#[test]
+fn a_check_while_another_copy_holds_the_claim_reports_it_and_changes_nothing() {
+    let server = Server::start();
+    let (_keep, staging) = staging_dir();
+    stage_portable(&server, &staging);
+    let record = staging.read_record().unwrap();
+    let before = std::fs::read(staging.asset_path(&record)).unwrap();
+    let claim = staging.begin_apply().unwrap();
+    let hits = server.hits.load(Ordering::SeqCst);
+    let outcome = check(
+        &server,
+        &staging,
+        &FakeSigner::signed_by(SIGNER),
+        Some(InstallMode::Portable),
+    )
+    .unwrap();
+    assert_eq!(outcome, Outcome::Busy);
+    // The latest tag and the manifest only; no download.
+    assert_eq!(server.hits.load(Ordering::SeqCst), hits + 2);
+    assert_eq!(staging.read_record(), Some(record.clone()));
+    assert_eq!(std::fs::read(staging.asset_path(&record)).unwrap(), before);
+    drop(claim);
 }
 
 #[test]

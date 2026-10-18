@@ -581,6 +581,34 @@ fn a_manual_check_with_the_option_off_reports_and_downloads_nothing() {
 }
 
 #[test]
+fn a_manual_check_while_another_copy_holds_the_staging_folder_does_not_say_current() {
+    let dir = tempfile::tempdir().unwrap();
+    let staging = dir.path().join("stage");
+    let (server, _) = release_server(next_version().to_string(), 404);
+    let claim = Staging::new(staging.clone()).begin_apply().unwrap();
+    let mut app = app_in(dir.path());
+    app.update_from(source(
+        &server,
+        &staging,
+        Some(InstallMode::Installed { machine: false }),
+    ));
+    check_just_done(dir.path());
+    assert!(run_frames(&mut app, |app| app.options().is_ready()));
+    assert!(run_frames(&mut app, |app| !app.is_checking_for_updates()));
+    quiet_frames(&mut app, 5);
+    app.run(Command::CheckForUpdates, &context());
+    assert!(run_frames(&mut app, |app| matches!(
+        app.update_notice(),
+        Some(UpdateNotice::Message(_))
+    )));
+    let Some(UpdateNotice::Message(text)) = app.update_notice() else {
+        panic!("{:?}", app.update_notice());
+    };
+    assert!(text.contains("Check again later"), "{text}");
+    drop(claim);
+}
+
+#[test]
 fn the_program_file_carries_its_version_for_the_updater() {
     let bytes = std::fs::read(env!("CARGO_BIN_EXE_compare-all")).unwrap();
     assert_eq!(
