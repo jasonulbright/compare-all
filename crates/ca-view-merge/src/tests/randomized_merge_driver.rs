@@ -1219,7 +1219,7 @@ fn replay_with_takes(
     takes: [(usize, Command); 2],
 ) -> TakeOrderReplay {
     PASTE.with(|p| p.set(paste));
-    let (mut view, dir) = open(inputs.0, inputs.1, inputs.2);
+    let (mut view, dir) = open_driven(inputs.0, inputs.1, inputs.2);
     run_until_ready(&mut view);
     let mut stats = Stats::default();
     for op in ops {
