@@ -11,6 +11,7 @@
 mod icon;
 mod notices;
 mod package;
+mod resource;
 mod update_manifest;
 mod version;
 

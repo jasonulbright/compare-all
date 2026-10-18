@@ -1,9 +1,14 @@
 //! Embeds the build version as `CA_VERSION` and, on Windows, the application
-//! icon as a resource of the `compare-all` executable.
+//! icon and the version information as resources of the `compare-all`
+//! executable.
 
 #[path = "../../xtask/src/version.rs"]
 mod version;
 
+#[path = "../../xtask/src/resource.rs"]
+mod resource;
+
+use resource::{append, append_version, new_resource_file, VersionInfo, LANGUAGE};
 use std::path::{Path, PathBuf};
 
 const ICON: &str = "../../assets/icon/compare-all.ico";
@@ -15,25 +20,37 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CA_BUILD_DATE");
     println!("cargo:rerun-if-changed=../../BUILD_NUMBER");
     println!("cargo:rerun-if-changed={ICON}");
-    println!("cargo:rustc-env=CA_VERSION={}", version::compute());
+    let version = version::compute();
+    println!("cargo:rustc-env=CA_VERSION={version}");
     let windows = std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows");
     let msvc = std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc");
     if windows && msvc {
-        if let Err(error) = embed_icon() {
-            println!("cargo:warning=the icon is not embedded: {error}");
+        if let Err(error) = embed_resources(&version) {
+            println!("cargo:warning=the resources are not embedded: {error}");
         }
     }
 }
 
-/// Writes the icon as a compiled resource file and hands it to the linker.
+/// Writes the icon and the version information as a compiled resource file
+/// and hands it to the linker.
 ///
 /// The MSVC linker takes a `.res` file as an input and converts it itself, so
 /// no resource compiler has to be installed.
-fn embed_icon() -> Result<(), String> {
+fn embed_resources(version: &str) -> Result<(), String> {
     let ico = std::fs::read(ICON).map_err(|error| format!("cannot read {ICON}: {error}"))?;
-    let res = resource_file(&ico)?;
+    let mut res = resource_file(&ico)?;
+    append_version(
+        &mut res,
+        &VersionInfo {
+            version,
+            description: "Compare All",
+            product: "Compare All",
+            company: "Jason Ulbright",
+            file_name: "compare-all.exe",
+        },
+    )?;
     let out = PathBuf::from(std::env::var("OUT_DIR").map_err(|error| error.to_string())?);
-    let path = out.join("compare-all-icon.res");
+    let path = out.join("compare-all.res");
     std::fs::write(&path, res).map_err(|error| error.to_string())?;
     link(&path);
     Ok(())
@@ -51,8 +68,6 @@ const RT_GROUP_ICON: u16 = 14;
 const ICON_FLAGS: u16 = 0x1010;
 /// Moveable, pure and discardable, as a resource compiler marks an icon group.
 const GROUP_FLAGS: u16 = 0x1030;
-/// English, United States.
-const LANGUAGE: u16 = 0x0409;
 
 /// A `.res` file with one icon group whose images are those of `ico`.
 fn resource_file(ico: &[u8]) -> Result<Vec<u8>, String> {
@@ -71,9 +86,7 @@ fn resource_file(ico: &[u8]) -> Result<Vec<u8>, String> {
         return Err(bad());
     }
     let count = u16_at(4).ok_or_else(bad)?;
-    let mut res = Vec::new();
-    // A resource file opens with an empty entry that marks its format.
-    append(&mut res, 0, 0, 0, 0, &[]);
+    let mut res = new_resource_file();
     let mut group = Vec::new();
     group.extend_from_slice(&0u16.to_le_bytes());
     group.extend_from_slice(&1u16.to_le_bytes());
@@ -94,24 +107,4 @@ fn resource_file(ico: &[u8]) -> Result<Vec<u8>, String> {
     }
     append(&mut res, RT_GROUP_ICON, 1, GROUP_FLAGS, LANGUAGE, &group);
     Ok(res)
-}
-
-/// One resource entry with a numeric type and a numeric name.
-fn append(res: &mut Vec<u8>, kind: u16, name: u16, flags: u16, language: u16, data: &[u8]) {
-    let size = u32::try_from(data.len()).unwrap_or(u32::MAX);
-    res.extend_from_slice(&size.to_le_bytes());
-    res.extend_from_slice(&32u32.to_le_bytes());
-    res.extend_from_slice(&0xFFFFu16.to_le_bytes());
-    res.extend_from_slice(&kind.to_le_bytes());
-    res.extend_from_slice(&0xFFFFu16.to_le_bytes());
-    res.extend_from_slice(&name.to_le_bytes());
-    res.extend_from_slice(&0u32.to_le_bytes());
-    res.extend_from_slice(&flags.to_le_bytes());
-    res.extend_from_slice(&language.to_le_bytes());
-    res.extend_from_slice(&0u32.to_le_bytes());
-    res.extend_from_slice(&0u32.to_le_bytes());
-    res.extend_from_slice(data);
-    while !res.len().is_multiple_of(4) {
-        res.push(0);
-    }
 }

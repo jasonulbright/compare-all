@@ -897,6 +897,7 @@ dependencies = [
  "anyhow",
  "ca-diff",
  "ca-fs",
+ "ca-io",
  "ca-script",
  "ca-session",
  "ca-update",
