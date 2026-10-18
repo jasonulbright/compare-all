@@ -1720,7 +1720,6 @@ mod tests {
                 override_quick: true,
                 ..ContentTests::default()
             },
-            ..CompareOptions::default()
         };
         let mut tree = align(
             &scan(dirs.left.path()),
