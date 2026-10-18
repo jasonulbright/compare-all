@@ -1685,14 +1685,16 @@ fn the_elevated_step_installs_its_own_checked_copy_and_removes_it() {
     let code = install_from(&staging, work.path(), Some(&program), &checks, &|command| {
         let copy = std::path::PathBuf::from(command.get_args().nth(1).unwrap());
         let bytes = std::fs::read(&copy).unwrap();
-        *seen.lock().unwrap() = Some((copy, bytes, program.exists()));
+        *seen.lock().unwrap() = Some((copy, bytes, std::fs::read(&program).ok()));
         Some(0)
     });
     assert_eq!(code, 0);
     let (copy, bytes, program_in_place) = seen.lock().unwrap().take().unwrap();
     assert_eq!(copy.parent(), Some(work.path()));
     assert_eq!(bytes, msi_bytes());
-    assert!(!program_in_place, "the program file stayed in use");
+    // The install folder holds a program file at every moment.
+    assert_eq!(program_in_place.as_deref(), Some(b"old exe".as_slice()));
+    assert_eq!(names(install.path()), ["compare-all.exe"]);
     assert!(!copy.exists());
     // The elevated step writes nothing in the staging folder of the user.
     assert_eq!(folder_files(staging.dir()), staged_before);
@@ -1739,7 +1741,72 @@ fn a_failed_install_puts_the_program_file_back() {
     });
     assert_eq!(code, 1603);
     assert_eq!(std::fs::read(&program).unwrap(), b"old exe");
+    assert_eq!(names(install.path()), ["compare-all.exe"]);
     assert_eq!(std::fs::read_dir(work.path()).unwrap().count(), 0);
+}
+
+/// Start a copy of a system program that runs for a while as `program`.
+#[cfg(windows)]
+fn run_as(program: &Path) -> std::process::Child {
+    let root = ca_update::system::system_root().unwrap();
+    std::fs::copy(root.join(r"System32\PING.EXE"), program).unwrap();
+    ca_io::host_command::host_command(program)
+        .args(["-n", "120", "127.0.0.1"])
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap()
+}
+
+#[cfg(windows)]
+fn in_use(path: &Path) -> bool {
+    std::fs::OpenOptions::new().write(true).open(path).is_err()
+}
+
+/// The running program file is set aside before the installer runs. An
+/// unused copy of it takes its place, so an interruption at any point
+/// leaves a program file in the install folder that the installer can
+/// replace.
+#[cfg(windows)]
+#[test]
+fn the_install_folder_keeps_a_program_file_the_installer_can_replace() {
+    use ca_update::install::{install_from, Checks};
+    let signer = FakeSigner::signed_by(SIGNER);
+    let checks = Checks {
+        signer: &signer,
+        signer_name: SIGNER,
+        running: &running(),
+    };
+    for result in [1603, 0] {
+        let (_server, _keep, staging, work, install) = elevated_setup();
+        let program = install.path().join("compare-all.exe");
+        std::fs::remove_file(&program).unwrap();
+        let mut child = run_as(&program);
+        let original = std::fs::read(&program).unwrap();
+        assert!(in_use(&program));
+        // (the program file has the original bytes, the file is in use)
+        let state = || {
+            (
+                std::fs::read(&program).is_ok_and(|bytes| bytes == original),
+                in_use(&program),
+            )
+        };
+        let seen = Mutex::new(None);
+        let code = install_from(&staging, work.path(), Some(&program), &checks, &|_| {
+            *seen.lock().unwrap() = Some(state());
+            Some(result)
+        });
+        let during = seen.lock().unwrap().take();
+        let after = state();
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(code, result);
+        assert_eq!(during, Some((true, false)), "{result}");
+        assert_eq!(names(install.path()), ["compare-all.exe"], "{result}");
+        // After a success the installer has replaced the unused copy and the
+        // running file is in the work folder; after a failure the running
+        // file is back under its name.
+        assert_eq!(after, (true, result != 0), "{result}");
+    }
 }
 
 fn flip_a_byte(staging: &Staging) {
