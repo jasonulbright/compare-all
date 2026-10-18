@@ -491,10 +491,12 @@ pub fn helper_main(
 
 /// [`helper_main`] that waits at most `wait` for the claim on the staging
 /// folder, which a download in another run of the program or another helper
-/// may hold. A helper that gets no claim, or finds nothing staged once it has
-/// one, changes nothing, reports no failure and does not start the program:
-/// the helper that holds or held the claim starts it. The program is started
-/// again only after the program that started the helper has ended.
+/// may hold. A helper that gets no claim changes nothing, reports no failure
+/// and does not start the program: an apply that still runs elsewhere may
+/// need the program files free. A helper that gets the claim and finds
+/// nothing staged, because another helper applied the update, starts the
+/// program when asked to. The program is started again only after the
+/// program that started the helper has ended.
 #[must_use]
 pub fn helper_main_waiting(
     arguments: &HelperArguments,
@@ -535,7 +537,17 @@ pub fn helper_main_with(
             Err(_) => return 2,
         }
     };
+    let mode = detect(&arguments.executable);
+    let wait_for_end = || match mode {
+        InstallMode::Installed { machine: true } => wait_for_parent(WAIT_FOR_EXIT),
+        _ => wait_until_free(&arguments.executable, WAIT_FOR_EXIT),
+    };
     if staging.read_record().is_none() {
+        // Another helper applied the update and released the claim.
+        drop(claim);
+        if wait_for_end().is_ok() {
+            relaunch();
+        }
         return 2;
     }
     let endpoints = Endpoints::github();
@@ -545,15 +557,11 @@ pub fn helper_main_with(
         endpoints: &endpoints,
         running,
     };
-    let mode = detect(&arguments.executable);
     let target = arguments
         .executable
         .parent()
         .map_or_else(PathBuf::new, Path::to_path_buf);
-    let ended = match mode {
-        InstallMode::Installed { machine: true } => wait_for_parent(WAIT_FOR_EXIT),
-        _ => wait_until_free(&arguments.executable, WAIT_FOR_EXIT),
-    };
+    let ended = wait_for_end();
     let program_ended = ended.is_ok();
     let outcome = ended
         .and_then(|()| apply_staged(&staging, mode, &trust, &run_installer, &|_| Ok(()), &target));
