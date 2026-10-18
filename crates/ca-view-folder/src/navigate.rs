@@ -22,15 +22,25 @@ fn is_difference(node: &ArenaNode) -> bool {
     node.status.is_difference() && (!node.is_dir || node.status.is_structural())
 }
 
+/// Where a node stands in the order of shown nodes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Place {
+    /// The node is shown at this position.
+    Shown(u32),
+    /// The node is hidden, and this many shown nodes come before it in the
+    /// sorted order with nothing hidden.
+    Hidden(u32),
+}
+
 /// The shown nodes in row order with every folder open, and the place of
-/// each node in that order.
+/// every node, shown or hidden, in that order.
 ///
 /// Built with the rows, because the menus ask every frame whether a move has
 /// a target and a walk of the tree per question is a pass over every node.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct DisplayOrder {
     order: Vec<u32>,
-    place: Vec<Option<u32>>,
+    place: Vec<Option<Place>>,
 }
 
 impl DisplayOrder {
@@ -42,7 +52,17 @@ impl DisplayOrder {
             if let (Some(slot), Ok(position)) =
                 (place.get_mut(*index as usize), u32::try_from(position))
             {
-                *slot = Some(position);
+                *slot = Some(Place::Shown(position));
+            }
+        }
+        // The shown order is a subsequence of the unfiltered walk, because
+        // both walks visit children in the same sorted order.
+        let mut before = 0u32;
+        for index in arena.display_order(&[]) {
+            match place.get_mut(index as usize) {
+                Some(Some(Place::Shown(_))) => before = before.saturating_add(1),
+                Some(slot) => *slot = Some(Place::Hidden(before)),
+                None => {}
             }
         }
         Self { order, place }
@@ -54,13 +74,9 @@ impl DisplayOrder {
         self.place.clear();
     }
 
-    /// The position of the node `index`, where the order holds it.
-    fn position_of(&self, index: u32) -> Option<usize> {
-        self.place
-            .get(index as usize)
-            .copied()
-            .flatten()
-            .map(|position| position as usize)
+    /// The place of the node `index`, where the arena holds it.
+    fn place_of(&self, index: u32) -> Option<Place> {
+        self.place.get(index as usize).copied().flatten()
     }
 }
 
@@ -84,20 +100,25 @@ impl FolderView {
     ) -> Option<usize> {
         let order = &self.order.order;
         let count = order.len();
-        let at = self
+        let place = self
             .selection
             .cursor()
             .and_then(|(_, rel)| self.arena.index_of(rel))
-            .and_then(|index| self.order.position_of(index));
+            .and_then(|index| self.order.place_of(index));
+        let (start, end) = match place {
+            Some(Place::Shown(at)) => (at as usize + usize::from(!inclusive), at as usize),
+            Some(Place::Hidden(before)) => (before as usize, before as usize),
+            None => (0, count),
+        };
         let positions: Box<dyn Iterator<Item = usize>> = if forward {
-            let start = at.map_or(0, |at| at + usize::from(!inclusive)).min(count);
+            let start = start.min(count);
             if wrap {
                 Box::new((start..count).chain(0..start))
             } else {
                 Box::new(start..count)
             }
         } else {
-            let end = at.unwrap_or(count).min(count);
+            let end = end.min(count);
             if wrap {
                 Box::new((0..end).rev().chain((end..count).rev()))
             } else {
@@ -220,8 +241,10 @@ impl FolderView {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    use crate::selection::ClickKind;
     use crate::tree::SortColumn;
     use crate::FolderView;
+    use ca_fs::{DisplayFilter, Side};
     use ca_ui::command::Command;
     use ca_ui::view::SessionView;
     use std::path::{Path, PathBuf};
@@ -296,6 +319,121 @@ mod tests {
         assert_eq!(seen, rows);
         view.run(Command::PreviousDifference);
         assert_eq!(cursor(&view), rows[1]);
+    }
+
+    /// Four files sorted by size into b, c, a, d. The files b and a differ;
+    /// c and d match.
+    fn mixed_view(dir: &Path, sync: bool) -> FolderView {
+        for side in ["left", "right", "journals"] {
+            std::fs::create_dir_all(dir.join(side)).unwrap();
+        }
+        for (name, size, differs) in [
+            ("a-match.txt", 30, true),
+            ("b-match.txt", 10, true),
+            ("c-match.txt", 20, false),
+            ("d-match.txt", 40, false),
+        ] {
+            std::fs::write(dir.join("left").join(name), vec![b'l'; size]).unwrap();
+            let right = if differs {
+                vec![b'r'; size + 1]
+            } else {
+                vec![b'l'; size]
+            };
+            std::fs::write(dir.join("right").join(name), right).unwrap();
+        }
+        let (left, right, journals) = (dir.join("left"), dir.join("right"), dir.join("journals"));
+        let context = ca_ui::testing::context();
+        let mut view = if sync {
+            FolderView::sync_with_journal_directory(left, right, &context, 1, journals)
+        } else {
+            FolderView::with_journal_directory(left, right, &context, 1, journals)
+        };
+        poll_until(&mut view, FolderView::is_ready);
+        view.set_sort(SortColumn::Size);
+        poll_until(&mut view, |view| view.sort_job.is_none());
+        assert_eq!(
+            shown(&view),
+            ["b-match.txt", "c-match.txt", "a-match.txt", "d-match.txt"].map(PathBuf::from)
+        );
+        view
+    }
+
+    /// Put the cursor on `name` with every row shown, then apply `filter`.
+    fn hide_cursor(view: &mut FolderView, name: &str, filter: DisplayFilter) {
+        view.filter = DisplayFilter::ShowAll;
+        view.rebuild();
+        let position = shown(view)
+            .iter()
+            .position(|rel| rel == Path::new(name))
+            .unwrap();
+        view.selection.click(
+            Side::Left,
+            position,
+            &view.rows,
+            &view.arena,
+            ClickKind::Replace,
+        );
+        view.filter = filter;
+        view.rebuild();
+        assert!(!shown(view).contains(&PathBuf::from(name)));
+        assert_eq!(cursor(view), PathBuf::from(name));
+    }
+
+    enum Tab {
+        Compare(FolderView),
+        Sync(crate::FolderSyncView),
+    }
+
+    impl Tab {
+        fn view(&mut self) -> &mut FolderView {
+            match self {
+                Self::Compare(view) => view,
+                Self::Sync(tab) => tab.view_mut(),
+            }
+        }
+
+        fn run(&mut self, command: Command) {
+            assert!(self.view().accepts(command), "{command:?} was refused");
+            match self {
+                Self::Compare(view) => view.run(command),
+                Self::Sync(tab) => tab.run(command),
+            }
+        }
+    }
+
+    fn moves_continue_from_a_hidden_cursor(sync: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let view = mixed_view(dir.path(), sync);
+        let mut tab = if sync {
+            Tab::Sync(crate::FolderSyncView::from(view))
+        } else {
+            Tab::Compare(view)
+        };
+
+        hide_cursor(tab.view(), "c-match.txt", DisplayFilter::ShowDifferences);
+        tab.run(Command::NextDifference);
+        assert_eq!(cursor(tab.view()), PathBuf::from("a-match.txt"));
+        hide_cursor(tab.view(), "c-match.txt", DisplayFilter::ShowDifferences);
+        tab.run(Command::PreviousDifference);
+        assert_eq!(cursor(tab.view()), PathBuf::from("b-match.txt"));
+
+        tab.view().set_find_text("match");
+        hide_cursor(tab.view(), "a-match.txt", DisplayFilter::ShowSame);
+        tab.run(Command::FindNext);
+        assert_eq!(cursor(tab.view()), PathBuf::from("d-match.txt"));
+        hide_cursor(tab.view(), "a-match.txt", DisplayFilter::ShowSame);
+        tab.run(Command::FindPrevious);
+        assert_eq!(cursor(tab.view()), PathBuf::from("c-match.txt"));
+    }
+
+    #[test]
+    fn compare_moves_continue_from_a_cursor_the_filter_hides() {
+        moves_continue_from_a_hidden_cursor(false);
+    }
+
+    #[test]
+    fn sync_moves_continue_from_a_cursor_the_filter_hides() {
+        moves_continue_from_a_hidden_cursor(true);
     }
 
     #[test]
