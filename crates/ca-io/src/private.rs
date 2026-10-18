@@ -4,20 +4,29 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 /// Create `folder` if it is missing, then check that it is a folder of the
-/// running user and, on Unix, narrow its access to that user.
+/// running user and, on Unix, narrow its access to that user. Returns the path
+/// to use for the folder from then on.
 ///
-/// Missing parents are created with default permissions. An existing link is
-/// refused, so a link planted at `folder` cannot send the contents elsewhere.
-/// On Unix a link is accepted when its target is a folder of the running user
-/// that no group and no other user can open, and the target is left as it is.
+/// Missing parents are created with default permissions. On Unix every check
+/// and the narrowing act on the opened folder, so a swap of the path after the
+/// open changes nothing.
+///
+/// On Unix an existing link is accepted only when the running user owns the
+/// link and its target is a folder of the running user that no group and no
+/// other user can open. The target is left as it is, and the returned path is
+/// the resolved target, so a later change of the link does not move the
+/// folder. Every other link is refused.
+///
 /// Windows cannot read the owner or the access list of a target without
-/// unsafe code, so a link or junction is always refused there. On Unix every check and the narrowing act on the opened folder, so a swap
-/// of the path after the open changes nothing.
+/// unsafe code, so a link or junction at `folder` is always refused there.
+/// For a folder that is not a link, the returned path is `folder`.
 ///
 /// # Errors
-/// Returns an error when the folder cannot be created, is a link, is not a
-/// folder, or belongs to another user.
-pub fn create_owned_folder(folder: &Path) -> io::Result<()> {
+/// Returns an error when the folder cannot be created, is not a folder, or
+/// belongs to another user. On Unix it also returns an error for a link that
+/// another user owns or whose target is not a private folder of the running
+/// user; on Windows, for every link.
+pub fn create_owned_folder(folder: &Path) -> io::Result<PathBuf> {
     if let Some(parent) = folder
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -47,7 +56,8 @@ pub fn create_owned_folder(folder: &Path) -> io::Result<()> {
         if std::fs::symlink_metadata(folder)?.file_type().is_symlink() {
             return Err(link_refused(folder));
         }
-        check_owned_folder(folder)
+        check_owned_folder(folder)?;
+        Ok(folder.to_path_buf())
     }
 }
 
@@ -104,19 +114,18 @@ fn check_handle(handle: &std::fs::File, folder: &Path, private: bool) -> io::Res
 
 /// Check the folder at `folder` as a folder of the running user and narrow it
 /// to that user, all on the opened folder. `between` runs after the open and
-/// before the first check.
+/// before the first check. Returns the path to use for the folder.
 #[cfg(unix)]
-fn adopt_folder(folder: &Path, between: impl FnOnce()) -> io::Result<()> {
+fn adopt_folder(folder: &Path, between: impl FnOnce()) -> io::Result<PathBuf> {
     use std::os::unix::fs::PermissionsExt as _;
     let handle = match open_folder(folder, false) {
         Ok(handle) => handle,
         Err(error) => {
-            return if std::fs::symlink_metadata(folder)
-                .is_ok_and(|metadata| metadata.file_type().is_symlink())
-            {
-                accept_linked_folder(folder)
-            } else {
-                Err(error)
+            return match std::fs::symlink_metadata(folder) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    accept_linked_folder(folder, &metadata)
+                }
+                _ => Err(error),
             };
         }
     };
@@ -125,14 +134,26 @@ fn adopt_folder(folder: &Path, between: impl FnOnce()) -> io::Result<()> {
     if handle.metadata()?.permissions().mode() & 0o077 != 0 {
         handle.set_permissions(std::fs::Permissions::from_mode(0o700))?;
     }
-    Ok(())
+    Ok(folder.to_path_buf())
 }
 
-/// Accept the link at `folder` only when its target is a private folder of
-/// the running user. The target is not changed.
+/// Accept the link at `folder`, whose own metadata is `link`, only when the
+/// running user owns it and its target is a private folder of that user.
+/// Returns the resolved target. The target is not changed.
+///
+/// The returned path holds no link, so a caller that resolves it again does
+/// not follow a link that was changed after this check.
 #[cfg(unix)]
-fn accept_linked_folder(folder: &Path) -> io::Result<()> {
-    let handle = open_folder(folder, true).map_err(|_| link_refused(folder))?;
+fn accept_linked_folder(folder: &Path, link: &std::fs::Metadata) -> io::Result<PathBuf> {
+    use std::os::unix::fs::MetadataExt as _;
+    if link.uid() != rustix::process::geteuid().as_raw() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} is a link of another user", folder.display()),
+        ));
+    }
+    let target = std::fs::canonicalize(folder).map_err(|_| link_refused(folder))?;
+    let handle = open_folder(&target, false).map_err(|_| link_refused(folder))?;
     check_handle(&handle, folder, true).map_err(|error| {
         io::Error::new(
             error.kind(),
@@ -141,7 +162,8 @@ fn accept_linked_folder(folder: &Path) -> io::Result<()> {
                 folder.display()
             ),
         )
-    })
+    })?;
+    Ok(target)
 }
 
 /// Check that `folder` is a folder and, on Unix, that the running user owns
@@ -266,9 +288,52 @@ mod tests {
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).unwrap();
         let link = parent.path().join("link");
         std::os::unix::fs::symlink(&target, &link).unwrap();
-        create_owned_folder(&link).unwrap();
+        let used = create_owned_folder(&link).unwrap();
+        assert_eq!(used, std::fs::canonicalize(&target).unwrap());
         let mode = std::fs::metadata(&target).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o700);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_change_of_an_accepted_link_does_not_move_the_folder() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let parent = tempfile::tempdir().unwrap();
+        let checked = parent.path().join("checked");
+        let other = parent.path().join("other");
+        std::fs::create_dir(&checked).unwrap();
+        std::fs::set_permissions(&checked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::create_dir(&other).unwrap();
+        std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let link = parent.path().join("link");
+        std::os::unix::fs::symlink(&checked, &link).unwrap();
+        let used = create_owned_folder(&link).unwrap();
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&other, &link).unwrap();
+        std::fs::write(used.join("copy"), b"x").unwrap();
+        assert!(checked.join("copy").is_file());
+        assert!(!other.join("copy").exists());
+    }
+
+    /// Only a privileged run can hand a link to another user, so the case is
+    /// checked where the test runs with that privilege.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_of_another_user_is_refused_when_run_as_root() {
+        use std::os::unix::fs::PermissionsExt as _;
+        if rustix::process::geteuid().as_raw() != 0 {
+            println!("skipped: handing a link to another user needs root");
+            return;
+        }
+        let parent = tempfile::tempdir().unwrap();
+        let target = parent.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let link = parent.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        std::os::unix::fs::lchown(&link, Some(65534), Some(65534)).unwrap();
+        let error = create_owned_folder(&link).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
     }
 
     #[cfg(unix)]

@@ -109,13 +109,16 @@ fn process_folder_name() -> String {
 /// Returns the error of the first step that fails to create or lock the
 /// folder of this process. Leftovers that cannot be deleted are skipped.
 pub fn sweep_temporary() -> std::io::Result<usize> {
-    static HELD: std::sync::OnceLock<std::fs::File> = std::sync::OnceLock::new();
-    let root = temporary_root();
+    static HELD: std::sync::OnceLock<(std::fs::File, PathBuf)> = std::sync::OnceLock::new();
     let own = process_folder_name();
-    if HELD.get().is_none() {
-        let lock = claim(&root.join(&own))?;
-        let _ = HELD.set(lock);
-    }
+    let root = if let Some((_, root)) = HELD.get() {
+        root.clone()
+    } else {
+        let (root, folder) = prepare_temporary(&temporary_root(), &own)?;
+        let lock = lock_folder(&folder)?;
+        let _ = HELD.set((lock, root.clone()));
+        root
+    };
     Ok(sweep_temporary_in(&root, &own))
 }
 
@@ -140,22 +143,22 @@ fn prepared_temporary_directory_in(
     root: &std::path::Path,
     own: impl AsRef<std::path::Path>,
 ) -> std::io::Result<PathBuf> {
-    ca_io::private::create_owned_folder(root)?;
-    let folder = root.join(own);
-    ca_io::private::create_owned_folder(&folder)?;
-    Ok(folder)
+    prepare_temporary(root, own).map(|(_, folder)| folder)
 }
 
-/// Create `folder` as the folder of a process under its shared root, then lock
-/// the marker file inside it.
-fn claim(folder: &std::path::Path) -> std::io::Result<std::fs::File> {
-    let (Some(root), Some(own)) = (folder.parent(), folder.file_name()) else {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("{} names no folder under a root", folder.display()),
-        ));
-    };
-    prepared_temporary_directory_in(root, own)?;
+/// [`prepared_temporary_directory_in`], returning the paths to use for the
+/// root and for the folder of the process.
+fn prepare_temporary(
+    root: &std::path::Path,
+    own: impl AsRef<std::path::Path>,
+) -> std::io::Result<(PathBuf, PathBuf)> {
+    let root = ca_io::private::create_owned_folder(root)?;
+    let folder = ca_io::private::create_owned_folder(&root.join(own))?;
+    Ok((root, folder))
+}
+
+/// Lock the marker file inside the prepared `folder` of a process.
+fn lock_folder(folder: &std::path::Path) -> std::io::Result<std::fs::File> {
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -163,6 +166,20 @@ fn claim(folder: &std::path::Path) -> std::io::Result<std::fs::File> {
         .open(folder.join(LOCK_FILE))?;
     file.try_lock().map_err(std::io::Error::from)?;
     Ok(file)
+}
+
+/// Create `folder` as the folder of a process under its shared root, then lock
+/// the marker file inside it.
+#[cfg(test)]
+fn claim(folder: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let (Some(root), Some(own)) = (folder.parent(), folder.file_name()) else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} names no folder under a root", folder.display()),
+        ));
+    };
+    let (_, folder) = prepare_temporary(root, own)?;
+    lock_folder(&folder)
 }
 
 /// Delete the folders that earlier runs of this application left under
@@ -345,6 +362,26 @@ mod tests {
         assert_eq!(mode, 0o700, "{mode:o}");
         let mode = std::fs::metadata(&own).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700, "{mode:o}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copies_stay_in_the_checked_root_when_its_link_changes() {
+        use std::os::unix::fs::PermissionsExt;
+        let settings = tempfile::tempdir().unwrap();
+        let checked = settings.path().join("checked");
+        std::fs::create_dir(&checked).unwrap();
+        std::fs::set_permissions(&checked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let other = settings.path().join("other");
+        std::fs::create_dir_all(other.join("process-1")).unwrap();
+        let root = settings.path().join("temporary");
+        std::os::unix::fs::symlink(&checked, &root).unwrap();
+        let own = super::prepared_temporary_directory_in(&root, "process-1").unwrap();
+        std::fs::remove_file(&root).unwrap();
+        std::os::unix::fs::symlink(&other, &root).unwrap();
+        std::fs::write(own.join("copy"), b"x").unwrap();
+        assert!(checked.join("process-1").join("copy").is_file());
+        assert!(!other.join("process-1").join("copy").exists());
     }
 
     /// Only a privileged run can hand a folder to another user, so the case
