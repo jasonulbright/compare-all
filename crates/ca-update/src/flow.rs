@@ -191,13 +191,19 @@ pub fn run(job: &Job<'_>) -> Result<Outcome, String> {
 }
 
 /// The reason kept when an apply of `latest` ended because this install
-/// cannot apply updates by itself. Each download of that release would end
-/// the same way, so it is not downloaded again; the warning stays.
+/// cannot apply updates by itself or put the install off at each of the last
+/// closes. Each download of that release would end the same way, so it is
+/// not downloaded again; the warning stays.
 fn cannot_apply(staging: &Staging, latest: &Version) -> Option<String> {
     let warning = staging.read_warning()?;
     let reason = staging.read_apply_failure()?;
-    (warning.parsed_version().as_ref() == Some(latest) && reason == crate::apply::CANNOT_APPLY_HERE)
-        .then_some(reason)
+    (warning.parsed_version().as_ref() == Some(latest)
+        && [
+            crate::apply::CANNOT_APPLY_HERE,
+            crate::apply::PUT_OFF_TOO_OFTEN,
+        ]
+        .contains(&reason.as_str()))
+    .then_some(reason)
 }
 
 fn stage(
@@ -232,7 +238,11 @@ fn stage(
     let scratch = job.staging.scratch_dir();
     let _ = std::fs::remove_dir_all(&scratch);
 
-    if job.staging.read_record().as_ref() == Some(&record) {
+    if job
+        .staging
+        .read_record()
+        .is_some_and(|staged| staged.same_file(&record))
+    {
         let kept = job.staging.asset_path(&record);
         let result = verify_file(&kept, &expected, job.signer, &scratch);
         let _ = std::fs::remove_dir_all(&scratch);
