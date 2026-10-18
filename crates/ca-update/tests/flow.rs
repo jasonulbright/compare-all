@@ -817,6 +817,136 @@ fn an_older_archive_under_a_newer_version_is_not_applied() {
     );
 }
 
+/// Open `path` so that it cannot be renamed or deleted while the handle lives;
+/// with `share_read` false it cannot be read either.
+#[cfg(windows)]
+fn pin(path: &Path, share_read: bool) -> std::fs::File {
+    use std::os::windows::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(u32::from(share_read))
+        .open(path)
+        .unwrap()
+}
+
+#[cfg(windows)]
+#[test]
+fn a_backup_that_cannot_be_moved_back_is_copied_back() {
+    let fresh = tempfile::tempdir().unwrap();
+    std::fs::write(fresh.path().join("compare-all.exe"), b"new exe").unwrap();
+    std::fs::write(fresh.path().join("ca.exe"), b"new ca").unwrap();
+    let target = program_folder();
+    let pinned = Mutex::new(None);
+    let result = apply_portable_with(target.path(), fresh.path(), &|name| {
+        if name == "compare-all.exe" {
+            let backup = backup_folder(target.path()).join("ca.exe");
+            *pinned.lock().unwrap() = Some(pin(&backup, true));
+            Err(std::io::Error::other("disk full"))
+        } else {
+            Ok(())
+        }
+    });
+    let reason = result.unwrap_err();
+    assert!(!reason.contains("restore"), "{reason}");
+    assert_eq!(
+        std::fs::read(target.path().join("ca.exe")).unwrap(),
+        b"old ca"
+    );
+    drop(pinned);
+}
+
+fn backup_folder(target: &Path) -> std::path::PathBuf {
+    std::fs::read_dir(target)
+        .unwrap()
+        .flatten()
+        .find(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with(".update-backup-")
+        })
+        .unwrap()
+        .path()
+}
+
+#[cfg(windows)]
+#[test]
+fn a_failed_restore_leaves_the_new_program_file_in_place() {
+    let fresh = tempfile::tempdir().unwrap();
+    std::fs::write(fresh.path().join("compare-all.exe"), b"new exe").unwrap();
+    std::fs::write(fresh.path().join("ca.exe"), b"new ca").unwrap();
+    let target = program_folder();
+    let pinned = Mutex::new(None);
+    // ca.exe is replaced, then compare-all.exe fails while the backup of
+    // ca.exe cannot be moved back.
+    let result = apply_portable_with(target.path(), fresh.path(), &|name| {
+        if name == "compare-all.exe" {
+            let backup = backup_folder(target.path()).join("ca.exe");
+            *pinned.lock().unwrap() = Some(pin(&backup, false));
+            Err(std::io::Error::other("disk full"))
+        } else {
+            Ok(())
+        }
+    });
+    let reason = result.unwrap_err();
+    assert!(reason.contains("restore"), "{reason}");
+    assert_eq!(
+        std::fs::read(target.path().join("ca.exe")).unwrap(),
+        b"new ca"
+    );
+    assert_eq!(
+        std::fs::read(target.path().join("compare-all.exe")).unwrap(),
+        b"old exe"
+    );
+    drop(pinned);
+}
+
+#[cfg(windows)]
+#[test]
+fn a_backup_that_cannot_be_removed_does_not_fail_the_update() {
+    let fresh = tempfile::tempdir().unwrap();
+    std::fs::write(fresh.path().join("compare-all.exe"), b"new exe").unwrap();
+    std::fs::write(fresh.path().join("ca.exe"), b"new ca").unwrap();
+    let target = program_folder();
+    let pinned = Mutex::new(None);
+    let result = apply_portable_with(target.path(), fresh.path(), &|name| {
+        if name == "compare-all.exe" {
+            let backup = backup_folder(target.path()).join("ca.exe");
+            *pinned.lock().unwrap() = Some(pin(&backup, false));
+        }
+        Ok(())
+    });
+    assert_eq!(result, Ok(()));
+    assert_eq!(
+        std::fs::read(target.path().join("compare-all.exe")).unwrap(),
+        b"new exe"
+    );
+    drop(pinned);
+}
+
+#[test]
+fn a_program_file_that_cannot_be_opened_is_not_waited_for() {
+    let server = Server::start();
+    let (_keep, staging) = staging_dir();
+    stage_portable(&server, &staging);
+    let target = program_folder();
+    let arguments = ca_update::apply::HelperArguments {
+        staging: staging.dir().to_path_buf(),
+        executable: target.path().join("missing").join("compare-all.exe"),
+        relaunch: false,
+        program_arguments: Vec::new(),
+    };
+    let started = std::time::Instant::now();
+    let code = ca_update::apply::helper_main_waiting(
+        &arguments,
+        &FakeSigner::signed_by(SIGNER),
+        SIGNER,
+        &running(),
+        Duration::from_millis(500),
+    );
+    assert_ne!(code, 0);
+    assert!(started.elapsed() < Duration::from_secs(20));
+}
+
 #[test]
 fn a_failed_restore_keeps_the_backup_and_reports_it() {
     let fresh = tempfile::tempdir().unwrap();

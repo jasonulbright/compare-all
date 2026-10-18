@@ -304,9 +304,10 @@ impl Staging {
         Some(text.trim().chars().take(MAX_FAILURE_TEXT).collect())
     }
 
-    /// Delete the warning.
+    /// Delete the warning and the reason of a failed apply that goes with it.
     pub fn clear_warning(&self) {
         let _ = std::fs::remove_file(self.dir.join(WARNING_FILE));
+        let _ = std::fs::remove_file(self.dir.join(APPLY_FAILURE_FILE));
     }
 
     /// Claim the staging folder for one download or one apply. A second claim

@@ -79,12 +79,11 @@ pub fn apply_unpacked(
         let mut unrestored = Vec::new();
         for (name, had) in done.iter().rev() {
             let live = target.join(name);
-            let _ = std::fs::remove_file(&live);
             let _ = std::fs::remove_file(target.join(format!("{name}.new")));
-            if *had {
-                if let Err(error) = std::fs::rename(backup.join(name), &live) {
-                    unrestored.push(format!("{name} ({error})"));
-                }
+            if !*had {
+                let _ = std::fs::remove_file(&live);
+            } else if let Err(error) = restore(&backup.join(name), &live) {
+                unrestored.push(format!("{name} ({error})"));
             }
         }
         if !unrestored.is_empty() {
@@ -97,7 +96,30 @@ pub fn apply_unpacked(
         let _ = std::fs::remove_dir_all(&backup);
         return Err(reason);
     }
-    std::fs::remove_dir_all(&backup).map_err(|error| format!("cannot remove backup: {error}"))
+    // Every file is in place. A backup folder that cannot be removed now is
+    // left behind; it is not a failed update.
+    let _ = std::fs::remove_dir_all(&backup);
+    Ok(())
+}
+
+/// Put `saved` back at `live`. The rename replaces whatever `live` holds, so
+/// the new file stays in place until the earlier one is back: a restore that
+/// fails never leaves the folder without the file. Short locks, such as a
+/// scan of the new file, are waited out; a backup that cannot be moved is
+/// copied.
+fn restore(saved: &Path, live: &Path) -> std::io::Result<()> {
+    const ATTEMPTS: u32 = 5;
+    let mut attempt = 1;
+    loop {
+        match std::fs::rename(saved, live) {
+            Ok(()) => return Ok(()),
+            Err(_) if attempt < ATTEMPTS => {
+                attempt += 1;
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(_) => return std::fs::copy(saved, live).map(drop),
+        }
+    }
 }
 
 /// The command that installs `msi` as a major upgrade with a progress window
@@ -117,21 +139,22 @@ pub fn msi_command(msi: &Path, machine: bool, log: &Path) -> Command {
 }
 
 /// Wait until `executable` can be opened for writing, which is when no process
-/// runs it.
-fn wait_until_free(executable: &Path, limit: Duration) -> bool {
+/// runs it. Only a sharing violation means the program still runs; any other
+/// error ends the wait at once.
+fn wait_until_free(executable: &Path, limit: Duration) -> Result<(), String> {
+    const ERROR_SHARING_VIOLATION: i32 = 32;
     let started = Instant::now();
     loop {
-        if std::fs::OpenOptions::new()
-            .write(true)
-            .open(executable)
-            .is_ok()
-        {
-            return true;
+        match std::fs::OpenOptions::new().write(true).open(executable) {
+            Ok(_) => return Ok(()),
+            Err(error) if error.raw_os_error() != Some(ERROR_SHARING_VIOLATION) => {
+                return Err(format!("cannot write the program file: {error}"));
+            }
+            Err(_) if started.elapsed() > limit => {
+                return Err("the program did not end".to_owned());
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis(250)),
         }
-        if started.elapsed() > limit {
-            return false;
-        }
-        std::thread::sleep(Duration::from_millis(250));
     }
 }
 
@@ -365,11 +388,8 @@ pub fn helper_main_waiting(
         .executable
         .parent()
         .map_or_else(PathBuf::new, Path::to_path_buf);
-    let outcome = if wait_until_free(&arguments.executable, WAIT_FOR_EXIT) {
-        apply_staged(&staging, mode, &trust, &run_installer, &|_| Ok(()), &target)
-    } else {
-        Err("the program did not end".to_owned())
-    };
+    let outcome = wait_until_free(&arguments.executable, WAIT_FOR_EXIT)
+        .and_then(|()| apply_staged(&staging, mode, &trust, &run_installer, &|_| Ok(()), &target));
     let code = match &outcome {
         Ok(_) => 0,
         Err(_) => 1,
