@@ -111,6 +111,12 @@ fn an_option_absent_from_the_document_takes_the_current_default() {
 }
 
 #[test]
+fn the_sync_method_type_starts_where_a_sync_session_starts() {
+    assert_eq!(SyncMethod::default(), SyncSettings::default().method);
+    assert_eq!(SyncMethod::default(), SyncMethod::UpdateBoth);
+}
+
+#[test]
 fn only_a_folder_merge_compares_contents_by_rules_unless_told_otherwise() {
     assert_eq!(
         FolderCompareSettings::default()

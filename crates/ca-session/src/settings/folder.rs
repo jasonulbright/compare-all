@@ -49,9 +49,9 @@ pub enum SyncMethod {
     /// Copy newer and orphan items from right to left.
     UpdateLeft,
     /// Copy newer and orphan items from left to right.
-    #[default]
     UpdateRight,
     /// Copy newer and orphan items in both directions.
+    #[default]
     UpdateBoth,
     /// Make the left side match the right, deleting left-side orphans.
     MirrorToLeft,
@@ -312,7 +312,7 @@ settings_group! {
     /// Direction and scope of a synchronization run.
     SyncSettings / SyncOverride {
         /// Direction and destructiveness of the run.
-        method: SyncMethod = SyncMethod::UpdateBoth,
+        method: SyncMethod = SyncMethod::default(),
         /// Copy items present on one side only.
         copy_orphans: bool = true,
         /// Delete items the method marks for removal rather than skipping them.
