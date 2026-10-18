@@ -5,7 +5,7 @@
 //! lets every case be tested without a thread.
 
 use crate::chars::CharEncoding;
-use crate::edit::from_hex_text;
+use crate::edit::{from_hex_text, PreparedStep};
 use crate::model::Side;
 use ca_ui::worker::{Cancel, Job, Terminal};
 use std::sync::Arc;
@@ -202,11 +202,13 @@ pub fn spawn(
     )
 }
 
-/// What a replace all scan posts back.
+/// What a replace all job posts back.
 #[derive(Debug, PartialEq, Eq)]
 pub enum FindAllMessage {
-    /// Every place the phrase starts, in ascending order, without overlaps.
-    Found(Side, Vec<u64>),
+    /// The step that replaces every match, ready to install on the side.
+    Prepared(Side, PreparedStep),
+    /// The job stopped with an error before reaching an answer.
+    Failed(String),
     /// The run stopped before reaching an answer.
     Cancelled,
 }
@@ -220,8 +222,8 @@ impl Terminal for FindAllMessage {
         FindAllMessage::Cancelled
     }
 
-    fn panicked(_detail: String) -> Self {
-        FindAllMessage::Found(Side::Left, Vec::new())
+    fn panicked(detail: String) -> Self {
+        FindAllMessage::Failed(detail)
     }
 }
 
@@ -257,23 +259,45 @@ pub fn find_every(
     Some(found)
 }
 
-/// Find every occurrence on one side on a worker thread, for a replace all.
+/// What a replace all puts in place of what.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplaceAll {
+    /// The bytes searched for.
+    pub needle: Vec<u8>,
+    /// The bytes put in place of each match.
+    pub replacement: Vec<u8>,
+    /// True when an upper case letter only matches an upper case letter.
+    pub match_case: bool,
+}
+
+/// Find every occurrence on one side and build the content after replacing
+/// them, on a worker thread. `bytes` is the content of revision `revision`.
 #[must_use]
-pub fn spawn_all(
+pub fn spawn_replace_all(
     side: Side,
     bytes: Arc<Vec<u8>>,
-    needle: Vec<u8>,
-    match_case: bool,
+    revision: u64,
+    request: ReplaceAll,
     notify: Arc<dyn Fn() + Send + Sync>,
 ) -> Job<FindAllMessage> {
     Job::spawn_notifying(
         move |emitter, cancel| {
-            let found = find_every(&bytes, &needle, match_case, cancel);
-            // The reader edits the buffer as soon as it sees the result. A
-            // handle still held here makes that edit copy the whole side.
+            let found = find_every(&bytes, &request.needle, request.match_case, cancel);
+            let prepared = found.map(|offsets| {
+                PreparedStep::replace_all(
+                    &bytes,
+                    revision,
+                    &offsets,
+                    request.needle.len() as u64,
+                    &request.replacement,
+                )
+            });
+            // Let go of the old side before the reader installs the new one,
+            // so the old side is freed at the install, not when this thread
+            // happens to exit.
             drop(bytes);
-            if let Some(found) = found {
-                emitter.send(FindAllMessage::Found(side, found));
+            if let Some(step) = prepared {
+                emitter.send(FindAllMessage::Prepared(side, step));
             }
         },
         notify,
@@ -462,11 +486,15 @@ mod tests {
         let probe = Arc::downgrade(&buffer.snapshot());
         let holders = Arc::new(AtomicUsize::new(0));
         let seen = Arc::clone(&holders);
-        let mut job = super::spawn_all(
+        let mut job = super::spawn_replace_all(
             Side::Left,
             buffer.snapshot(),
-            b"X".to_vec(),
-            true,
+            buffer.revision(),
+            super::ReplaceAll {
+                needle: b"X".to_vec(),
+                replacement: b"Y".to_vec(),
+                match_case: true,
+            },
             Arc::new(move || {
                 seen.fetch_max(probe.strong_count(), Ordering::SeqCst);
             }),
@@ -476,10 +504,19 @@ mod tests {
             found |= job
                 .drain()
                 .iter()
-                .any(|message| matches!(message, super::FindAllMessage::Found(..)));
+                .any(|message| matches!(message, super::FindAllMessage::Prepared(..)));
             found
         }));
         assert_eq!(holders.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_replace_all_worker_that_fails_reports_a_failure_not_an_empty_result() {
+        use ca_ui::worker::Terminal as _;
+        assert_eq!(
+            super::FindAllMessage::panicked("boom".to_owned()),
+            super::FindAllMessage::Failed("boom".to_owned())
+        );
     }
 
     fn run(from: u64, direction: Direction, wrap: bool) -> Vec<FindMessage> {
