@@ -59,6 +59,28 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
 
+  # Fails on any RustSec vulnerability advisory in Cargo.lock. The advisory
+  # database is fetched at run time, so a new advisory can fail a run with no
+  # change in the repository.
+  advisories:
+    name: check (advisories)
+    if: >-
+      (github.event.repository.name != '' && github.event.repository.private == false) ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
+      (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
+    permissions:
+      contents: read
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@9376cdc5a5e25b16da71af47712785cf06b0d6d4 # 1.94.1
+      - run: cargo install cargo-audit --version 0.22.1 --locked
+      - run: cargo audit
+
   # Builds the AppImage as the release does and starts it on clean systems,
   # so a packaging fault shows before a release tag exists. The deployment
   # runs in the pinned archlinux container through the runner's Docker.
