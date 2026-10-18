@@ -600,14 +600,18 @@ fn a_take_of_the_first_holder_puts_the_given_back_text_before_the_lenders_other_
     );
 }
 
-#[test]
-fn a_reload_that_gives_text_back_to_a_carried_holder_keeps_its_records_on_their_text() {
-    let left = "[u1]\n[l4]\n[l5]\n[u6]\n\n[l9]\n[l10]\n[u13]\n[u14]\n[u15]\n[u17]\n~\n[u18]\n[s21]\n[s22]\n\n";
-    let center =
-        "[u1]\n[c2]\n[c3]\n[u6]\n\n[c7]\n[c8]\n[u13]\n[u14]\n[u15]\n[u17]\n~\n[u18]\n[c19]\n[c20]";
-    let right =
-        "[u1]\n[u6]\n\n[r11]\n[r12]\n[u13]\n[u14]\n[u15]\n[r16]\n[u17]\n~\n[u18]\n[s21]\n[s22]\n\n";
-    let (mut view, dir) = open(left, Some(center), right);
+const CARRIED_HOLDER: [&str; 3] = [
+    "[u1]\n[l4]\n[l5]\n[u6]\n\n[l9]\n[l10]\n[u13]\n[u14]\n[u15]\n[u17]\n~\n[u18]\n[s21]\n[s22]\n\n",
+    "[u1]\n[c2]\n[c3]\n[u6]\n\n[c7]\n[c8]\n[u13]\n[u14]\n[u15]\n[u17]\n~\n[u18]\n[c19]\n[c20]",
+    "[u1]\n[u6]\n\n[r11]\n[r12]\n[u13]\n[u14]\n[u15]\n[r16]\n[u17]\n~\n[u18]\n[s21]\n[s22]\n\n",
+];
+
+/// Join `[c8]` and `[u13]` to `[c7]`, select from inside `[u15]` to `end`
+/// and type over it, then change `[l9]` in the left input and reload.
+/// Returns the output before and after the reload.
+fn carried_holder_reload(separation: u32, end: Caret) -> (String, String) {
+    let [left, center, right] = CARRIED_HOLDER;
+    let (mut view, dir) = open_separated(left, Some(center), right, separation);
     run_until_ready(&mut view);
     for _ in 0..2 {
         view.output_pane.place(Caret::new(6, 0), false);
@@ -615,24 +619,48 @@ fn a_reload_that_gives_text_back_to_a_carried_holder_keeps_its_records_on_their_
         absorb(&mut view);
     }
     view.output_pane.place(Caret::new(7, 4), false);
-    view.output_pane.place(Caret::new(15, 2), true);
+    view.output_pane.place(end, true);
     view.output_pane.type_character('Z');
     absorb(&mut view);
-    assert_eq!(
-        view.output_text(),
-        "[u1]\n[c2]\n[c3]\n[u6]\n\n[c7][c8][u13]\n[u14]\n[u15Z20]"
-    );
+    let before = view.output_text();
     records_on_their_text(&view).unwrap();
     let changed = left.replace("[l9]", "[d53]");
     std::fs::write(dir.path().join("left.txt"), changed).unwrap();
     view.run(Command::Reload);
     run_until_ready(&mut view);
     assert_output_lines_match_pane(&view);
+    records_on_their_text(&view).unwrap();
+    (before, view.output_text())
+}
+
+#[test]
+fn a_reload_that_gives_text_back_to_a_carried_holder_keeps_its_records_on_their_text() {
+    let (before, after) = carried_holder_reload(2, Caret::new(15, 2));
     assert_eq!(
-        view.output_text(),
+        before,
+        "[u1]\n[c2]\n[c3]\n[u6]\n\n[c7][c8][u13]\n[u14]\n[u15Z20]"
+    );
+    assert_eq!(
+        after,
         "[u1]\n[c2]\n[c3]\n[u6]\n\n[c7]\n[c8]\n[u13]\n[u14]\n[u15Z20]"
     );
-    records_on_their_text(&view).unwrap();
+}
+
+/// At a separation of one line `[u13]` goes back to its own section, which
+/// holds the end of the typed line, and the record of that end moves down
+/// one line with it.
+#[test]
+fn a_reload_that_gives_text_back_to_a_carried_holder_keeps_its_records_on_their_text_at_one_line_apart(
+) {
+    let (before, after) = carried_holder_reload(1, Caret::new(13, 2));
+    assert_eq!(
+        before,
+        "[u1]\n[c2]\n[c3]\n[u6]\n\n[c7][c8][u13]\n[u14]\n[u15Z22]\n\n"
+    );
+    assert_eq!(
+        after,
+        "[u1]\n[c2]\n[c3]\n[u6]\n\n[c7]\n[c8]\n[u13]\n[u14]\n[u15Z22]\n\n"
+    );
 }
 
 /// s1 was taken from the right and its `[r3]` joined to s0. The right input

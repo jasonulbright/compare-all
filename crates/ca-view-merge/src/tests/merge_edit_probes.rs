@@ -415,13 +415,15 @@ const UNDO_ALL_INPUTS: [&str; 3] = [
     "[r2]\r\n[u3]\r\n~\r\n[r6]\r\n[u7]\r\n[u8]\r\n[r10]\r\n[r11]\r\n[u12]\r\n[s14]\r\n[u15]",
 ];
 
-#[test]
-fn undoing_every_edit_then_taking_matches_a_fresh_merge() {
-    let (mut view, _dir) = open(
-        UNDO_ALL_INPUTS[0],
-        Some(UNDO_ALL_INPUTS[1]),
-        UNDO_ALL_INPUTS[2],
-    );
+/// Edit the output of `UNDO_ALL_INPUTS`, undo every edit, then take s0
+/// from the left. Returns the output and the conflicts waiting before the
+/// take, with the output of the same take on a fresh merge.
+fn undo_all_then_take(separation: u32) -> (String, u32, String) {
+    let [left, center, right] = UNDO_ALL_INPUTS;
+    let (mut fresh, _fresh_dir) = open_separated(left, Some(center), right, separation);
+    run_until_ready(&mut fresh);
+    take_at(&mut fresh, 0, Command::TakeLeft);
+    let (mut view, _dir) = open_separated(left, Some(center), right, separation);
     run_until_ready(&mut view);
     let initial = view.output_text();
     let first = u32::try_from(view.output_pane.line_text(0).chars().count()).unwrap();
@@ -438,11 +440,31 @@ fn undoing_every_edit_then_taking_matches_a_fresh_merge() {
     assert_eq!(view.output_text(), initial);
     let waiting = conflicts(&view);
     take_at(&mut view, 0, Command::TakeLeft);
+    (view.output_text(), waiting, fresh.output_text())
+}
+
+#[test]
+fn undoing_every_edit_then_taking_matches_a_fresh_merge() {
+    let (taken, waiting, fresh) = undo_all_then_take(2);
     assert_eq!(
-        view.output_text(),
+        taken,
         "[l1]\r\n[u3]\r\n~\r\n[l5]\r\n[u7]\r\n[u8]\r\n[l9]\r\n[u12]\r\n[s14]\r\n[u15]\r\n"
     );
     assert_eq!(waiting, 1);
+    assert_eq!(taken, fresh);
+}
+
+/// At a separation of one line the inputs hold two conflicts, and the take
+/// of the first leaves the second showing its ancestor lines.
+#[test]
+fn undoing_every_edit_then_taking_matches_a_fresh_merge_at_one_line_apart() {
+    let (taken, waiting, fresh) = undo_all_then_take(1);
+    assert_eq!(
+        taken,
+        "[l1]\r\n[u3]\r\n~\r\n[l5]\r\n[u7]\r\n[u8]\r\n[u12]\r\n[c13]\r\n[u15]\r\n"
+    );
+    assert_eq!(waiting, 2);
+    assert_eq!(taken, fresh);
 }
 
 #[test]
