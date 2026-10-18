@@ -418,14 +418,22 @@ const BYTES_PER_CHECK: usize = 1 << 20;
 
 /// Asks a stop check after every fixed amount of work, so a cancelled
 /// preparation ends without building the whole output first.
+///
+/// The byte count carries over between copies; a per-copy count lets many
+/// copies each shorter than the interval run without any check.
 struct Pace<'a> {
     stop: &'a dyn Fn() -> bool,
     edits: usize,
+    bytes: usize,
 }
 
 impl<'a> Pace<'a> {
     fn new(stop: &'a dyn Fn() -> bool) -> Self {
-        Self { stop, edits: 0 }
+        Self {
+            stop,
+            edits: 0,
+            bytes: 0,
+        }
     }
 
     /// A pace whose check never asks the work to end.
@@ -443,12 +451,28 @@ impl<'a> Pace<'a> {
         (self.stop)()
     }
 
-    /// Append `part` to `out` in fixed-size pieces; false when the work must
-    /// end.
+    /// Count `copied` bytes; true when the work must end.
+    fn bytes(&mut self, copied: usize) -> bool {
+        self.bytes = self.bytes.saturating_add(copied);
+        if self.bytes < BYTES_PER_CHECK {
+            return false;
+        }
+        self.bytes %= BYTES_PER_CHECK;
+        (self.stop)()
+    }
+
+    /// Append `part` to `out`, asking the stop check each time the total
+    /// copied reaches the interval; false when the work must end.
     fn copy(&mut self, out: &mut Vec<u8>, part: &[u8]) -> bool {
-        for piece in part.chunks(BYTES_PER_CHECK) {
+        let mut rest = part;
+        while !rest.is_empty() {
+            let room = BYTES_PER_CHECK.saturating_sub(self.bytes).max(1);
+            let Some((piece, after)) = rest.split_at_checked(room.min(rest.len())) else {
+                break;
+            };
             out.extend_from_slice(piece);
-            if piece.len() == BYTES_PER_CHECK && (self.stop)() {
+            rest = after;
+            if self.bytes(piece.len()) {
                 return false;
             }
         }
@@ -484,7 +508,11 @@ fn plan_all(
             continue;
         };
         free_from = at.saturating_add(len.max(1));
+        let copied = edit.removed.len().saturating_add(edit.inserted.len());
         edits.push(edit);
+        if pace.bytes(copied) {
+            return None;
+        }
     }
     Some(edits)
 }
@@ -517,7 +545,9 @@ fn rebuilt(old: &[u8], edits: &[Edit], pace: &mut Pace<'_>) -> Option<Vec<u8>> {
         if !pace.copy(&mut out, old.get(from..at).unwrap_or_default()) {
             return None;
         }
-        out.extend_from_slice(&edit.inserted);
+        if !pace.copy(&mut out, &edit.inserted) {
+            return None;
+        }
         from = at.saturating_add(edit.removed.len()).min(old.len());
     }
     if !pace.copy(&mut out, old.get(from..).unwrap_or_default()) {
@@ -739,6 +769,57 @@ mod tests {
         let Some(step) = step else { return };
         assert_eq!(locked.install(step), Some(0));
         assert_eq!(locked.bytes(), &[1]);
+    }
+
+    #[test]
+    fn copied_bytes_are_counted_across_spans_shorter_than_one_check() {
+        use std::cell::Cell;
+        let span = super::BYTES_PER_CHECK - 1;
+        let spans = 8usize;
+        let mut source = Vec::with_capacity((span + 1) * spans);
+        let mut offsets = Vec::with_capacity(spans);
+        for _ in 0..spans {
+            source.resize(source.len() + span, 0);
+            offsets.push(source.len() as u64);
+            source.push(1);
+        }
+        let checks = Cell::new(0usize);
+        let step = super::PreparedStep::replace_all(&source, 0, &offsets, 1, &[2], &|| {
+            checks.set(checks.get() + 1);
+            false
+        });
+        assert_eq!(step.map(|step| step.count()), Some(spans));
+        let unchanged = span * spans;
+        assert!(checks.get() >= unchanged / super::BYTES_PER_CHECK);
+
+        let checks = Cell::new(0usize);
+        let stopped = super::PreparedStep::replace_all(&source, 0, &offsets, 1, &[2], &|| {
+            checks.set(checks.get() + 1);
+            true
+        });
+        assert!(stopped.is_none());
+        assert_eq!(checks.get(), 1);
+    }
+
+    #[test]
+    fn replacement_bytes_count_toward_the_copy_checks() {
+        use std::cell::Cell;
+        let inserted = vec![9u8; super::BYTES_PER_CHECK / 2];
+        let checks = Cell::new(0usize);
+        let step = super::PreparedStep::replace_all(
+            &[1, 1, 1, 1],
+            0,
+            &[0, 1, 2, 3],
+            1,
+            &inserted,
+            &|| {
+                checks.set(checks.get() + 1);
+                false
+            },
+        );
+        assert_eq!(step.map(|step| step.count()), Some(4));
+        // Planning clones each replacement once and the rebuild copies it once.
+        assert!(checks.get() >= 4);
     }
 
     #[test]
