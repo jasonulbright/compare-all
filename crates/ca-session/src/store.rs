@@ -2525,6 +2525,18 @@ impl SettingsPaths {
         path == unusable_directory()
     }
 
+    /// False when state written to `path` is gone once this process ends:
+    /// the private folder made for this run, or the folder no file system
+    /// call accepts. Every other folder, `$XDG_RUNTIME_DIR/compare-all`
+    /// included, is read again by the next process of the same login.
+    #[must_use]
+    pub fn outlives_process(path: &Path) -> bool {
+        if Self::is_unusable(path) {
+            return false;
+        }
+        !matches!(RUN_FOLDER.get(), Some(Ok(run)) if run == path)
+    }
+
     /// Delete the private folder [`SettingsPaths::state_directory`] made for
     /// this run, if it made one. For the end of the process: a later call to
     /// [`SettingsPaths::state_directory`] still names the deleted folder.
@@ -4011,6 +4023,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn state_in_the_folder_made_for_this_run_does_not_outlive_the_process() {
+        let state = run_directory(&environment(PlatformFamily::running()), "HOME is not set");
+        assert!(state.notice.is_some());
+        assert!(!SettingsPaths::outlives_process(&state.path), "{state:?}");
+        SettingsPaths::remove_run_directory();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_in_the_runtime_folder_outlives_the_process_despite_its_notice() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let runtime = TempDir::new().unwrap();
+        fs::set_permissions(runtime.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let state = run_directory(&runtime_environment(runtime.path()), "HOME is not set");
+        assert_eq!(state.path, runtime.path().join("compare-all"));
+        assert!(state.notice.is_some());
+        assert!(SettingsPaths::outlives_process(&state.path));
+    }
+
     #[cfg(unix)]
     fn mode_of(path: &Path) -> u32 {
         use std::os::unix::fs::PermissionsExt as _;
@@ -4142,6 +4174,8 @@ mod tests {
         assert!(notice.contains("/missing"), "{notice}");
         assert!(!notice.contains('\0'), "{notice:?}");
         assert!(SettingsPaths::is_unusable(&unusable_directory()));
+        assert!(!SettingsPaths::outlives_process(&unusable_directory()));
+        assert!(SettingsPaths::outlives_process(Path::new("/tmp")));
         assert!(!SettingsPaths::is_unusable(Path::new("/tmp")));
     }
 
