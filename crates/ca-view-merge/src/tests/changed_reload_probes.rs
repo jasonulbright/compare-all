@@ -325,3 +325,35 @@ fn a_reload_copies_the_lines_of_a_changed_section_only_for_a_record_it_leaves_ou
         );
     }
 }
+
+// s0 and s4 hold the same three texts. s1 conflict c1, s2 u3 u4, s3 left
+// change l5, s5 conflict c5, s6 u8.
+const ALIKE: [&str; 3] = [
+    "\n~\n[u3]\n[u4]\n[l5]\n\n~\n[l6]\n[u8]",
+    "\n~\n[c1]\n[u3]\n[u4]\n\n~\n[c5]\n[u8]\n",
+    "\n~\n[r2]\n[u3]\n[u4]\n\n~\n[u8]",
+];
+
+/// Join `[l5]` to `[u4]`, then the lines of s1 to s3 to the `~` line of
+/// s0, so s0 holds the text of three lenders. A reload changes the first
+/// right line: s0 and s1 become one new conflict, which is not carried.
+/// The held text goes back to its lenders, in order and once, and s4,
+/// alike to s0 before the reload, keeps its own lines.
+#[test]
+fn a_reload_that_changes_a_holder_gives_its_text_back_and_leaves_an_alike_section_alone() {
+    let (mut view, dir) = open_separated(ALIKE[0], Some(ALIKE[1]), ALIKE[2], 1);
+    run_until_ready(&mut view);
+    assert_eq!(view.model().sections().len(), 7);
+    join(&mut view, 4);
+    for _ in 0..3 {
+        join(&mut view, 1);
+    }
+    assert_eq!(view.output_text(), "\n~[c1][u3][u4][l5]\n\n~\n[c5]\n[u8]\n");
+    let changed = ALIKE[2].replacen('\n', "[d1]\n", 1);
+    std::fs::write(dir.path().join("right.txt"), changed).unwrap();
+    reload(&mut view);
+    assert_eq!(
+        view.output_text(),
+        "\n~\n[c1]\n[u3][u4]\n[l5]\n\n~\n[c5]\n[u8]\n"
+    );
+}

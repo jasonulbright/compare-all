@@ -986,12 +986,94 @@ struct Returning {
     dropped: Vec<Lent>,
 }
 
-/// How many sections before this one hold `print`, counting this one in.
-fn next_occurrence(seen: &mut HashMap<Fingerprint, usize>, print: &Fingerprint) -> usize {
-    let count = seen.entry(print.clone()).or_insert(0);
-    let occurrence = *count;
-    *count += 1;
-    occurrence
+/// Pairs `(old index, new index)` of equal items, both indices increasing.
+///
+/// Equal leading and trailing runs pair first. Between them, items that
+/// occur once in each part anchor the pairing, the longest run of anchors
+/// in the same order on both sides is kept, and each gap between kept
+/// anchors pairs the same way. Items that only repeat inside a gap with
+/// no anchor stay unpaired.
+fn align<T: Eq + std::hash::Hash>(old: &[T], new: &[T]) -> Vec<(usize, usize)> {
+    let mut pairs = Vec::new();
+    let mut parts = vec![(0..old.len(), 0..new.len())];
+    while let Some((mut olds, mut news)) = parts.pop() {
+        while olds.start < olds.end && news.start < news.end && old[olds.start] == new[news.start] {
+            pairs.push((olds.start, news.start));
+            olds.start += 1;
+            news.start += 1;
+        }
+        while olds.start < olds.end
+            && news.start < news.end
+            && old[olds.end - 1] == new[news.end - 1]
+        {
+            olds.end -= 1;
+            news.end -= 1;
+            pairs.push((olds.end, news.end));
+        }
+        if olds.is_empty() || news.is_empty() {
+            continue;
+        }
+        // (count in old, count in new, index in old)
+        let mut seen: HashMap<&T, (usize, usize, usize)> = HashMap::new();
+        for index in olds.clone() {
+            let entry = seen.entry(&old[index]).or_insert((0, 0, index));
+            entry.0 += 1;
+        }
+        for index in news.clone() {
+            if let Some(entry) = seen.get_mut(&new[index]) {
+                entry.1 += 1;
+            }
+        }
+        let anchors: Vec<(usize, usize)> = news
+            .clone()
+            .filter_map(|index| {
+                let (in_old, in_new, at) = *seen.get(&new[index])?;
+                (in_old == 1 && in_new == 1).then_some((at, index))
+            })
+            .collect();
+        let anchors = increasing_run(&anchors);
+        if anchors.is_empty() {
+            continue;
+        }
+        let (mut old_from, mut new_from) = (olds.start, news.start);
+        for (old_at, new_at) in anchors {
+            pairs.push((old_at, new_at));
+            parts.push((old_from..old_at, new_from..new_at));
+            old_from = old_at + 1;
+            new_from = new_at + 1;
+        }
+        parts.push((old_from..olds.end, new_from..news.end));
+    }
+    pairs.sort_unstable();
+    pairs
+}
+
+/// The longest subsequence of `pairs`, which are ordered by their second
+/// index, whose first indices increase.
+fn increasing_run(pairs: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    // tails[k]: the pair ending the run of length k + 1 whose first index is
+    // the smallest found so far.
+    let mut tails: Vec<usize> = Vec::new();
+    let mut before: Vec<Option<usize>> = vec![None; pairs.len()];
+    for (index, &(first, _)) in pairs.iter().enumerate() {
+        let length = tails.partition_point(|&tail| pairs[tail].0 < first);
+        before[index] = length
+            .checked_sub(1)
+            .and_then(|shorter| tails.get(shorter).copied());
+        if length == tails.len() {
+            tails.push(index);
+        } else {
+            tails[length] = index;
+        }
+    }
+    let mut run = Vec::with_capacity(tails.len());
+    let mut at = tails.last().copied();
+    while let Some(index) = at {
+        run.push(pairs[index]);
+        at = before[index];
+    }
+    run.reverse();
+    run
 }
 
 fn slice(lines: &[String], range: &Range<u32>) -> Vec<String> {
@@ -1877,8 +1959,9 @@ impl MergeModel {
     /// A section keeps its resolution only when all three of its input texts
     /// are unchanged, so a reload that altered a region drops the decision that
     /// was made about the old content rather than applying it to new content.
-    /// Among sections that hold the same three texts, the first takes the
-    /// decision of the first, the second that of the second, and so on.
+    /// Sections pair in file order, so among sections that hold the same
+    /// three texts a decision stays on the section it was made on. A
+    /// decision whose section has no partner in the new merge is dropped.
     pub fn carry_over(&mut self, previous: &Self) {
         self.carry(previous, false);
     }
@@ -1909,19 +1992,31 @@ impl MergeModel {
                 resolution
             }
         };
-        // Several sections can hold the same three texts. A decision is kept
-        // under its fingerprint and the order of its section among those that
-        // share it, so it lands on the matching section alone.
-        let mut kept: HashMap<(Fingerprint, usize), Decision> = HashMap::new();
-        let mut seen: HashMap<Fingerprint, usize> = HashMap::new();
+        // Several sections can hold the same three texts. Sections pair in
+        // order, untouched ones included, so a decision never lands on a
+        // section with the same texts elsewhere in the file, and carried
+        // sections keep their order: a holder stays in front of the sections
+        // that lent it text.
+        let old_prints: Vec<Fingerprint> = previous
+            .sections
+            .iter()
+            .map(|section| {
+                let (left, center, right) = previous.fingerprint(section);
+                if swapped {
+                    (right, center, left)
+                } else {
+                    (left, center, right)
+                }
+            })
+            .collect();
+        let new_prints: Vec<Fingerprint> = self
+            .sections
+            .iter()
+            .map(|section| self.fingerprint(section))
+            .collect();
+        let pairs = align(&old_prints, &new_prints);
+        let mut kept: Vec<Decision> = Vec::new();
         for (index, section) in previous.sections.iter().enumerate() {
-            let (left, center, right) = previous.fingerprint(section);
-            let print = if swapped {
-                (right, center, left)
-            } else {
-                (left, center, right)
-            };
-            let occurrence = next_occurrence(&mut seen, &print);
             if untouched(section) {
                 continue;
             }
@@ -1929,26 +2024,24 @@ impl MergeModel {
                 restore.resolution = mirror(restore.resolution);
                 restore
             });
-            kept.insert(
-                (print, occurrence),
-                Decision {
-                    index,
-                    resolution: mirror(section.resolution),
-                    edited: previous.edited_content(index, section),
-                    conflict: section.conflict,
-                    ignored: section.ignored,
-                    lent: section.lent.clone(),
-                    restore,
-                    restore_from_take: section.restore_from_take,
-                },
-            );
+            kept.push(Decision {
+                index,
+                resolution: mirror(section.resolution),
+                edited: previous.edited_content(index, section),
+                conflict: section.conflict,
+                ignored: section.ignored,
+                lent: section.lent.clone(),
+                restore,
+                restore_from_take: section.restore_from_take,
+            });
         }
+        let by_old: HashMap<usize, &Decision> = kept
+            .iter()
+            .map(|decision| (decision.index, decision))
+            .collect();
         let mut moved: HashMap<usize, usize> = HashMap::new();
-        let mut seen: HashMap<Fingerprint, usize> = HashMap::new();
-        for index in 0..self.sections.len() {
-            let print = self.fingerprint(&self.sections[index]);
-            let occurrence = next_occurrence(&mut seen, &print);
-            let Some(decision) = kept.get(&(print, occurrence)) else {
+        for (old_index, index) in pairs {
+            let Some(decision) = by_old.get(&old_index) else {
                 continue;
             };
             moved.insert(decision.index, index);
@@ -1970,8 +2063,7 @@ impl MergeModel {
         // A carried record keeps its order number, so a new one must not
         // reuse it.
         self.lend_seq = self.lend_seq.max(previous.lend_seq);
-        let mut decisions: Vec<&Decision> = kept.values().collect();
-        decisions.sort_by_key(|decision| decision.index);
+        let decisions: Vec<&Decision> = kept.iter().collect();
         let mut returning = self.carry_lent_text(&decisions, &moved);
         self.rebuild();
         // Last in output order first: a strip moves only the text after it
@@ -3121,6 +3213,40 @@ mod tests {
         second.carry_over(&first);
         assert_eq!(second.output_text(), first.output_text());
         assert_eq!(second.totals().edited, 1);
+    }
+
+    /// The first of two alike sections is decided, then a reload changes its
+    /// left text. The decision is dropped; the second section, alike to the
+    /// first before the reload, keeps its own state.
+    #[test]
+    fn a_decision_on_a_changed_section_does_not_move_to_a_later_alike_one() {
+        let text = |first: &str, second: &str| format!("a\n{first}\nc\nd\ne\nf\ng\n{second}\nh\n");
+        for edited in [false, true] {
+            let (mut first, conflicts) = repeated_conflicts("L", "R");
+            if edited {
+                first.set_edited(conflicts[0], vec!["X\n".to_owned()]);
+            } else {
+                first.set_resolution(conflicts[0], Resolution::Left);
+            }
+            let mut second = model(&text("M", "L"), &text("b", "b"), &text("R", "R"));
+            second.carry_over(&first);
+            assert_eq!(second.output_text(), text("b", "b"), "edited {edited}");
+            assert_eq!(second.totals().conflicts_remaining, 2, "edited {edited}");
+        }
+    }
+
+    #[test]
+    fn sections_pair_in_order_around_changed_and_repeated_ones() {
+        assert_eq!(
+            super::align(&["a", "b", "c", "d", "a", "e"], &["x", "c", "d", "a", "e"]),
+            vec![(2, 1), (3, 2), (4, 3), (5, 4)]
+        );
+        assert_eq!(
+            super::align(&["p", "a", "q", "a", "r"], &["p", "a", "r", "q", "a", "s"]),
+            vec![(0, 0), (1, 1), (2, 3), (3, 4)]
+        );
+        assert_eq!(super::align(&["a", "a"], &["b", "a", "a", "b"]), Vec::new());
+        assert_eq!(super::align::<&str>(&[], &["a"]), Vec::new());
     }
 
     /// Swap Sides mirrors a carried decision onto the same section only.
