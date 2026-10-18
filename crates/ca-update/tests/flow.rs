@@ -1728,6 +1728,15 @@ fn an_install_folder_open_to_other_accounts_is_refused() {
     let closed = prepare_work_folder(parent.path()).unwrap();
     let program = closed.path().join("compare-all.exe");
     std::fs::write(&program, b"old exe").unwrap();
+    // The installer service owns the files it writes; a test process may
+    // give new files the owner of its account.
+    let status = ca_io::host_command::host_command("icacls")
+        .arg(&program)
+        .args(["/setowner", "*S-1-5-18", "/q"])
+        .stdout(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success());
     assert!(install_folder_closed(&program));
     let system = ca_update::system::program_files().unwrap();
     assert!(install_folder_closed(&system.join("Common Files")));
