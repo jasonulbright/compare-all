@@ -17,6 +17,7 @@ use ca_diff::{
 use ca_ui::theme::merge::MergeClass;
 use std::collections::HashMap;
 use std::ops::Range;
+use std::sync::Arc;
 
 mod history;
 pub(crate) mod ownership;
@@ -932,7 +933,7 @@ impl ChunkedVec<String> {
 /// A merge and the state of every one of its sections.
 #[derive(Debug, Clone, Default)]
 pub struct MergeModel {
-    inputs: Inputs,
+    inputs: Arc<Inputs>,
     sections: Vec<Section>,
     rows: ChunkedVec<Row>,
     section_rows: PrefixLengths,
@@ -956,6 +957,51 @@ pub struct MergeModel {
 /// three of its texts match, which is what lets a manual resolution survive a
 /// reload that did not touch that region.
 type Fingerprint = (String, String, String);
+
+fn fingerprint_of(
+    inputs: &Inputs,
+    left: &Range<u32>,
+    center: &Range<u32>,
+    right: &Range<u32>,
+) -> Fingerprint {
+    (
+        joined(&inputs.left, left),
+        joined(&inputs.center, center),
+        joined(&inputs.right, right),
+    )
+}
+
+/// The inputs and section ranges of a merge, which a later merge pairs its
+/// sections with.
+#[derive(Debug, Clone, Default)]
+pub struct Layout {
+    inputs: Arc<Inputs>,
+    ranges: Vec<(Range<u32>, Range<u32>, Range<u32>)>,
+}
+
+/// Sections of a later merge paired with those of an earlier one, as
+/// `(earlier index, later index)` in increasing order on both sides.
+#[derive(Debug, Clone)]
+pub struct Pairing {
+    earlier: Arc<Inputs>,
+    earlier_sections: usize,
+    later: Arc<Inputs>,
+    later_sections: usize,
+    swapped: bool,
+    pairs: Vec<(usize, usize)>,
+}
+
+impl Pairing {
+    /// Inputs and sections never change after a build, so the same input
+    /// allocations and section counts identify the same two merges.
+    pub(crate) fn fits(&self, earlier: &MergeModel, later: &MergeModel, swapped: bool) -> bool {
+        self.swapped == swapped
+            && Arc::ptr_eq(&self.earlier, &earlier.inputs)
+            && self.earlier_sections == earlier.sections.len()
+            && Arc::ptr_eq(&self.later, &later.inputs)
+            && self.later_sections == later.sections.len()
+    }
+}
 
 /// What a user decided about one section, carried across a reload.
 #[derive(Debug, Clone)]
@@ -1170,7 +1216,7 @@ impl MergeModel {
         }
         let mut model = Self {
             output_ending: Some(input_ending(&inputs.left)),
-            inputs,
+            inputs: Arc::new(inputs),
             sections,
             rows: ChunkedVec::default(),
             section_rows: PrefixLengths::default(),
@@ -1189,7 +1235,7 @@ impl MergeModel {
 
     /// The three inputs.
     #[must_use]
-    pub const fn inputs(&self) -> &Inputs {
+    pub fn inputs(&self) -> &Inputs {
         &self.inputs
     }
 
@@ -1976,7 +2022,75 @@ impl MergeModel {
     /// three texts a decision stays on the section it was made on. A
     /// decision whose section has no partner in the new merge is dropped.
     pub fn carry_over(&mut self, previous: &Self) {
-        self.carry(previous, false);
+        self.carry(previous, false, None);
+    }
+
+    /// Adopt the resolutions of an earlier merge with sections paired before,
+    /// by [`Self::pair_with`] on a worker thread. A pairing made for another
+    /// earlier merge, another side order or another merge is not used; the
+    /// sections then pair here.
+    pub fn carry_over_paired(&mut self, previous: &Self, swapped: bool, pairing: Option<&Pairing>) {
+        self.carry(previous, swapped, pairing);
+    }
+
+    /// The section layout a later merge pairs its sections with.
+    #[must_use]
+    pub fn layout(&self) -> Layout {
+        Layout {
+            inputs: Arc::clone(&self.inputs),
+            ranges: self
+                .sections
+                .iter()
+                .map(|section| {
+                    (
+                        section.left.clone(),
+                        section.center.clone(),
+                        section.right.clone(),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    /// Pair the sections of this merge with those of an earlier one whose
+    /// texts match, in file order. `swapped` says the earlier merge had its
+    /// left and right inputs the other way round.
+    ///
+    /// Every section text of both merges is compared, so this runs on a
+    /// worker thread.
+    #[must_use]
+    pub fn pair_with(&self, earlier: &Layout, swapped: bool) -> Pairing {
+        let pairs = if earlier.ranges.is_empty() {
+            Vec::new()
+        } else {
+            let old_prints: Vec<Fingerprint> = earlier
+                .ranges
+                .iter()
+                .map(|(left, center, right)| {
+                    let (left, center, right) =
+                        fingerprint_of(&earlier.inputs, left, center, right);
+                    if swapped {
+                        (right, center, left)
+                    } else {
+                        (left, center, right)
+                    }
+                })
+                .collect();
+            let new_prints: Vec<Fingerprint> = self
+                .sections
+                .iter()
+                .map(|section| self.fingerprint(section))
+                .collect();
+            align(&old_prints, &new_prints)
+        };
+        Pairing {
+            earlier: Arc::clone(&earlier.inputs),
+            earlier_sections: earlier.ranges.len(),
+            later: Arc::clone(&self.inputs),
+            later_sections: self.sections.len(),
+            swapped,
+            pairs,
+        }
     }
 
     /// Adopt the resolutions of an earlier merge whose left and right inputs
@@ -1985,10 +2099,10 @@ impl MergeModel {
     /// A take from one side becomes a take from the other side, so the output
     /// text stays the same.
     pub fn carry_over_swapped(&mut self, previous: &Self) {
-        self.carry(previous, true);
+        self.carry(previous, true, None);
     }
 
-    fn carry(&mut self, previous: &Self, swapped: bool) {
+    fn carry(&mut self, previous: &Self, swapped: bool, pairing: Option<&Pairing>) {
         let untouched = |section: &Section| {
             section.resolution == previous.automatic_for(section.kind)
                 && section.conflict == matches!(section.kind, MergeKind::Conflict)
@@ -2010,24 +2124,10 @@ impl MergeModel {
         // section with the same texts elsewhere in the file, and carried
         // sections keep their order: a holder stays in front of the sections
         // that lent it text.
-        let old_prints: Vec<Fingerprint> = previous
-            .sections
-            .iter()
-            .map(|section| {
-                let (left, center, right) = previous.fingerprint(section);
-                if swapped {
-                    (right, center, left)
-                } else {
-                    (left, center, right)
-                }
-            })
-            .collect();
-        let new_prints: Vec<Fingerprint> = self
-            .sections
-            .iter()
-            .map(|section| self.fingerprint(section))
-            .collect();
-        let pairs = align(&old_prints, &new_prints);
+        let pairs = match pairing.filter(|pairing| pairing.fits(previous, self, swapped)) {
+            Some(pairing) => pairing.pairs.clone(),
+            None => self.pair_with(&previous.layout(), swapped).pairs,
+        };
         let mut kept: Vec<Decision> = Vec::new();
         for (index, section) in previous.sections.iter().enumerate() {
             if untouched(section) {
@@ -2308,11 +2408,7 @@ impl MergeModel {
     }
 
     fn fingerprint(&self, section: &Section) -> Fingerprint {
-        (
-            joined(&self.inputs.left, &section.left),
-            joined(&self.inputs.center, &section.center),
-            joined(&self.inputs.right, &section.right),
-        )
+        fingerprint_of(&self.inputs, &section.left, &section.center, &section.right)
     }
 
     /// The output lines one section contributes.
@@ -2736,6 +2832,7 @@ mod tests {
     };
     use ca_diff::merge3::{MergeKind, MergeOptions};
     use ca_ui::worker::Cancel;
+    use std::sync::Arc;
 
     fn model(left: &str, center: &str, right: &str) -> MergeModel {
         MergeModel::build(
@@ -2766,12 +2863,12 @@ mod tests {
         let end = u32::try_from(line_count).unwrap();
         let sections = vec![Section::new(kind, 0..end, 0..end, 0..end)];
         let mut merged = MergeModel {
-            inputs: Inputs {
+            inputs: Arc::new(Inputs {
                 left,
                 center: std::mem::take(&mut center),
                 right,
                 two_way: false,
-            },
+            }),
             sections,
             rows: ChunkedVec::default(),
             section_rows: PrefixLengths::default(),
@@ -2805,12 +2902,12 @@ mod tests {
             })
             .collect();
         let mut merged = MergeModel {
-            inputs: Inputs {
+            inputs: Arc::new(Inputs {
                 left: lines.clone(),
                 center: lines.clone(),
                 right: lines,
                 two_way: false,
-            },
+            }),
             sections,
             rows: ChunkedVec::default(),
             section_rows: PrefixLengths::default(),
@@ -3257,6 +3354,48 @@ mod tests {
         );
         assert_eq!(second.totals().conflicts_remaining, 0);
         assert_eq!(second.totals().edited, 1);
+    }
+
+    /// A pairing made from the layout before the decisions were taken carries
+    /// them the same way. A pairing made for another earlier merge or the
+    /// other side order is not used.
+    #[test]
+    fn a_pairing_made_before_the_decisions_carries_them() {
+        let block = "u\nv\nw\n";
+        let old = |middle: &str| format!("{block}{middle}\n{block}{middle}\n{block}");
+        let new = |end: &str, middle: &str| {
+            format!("{end}\n{block}{middle}\n{block}{middle}\n{block}{end}\n")
+        };
+        let expected = "N\nu\nv\nw\nL\nu\nv\nw\nX\nu\nv\nw\nN\n";
+        let mut first = model(&old("L"), &old("b"), &old("R"));
+        let layout = first.layout();
+        let fresh = || model(&new("N", "L"), &new("n", "b"), &new("n", "R"));
+        let mut second = fresh();
+        let pairing = second.pair_with(&layout, false);
+        let other = second.pair_with(&model(&old("L"), &old("b"), &old("R")).layout(), false);
+        let conflicts: Vec<usize> = first
+            .sections()
+            .iter()
+            .enumerate()
+            .filter(|(_, section)| section.is_unresolved_conflict())
+            .map(|(index, _)| index)
+            .collect();
+        first.set_resolution(conflicts[0], Resolution::Left);
+        first.set_edited(conflicts[1], vec!["X\n".to_owned()]);
+        second.carry_over_paired(&first, false, Some(&pairing));
+        assert_eq!(second.output_text(), expected);
+        assert_eq!(second.totals().conflicts_remaining, 0);
+        for (pairing, swapped) in [(&other, false), (&pairing, true)] {
+            let mut later = fresh();
+            let mut unswapped = fresh();
+            later.carry_over_paired(&first, swapped, Some(pairing));
+            if swapped {
+                unswapped.carry_over_swapped(&first);
+            } else {
+                unswapped.carry_over(&first);
+            }
+            assert_eq!(later.output_text(), unswapped.output_text(), "{swapped}");
+        }
     }
 
     /// The first of two alike sections is decided, then a reload changes its
