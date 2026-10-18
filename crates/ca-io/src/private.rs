@@ -89,15 +89,32 @@ fn open_folder(folder: &Path, follow: bool) -> io::Result<std::fs::File> {
 /// belong to the running user and, when `private`, be closed to others.
 #[cfg(unix)]
 fn check_handle(handle: &std::fs::File, folder: &Path, private: bool) -> io::Result<()> {
+    check_folder_metadata(&handle.metadata()?, running_user(), folder, private)
+}
+
+/// The user ID the owner checks compare with.
+#[cfg(unix)]
+fn running_user() -> u32 {
+    rustix::process::geteuid().as_raw()
+}
+
+/// [`check_handle`] on the `metadata` of `folder`, with `running` as the ID of
+/// the running user.
+#[cfg(unix)]
+fn check_folder_metadata(
+    metadata: &std::fs::Metadata,
+    running: u32,
+    folder: &Path,
+    private: bool,
+) -> io::Result<()> {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-    let metadata = handle.metadata()?;
     if !metadata.is_dir() {
         return Err(io::Error::new(
             io::ErrorKind::NotADirectory,
             format!("{} is not a folder", folder.display()),
         ));
     }
-    if metadata.uid() != rustix::process::geteuid().as_raw() {
+    if metadata.uid() != running {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!("{} belongs to another user", folder.display()),
@@ -145,13 +162,7 @@ fn adopt_folder(folder: &Path, between: impl FnOnce()) -> io::Result<PathBuf> {
 /// not follow a link that was changed after this check.
 #[cfg(unix)]
 fn accept_linked_folder(folder: &Path, link: &std::fs::Metadata) -> io::Result<PathBuf> {
-    use std::os::unix::fs::MetadataExt as _;
-    if link.uid() != rustix::process::geteuid().as_raw() {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!("{} is a link of another user", folder.display()),
-        ));
-    }
+    check_link_owner(link, running_user(), folder)?;
     let target = std::fs::canonicalize(folder).map_err(|_| link_refused(folder))?;
     let handle = open_folder(&target, false).map_err(|_| link_refused(folder))?;
     check_handle(&handle, folder, true).map_err(|error| {
@@ -164,6 +175,21 @@ fn accept_linked_folder(folder: &Path, link: &std::fs::Metadata) -> io::Result<P
         )
     })?;
     Ok(target)
+}
+
+/// Refuse the link at `folder`, whose own metadata is `link`, unless the user
+/// with ID `running` owns it.
+#[cfg(unix)]
+fn check_link_owner(link: &std::fs::Metadata, running: u32, folder: &Path) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+    if link.uid() == running {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} is a link of another user", folder.display()),
+        ))
+    }
 }
 
 /// The path to use for an existing `folder` under the rules of
@@ -340,16 +366,25 @@ mod tests {
         assert!(!other.join("copy").exists());
     }
 
-    /// Only a privileged run can hand a link to another user, so the case is
-    /// checked where the test runs with that privilege.
     #[cfg(unix)]
     #[test]
+    fn a_link_of_another_user_is_refused() {
+        use std::os::unix::fs::MetadataExt as _;
+        let parent = tempfile::tempdir().unwrap();
+        let link = parent.path().join("link");
+        std::os::unix::fs::symlink(parent.path(), &link).unwrap();
+        let metadata = std::fs::symlink_metadata(&link).unwrap();
+        let owner = metadata.uid();
+        assert!(super::check_link_owner(&metadata, owner, &link).is_ok());
+        let error = super::check_link_owner(&metadata, owner.wrapping_add(1), &link).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "needs root to hand a link to another user; run with --ignored as root"]
     fn a_link_of_another_user_is_refused_when_run_as_root() {
         use std::os::unix::fs::PermissionsExt as _;
-        if rustix::process::geteuid().as_raw() != 0 {
-            println!("skipped: handing a link to another user needs root");
-            return;
-        }
         let parent = tempfile::tempdir().unwrap();
         let target = parent.path().join("target");
         std::fs::create_dir(&target).unwrap();
@@ -484,15 +519,31 @@ mod tests {
         assert_eq!(mode & 0o777, 0o700, "{mode:o}");
     }
 
-    /// Only a privileged run can hand a folder to another user, so the case
-    /// is checked where the test runs with that privilege.
     #[cfg(unix)]
     #[test]
-    fn a_folder_of_another_user_is_refused_when_run_as_root() {
-        if rustix::process::geteuid().as_raw() != 0 {
-            println!("skipped: handing a folder to another user needs root");
-            return;
+    fn a_folder_of_another_user_is_refused() {
+        use std::os::unix::fs::MetadataExt as _;
+        let parent = tempfile::tempdir().unwrap();
+        let metadata = std::fs::metadata(parent.path()).unwrap();
+        let owner = metadata.uid();
+        for private in [false, true] {
+            let refused = super::check_folder_metadata(
+                &metadata,
+                owner.wrapping_add(1),
+                parent.path(),
+                private,
+            )
+            .unwrap_err();
+            assert_eq!(refused.kind(), std::io::ErrorKind::PermissionDenied);
+            assert!(refused.to_string().contains("another user"), "{refused}");
         }
+        assert!(super::check_folder_metadata(&metadata, owner, parent.path(), true).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "needs root to hand a folder to another user; run with --ignored as root"]
+    fn a_folder_of_another_user_is_refused_when_run_as_root() {
         let parent = tempfile::tempdir().unwrap();
         let folder = parent.path().join("foreign");
         std::fs::create_dir(&folder).unwrap();
