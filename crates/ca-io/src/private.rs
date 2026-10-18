@@ -194,7 +194,7 @@ fn check_link_owner(link: &std::fs::Metadata, running: u32, folder: &Path) -> io
 
 /// The path to use for an existing `folder` under the rules of
 /// [`create_owned_folder`], without creating or changing anything. None when
-/// nothing is at `folder`.
+/// nothing is at `folder`, also when a folder above it is a file.
 ///
 /// A plain folder must belong to the running user; its access is not narrowed.
 /// A link is accepted only as [`create_owned_folder`] accepts it, and the
@@ -207,7 +207,16 @@ fn check_link_owner(link: &std::fs::Metadata, running: u32, folder: &Path) -> io
 pub fn resolve_owned_folder(folder: &Path) -> io::Result<Option<PathBuf>> {
     let metadata = match std::fs::symlink_metadata(folder) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        // ENOTDIR here comes from a component above `folder`, so no entry can
+        // exist at `folder`; Windows reports the same case as not found.
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(None)
+        }
         Err(error) => return Err(error),
     };
     if metadata.file_type().is_symlink() {
@@ -428,6 +437,11 @@ mod tests {
         let file = parent.path().join("file");
         std::fs::write(&file, b"x").unwrap();
         assert!(resolve_owned_folder(&file).is_err());
+        assert_eq!(
+            resolve_owned_folder(&file.join("below")).unwrap(),
+            None,
+            "nothing can be below a file"
+        );
     }
 
     #[cfg(unix)]
