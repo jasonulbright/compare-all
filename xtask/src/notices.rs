@@ -67,9 +67,33 @@ pub fn run(root: &Path) -> Result<()> {
         .split_once("{{#each licenses}}")
         .context("notice template has no inventory marker")?
         .0;
-    let rendered = render(&inventory, &supplements, header)?;
+    let rendered = render(&inventory, &supplements, header).map_err(|error| {
+        let rejected = rejected_clarifications(&String::from_utf8_lossy(&output.stderr));
+        if rejected.is_empty() {
+            error
+        } else {
+            error.context(format!(
+                "cargo-about rejected these about.toml clarifications:\n{}",
+                rejected.join("\n")
+            ))
+        }
+    })?;
     std::fs::write(root.join("THIRD-PARTY-NOTICES.md"), rendered)?;
     Ok(())
+}
+
+/// A clarification whose file is missing upstream or whose checksum differs falls back to the
+/// placeholder license text, which then reports only as a missing supplement.
+fn rejected_clarifications(stderr: &str) -> Vec<String> {
+    stderr
+        .lines()
+        .filter(|line| line.contains("failed to validate all files specified in clarification"))
+        .map(|line| {
+            line.split_once("] ")
+                .map_or(line, |(_, rest)| rest)
+                .to_owned()
+        })
+        .collect()
 }
 
 type Supplements = BTreeMap<(String, String), (String, String, String)>;
@@ -166,6 +190,14 @@ mod tests {
         }]});
         assert!(render(&changed_version, &supplements, "").is_err());
         Ok(())
+    }
+
+    #[test]
+    fn rejected_clarifications_are_extracted_from_inventory_logs() {
+        let log = "[WARN] failed to validate all files specified in clarification for crate a 1.0.0: x\n[INFO] other";
+        let rejected = rejected_clarifications(log);
+        assert_eq!(rejected.len(), 1);
+        assert!(rejected[0].starts_with("failed to validate"));
     }
 
     #[test]
