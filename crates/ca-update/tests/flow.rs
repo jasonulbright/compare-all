@@ -1969,7 +1969,7 @@ fn setting_the_running_program_aside_never_leaves_its_name_empty() {
     let after = std::fs::read(&program).is_ok_and(|bytes| bytes == original);
     let _ = child.kill();
     let _ = child.wait();
-    assert!(moved.is_some());
+    assert!(moved.is_ok());
     let seen = seen.into_inner().unwrap();
     assert!(!seen.is_empty());
     assert!(seen.iter().all(|present| *present), "{seen:?}");
@@ -2096,6 +2096,37 @@ fn an_update_put_off_at_every_close_ends_in_the_warning() {
         Outcome::Staged { .. }
     ));
     assert_eq!(staging.read_record().unwrap().put_off, 0);
+}
+
+/// A second name of the program file needs the volume of the install folder.
+/// An install folder on another volume than the work folder is refused
+/// before the prompt, and a link across volumes gives the refusal that every
+/// later close repeats.
+#[cfg(windows)]
+#[test]
+fn an_install_folder_on_another_volume_is_refused() {
+    use ca_update::install::{
+        install_folder_usable, link_failure_code, same_volume, KEPT, NOT_APPLICABLE,
+    };
+    let here = tempfile::tempdir().unwrap();
+    let nested = here.path().join("nested");
+    std::fs::create_dir(&nested).unwrap();
+    let program = nested.join("compare-all.exe");
+    std::fs::write(&program, b"old exe").unwrap();
+    assert!(same_volume(here.path(), &nested));
+    let missing = ('D'..='Z')
+        .rev()
+        .map(|letter| std::path::PathBuf::from(format!("{letter}:\\")))
+        .find(|root| !root.exists())
+        .unwrap();
+    assert!(!same_volume(here.path(), &missing));
+    assert!(!same_volume(&missing, &missing));
+    assert!(!install_folder_usable(&program, &missing));
+    let error = |code| std::io::Error::from_raw_os_error(code);
+    assert_eq!(link_failure_code(&error(17)), NOT_APPLICABLE);
+    for code in [1, 5, 32, 183] {
+        assert_eq!(link_failure_code(&error(code)), KEPT, "{code}");
+    }
 }
 
 /// One elevated step at a time sets aside, installs and restores; a second

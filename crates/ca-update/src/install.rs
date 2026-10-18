@@ -52,7 +52,8 @@ pub const NOT_PREPARED: i32 = 0x1000_0002;
 pub const KEPT: i32 = 0x1000_0003;
 
 /// Exit code: this install cannot apply an update by itself, because the
-/// install folder or program file is open to other accounts or the staging
+/// install folder or program file is open to other accounts, the install
+/// folder is on another volume than the program files folder, or the staging
 /// folder is not one the elevated step reads. A later close gives the same
 /// result.
 pub const NOT_APPLICABLE: i32 = 0x1000_0004;
@@ -69,15 +70,45 @@ pub fn install_folder_closed(program: &Path) -> bool {
     })
 }
 
+/// True when the elevated step can set `program` aside in a work folder in
+/// `work_parent`: the install folder is on the volume of `work_parent`,
+/// which a second name of the program file needs, and it is closed to other
+/// accounts.
+#[must_use]
+pub fn install_folder_usable(program: &Path, work_parent: &Path) -> bool {
+    program
+        .parent()
+        .is_some_and(|folder| same_volume(folder, work_parent))
+        && install_folder_closed(program)
+}
+
+/// True when `first` and `second` exist and, with every link resolved, are
+/// on the same drive. A path that cannot be resolved counts as another
+/// volume.
+#[must_use]
+pub fn same_volume(first: &Path, second: &Path) -> bool {
+    let drive = |path: &Path| {
+        resolve(path).and_then(|resolved| {
+            resolved
+                .components()
+                .next()
+                .map(|part| part.as_os_str().to_string_lossy().to_lowercase())
+        })
+    };
+    matches!((drive(first), drive(second)), (Some(a), Some(b)) if a == b)
+}
+
 /// True when an update of the install for every user at `program` can be
-/// applied from `staging`: the elevated step would read that staging folder
-/// and the install folder is closed to other accounts. The helper asks this
-/// before the elevation prompt, so a prompt that can only end in a refusal is
-/// not shown.
+/// applied from `staging`: the elevated step would read that staging folder,
+/// and the install folder is usable in the sense of
+/// [`install_folder_usable`] for a work folder in the program files folder.
+/// The helper asks this before the elevation prompt, so a prompt that can
+/// only end in a refusal is not shown.
 #[must_use]
 pub fn install_place_accepted(staging: &Path, program: &Path) -> bool {
     accepted_staging(staging, &crate::system::profile_folders()).is_some()
-        && install_folder_closed(program)
+        && crate::system::program_files()
+            .is_ok_and(|parent| install_folder_usable(program, &parent))
 }
 
 /// What the copy of the installer must match.
@@ -206,7 +237,7 @@ pub fn install_main(staging: &Path, checks: &Checks<'_>) -> i32 {
     };
     let _ = remove_stale_standby(&program);
     sweep_work_folders(&parent);
-    if !install_folder_closed(&program) {
+    if !install_folder_usable(&program, &parent) {
         return NOT_APPLICABLE;
     }
     let Some(staging) = accepted_staging(staging, &crate::system::profile_folders()) else {
@@ -235,8 +266,9 @@ pub fn install_main(staging: &Path, checks: &Checks<'_>) -> i32 {
 /// given, is the running program file: it keeps only a name in `work` while
 /// the installer runs and an unused copy takes its place, so the installer
 /// finds no program file in use, and it goes back when the install fails.
-/// Returns the exit code of the installer, [`REFUSED`], [`NOT_PREPARED`] or
-/// [`KEPT`] when the program file cannot be set aside.
+/// Returns the exit code of the installer, [`REFUSED`], [`NOT_PREPARED`],
+/// or [`KEPT`] or [`NOT_APPLICABLE`] when the program file cannot be set
+/// aside.
 #[must_use]
 pub fn install_from(
     staging: &Staging,
@@ -278,14 +310,14 @@ pub fn install_from(
         return REFUSED;
     }
     let aside = match program {
-        Some(program) => {
-            let Some(moved) = set_aside(program, work) else {
+        Some(program) => match set_aside(program, work) {
+            Ok(moved) => Some((program, moved)),
+            Err(code) => {
                 drop(held);
                 let _ = std::fs::remove_file(&copy);
-                return KEPT;
-            };
-            Some((program, moved))
-        }
+                return code;
+            }
+        },
         None => None,
     };
     let code = run(installer_command(&copy));
@@ -302,26 +334,34 @@ pub fn install_from(
 
 /// Give the running `program` a second name in `work` and put an unused
 /// copy of it under the program name. Returns the name in `work`, which is
-/// then the only name of the running file, or `None` when the program file
-/// is as it was.
+/// then the only name of the running file. When the program file is as it
+/// was, returns [`NOT_APPLICABLE`] when no second name can ever be made in
+/// `work`, otherwise [`KEPT`].
 ///
 /// The program name is replaced by one rename and never removed, so an
 /// interruption at any step leaves a complete program file under it.
-fn set_aside(program: &Path, work: &Path) -> Option<PathBuf> {
+fn set_aside(program: &Path, work: &Path) -> Result<PathBuf, i32> {
     set_aside_observed(program, work, &|| {})
 }
 
 /// [`set_aside`] that calls `after_step` after each change on the disk.
-pub fn set_aside_observed(program: &Path, work: &Path, after_step: &dyn Fn()) -> Option<PathBuf> {
-    let standby = program.parent()?.join(STANDBY_NAME);
+///
+/// # Errors
+/// As [`set_aside`].
+pub fn set_aside_observed(
+    program: &Path,
+    work: &Path,
+    after_step: &dyn Fn(),
+) -> Result<PathBuf, i32> {
+    let standby = program.parent().ok_or(KEPT)?.join(STANDBY_NAME);
     if !remove_standby(&standby) {
-        return None;
+        return Err(KEPT);
     }
     let moved = work.join(ASIDE_NAME);
     // Windows refuses to replace the last name of a running program file;
     // with a second name the replace only removes a link.
-    if std::fs::hard_link(program, &moved).is_err() {
-        return None;
+    if let Err(error) = std::fs::hard_link(program, &moved) {
+        return Err(link_failure_code(&error));
     }
     after_step();
     // The copy is created in the install folder, so it gets the access list
@@ -329,16 +369,29 @@ pub fn set_aside_observed(program: &Path, work: &Path, after_step: &dyn Fn()) ->
     if copy_flushed(program, &standby).is_err() {
         let _ = std::fs::remove_file(&standby);
         let _ = std::fs::remove_file(&moved);
-        return None;
+        return Err(KEPT);
     }
     after_step();
     if rename_retrying(&standby, program).is_err() {
         let _ = std::fs::remove_file(&standby);
         let _ = std::fs::remove_file(&moved);
-        return None;
+        return Err(KEPT);
     }
     after_step();
-    Some(moved)
+    Ok(moved)
+}
+
+/// The exit code for a second name of the program file that could not be
+/// made: [`NOT_APPLICABLE`] when the work folder is on another volume, a
+/// result every later close repeats, otherwise [`KEPT`].
+#[must_use]
+pub fn link_failure_code(error: &std::io::Error) -> i32 {
+    const ERROR_NOT_SAME_DEVICE: i32 = 17;
+    if error.raw_os_error() == Some(ERROR_NOT_SAME_DEVICE) {
+        NOT_APPLICABLE
+    } else {
+        KEPT
+    }
 }
 
 /// Rename `from` over `to`. A file scanner opens a new program file for a
