@@ -71,6 +71,8 @@ const NO_CONFLICTS: &str = "There are no conflicts to move to";
 const NO_OUTPUT: &str = "This session names no output file";
 /// Why a save command must wait for the current write.
 const WRITING: &str = "Available once the current write finishes";
+/// Why a save waits while the kept version notice is open.
+const KEPT_COPY: &str = "Note the path of the kept version first";
 /// Why a file panel cannot open while another one is open.
 const PICKING: &str = "A file panel is already open";
 /// What the view says when an edit of the output is asked for while the
@@ -979,6 +981,14 @@ impl MergeView {
             self.message = Some("A save is still running. Try Save As again.".to_owned());
             return;
         }
+        if self.kept_copy_open() {
+            self.message = Some(format!("{KEPT_COPY}."));
+            return;
+        }
+        if self.editing_off() {
+            self.message = Some(EDITING_OFF.to_owned());
+            return;
+        }
         self.paths.output = Some(path);
         self.titles.output = None;
         self.output_baseline = Baseline::Unchecked;
@@ -1704,8 +1714,14 @@ impl MergeView {
             .map_or(200.0, |rect| rect.height())
     }
 
+    /// True while the notice naming a kept version waits to be acknowledged.
+    const fn kept_copy_open(&self) -> bool {
+        matches!(self.question, Some(Question::KeptCopy(_)))
+    }
+
     fn save_output(&mut self) {
-        if matches!(self.question, Some(Question::KeptCopy(_))) {
+        if self.kept_copy_open() {
+            self.message = Some(format!("{KEPT_COPY}."));
             return;
         }
         if self.editing_off() {
@@ -2772,6 +2788,9 @@ impl SessionView for MergeView {
         if self.picker.is_some() && matches!(command, Command::OpenFile | Command::SaveFileAs) {
             return Some(PICKING);
         }
+        if self.kept_copy_open() && matches!(command, Command::SaveFile | Command::SaveFileAs) {
+            return Some(KEPT_COPY);
+        }
         if self.editing_off() && CHANGES_OUTPUT.contains(&command) {
             return Some(EDITING_OFF);
         }
@@ -2865,11 +2884,18 @@ impl SessionView for MergeView {
             }
             Command::Undo => self.output_pane.buffer().can_undo(),
             Command::Redo => self.output_pane.buffer().can_redo(),
-            Command::SaveFile => ready && self.paths.output.is_some() && self.save_job.is_none(),
+            Command::SaveFile => {
+                ready
+                    && self.paths.output.is_some()
+                    && self.save_job.is_none()
+                    && !self.kept_copy_open()
+            }
             Command::Reload | Command::Recompare => !self.status.is_running(),
             Command::SwapSides => ready && self.save_job.is_none(),
             Command::OpenFile => self.picker.is_none() && self.save_job.is_none(),
-            Command::SaveFileAs => ready && self.save_job.is_none() && self.picker.is_none(),
+            Command::SaveFileAs => {
+                ready && self.save_job.is_none() && self.picker.is_none() && !self.kept_copy_open()
+            }
 
             Command::Thumbnail
             | Command::ToggleLineNumbers
@@ -6724,5 +6750,30 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&renamed).unwrap(), "a\nb\nX\n");
         assert!(!dir.path().join("out.txt").exists());
         assert!(!view.is_modified());
+    }
+
+    #[test]
+    fn save_file_as_waits_until_the_kept_version_is_acknowledged() {
+        let (mut view, dir) = open("a\nb\nc\n", Some("a\nb\nc\n"), "a\nb\nX\n");
+        run_until_ready(&mut view);
+        let output = view.paths().output.clone();
+        let kept = dir.path().join("kept.txt").display().to_string();
+        view.question = Some(Question::KeptCopy(kept));
+        assert!(!view.accepts(Command::SaveFileAs));
+        assert!(!view.accepts(Command::SaveFile));
+        assert_eq!(view.refusal(Command::SaveFileAs), Some(super::KEPT_COPY));
+        assert_eq!(view.refusal(Command::SaveFile), Some(super::KEPT_COPY));
+
+        let renamed = dir.path().join("renamed.txt");
+        view.save_output_as(renamed.clone());
+        wait_for_save(&mut view);
+        assert_eq!(view.paths().output, output);
+        assert!(!renamed.exists());
+
+        view.question = None;
+        assert!(view.accepts(Command::SaveFileAs));
+        view.save_output_as(renamed.clone());
+        wait_for_save(&mut view);
+        assert_eq!(std::fs::read_to_string(&renamed).unwrap(), "a\nb\nX\n");
     }
 }
