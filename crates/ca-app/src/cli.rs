@@ -448,7 +448,7 @@ pub fn run_left_side(
     settings_directory: &Path,
     probe: &dyn Fn(&Path) -> PathKind,
 ) -> Result<Startup, i32> {
-    let lasts = ca_ui::paths::settings_notice_for(settings_directory).is_none();
+    let lasts = ca_session::SettingsPaths::outlives_process(settings_directory);
     run_left_side_in(startup, settings_directory, lasts, probe)
 }
 
@@ -647,6 +647,20 @@ mod tests {
         );
         assert!(matches!(outcome, Ok(Startup::Rejected(_))), "{outcome:?}");
         assert!(!settings.exists());
+    }
+
+    #[test]
+    fn the_left_side_is_remembered_in_a_folder_that_outlives_the_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dir.path().join("settings");
+        let folders = probe(&["dir-"]);
+        let outcome = super::run_left_side(
+            Startup::RememberLeft(dir.path().join("dir-left")),
+            &settings,
+            &folders,
+        );
+        assert_eq!(outcome, Err(0));
+        assert!(settings.join(super::LEFT_SIDE_FILE).is_file());
     }
 
     #[test]
