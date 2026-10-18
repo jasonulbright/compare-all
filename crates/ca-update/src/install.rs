@@ -396,7 +396,7 @@ pub fn set_aside_observed(
     let fresh = work.join(STANDBY_NAME);
     let prepared = copy_flushed(program, &fresh).is_ok()
         && own_by_administrators(&fresh).is_ok()
-        && std::fs::rename(&fresh, &standby).is_ok()
+        && rename_retrying(&fresh, &standby).is_ok()
         && inherit_access_list(&standby).is_ok();
     if !prepared {
         let _ = std::fs::remove_file(&fresh);
