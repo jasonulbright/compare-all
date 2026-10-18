@@ -109,9 +109,9 @@ impl StoredRecord {
             && zip::DateTime::try_from_msdos(self.header.date, self.header.time).ok()
                 == file.last_modified()
             && super::zip_format::ntfs_mtime(&self.extra)
-                == super::zip_format::ntfs_mtime(file.extra_data().unwrap_or_default())
+                == super::zip_format::reader_ntfs_mtime(file)
             && super::zip_format::extended_mtime(&self.extra)
-                == super::zip_format::extended_mtime(file.extra_data().unwrap_or_default())
+                == super::zip_format::reader_extended_mtime(file)
             && self.name == file.name_raw()
             && self.offset == file.header_start()
     }
@@ -583,7 +583,7 @@ pub(super) fn verify(path: &Path, expected: &[Expected]) -> VfsResult<()> {
         let file = archive
             .by_index_raw(index)
             .map_err(|error| differs(error.to_string()))?;
-        let same = file.name() == want.name
+        let same = super::zip_format::stored_name(&file) == want.name
             && file.crc32() == want.crc
             && file.compressed_size() == want.compressed
             && file.size() == want.size
