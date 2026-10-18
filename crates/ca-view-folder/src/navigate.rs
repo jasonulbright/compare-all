@@ -380,8 +380,8 @@ mod tests {
     }
 
     enum Tab {
-        Compare(FolderView),
-        Sync(crate::FolderSyncView),
+        Compare(Box<FolderView>),
+        Sync(Box<crate::FolderSyncView>),
     }
 
     impl Tab {
@@ -405,9 +405,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let view = mixed_view(dir.path(), sync);
         let mut tab = if sync {
-            Tab::Sync(crate::FolderSyncView::from(view))
+            Tab::Sync(Box::new(crate::FolderSyncView::from(view)))
         } else {
-            Tab::Compare(view)
+            Tab::Compare(Box::new(view))
         };
 
         hide_cursor(tab.view(), "c-match.txt", DisplayFilter::ShowDifferences);
