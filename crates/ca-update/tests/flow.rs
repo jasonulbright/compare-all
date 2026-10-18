@@ -1167,6 +1167,7 @@ fn the_machine_installer_command_writes_no_log_in_the_user_folder() {
     }
 }
 
+#[cfg(windows)]
 #[test]
 fn the_elevation_prompt_starts_the_installed_program_and_not_the_installer() {
     let program = Path::new(r"C:\Program Files\compare-all\compare-all.exe");
