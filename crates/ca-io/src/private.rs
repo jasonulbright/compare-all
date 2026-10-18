@@ -166,6 +166,31 @@ fn accept_linked_folder(folder: &Path, link: &std::fs::Metadata) -> io::Result<P
     Ok(target)
 }
 
+/// The path to use for an existing `folder` under the rules of
+/// [`create_owned_folder`], without creating or changing anything. None when
+/// nothing is at `folder`.
+///
+/// A plain folder must belong to the running user; its access is not narrowed.
+/// A link is accepted only as [`create_owned_folder`] accepts it, and the
+/// resolved target is returned.
+///
+/// # Errors
+/// Returns an error when `folder` cannot be read, is not a folder, belongs to
+/// another user, or is a link that [`create_owned_folder`] refuses.
+#[cfg(unix)]
+pub fn resolve_owned_folder(folder: &Path) -> io::Result<Option<PathBuf>> {
+    let metadata = match std::fs::symlink_metadata(folder) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if metadata.file_type().is_symlink() {
+        return accept_linked_folder(folder, &metadata).map(Some);
+    }
+    check_handle(&open_folder(folder, false)?, folder, false)?;
+    Ok(Some(folder.to_path_buf()))
+}
+
 /// Check that `folder` is a folder and, on Unix, that the running user owns
 /// it.
 ///
@@ -334,6 +359,40 @@ mod tests {
         std::os::unix::fs::lchown(&link, Some(65534), Some(65534)).unwrap();
         let error = create_owned_folder(&link).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolving_follows_the_rules_of_creation_and_changes_nothing() {
+        use super::resolve_owned_folder;
+        use std::os::unix::fs::PermissionsExt as _;
+        let parent = tempfile::tempdir().unwrap();
+        assert_eq!(
+            resolve_owned_folder(&parent.path().join("missing")).unwrap(),
+            None
+        );
+        let plain = parent.path().join("plain");
+        std::fs::create_dir(&plain).unwrap();
+        std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(resolve_owned_folder(&plain).unwrap(), Some(plain.clone()));
+        let mode = std::fs::metadata(&plain).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755, "resolving does not narrow access");
+        let private = parent.path().join("private");
+        std::fs::create_dir(&private).unwrap();
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let accepted = parent.path().join("accepted");
+        std::os::unix::fs::symlink(&private, &accepted).unwrap();
+        assert_eq!(
+            resolve_owned_folder(&accepted).unwrap(),
+            Some(std::fs::canonicalize(&private).unwrap())
+        );
+        let refused = parent.path().join("refused");
+        std::os::unix::fs::symlink(&plain, &refused).unwrap();
+        let error = resolve_owned_folder(&refused).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        let file = parent.path().join("file");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(resolve_owned_folder(&file).is_err());
     }
 
     #[cfg(unix)]

@@ -121,8 +121,13 @@ impl Journal {
     /// belongs to another user. A link is refused on Windows; on Unix it is
     /// refused unless the running user owns it and its target is a private
     /// folder of that user, and then the journal is created in the target.
+    ///
+    /// The first folder a `directory` is resolved to in this process is kept
+    /// for it, and a later call fails when `directory` leads elsewhere; see
+    /// [`journal_folder`].
     pub fn create_in(directory: &Path) -> std::io::Result<Self> {
-        let directory = ca_io::private::create_owned_folder(directory)?;
+        let resolved = ca_io::private::create_owned_folder(directory)?;
+        let directory = pin_journal_folder(directory, resolved)?;
         let stamp = now_unix_seconds();
         let process = std::process::id();
         for attempt in 0..1_000u32 {
@@ -296,6 +301,71 @@ pub fn recover(journal_path: &Path) -> std::io::Result<Recovery> {
     Ok(recovery)
 }
 
+/// The folder the journals of `directory` are in, checked under the rules
+/// [`Journal::create_in`] applies. None when nothing is at `directory`.
+///
+/// On Unix an accepted link yields its resolved target. The first folder a
+/// `directory` is resolved to in this process, by this call or by
+/// [`Journal::create_in`], is kept for it: journals already written there stay
+/// where recovery reads, and a `directory` that leads elsewhere later is an
+/// error rather than an empty folder. On Windows `directory` is returned as it
+/// is.
+///
+/// # Errors
+/// Returns an error when `directory` is refused as a journal folder, or leads
+/// to another folder than the one this process uses for it.
+pub fn journal_folder(directory: &Path) -> std::io::Result<Option<PathBuf>> {
+    #[cfg(unix)]
+    let resolved = ca_io::private::resolve_owned_folder(directory)?;
+    #[cfg(not(unix))]
+    let resolved = Some(directory.to_path_buf());
+    match resolved {
+        Some(resolved) => pin_journal_folder(directory, resolved).map(Some),
+        None => match pinned_journal_folder(directory)? {
+            Some(kept) if kept != directory => Err(moved_journal_folder(directory, &kept)),
+            _ => Ok(None),
+        },
+    }
+}
+
+type Pins = std::collections::HashMap<PathBuf, PathBuf>;
+
+fn lock_pins() -> std::io::Result<std::sync::MutexGuard<'static, Pins>> {
+    static PINS: std::sync::OnceLock<Mutex<Pins>> = std::sync::OnceLock::new();
+    PINS.get_or_init(Mutex::default)
+        .lock()
+        .map_err(|_| std::io::Error::other("the record of journal folders is poisoned"))
+}
+
+fn pinned_journal_folder(directory: &Path) -> std::io::Result<Option<PathBuf>> {
+    Ok(lock_pins()?.get(directory).cloned())
+}
+
+/// Keep `resolved` as the folder of `directory` when none is kept yet, and
+/// return the kept folder. A kept folder other than `resolved` is an error.
+fn pin_journal_folder(directory: &Path, resolved: PathBuf) -> std::io::Result<PathBuf> {
+    let mut pins = lock_pins()?;
+    let kept = pins
+        .entry(directory.to_path_buf())
+        .or_insert_with(|| resolved.clone());
+    if *kept == resolved {
+        Ok(resolved)
+    } else {
+        Err(moved_journal_folder(directory, kept))
+    }
+}
+
+fn moved_journal_folder(directory: &Path, kept: &Path) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        format!(
+            "{} no longer leads to {}, where the journals of this run are",
+            directory.display(),
+            kept.display()
+        ),
+    )
+}
+
 /// Read every journal in `directory` and report the batches that did not
 /// finish.
 ///
@@ -440,6 +510,41 @@ mod tests {
     use crate::ops::exec::StepOutcome;
     use crate::ops::fsops::RealFs;
     use crate::ops::plan::{OperationKind, StepAction};
+
+    #[test]
+    fn recovery_reads_the_folder_journals_are_created_in() {
+        let parent = tempfile::tempdir().unwrap();
+        let directory = parent.path().join("journals");
+        let journal = Journal::create_in(&directory).unwrap();
+        let folder = super::journal_folder(&directory).unwrap();
+        assert_eq!(folder.as_deref(), journal.path().parent());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_journal_folder_that_leads_elsewhere_later_is_refused() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let parent = tempfile::tempdir().unwrap();
+        let [first, second] = ["first", "second"].map(|name| {
+            let folder = parent.path().join(name);
+            std::fs::create_dir(&folder).unwrap();
+            std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o700)).unwrap();
+            folder
+        });
+        let directory = parent.path().join("journals");
+        std::os::unix::fs::symlink(&first, &directory).unwrap();
+        assert_eq!(
+            super::journal_folder(&directory).unwrap(),
+            Some(std::fs::canonicalize(&first).unwrap())
+        );
+        std::fs::remove_file(&directory).unwrap();
+        std::os::unix::fs::symlink(&second, &directory).unwrap();
+        let refused = super::journal_folder(&directory).unwrap_err();
+        assert_eq!(refused.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(Journal::create_in(&directory).is_err());
+        std::fs::remove_file(&directory).unwrap();
+        assert!(super::journal_folder(&directory).is_err());
+    }
 
     /// Write a one step batch whose step ends with `outcome` and whose batch
     /// end record counts `finished` steps.

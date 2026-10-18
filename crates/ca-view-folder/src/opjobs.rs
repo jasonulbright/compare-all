@@ -9,11 +9,11 @@ use crate::operations::{Operation, Request};
 use crate::selection::Scope;
 use crate::tree::Arena;
 use ca_fs::{
-    execute, plan_attributes, plan_copy, plan_delete, plan_exchange, plan_move, plan_new_folder,
-    plan_rename, plan_sync, plan_to_folder, plan_touch, recover_all, retire, sweep, Bases,
-    Conflict, ConflictDecision, Decision, Drift, ErrorPolicy, ExcludeMasks, ExecutionContext,
-    ExecutionReport, Journal, Journaling, Node, OperationOptions, OperationPlan, PlanStep,
-    Progress, RealFs, Side, Sides, SyncPreset, SyncPreview,
+    execute, journal_folder, plan_attributes, plan_copy, plan_delete, plan_exchange, plan_move,
+    plan_new_folder, plan_rename, plan_sync, plan_to_folder, plan_touch, recover_all, retire,
+    sweep, Bases, Conflict, ConflictDecision, Decision, Drift, ErrorPolicy, ExcludeMasks,
+    ExecutionContext, ExecutionReport, Journal, Journaling, Node, OperationOptions, OperationPlan,
+    PlanStep, Progress, RealFs, Side, Sides, SyncPreset, SyncPreview,
 };
 use ca_fs::{ArchiveTypes, FileOps, Mount, SourceOps};
 use ca_ui::worker::{Cancel, Job, Terminal};
@@ -912,6 +912,20 @@ pub fn spawn_recovery(
     Job::spawn_notifying(
         move |emitter, _| {
             let offset_seconds = ca_ui::format::local_offset_seconds();
+            let journal_directory = match journal_folder(&journal_directory) {
+                Ok(Some(folder)) => folder,
+                Ok(None) => {
+                    emitter.send(RecoverMessage::Done {
+                        notices: Vec::new(),
+                        offset_seconds,
+                    });
+                    return;
+                }
+                Err(error) => {
+                    emitter.send(RecoverMessage::Failed(error.to_string()));
+                    return;
+                }
+            };
             // Records nothing is waiting on go first, so the check reports only
             // batches the user still has a choice about.
             let _ = sweep(&journal_directory, ca_fs::KEEP_TROUBLED_DAYS);
@@ -1268,6 +1282,101 @@ mod tests {
     use ca_ui::worker::Cancel;
     use std::path::PathBuf;
     use std::sync::Arc;
+
+    /// Run the recovery check on `journals` and take its one result.
+    #[cfg(unix)]
+    fn recover_from(journals: &std::path::Path) -> super::RecoverMessage {
+        let mut job = super::spawn_recovery(journals.to_path_buf(), Arc::new(|| {}));
+        let mut messages = job.wait(std::time::Duration::from_secs(30));
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        messages.remove(0)
+    }
+
+    /// A private folder under `parent` holding nothing.
+    #[cfg(unix)]
+    fn private_folder(parent: &std::path::Path, name: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let folder = parent.join(name);
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o700)).unwrap();
+        folder
+    }
+
+    /// An unfinished batch journaled through `journals`.
+    #[cfg(unix)]
+    fn interrupted_batch_in(journals: &std::path::Path) -> PathBuf {
+        let journal = ca_fs::Journal::create_in(journals).unwrap();
+        journal
+            .append(&ca_fs::JournalRecord::BatchStart {
+                kind: ca_fs::OperationKind::Copy,
+                steps: 1,
+                unix_seconds: 0,
+            })
+            .unwrap();
+        journal.path().to_path_buf()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_reads_the_journals_behind_an_accepted_link() {
+        let parent = tempfile::tempdir().unwrap();
+        let checked = private_folder(parent.path(), "checked");
+        let journals = parent.path().join("journals");
+        std::os::unix::fs::symlink(&checked, &journals).unwrap();
+        let written = interrupted_batch_in(&journals);
+        let found = match recover_from(&journals) {
+            super::RecoverMessage::Done { notices, .. } => Ok(notices
+                .into_iter()
+                .map(|notice| notice.journal)
+                .collect::<Vec<_>>()),
+            super::RecoverMessage::Failed(reason) => Err(reason),
+        };
+        assert_eq!(found, Ok(vec![written]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_refuses_a_journal_link_that_now_leads_elsewhere() {
+        let parent = tempfile::tempdir().unwrap();
+        let checked = private_folder(parent.path(), "checked");
+        let other = private_folder(parent.path(), "other");
+        let journals = parent.path().join("journals");
+        std::os::unix::fs::symlink(&checked, &journals).unwrap();
+        let written = interrupted_batch_in(&journals);
+        std::fs::remove_file(&journals).unwrap();
+        std::os::unix::fs::symlink(&other, &journals).unwrap();
+        let reason = match recover_from(&journals) {
+            super::RecoverMessage::Failed(reason) => Some(reason),
+            super::RecoverMessage::Done { .. } => None,
+        };
+        assert!(
+            reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("no longer leads to")),
+            "the journal in the checked folder was missed: {reason:?}"
+        );
+        assert!(
+            written.is_file(),
+            "the journal is left where it was written"
+        );
+        assert!(ca_fs::Journal::create_in(&journals).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_refuses_a_journal_link_to_a_folder_open_to_others() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let parent = tempfile::tempdir().unwrap();
+        let open = parent.path().join("open");
+        std::fs::create_dir(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let journals = parent.path().join("journals");
+        std::os::unix::fs::symlink(&open, &journals).unwrap();
+        assert!(matches!(
+            recover_from(&journals),
+            super::RecoverMessage::Failed(_)
+        ));
+    }
 
     #[test]
     fn a_root_inside_another_root_is_dropped() {
