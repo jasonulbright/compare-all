@@ -15,4 +15,4 @@ pub mod system;
 pub mod verify;
 mod version;
 
-pub use version::Version;
+pub use version::{InstallerVersion, Version};

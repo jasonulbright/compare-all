@@ -107,10 +107,43 @@ fn running() -> Version {
     Version::parse(CURRENT).unwrap()
 }
 
+const UPGRADE_CODE: &str = "{6F1C2A4E-3B7D-4E59-9A21-C0DE0A11C0A1}";
+
+/// An installer database whose `Property` table names `upgrade_code` and
+/// `product_version`.
+fn msi_package(upgrade_code: &str, product_version: &str) -> Vec<u8> {
+    let cursor = std::io::Cursor::new(Vec::new());
+    let mut package = msi::Package::create(msi::PackageType::Installer, cursor).unwrap();
+    package
+        .create_table(
+            "Property",
+            vec![
+                msi::Column::build("Property").primary_key().id_string(72),
+                msi::Column::build("Value").text_string(0),
+            ],
+        )
+        .unwrap();
+    let rows = [
+        ("ProductName", "Compare All"),
+        ("Manufacturer", SIGNER),
+        ("UpgradeCode", upgrade_code),
+        ("ProductVersion", product_version),
+    ];
+    package
+        .insert_rows(
+            msi::Insert::into("Property").rows(
+                rows.iter()
+                    .map(|(name, value)| vec![msi::Value::from(*name), msi::Value::from(*value)])
+                    .collect(),
+            ),
+        )
+        .unwrap();
+    package.into_inner().unwrap().into_inner()
+}
+
+/// The installer of [`NEXT`].
 fn msi_bytes() -> Vec<u8> {
-    let mut bytes = vec![0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
-    bytes.extend(std::iter::repeat_n(7u8, 300));
-    bytes
+    msi_package(UPGRADE_CODE, "26.10.7")
 }
 
 fn zip_bytes(files: &[(&str, &[u8])]) -> Vec<u8> {
@@ -1729,6 +1762,49 @@ fn break_the_record(staging: &Staging) {
 
 fn leave_alone(_: &Staging) {}
 
+/// Stage `bytes` with a record of its own for version `version`, as a
+/// process of the same user can: the record matches the file.
+fn restage(staging: &Staging, version: &str, bytes: &[u8]) {
+    let version = Version::parse(version).unwrap();
+    let asset = msi_name(&version.to_string());
+    std::fs::write(staging.dir().join(&asset), bytes).unwrap();
+    let record = ca_update::staging::StagedRecord::new(
+        &version,
+        asset,
+        sha(bytes),
+        u64::try_from(bytes.len()).unwrap(),
+    );
+    staging.write_record(&record).unwrap();
+}
+
+/// A signed installer of another product under a record for a far newer
+/// release.
+fn other_product(staging: &Staging) {
+    let bytes = msi_package("{00000000-1111-2222-3333-444444444444}", "99.1.1");
+    restage(staging, "2099.01.01.0001", &bytes);
+}
+
+/// The installed release, or an older one, under a record for a newer one.
+fn older_package(staging: &Staging) {
+    restage(
+        staging,
+        "2099.01.01.0001",
+        &msi_package(UPGRADE_CODE, "26.10.1"),
+    );
+}
+
+/// The installer of a newer release under a record of another version.
+fn record_of_another_version(staging: &Staging) {
+    restage(staging, "2026.11.01.0009", &msi_bytes());
+}
+
+/// A file that is no installer database.
+fn not_a_database(staging: &Staging) {
+    let mut bytes = vec![0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
+    bytes.extend(std::iter::repeat_n(7u8, 300));
+    restage(staging, NEXT, &bytes);
+}
+
 /// Name, change to the staged files, verifier, installed version.
 type Case<'a> = (&'a str, fn(&Staging), &'a FakeSigner, &'a Version);
 
@@ -1739,12 +1815,21 @@ fn the_elevated_step_refuses_a_staged_installer_that_fails_a_check() {
     let other = FakeSigner::signed_by("Someone Else");
     let newer = Version::parse("2026.12.31.0001").unwrap();
     let current = running();
-    let cases: [Case<'_>; 5] = [
+    let cases: [Case<'_>; 9] = [
         ("changed", flip_a_byte, &signer, &current),
         ("longer", add_a_byte, &signer, &current),
         ("bad record", break_the_record, &signer, &current),
         ("other signer", leave_alone, &other, &current),
         ("not newer", leave_alone, &signer, &newer),
+        ("other product", other_product, &signer, &current),
+        ("older package", older_package, &signer, &current),
+        (
+            "other version",
+            record_of_another_version,
+            &signer,
+            &current,
+        ),
+        ("no database", not_a_database, &signer, &current),
     ];
     for (name, tamper, verifier, installed) in cases {
         let (_server, _keep, staging, work, install) = elevated_setup();
