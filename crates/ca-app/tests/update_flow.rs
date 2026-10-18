@@ -403,8 +403,9 @@ fn a_cancelled_restart_does_not_relaunch_after_a_later_close_of_the_last_tab() {
 }
 
 #[test]
-fn a_download_warning_shows_without_a_network_call_when_checks_are_off() {
-    for by_policy in [false, true] {
+fn a_download_warning_shows_without_a_network_call_when_the_option_is_off() {
+    {
+        let by_policy = false;
         let dir = tempfile::tempdir().unwrap();
         let staging = dir.path().join("stage");
         let version = next_version();
@@ -464,8 +465,9 @@ fn launch_with_checks_off(
 }
 
 #[test]
-fn a_staged_update_with_checks_off_is_offered_and_applied_only_by_the_button() {
-    for by_policy in [false, true] {
+fn a_staged_update_with_the_option_off_is_offered_and_applied_only_by_the_button() {
+    {
+        let by_policy = false;
         let dir = tempfile::tempdir().unwrap();
         let staging = dir.path().join("stage");
         let version = next_version();
@@ -532,6 +534,46 @@ fn a_staged_update_with_checks_off_is_offered_and_applied_only_by_the_button() {
         assert_eq!(*started.lock().unwrap(), vec![true]);
         assert_eq!(asked.load(Ordering::SeqCst), 0, "policy {by_policy}");
     }
+}
+
+#[test]
+fn the_policy_shows_no_update_notice_and_applies_nothing_but_keeps_the_staged_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let staging = dir.path().join("stage");
+    let version = next_version();
+    let record = stage_fake(&staging, &version);
+    let (server, asked) = release_server(version.to_string(), 404);
+    write_warning(&staging, &server, &version);
+    Staging::new(staging.clone()).write_apply_failure("cannot place ca.exe");
+    let mut app = launch_with_checks_off(dir.path(), &staging, &server, true);
+    let hook = app.update_exit_hook();
+    quiet_frames(&mut app, 30);
+    assert!(!app.is_checking_for_updates());
+    assert_eq!(app.update_notice(), None);
+    app.run(Command::CheckForUpdates, &context());
+    quiet_frames(&mut app, 10);
+    assert_eq!(app.update_notice(), None);
+    app.restart_to_update();
+    if app.asks_before_closing() {
+        app.answer_exit(true);
+    }
+    assert!(run_frames(&mut app, App::is_closing));
+    let started = Mutex::new(0);
+    let start = |_: &Staging, _: bool| {
+        *started.lock().unwrap() += 1;
+        Ok(())
+    };
+    assert!(!finish_at_exit(
+        &hook,
+        &Staging::new(staging.clone()),
+        &start
+    ));
+    assert_eq!(*started.lock().unwrap(), 0);
+    let kept = Staging::new(staging.clone());
+    assert_eq!(kept.read_record(), Some(record.clone()));
+    assert!(staging.join(&record.asset).exists());
+    assert!(kept.read_warning().is_some());
+    assert_eq!(asked.load(Ordering::SeqCst), 0);
 }
 
 #[test]
