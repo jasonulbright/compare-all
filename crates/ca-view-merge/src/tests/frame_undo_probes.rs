@@ -87,7 +87,8 @@ fn frames_of_mixed_events_undo_and_redo_with_the_model_on_the_pane() {
     let mut undos_total = 0;
     let mut redos_total = 0;
     let mut problems = Vec::new();
-    for case in 0..600 {
+    let cases = super::randomized_merge_driver::case_override().unwrap_or(600);
+    for case in 0..cases {
         let inputs = FRAME_FIXTURES[case % FRAME_FIXTURES.len()];
         let (mut view, dir) = open(inputs[0], Some(inputs[1]), inputs[2]);
         run_until_ready(&mut view);
