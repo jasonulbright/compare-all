@@ -1,12 +1,12 @@
 //! Administrator policies.
 //!
 //! Policies come from a machine-wide store read once at startup and are never
-//! written by the program, so the resolved struct exposes readers only. The
-//! platform-specific sources land later; this module defines the keys, the
-//! loader trait, an in-memory source, and the text file format used outside
-//! Windows.
+//! written by the program, so the resolved struct exposes readers only. This
+//! module defines the keys, the loader trait, an in-memory source, the text
+//! file source used outside Windows, and the registry source used on Windows.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 /// Path of the policy file on platforms without a registry.
 pub const POLICY_FILE_PATH: &str = "/etc/compare-all.conf";
@@ -105,6 +105,117 @@ impl AdminPolicies {
     pub fn saved_passwords_disabled(&self) -> bool {
         self.saved_passwords_disabled
     }
+}
+
+/// The policy file read on platforms without a registry.
+///
+/// A missing file means no policy is in force. Bytes that are not UTF-8 and
+/// lines that do not parse are ignored.
+#[derive(Debug, Clone)]
+pub struct FilePolicySource {
+    path: PathBuf,
+}
+
+impl FilePolicySource {
+    /// A source reading `path`.
+    #[must_use]
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+
+    /// A source reading [`POLICY_FILE_PATH`].
+    #[must_use]
+    pub fn system() -> Self {
+        Self::new(POLICY_FILE_PATH)
+    }
+}
+
+impl PolicyLoader for FilePolicySource {
+    fn load(&self) -> Result<AdminPolicies, PolicyError> {
+        match std::fs::read(&self.path) {
+            Ok(bytes) => InMemoryPolicySource::from_conf(&String::from_utf8_lossy(&bytes)).load(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(AdminPolicies::default())
+            }
+            Err(error) => Err(PolicyError::Unreadable(error.to_string())),
+        }
+    }
+}
+
+/// Registry key holding the policy values, below `HKEY_LOCAL_MACHINE` and
+/// `HKEY_CURRENT_USER`.
+#[cfg(windows)]
+pub const POLICY_REGISTRY_PATH: &str = "SOFTWARE\\Policies\\compare-all";
+
+/// The policy values in the registry.
+///
+/// Each key is a `REG_DWORD` named as the key; a non-zero value enables it.
+/// The locations are read in order and a key enabled in any of them is in
+/// force, so a per-user value of zero never clears a machine value of one. A
+/// missing key, a missing value, and a value of another type count as not set.
+#[cfg(windows)]
+#[derive(Debug, Clone)]
+pub struct RegistryPolicySource {
+    locations: Vec<(winreg::HKEY, String)>,
+}
+
+#[cfg(windows)]
+impl RegistryPolicySource {
+    /// The machine location, then the user location.
+    #[must_use]
+    pub fn system() -> Self {
+        Self::with_locations(vec![
+            (
+                winreg::enums::HKEY_LOCAL_MACHINE,
+                POLICY_REGISTRY_PATH.to_owned(),
+            ),
+            (
+                winreg::enums::HKEY_CURRENT_USER,
+                POLICY_REGISTRY_PATH.to_owned(),
+            ),
+        ])
+    }
+
+    /// Reads the given predefined roots and subkey paths, in order.
+    #[must_use]
+    pub fn with_locations(locations: Vec<(winreg::HKEY, String)>) -> Self {
+        Self { locations }
+    }
+}
+
+#[cfg(windows)]
+impl PolicyLoader for RegistryPolicySource {
+    fn load(&self) -> Result<AdminPolicies, PolicyError> {
+        use winreg::enums::{KEY_READ, KEY_WOW64_64KEY};
+        use winreg::RegKey;
+
+        let mut enabled = BTreeMap::new();
+        for (root, path) in &self.locations {
+            let Ok(key) =
+                RegKey::predef(*root).open_subkey_with_flags(path, KEY_READ | KEY_WOW64_64KEY)
+            else {
+                continue;
+            };
+            for policy in PolicyKey::ALL {
+                if matches!(key.get_value::<u32, _>(policy.name()), Ok(value) if value != 0) {
+                    enabled.insert(*policy, true);
+                }
+            }
+        }
+        Ok(AdminPolicies::from_keys(&enabled))
+    }
+}
+
+/// Reads the policies of this machine once.
+///
+/// A store that cannot be read leaves every policy off.
+#[must_use]
+pub fn load_system_policies() -> AdminPolicies {
+    #[cfg(windows)]
+    let loaded = RegistryPolicySource::system().load();
+    #[cfg(not(windows))]
+    let loaded = FilePolicySource::system().load();
+    loaded.unwrap_or_default()
 }
 
 /// Failure to read the policy store.
@@ -236,6 +347,157 @@ mod tests {
         assert!(policies.check_for_updates_disabled());
         assert!(!policies.remote_profiles_disabled());
         assert!(policies.saved_passwords_disabled());
+    }
+
+    #[test]
+    fn a_missing_file_sets_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let policies = FilePolicySource::new(dir.path().join("absent.conf"))
+            .load()
+            .unwrap();
+        assert_eq!(policies, AdminPolicies::default());
+    }
+
+    #[test]
+    fn a_file_is_read_and_bad_lines_are_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("compare-all.conf");
+        std::fs::write(
+            &path,
+            b"DisableRemoteProfiles=yes\n\xff\xfe garbage\nDisableSavedPasswords=maybe\n=\n",
+        )
+        .unwrap();
+        let policies = FilePolicySource::new(&path).load().unwrap();
+        assert!(policies.remote_profiles_disabled());
+        assert!(!policies.saved_passwords_disabled());
+        assert!(!policies.check_for_updates_disabled());
+    }
+
+    #[test]
+    fn an_unreadable_file_is_an_error_not_a_crash() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = FilePolicySource::new(dir.path()).load();
+        assert!(matches!(result, Err(PolicyError::Unreadable(_))));
+    }
+
+    #[cfg(windows)]
+    mod registry {
+        use super::*;
+        use winreg::enums::{HKEY_CURRENT_USER, KEY_ALL_ACCESS};
+        use winreg::RegKey;
+
+        struct TestRoot(String);
+
+        impl TestRoot {
+            fn new(name: &str) -> Self {
+                let path = format!(
+                    "SOFTWARE\\compare-all-test-policies\\{}-{name}",
+                    std::process::id()
+                );
+                let root = Self(path);
+                root.remove();
+                RegKey::predef(HKEY_CURRENT_USER)
+                    .create_subkey(&root.0)
+                    .unwrap();
+                root
+            }
+
+            fn key(&self) -> RegKey {
+                RegKey::predef(HKEY_CURRENT_USER)
+                    .open_subkey_with_flags(&self.0, KEY_ALL_ACCESS)
+                    .unwrap()
+            }
+
+            fn remove(&self) {
+                let _ = RegKey::predef(HKEY_CURRENT_USER).delete_subkey_all(&self.0);
+            }
+
+            fn location(&self) -> (winreg::HKEY, String) {
+                (HKEY_CURRENT_USER, self.0.clone())
+            }
+        }
+
+        impl Drop for TestRoot {
+            fn drop(&mut self) {
+                self.remove();
+            }
+        }
+
+        #[test]
+        fn a_missing_key_sets_nothing() {
+            let source = RegistryPolicySource::with_locations(vec![(
+                HKEY_CURRENT_USER,
+                "SOFTWARE\\compare-all-test-policies\\absent".to_owned(),
+            )]);
+            assert_eq!(source.load().unwrap(), AdminPolicies::default());
+        }
+
+        #[test]
+        fn non_zero_dwords_enable_and_zero_does_not() {
+            let root = TestRoot::new("dword");
+            root.key()
+                .set_value("DisableCheckForUpdates", &1u32)
+                .unwrap();
+            root.key()
+                .set_value("DisableRemoteProfiles", &7u32)
+                .unwrap();
+            root.key()
+                .set_value("DisableSavedPasswords", &0u32)
+                .unwrap();
+            let policies = RegistryPolicySource::with_locations(vec![root.location()])
+                .load()
+                .unwrap();
+            assert!(policies.check_for_updates_disabled());
+            assert!(policies.remote_profiles_disabled());
+            assert!(!policies.saved_passwords_disabled());
+        }
+
+        #[test]
+        fn values_of_other_types_are_ignored() {
+            let root = TestRoot::new("types");
+            root.key()
+                .set_value("DisableCheckForUpdates", &"1")
+                .unwrap();
+            root.key()
+                .set_value("DisableRemoteProfiles", &1u64)
+                .unwrap();
+            root.key()
+                .set_raw_value(
+                    "DisableSavedPasswords",
+                    &winreg::RegValue {
+                        vtype: winreg::enums::REG_BINARY,
+                        bytes: vec![1, 0, 0, 0].into(),
+                    },
+                )
+                .unwrap();
+            let policies = RegistryPolicySource::with_locations(vec![root.location()])
+                .load()
+                .unwrap();
+            assert_eq!(policies, AdminPolicies::default());
+        }
+
+        #[test]
+        fn the_user_location_cannot_clear_the_machine_location() {
+            let machine = TestRoot::new("machine");
+            let user = TestRoot::new("user");
+            machine
+                .key()
+                .set_value("DisableCheckForUpdates", &1u32)
+                .unwrap();
+            user.key()
+                .set_value("DisableCheckForUpdates", &0u32)
+                .unwrap();
+            user.key()
+                .set_value("DisableSavedPasswords", &1u32)
+                .unwrap();
+            let policies =
+                RegistryPolicySource::with_locations(vec![machine.location(), user.location()])
+                    .load()
+                    .unwrap();
+            assert!(policies.check_for_updates_disabled());
+            assert!(policies.saved_passwords_disabled());
+            assert!(!policies.remote_profiles_disabled());
+        }
     }
 
     #[test]

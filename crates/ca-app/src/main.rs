@@ -115,6 +115,7 @@ fn main() -> eframe::Result {
             .with_icon(Arc::new(ca_app::icon::window_icon())),
         ..eframe::NativeOptions::default()
     };
+    let policies = ca_session::load_system_policies();
     let outcome = eframe::run_native(
         &ca_app::product_title(),
         options,
@@ -122,15 +123,12 @@ fn main() -> eframe::Result {
             let repaint = creation.egui_ctx.clone();
             let variant = Variant::from_dark_mode(creation.egui_ctx.style().visuals.dark_mode);
             let context = ViewContext {
-                options: Arc::new(AppOptions::resolve(
-                    stored,
-                    variant,
-                    ca_session::AdminPolicies::default(),
-                )),
+                options: Arc::new(AppOptions::resolve(stored, variant, policies)),
                 palette: palette(variant),
                 notify: Arc::new(move || repaint.request_repaint()),
             };
             let mut app = App::from_startup(startup, &context);
+            app.set_policies(policies);
             app.report_exit_to(reported);
             app.apply_updates_on_exit(update_hook);
             Ok(Box::new(app))
