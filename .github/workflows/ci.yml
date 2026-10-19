@@ -57,7 +57,36 @@ jobs:
           bash -n scripts/verify-linux-appimage.sh
           sh -n assets/linux/AppRun.sh
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # The randomized merge drivers run a reduced case count here. The
+      # merge-drivers job runs them at the full count.
       - run: cargo test --workspace
+        env:
+          MERGE_DRIVER_CASES: "60"
+
+  # Runs the randomized merge drivers at their full case counts. Release
+  # mode keeps the full counts within a short run.
+  merge-drivers:
+    name: check (merge drivers)
+    if: >-
+      (github.event.repository.name != '' && github.event.repository.private == false) ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
+      (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
+    permissions:
+      contents: read
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@9376cdc5a5e25b16da71af47712785cf06b0d6d4 # 1.94.1
+      - run: >-
+          cargo test --release -p ca-view-merge --lib --
+          tests::randomized_merge_driver tests::merge_edit_driver tests::frame_undo_probes
+        env:
+          CARGO_PROFILE_RELEASE_LTO: "off"
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
 
   # Fails on any RustSec vulnerability advisory in Cargo.lock. The advisory
   # database is fetched at run time, so a new advisory can fail a run with no

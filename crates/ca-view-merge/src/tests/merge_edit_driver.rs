@@ -827,9 +827,10 @@ fn run_case(
 fn randomized_merge_edits_keep_every_line_through_takes_undo_and_redo() {
     let mut stats = Stats::default();
     let mut findings: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let cases = super::randomized_merge_driver::case_override().unwrap_or(CASES);
     for seed in SEEDS {
         let mut gen = Gen(Seeded(seed));
-        for case in 0..CASES {
+        for case in 0..cases {
             run_case(seed, case, &mut gen, &mut stats, &mut findings);
         }
     }
@@ -852,7 +853,7 @@ fn randomized_merge_edits_keep_every_line_through_takes_undo_and_redo() {
         .filter(|(class, _)| ASSERTED.contains(&class.as_str()))
         .map(|(class, list)| (class, list.len()))
         .collect();
-    assert_eq!(stats.cases, SEEDS.len() * CASES);
+    assert_eq!(stats.cases, SEEDS.len() * cases);
     assert!(
         failing.is_empty(),
         "invariant classes with cases: {failing:?}"

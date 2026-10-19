@@ -1880,11 +1880,16 @@ fn plan(cases: usize) -> (Vec<u64>, usize) {
         })
         .filter(|seeds| !seeds.is_empty())
         .unwrap_or_else(|| SEEDS.to_vec());
-    let cases = std::env::var("MERGE_DRIVER_CASES")
+    (seeds, case_override().unwrap_or(cases))
+}
+
+/// `MERGE_DRIVER_CASES`, when set to a positive count, replaces the tracked
+/// case count of every randomized driver.
+pub(super) fn case_override() -> Option<usize> {
+    std::env::var("MERGE_DRIVER_CASES")
         .ok()
         .and_then(|count| count.trim().parse().ok())
-        .unwrap_or(cases);
-    (seeds, cases)
+        .filter(|count| *count > 0)
 }
 
 fn run(frames: bool, two_way: bool, cases: usize) {
