@@ -1,3 +1,43 @@
+# v2026.10.19.0007
+
+## 9 dependency security advisories fixed
+
+### Features
+
+- Check for, download and verify updates on Windows installed and portable copies.
+- Offer Restart to update; otherwise install the update after the app closes.
+- Show the release page when an update cannot be downloaded.
+- Ask for administrator approval before updating an install for all users.
+
+### Fixes
+
+- Keep takes and edits on the right merge section after a reload.
+- Keep takes and edits on repeated identical merge sections after a reload.
+- Run Next and Previous Difference, Find Filename and Full Refresh in folder views.
+- Run Recompare, Open, Save As, indent and overwrite commands in file views.
+- Copy table rows and change the table font size from the keyboard.
+- Copy the picture shown in the focused pane.
+- Change default shortcuts and menu captions in every view.
+- Keep AltGr and Option characters typing; stop Alt+letter from typing on Windows.
+- Keep Hex Find and Replace All from copying a file side on the screen thread.
+- Stop a cancelled Hex Replace All without changing the file.
+- Refuse /leftside when settings do not outlast the session.
+- Accept a link to a private temporary folder on Linux and macOS.
+- Change default values: skew tolerance 2000, folder sync Update Both, conflict separation 1.
+- Keep saved settings above a new maximum until the field is edited.
+
+### Security
+
+- Update zip, quick-xml and rustls to versions with the published fixes.
+- Advisories: RUSTSEC-2026-0194, -0195, -0346 to -0349, -0367 to -0369.
+
+### Build
+
+- Check dependencies against the RustSec advisory database in CI.
+- Publish an update manifest with each release.
+
+Full changelog: CHANGELOG.md
+
 # v2026.10.15.0006
 
 ## Text Merge
