@@ -1042,11 +1042,33 @@ struct Returning {
 /// in old with the n-th in new, kept the same way. Items whose counts
 /// differ in a part without anchors stay unpaired, because which
 /// occurrence changed is unknown.
+#[cfg(test)]
 fn align<T: Eq + std::hash::Hash>(old: &[T], new: &[T]) -> Vec<(usize, usize)> {
+    align_cancellable(old, new, &ca_diff::NeverCancel).unwrap_or_default()
+}
+
+/// How many items [`align_cancellable`] handles between two looks at the
+/// cancel flag.
+const CANCEL_POLL_INTERVAL: usize = 256;
+
+/// [`align`], stopping with `None` once `cancel` is raised.
+fn align_cancellable<T: Eq + std::hash::Hash>(
+    old: &[T],
+    new: &[T],
+    cancel: &dyn Cancel,
+) -> Option<Vec<(usize, usize)>> {
     let mut pairs = Vec::new();
     let mut parts = vec![(0..old.len(), 0..new.len())];
+    let mut handled = 0_usize;
     while let Some((mut olds, mut news)) = parts.pop() {
+        if cancel.is_cancelled() {
+            return None;
+        }
         while olds.start < olds.end && news.start < news.end && old[olds.start] == new[news.start] {
+            handled += 1;
+            if handled % CANCEL_POLL_INTERVAL == 0 && cancel.is_cancelled() {
+                return None;
+            }
             pairs.push((olds.start, news.start));
             olds.start += 1;
             news.start += 1;
@@ -1055,6 +1077,10 @@ fn align<T: Eq + std::hash::Hash>(old: &[T], new: &[T]) -> Vec<(usize, usize)> {
             && news.start < news.end
             && old[olds.end - 1] == new[news.end - 1]
         {
+            handled += 1;
+            if handled % CANCEL_POLL_INTERVAL == 0 && cancel.is_cancelled() {
+                return None;
+            }
             olds.end -= 1;
             news.end -= 1;
             pairs.push((olds.end, news.end));
@@ -1065,9 +1091,17 @@ fn align<T: Eq + std::hash::Hash>(old: &[T], new: &[T]) -> Vec<(usize, usize)> {
         // (indices in old, count in new)
         let mut seen: HashMap<&T, (Vec<usize>, usize)> = HashMap::new();
         for index in olds.clone() {
+            handled += 1;
+            if handled % CANCEL_POLL_INTERVAL == 0 && cancel.is_cancelled() {
+                return None;
+            }
             seen.entry(&old[index]).or_default().0.push(index);
         }
         for index in news.clone() {
+            handled += 1;
+            if handled % CANCEL_POLL_INTERVAL == 0 && cancel.is_cancelled() {
+                return None;
+            }
             if let Some(entry) = seen.get_mut(&new[index]) {
                 entry.1 += 1;
             }
@@ -1104,7 +1138,7 @@ fn align<T: Eq + std::hash::Hash>(old: &[T], new: &[T]) -> Vec<(usize, usize)> {
         parts.push((old_from..olds.end, new_from..news.end));
     }
     pairs.sort_unstable();
-    pairs
+    Some(pairs)
 }
 
 /// The longest subsequence of `pairs`, which are ordered by their second
@@ -2060,29 +2094,47 @@ impl MergeModel {
     /// worker thread.
     #[must_use]
     pub fn pair_with(&self, earlier: &Layout, swapped: bool) -> Pairing {
+        self.pair_with_cancellable(earlier, swapped, &ca_diff::NeverCancel)
+            .unwrap_or_else(|| self.pairing_of(earlier, swapped, Vec::new()))
+    }
+
+    /// [`Self::pair_with`], stopping with `None` once `cancel` is raised.
+    /// The flag is read while fingerprinting and while aligning.
+    #[must_use]
+    pub fn pair_with_cancellable(
+        &self,
+        earlier: &Layout,
+        swapped: bool,
+        cancel: &dyn Cancel,
+    ) -> Option<Pairing> {
         let pairs = if earlier.ranges.is_empty() {
             Vec::new()
         } else {
-            let old_prints: Vec<Fingerprint> = earlier
-                .ranges
-                .iter()
-                .map(|(left, center, right)| {
-                    let (left, center, right) =
-                        fingerprint_of(&earlier.inputs, left, center, right);
-                    if swapped {
-                        (right, center, left)
-                    } else {
-                        (left, center, right)
-                    }
-                })
-                .collect();
-            let new_prints: Vec<Fingerprint> = self
-                .sections
-                .iter()
-                .map(|section| self.fingerprint(section))
-                .collect();
-            align(&old_prints, &new_prints)
+            let mut old_prints: Vec<Fingerprint> = Vec::with_capacity(earlier.ranges.len());
+            for (index, (left, center, right)) in earlier.ranges.iter().enumerate() {
+                if index % CANCEL_POLL_INTERVAL == 0 && cancel.is_cancelled() {
+                    return None;
+                }
+                let (left, center, right) = fingerprint_of(&earlier.inputs, left, center, right);
+                old_prints.push(if swapped {
+                    (right, center, left)
+                } else {
+                    (left, center, right)
+                });
+            }
+            let mut new_prints: Vec<Fingerprint> = Vec::with_capacity(self.sections.len());
+            for (index, section) in self.sections.iter().enumerate() {
+                if index % CANCEL_POLL_INTERVAL == 0 && cancel.is_cancelled() {
+                    return None;
+                }
+                new_prints.push(self.fingerprint(section));
+            }
+            align_cancellable(&old_prints, &new_prints, cancel)?
         };
+        Some(self.pairing_of(earlier, swapped, pairs))
+    }
+
+    fn pairing_of(&self, earlier: &Layout, swapped: bool, pairs: Vec<(usize, usize)>) -> Pairing {
         Pairing {
             earlier: Arc::clone(&earlier.inputs),
             earlier_sections: earlier.ranges.len(),
@@ -3438,6 +3490,100 @@ mod tests {
         );
         assert_eq!(super::align(&["a", "a"], &["b", "a", "b"]), Vec::new());
         assert_eq!(super::align::<&str>(&[], &["a"]), Vec::new());
+    }
+
+    /// Pairs keep file order on both sides and join equal items only, so
+    /// no pair crosses another, whatever repeats.
+    #[test]
+    fn sections_pair_without_crossing_for_every_short_sequence() {
+        let sequences = |len: u32| -> Vec<Vec<u8>> {
+            (0..3_usize.pow(len))
+                .map(|mut code| {
+                    (0..len)
+                        .map(|_| {
+                            let item = u8::try_from(code % 3).unwrap_or(0);
+                            code /= 3;
+                            item
+                        })
+                        .collect()
+                })
+                .collect()
+        };
+        for old_len in 0..=5 {
+            for new_len in 0..=5 {
+                for old in sequences(old_len) {
+                    for new in sequences(new_len) {
+                        let pairs = super::align(&old, &new);
+                        for pair in pairs.windows(2) {
+                            assert!(
+                                pair[0].0 < pair[1].0 && pair[0].1 < pair[1].1,
+                                "{old:?} {new:?} {pairs:?}"
+                            );
+                        }
+                        for &(from, to) in &pairs {
+                            assert_eq!(old[from], new[to], "{old:?} {new:?} {pairs:?}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Raises the flag at its `limit`-th look and counts the looks.
+    struct RaisedAfter {
+        limit: usize,
+        looks: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ca_diff::Cancel for RaisedAfter {
+        fn is_cancelled(&self) -> bool {
+            self.looks
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                >= self.limit
+        }
+    }
+
+    /// A merge of `count` conflicts that share no text, each kept apart by a
+    /// common line.
+    fn many_conflicts(count: usize) -> MergeModel {
+        let build = |prefix: &str| -> String {
+            (0..count)
+                .map(|index| format!("a{index}\nb{index}\nc{index}\nd{index}\n{prefix}{index}\n"))
+                .collect()
+        };
+        model(&build("L"), &build("b"), &build("R"))
+    }
+
+    /// A reload superseded while its sections pair stops pairing: the flag
+    /// is read many times across fingerprinting and alignment, and a raised
+    /// flag at any of them ends the work with no pairing.
+    #[test]
+    fn pairing_stops_when_the_flag_is_raised_at_any_look() {
+        let earlier = many_conflicts(1_000);
+        let later = many_conflicts(1_000);
+        let layout = earlier.layout();
+        let counter = RaisedAfter {
+            limit: usize::MAX,
+            looks: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let full = later
+            .pair_with_cancellable(&layout, false, &counter)
+            .expect("an unraised flag lets pairing finish");
+        assert!(!full.pairs.is_empty());
+        let looks = counter.looks.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(looks > 8, "{looks} {}", later.sections().len());
+        for limit in [0, 1, 2, looks / 4, looks / 2, looks - 1] {
+            let raised = RaisedAfter {
+                limit,
+                looks: std::sync::atomic::AtomicUsize::new(0),
+            };
+            assert!(
+                later
+                    .pair_with_cancellable(&layout, false, &raised)
+                    .is_none(),
+                "limit {limit} of {looks}"
+            );
+        }
     }
 
     /// Swap Sides mirrors a carried decision onto the same section only.
