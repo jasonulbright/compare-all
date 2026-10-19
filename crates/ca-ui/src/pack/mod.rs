@@ -6,6 +6,7 @@
 //! look is the default pack and needs no files: any icon a pack does not supply
 //! is painted from the built-in set.
 
+mod builtin_files;
 pub mod host;
 pub mod load;
 pub mod manifest;

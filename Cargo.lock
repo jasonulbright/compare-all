@@ -7231,6 +7231,8 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "ico",
+ "image",
+ "png 0.18.1",
  "resvg",
  "serde",
  "serde_json",

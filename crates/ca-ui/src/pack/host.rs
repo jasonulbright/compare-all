@@ -1,6 +1,7 @@
 //! Finding packs, loading the selected one off the frame thread, and handing
 //! the result to the painting code.
 
+use super::builtin_files;
 use super::load::{self, DirectoryFiles, LoadedPack, MemoryFiles, PackFiles};
 use super::manifest::{PackManifest, MANIFEST_FILE, MAX_MANIFEST_BYTES};
 use super::{install_active, install_catalog, PackError, PackModes};
@@ -22,7 +23,16 @@ pub struct BuiltinPack {
 }
 
 /// The packs compiled into the program.
-pub const BUILTIN: &[BuiltinPack] = &[];
+pub const BUILTIN: &[BuiltinPack] = &[
+    BuiltinPack {
+        manifest: builtin_files::LUMINOUS_DARK_MANIFEST,
+        files: builtin_files::LUMINOUS_DARK_FILES,
+    },
+    BuiltinPack {
+        manifest: builtin_files::BOLD_OUTLINE_MANIFEST,
+        files: builtin_files::BOLD_OUTLINE_FILES,
+    },
+];
 
 /// One line of the pack list.
 #[derive(Debug, Clone, PartialEq, Eq)]
