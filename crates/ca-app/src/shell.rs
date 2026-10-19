@@ -919,6 +919,8 @@ pub struct App {
     packs: ca_ui::pack::PackHost,
     /// A theme pack sets the egui theme instead of the system.
     pack_sets_theme: bool,
+    /// Whether the system, or the style before any pack forced a mode, is dark.
+    system_dark: Option<bool>,
     /// The options dialog, while it is open.
     options_dialog: Option<OptionsDialog>,
     /// The restore factory defaults wizard, while it is open.
@@ -1078,6 +1080,7 @@ impl App {
                 ca_ui::pack::BUILTIN,
             ),
             pack_sets_theme: false,
+            system_dark: None,
             options_dialog: None,
             restore: None,
             tab_sessions: Vec::new(),
@@ -1488,14 +1491,14 @@ impl App {
             _ => self.options.options_or_default(),
         };
         let pack = self.packs.update(ctx, &stored.appearance.theme_pack);
-        let system_dark = if self.pack_sets_theme {
-            ctx.system_theme()
-                .map_or(ctx.style().visuals.dark_mode, |theme| {
-                    theme == egui::Theme::Dark
-                })
-        } else {
-            ctx.style().visuals.dark_mode
+        let system_dark = match ctx.system_theme() {
+            Some(theme) => theme == egui::Theme::Dark,
+            None if self.pack_sets_theme => self
+                .system_dark
+                .unwrap_or_else(|| ctx.style().visuals.dark_mode),
+            None => ctx.style().visuals.dark_mode,
         };
+        self.system_dark = Some(system_dark);
         let wants_dark = stored.appearance.wants_dark(system_dark);
         let dark = pack
             .as_ref()
@@ -1508,7 +1511,11 @@ impl App {
             });
             self.pack_sets_theme = true;
         } else if self.pack_sets_theme {
-            ctx.set_theme(egui::ThemePreference::System);
+            ctx.set_theme(match (ctx.system_theme(), self.system_dark) {
+                (None, Some(true)) => egui::ThemePreference::Dark,
+                (None, Some(false)) => egui::ThemePreference::Light,
+                _ => egui::ThemePreference::System,
+            });
             self.pack_sets_theme = false;
         }
         AppOptions::resolve_with_pack(

@@ -478,3 +478,105 @@ fn a_colored_icon_paints_untinted_and_an_icon_the_pack_lacks_paints_as_a_mask() 
         _ => true,
     }));
 }
+
+#[test]
+fn windows_device_names_are_refused_in_every_path_form() {
+    let dir = tempfile::tempdir().unwrap();
+    write_pack(dir.path(), MANIFEST, &fixture_files());
+    let files = DirectoryFiles::new(dir.path()).unwrap();
+    for path in [
+        "NUL",
+        "nul.png",
+        "icons/16/Con.png",
+        "icons/aux.tar.png",
+        "icons/PRN.",
+        "icons/com1.png",
+        "icons/COM9",
+        "lpt1.png",
+        "icons/LPT9.x.png",
+    ] {
+        assert!(
+            pack::manifest::check_path(path).is_err(),
+            "{path} was accepted"
+        );
+        assert!(
+            pack::PackFiles::read(&files, path, 1024).is_err(),
+            "{path} was read"
+        );
+    }
+    for path in [
+        "icons/16/console.png",
+        "icons/16/com0.png",
+        "icons/null-1.png",
+    ] {
+        assert!(
+            pack::manifest::check_path(path).is_ok(),
+            "{path} was refused"
+        );
+    }
+    let manifest = manifest_with(|v| v["icons"]["files"]["stop"]["24"] = "special/NUL.png".into());
+    let message = refused(&manifest, &memory(fixture_files()));
+    assert!(message.contains("NUL.png"), "{message}");
+}
+
+#[test]
+fn a_folder_with_very_many_subfolders_is_read_up_to_a_bound() {
+    let dir = tempfile::tempdir().unwrap();
+    let total = pack::host::MAX_SCANNED_ENTRIES + 200;
+    for index in 0..total {
+        std::fs::create_dir(dir.path().join(format!("d{index:05}"))).unwrap();
+    }
+    let folders = pack::host::installed_folders(dir.path());
+    assert_eq!(folders.len(), pack::host::MAX_INSTALLED_PACKS);
+    let mut sorted = folders.clone();
+    sorted.sort();
+    assert_eq!(folders, sorted);
+}
+
+#[test]
+fn a_pack_whose_manifest_changed_after_the_scan_is_not_applied_under_the_old_id() {
+    let (_dir, packs) = packs_folder();
+    let mut host = PackHost::new(packs.clone(), &BUILT_IN);
+    let ctx = egui::Context::default();
+    wait_for(&ctx, &mut host, "", |_, _| pack::catalog(&ctx).scanned);
+    std::fs::write(
+        packs.join("one").join("pack.json"),
+        manifest_with(|v| v["id"] = "renamed".into()),
+    )
+    .unwrap();
+    wait_for(&ctx, &mut host, "fixture-dark", |_, _| {
+        pack::catalog(&ctx).find("renamed").is_some()
+    });
+    assert!(pack::active(&ctx).is_none());
+    assert!(pack::catalog(&ctx).find("fixture-dark").is_none());
+    assert!(host.update(&ctx, "fixture-dark").is_none());
+}
+
+#[test]
+fn a_colored_icon_in_a_disabled_ui_paints_dimmed() {
+    let loaded = Arc::new(load::load(MANIFEST, &memory(fixture_files())).unwrap());
+    let ctx = egui::Context::default();
+    pack::install_active(&ctx, Some(Arc::clone(&loaded)));
+    let output = ctx.run(ca_ui::testing::raw_input(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.add_enabled_ui(false, |ui| {
+                let rect =
+                    egui::Rect::from_min_size(egui::pos2(10.0, 10.0), egui::vec2(16.0, 16.0));
+                Icon::Find.paint(ui.painter(), rect, egui::Color32::WHITE);
+            });
+        });
+    });
+    let find = loaded.texture(&ctx, Icon::Find, 16).unwrap();
+    let colored = output
+        .shapes
+        .iter()
+        .find_map(|shape| match &shape.shape {
+            egui::Shape::Mesh(mesh) if mesh.texture_id == find.id() => Some(mesh.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert!(colored
+        .vertices
+        .iter()
+        .all(|vertex| vertex.color != egui::Color32::WHITE));
+}
