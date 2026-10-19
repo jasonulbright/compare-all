@@ -776,6 +776,7 @@ fn a_manual_check_while_another_copy_holds_the_staging_folder_does_not_say_curre
     drop(claim);
 }
 
+#[cfg(windows)]
 #[test]
 fn the_program_file_carries_its_version_for_the_updater() {
     let bytes = std::fs::read(env!("CARGO_BIN_EXE_compare-all")).unwrap();
