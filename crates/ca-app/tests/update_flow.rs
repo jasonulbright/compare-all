@@ -200,6 +200,24 @@ fn a_policy_file_that_disables_checks_stops_the_call_and_hides_the_command() {
 }
 
 #[test]
+fn an_unreadable_policy_store_stops_the_call_and_shows_the_reason() {
+    let dir = tempfile::tempdir().unwrap();
+    let load = ca_session::load_policies(&ca_session::FilePolicySource::new(dir.path()));
+    let (server, asked) = release_server(next_version().to_string(), 404);
+    let mut app = app_in(dir.path());
+    app.update_from(source(&server, &dir.path().join("stage"), None));
+    app.set_policies(load.policies);
+    app.set_policy_warning(load.warning);
+    assert!(run_frames(&mut app, |app| app.options().is_ready()));
+    quiet_frames(&mut app, 40);
+    assert_eq!(asked.load(Ordering::SeqCst), 0);
+    assert!(!app.accepts(Command::CheckForUpdates));
+    assert!(app
+        .policy_notice()
+        .is_some_and(|text| text.contains("cannot read policy store")));
+}
+
+#[test]
 fn a_good_check_and_a_blocked_download_warn_at_each_launch_until_installed() {
     let dir = tempfile::tempdir().unwrap();
     let staging = dir.path().join("stage");

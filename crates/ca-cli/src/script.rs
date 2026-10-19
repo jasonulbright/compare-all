@@ -1,6 +1,7 @@
 //! Running a script file named on the command line.
 
 use ca_script::{RunError, Session, SessionOptions, Substitution};
+use ca_session::AdminPolicies;
 use std::io::Read;
 use std::path::Path;
 
@@ -9,10 +10,13 @@ use crate::exit;
 
 /// Read the script file, run it, and return the exit code.
 ///
+/// The policies decide whether a stored remote profile or a saved password
+/// may be used.
+///
 /// A time a command names, the clock variables and the log stamps are wall
 /// clocks in the current zone of the machine.
 #[must_use]
-pub fn run(request: &ScriptRun) -> u8 {
+pub fn run(request: &ScriptRun, policies: &AdminPolicies) -> u8 {
     let source = match read_script_file(&request.file) {
         Ok(text) => text,
         Err(error) => {
@@ -27,7 +31,9 @@ pub fn run(request: &ScriptRun) -> u8 {
         left_read_only: request.read_only.left,
         right_read_only: request.read_only.right,
         working_directory,
-        profiles: std::sync::Arc::new(crate::profiles::StoredProfiles::of_settings()),
+        profiles: std::sync::Arc::new(
+            crate::profiles::StoredProfiles::of_settings().with_policies(policies),
+        ),
         archive_types: ca_script::paths::stored_archive_types(),
         offset_seconds,
         ..SessionOptions::default()

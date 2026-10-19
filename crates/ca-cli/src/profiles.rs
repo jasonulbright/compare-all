@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ca_script::ProfileLookup;
+use ca_session::AdminPolicies;
 use ca_vfs::remote::profile::MAX_PROFILE_BYTES;
 use ca_vfs::{RemoteProfile, SecretStore};
 
@@ -23,6 +24,10 @@ pub const PROFILE_FOLDER: &str = "profiles";
 /// Name the credential store entries of this program sit under.
 pub const CREDENTIAL_SERVICE: &str = "compare-all";
 
+/// What a refused remote location reports when policy disables profiles.
+pub const REMOTE_PROFILES_DISABLED: &str =
+    "remote profiles are disabled by administrator policy (DisableRemoteProfiles)";
+
 /// The extension one stored profile carries.
 const PROFILE_EXTENSION: &str = "json";
 
@@ -31,6 +36,7 @@ const PROFILE_EXTENSION: &str = "json";
 pub struct StoredProfiles {
     folder: PathBuf,
     secrets: Arc<dyn SecretStore>,
+    remote_disabled: bool,
 }
 
 impl std::fmt::Debug for StoredProfiles {
@@ -48,6 +54,7 @@ impl StoredProfiles {
         Self {
             folder: folder.into(),
             secrets: secret_store(),
+            remote_disabled: false,
         }
     }
 
@@ -55,6 +62,18 @@ impl StoredProfiles {
     #[must_use]
     pub fn with_secrets(mut self, secrets: Arc<dyn SecretStore>) -> Self {
         self.secrets = secrets;
+        self
+    }
+
+    /// Apply the administrator policies: no profile is read when remote
+    /// profiles are disabled, and no saved secret is read when saved
+    /// passwords are disabled.
+    #[must_use]
+    pub fn with_policies(mut self, policies: &AdminPolicies) -> Self {
+        self.remote_disabled = policies.remote_profiles_disabled();
+        if policies.saved_passwords_disabled() {
+            self.secrets = Arc::new(ca_script::profiles::NoStore);
+        }
         self
     }
 
@@ -87,6 +106,9 @@ pub fn profile_name(location: &str) -> Option<String> {
 
 impl ProfileLookup for StoredProfiles {
     fn profile(&self, location: &str) -> Option<RemoteProfile> {
+        if self.remote_disabled {
+            return None;
+        }
         let name = profile_name(location)?;
         // A name taken from a location never reaches the file system as a
         // path: a separator or a parent reference in it would leave the
@@ -116,6 +138,11 @@ impl ProfileLookup for StoredProfiles {
 
     fn secrets(&self) -> Arc<dyn SecretStore> {
         Arc::clone(&self.secrets)
+    }
+
+    fn refusal(&self) -> Option<String> {
+        self.remote_disabled
+            .then(|| REMOTE_PROFILES_DISABLED.to_owned())
     }
 }
 
@@ -231,3 +258,6 @@ mod tests {
         assert_eq!(found.expose(), "hunter2");
     }
 }
+
+#[cfg(test)]
+mod policy_tests;

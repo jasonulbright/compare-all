@@ -115,7 +115,9 @@ fn main() -> eframe::Result {
             .with_icon(Arc::new(ca_app::icon::window_icon())),
         ..eframe::NativeOptions::default()
     };
-    let policies = ca_session::load_system_policies();
+    let policy_load = ca_session::load_system_policies_reported();
+    let policies = policy_load.policies;
+    let policy_warning = policy_load.warning;
     let outcome = eframe::run_native(
         &ca_app::product_title(),
         options,
@@ -129,6 +131,7 @@ fn main() -> eframe::Result {
             };
             let mut app = App::from_startup(startup, &context);
             app.set_policies(policies);
+            app.set_policy_warning(policy_warning.clone());
             app.report_exit_to(reported);
             app.apply_updates_on_exit(update_hook);
             Ok(Box::new(app))

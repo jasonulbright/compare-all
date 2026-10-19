@@ -40,6 +40,12 @@ pub trait ProfileLookup: std::fmt::Debug + Send + Sync {
     fn secrets(&self) -> Arc<dyn SecretStore> {
         Arc::new(NoStore)
     }
+
+    /// Why every remote location is refused before any profile is read, when
+    /// an administrator policy forbids remote profiles.
+    fn refusal(&self) -> Option<String> {
+        None
+    }
 }
 
 /// A store that holds nothing.
@@ -73,6 +79,9 @@ pub fn connect(
     lookup: &dyn ProfileLookup,
     cancel: &ca_vfs::Cancel,
 ) -> Result<Arc<dyn FileSystem>, ExecError> {
+    if let Some(reason) = lookup.refusal() {
+        return Err(ExecError::Refused(reason));
+    }
     let profile = lookup.profile(location).ok_or_else(|| {
         ExecError::not_supported("load", format!("no stored profile matches {location}"))
     })?;

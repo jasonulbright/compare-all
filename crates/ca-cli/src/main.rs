@@ -186,6 +186,16 @@ fn main() -> ExitCode {
     code
 }
 
+/// Read the administrator policies once and report an unreadable policy store
+/// on the error stream. The program treats such a store as every policy on.
+fn load_policies() -> ca_session::AdminPolicies {
+    let load = ca_session::load_system_policies_reported();
+    if let Some(reason) = &load.warning {
+        eprintln!("{reason}");
+    }
+    load.policies
+}
+
 fn run_arguments() -> ExitCode {
     let arguments: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     if arguments
@@ -208,9 +218,18 @@ fn run_arguments() -> ExitCode {
             println!("{}", env!("CA_VERSION"));
             ExitCode::from(exit::SUCCESS)
         }
-        Ok(Invocation::Script(request)) => ExitCode::from(script::run(&request)),
-        Ok(Invocation::Quick(request)) => ExitCode::from(quick::compare(&request)),
-        Ok(Invocation::Desktop(request)) => ExitCode::from(run_desktop(&request)),
+        Ok(Invocation::Script(request)) => {
+            let policies = load_policies();
+            ExitCode::from(script::run(&request, &policies))
+        }
+        Ok(Invocation::Quick(request)) => {
+            let _policies = load_policies();
+            ExitCode::from(quick::compare(&request))
+        }
+        Ok(Invocation::Desktop(request)) => {
+            let _policies = load_policies();
+            ExitCode::from(run_desktop(&request))
+        }
         Err(error) => {
             eprintln!("{error}");
             eprintln!("run ca --help for the switches this program knows");

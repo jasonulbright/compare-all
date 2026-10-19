@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use ca_cli::args::{Invocation, QuickKind, QuickRun};
 use ca_cli::request::Pane;
 use ca_cli::{exit, help, parse, quick, script};
+use ca_session::AdminPolicies;
 
 fn desktop(arguments: &[&str]) -> ca_cli::DesktopRequest {
     match parse(arguments.iter().map(|a| (*a).to_string())) {
@@ -271,7 +272,10 @@ fn a_missing_script_file_returns_its_own_code() {
         read_only: ca_cli::ReadOnly::default(),
         dry_run: false,
     };
-    assert_eq!(script::run(&run), exit::SCRIPT_NOT_LOADED);
+    assert_eq!(
+        script::run(&run, &AdminPolicies::default()),
+        exit::SCRIPT_NOT_LOADED
+    );
 }
 
 #[test]
@@ -287,7 +291,10 @@ fn a_script_with_a_syntax_error_returns_its_own_code() {
         read_only: ca_cli::ReadOnly::default(),
         dry_run: false,
     };
-    assert_eq!(script::run(&run), exit::SCRIPT_SYNTAX);
+    assert_eq!(
+        script::run(&run, &AdminPolicies::default()),
+        exit::SCRIPT_SYNTAX
+    );
 }
 
 #[test]
@@ -303,7 +310,10 @@ fn a_script_that_cannot_open_its_folders_returns_its_own_code() {
         read_only: ca_cli::ReadOnly::default(),
         dry_run: false,
     };
-    assert_eq!(script::run(&run), exit::SCRIPT_PATHS);
+    assert_eq!(
+        script::run(&run, &AdminPolicies::default()),
+        exit::SCRIPT_PATHS
+    );
 }
 
 #[test]
@@ -319,7 +329,7 @@ fn a_script_that_runs_cleanly_returns_success() {
         read_only: ca_cli::ReadOnly::default(),
         dry_run: false,
     };
-    assert_eq!(script::run(&run), exit::SUCCESS);
+    assert_eq!(script::run(&run, &AdminPolicies::default()), exit::SUCCESS);
 }
 
 #[test]
@@ -348,7 +358,7 @@ fn a_dry_run_script_writes_nothing() {
         read_only: ca_cli::ReadOnly::default(),
         dry_run: true,
     };
-    assert_eq!(script::run(&run), exit::SUCCESS);
+    assert_eq!(script::run(&run, &AdminPolicies::default()), exit::SUCCESS);
     assert!(!right.join("a.txt").exists());
 }
 
@@ -381,7 +391,10 @@ fn a_read_only_side_refuses_a_write() {
         },
         dry_run: false,
     };
-    assert_eq!(script::run(&run), exit::UNKNOWN_ERROR);
+    assert_eq!(
+        script::run(&run, &AdminPolicies::default()),
+        exit::UNKNOWN_ERROR
+    );
     assert!(!right.join("a.txt").exists());
 }
 
@@ -420,7 +433,10 @@ fn a_touch_with_a_wall_clock_time_stamps_that_time_in_the_machine_zone() {
         ),
     )
     .expect("write");
-    assert_eq!(script::run(&quiet_run(file)), exit::SUCCESS);
+    assert_eq!(
+        script::run(&quiet_run(file), &AdminPolicies::default()),
+        exit::SUCCESS
+    );
     let modified = std::fs::metadata(left.join("a.txt"))
         .expect("metadata")
         .modified()
@@ -446,7 +462,10 @@ fn the_log_and_the_clock_variables_read_the_machine_zone() {
     let offset = i64::from(ca_fs::local_offset_seconds());
     let wall_clock = || ca_script::clock::unix_seconds(std::time::SystemTime::now()) + offset;
     let before = wall_clock();
-    assert_eq!(script::run(&quiet_run(file)), exit::SUCCESS);
+    assert_eq!(
+        script::run(&quiet_run(file), &AdminPolicies::default()),
+        exit::SUCCESS
+    );
     let after = wall_clock();
 
     let log = (before..=after)
@@ -684,4 +703,23 @@ fn the_help_names_every_exit_code_and_every_switch() {
     }
     assert!(text.contains("@<script file>"));
     assert!(text.contains("ca text <left> <right>"));
+}
+
+#[test]
+fn a_remote_load_under_the_remote_profile_policy_fails_the_run() {
+    let dir = tempfile::tempdir().expect("temporary folder");
+    let file = dir.path().join("remote.txt");
+    std::fs::write(&file, "load dav://shelf/a dav://shelf/b\n").expect("write");
+    let run = ca_cli::ScriptRun {
+        file,
+        arguments: Vec::new(),
+        silent: true,
+        close_script: false,
+        read_only: ca_cli::ReadOnly::default(),
+        dry_run: false,
+    };
+    assert_ne!(
+        script::run(&run, &AdminPolicies::all_restricted()),
+        exit::SUCCESS
+    );
 }
