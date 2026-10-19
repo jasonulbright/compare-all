@@ -270,15 +270,15 @@ fn decode(path: &str, bytes: &[u8], size: u32) -> Result<egui::ColorImage, PackE
     limits.max_image_width = Some(size);
     limits.max_image_height = Some(size);
     limits.max_alloc = Some(1 << 20);
-    let mut decoder = reader();
-    decoder.limits(limits);
-    let decoded = decoder
+    let mut png_reader = reader();
+    png_reader.limits(limits);
+    let rgba = png_reader
         .decode()
         .map_err(|_| fail("could not be decoded"))?
         .to_rgba8();
     let edge = size as usize;
     Ok(egui::ColorImage::from_rgba_unmultiplied(
         [edge, edge],
-        decoded.as_raw(),
+        rgba.as_raw(),
     ))
 }
