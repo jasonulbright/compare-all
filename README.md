@@ -98,6 +98,16 @@ On Linux and macOS, write one `Name=yes` or `Name=no` line for each policy in
 `/etc/compare-all.conf`. A `#` starts a comment. The program ignores unknown
 names and lines it cannot read. A missing file sets no policy.
 
+If the policy store exists but the program cannot read it, every policy is in
+force. On Linux and macOS this happens when `/etc/compare-all.conf` exists and
+the program cannot open or read it. On Windows this happens when a policy key
+exists and the program cannot open it, or cannot read a value for lack of
+access. A missing key is not an error. The program reports the reason once:
+the desktop program shows a message after the window opens, and `ca` writes a
+line to the error stream. `ca` applies the policies to scripts. With
+`DisableRemoteProfiles`, a script cannot load a remote location, and the run
+fails. With `DisableSavedPasswords`, `ca` reads no saved password.
+
 ## Build from source
 
 1. Install `rustup`. The file `rust-toolchain.toml` sets the Rust version.

@@ -927,6 +927,8 @@ pub struct App {
     settings_shown: Option<Sides>,
     /// Why the last settings did not all apply, while it is on screen.
     settings_notice: Option<String>,
+    /// Why every administrator policy is in force, until the user closes it.
+    policy_notice: Option<String>,
     /// The workspace manager, while it is open.
     workspaces: Option<WorkspaceManager>,
     /// The report of the last import, while it is on screen.
@@ -1076,6 +1078,7 @@ impl App {
             settings_tab: 0,
             settings_shown: None,
             settings_notice: None,
+            policy_notice: None,
             workspaces: None,
             import_report: None,
             share: None,
@@ -1508,6 +1511,37 @@ impl App {
     /// Take the policies read from the machine-wide store.
     pub fn set_policies(&mut self, policies: AdminPolicies) {
         self.policies = policies;
+    }
+
+    /// Show why the policy store could not be read. The notice appears in the
+    /// first frame and stays until the user closes it.
+    pub fn set_policy_warning(&mut self, warning: Option<String>) {
+        self.policy_notice = warning;
+    }
+
+    /// The policy warning, while it is open.
+    #[must_use]
+    pub fn policy_notice(&self) -> Option<&str> {
+        self.policy_notice.as_deref()
+    }
+
+    fn draw_policy_notice(&mut self, ctx: &egui::Context) {
+        let Some(text) = self.policy_notice.clone() else {
+            return;
+        };
+        let mut open = true;
+        egui::Window::new("Administrator Policy")
+            .id(egui::Id::new("policy-notice"))
+            .anchor(egui::Align2::LEFT_BOTTOM, [12.0, -132.0])
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(text);
+            });
+        if !open {
+            self.policy_notice = None;
+        }
     }
 
     /// State what starts an Open With entry.
@@ -3797,6 +3831,7 @@ impl App {
         self.draw_update_notice(ctx, &context);
         self.draw_workspace_notice(ctx);
         self.draw_settings_notice(ctx);
+        self.draw_policy_notice(ctx);
         if ctx.input(|input| input.viewport().close_requested()) && !self.closing {
             self.request_exit();
             if !self.closing {

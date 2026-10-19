@@ -78,6 +78,17 @@ impl AdminPolicies {
         }
     }
 
+    /// Every restricting policy in force, as when the policy store exists but
+    /// cannot be read.
+    #[must_use]
+    pub fn all_restricted() -> Self {
+        Self {
+            check_for_updates_disabled: true,
+            remote_profiles_disabled: true,
+            saved_passwords_disabled: true,
+        }
+    }
+
     /// Whether the named policy is in force.
     #[must_use]
     pub fn is_set(&self, key: PolicyKey) -> bool {
@@ -153,6 +164,8 @@ pub const POLICY_REGISTRY_PATH: &str = "SOFTWARE\\Policies\\compare-all";
 /// The locations are read in order and a key enabled in any of them is in
 /// force, so a per-user value of zero never clears a machine value of one. A
 /// missing key, a missing value, and a value of another type count as not set.
+/// A key that exists but cannot be opened, or a value that cannot be read for
+/// lack of access, is an error.
 #[cfg(windows)]
 #[derive(Debug, Clone)]
 pub struct RegistryPolicySource {
@@ -191,14 +204,27 @@ impl PolicyLoader for RegistryPolicySource {
 
         let mut enabled = BTreeMap::new();
         for (root, path) in &self.locations {
-            let Ok(key) =
-                RegKey::predef(*root).open_subkey_with_flags(path, KEY_READ | KEY_WOW64_64KEY)
-            else {
-                continue;
+            let key = match RegKey::predef(*root)
+                .open_subkey_with_flags(path, KEY_READ | KEY_WOW64_64KEY)
+            {
+                Ok(key) => key,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(PolicyError::Unreadable(format!("{path}: {error}")));
+                }
             };
             for policy in PolicyKey::ALL {
-                if matches!(key.get_value::<u32, _>(policy.name()), Ok(value) if value != 0) {
-                    enabled.insert(*policy, true);
+                match key.get_value::<u32, _>(policy.name()) {
+                    Ok(value) if value != 0 => {
+                        enabled.insert(*policy, true);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                        return Err(PolicyError::Unreadable(format!(
+                            "{path}: {}: {error}",
+                            policy.name()
+                        )));
+                    }
+                    _ => {}
                 }
             }
         }
@@ -206,16 +232,51 @@ impl PolicyLoader for RegistryPolicySource {
     }
 }
 
+/// Policies read at startup, with the reason when the store was unreadable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyLoad {
+    /// The policies in force.
+    pub policies: AdminPolicies,
+    /// Why every restricting policy was put in force, when the store exists
+    /// but could not be read.
+    pub warning: Option<String>,
+}
+
+/// Reads `loader` once. A store that exists but cannot be read puts every
+/// restricting policy in force and reports the reason.
+#[must_use]
+pub fn load_policies(loader: &dyn PolicyLoader) -> PolicyLoad {
+    match loader.load() {
+        Ok(policies) => PolicyLoad {
+            policies,
+            warning: None,
+        },
+        Err(error) => PolicyLoad {
+            policies: AdminPolicies::all_restricted(),
+            warning: Some(format!(
+                "{error}. Every administrator policy is in force until the store can be read."
+            )),
+        },
+    }
+}
+
+/// Reads the policies of this machine once, with the reason when the store
+/// was unreadable.
+#[must_use]
+pub fn load_system_policies_reported() -> PolicyLoad {
+    #[cfg(windows)]
+    let loaded = load_policies(&RegistryPolicySource::system());
+    #[cfg(not(windows))]
+    let loaded = load_policies(&FilePolicySource::system());
+    loaded
+}
+
 /// Reads the policies of this machine once.
 ///
-/// A store that cannot be read leaves every policy off.
+/// A store that exists but cannot be read puts every policy in force.
 #[must_use]
 pub fn load_system_policies() -> AdminPolicies {
-    #[cfg(windows)]
-    let loaded = RegistryPolicySource::system().load();
-    #[cfg(not(windows))]
-    let loaded = FilePolicySource::system().load();
-    loaded.unwrap_or_default()
+    load_system_policies_reported().policies
 }
 
 /// Failure to read the policy store.
@@ -371,6 +432,24 @@ mod tests {
         assert!(policies.remote_profiles_disabled());
         assert!(!policies.saved_passwords_disabled());
         assert!(!policies.check_for_updates_disabled());
+    }
+
+    #[test]
+    fn an_unreadable_store_puts_every_policy_in_force_and_says_why() {
+        let dir = tempfile::tempdir().unwrap();
+        let load = load_policies(&FilePolicySource::new(dir.path()));
+        for key in PolicyKey::ALL {
+            assert!(load.policies.is_set(*key));
+        }
+        assert!(load.warning.unwrap().contains("cannot read policy store"));
+    }
+
+    #[test]
+    fn a_missing_store_puts_nothing_in_force_and_says_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let load = load_policies(&FilePolicySource::new(dir.path().join("absent.conf")));
+        assert_eq!(load.policies, AdminPolicies::default());
+        assert!(load.warning.is_none());
     }
 
     #[test]

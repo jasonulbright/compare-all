@@ -28,8 +28,8 @@ pub use options::{
     OPTIONS_SCHEMA_VERSION,
 };
 pub use policy::{
-    load_system_policies, AdminPolicies, FilePolicySource, InMemoryPolicySource, PolicyError,
-    PolicyKey, PolicyLoader,
+    load_policies, load_system_policies, load_system_policies_reported, AdminPolicies,
+    FilePolicySource, InMemoryPolicySource, PolicyError, PolicyKey, PolicyLoad, PolicyLoader,
 };
 #[cfg(windows)]
 pub use policy::{RegistryPolicySource, POLICY_REGISTRY_PATH};
