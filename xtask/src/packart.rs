@@ -28,6 +28,10 @@ const PADDING_DIVISOR: u32 = 32;
 /// beyond it, so a small glyph stays small beside a large one.
 const MINIMUM_FILL_PERCENT: u32 = 60;
 
+/// A source image with a side above this many pixels is refused: the working
+/// canvas is a square of four 32-bit floats per pixel.
+const MAXIMUM_SOURCE_SIDE: u32 = 8192;
+
 type Linear = ImageBuffer<Rgba<f32>, Vec<f32>>;
 
 /// Writes `<destination>/<size>/<name>.png` for every PNG in `source`.
@@ -43,7 +47,7 @@ pub fn icons(arguments: &[String]) -> anyhow::Result<()> {
     let mut names = Vec::new();
     for entry in std::fs::read_dir(source).with_context(|| format!("cannot read {source}"))? {
         let path = entry?.path();
-        if path.extension().is_some_and(|e| e == "png") {
+        if is_png(&path) {
             names.push(path);
         }
     }
@@ -76,10 +80,23 @@ pub fn icons(arguments: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn is_png(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("png"))
+}
+
+fn check_size(width: u32, height: u32) -> anyhow::Result<()> {
+    if width.max(height) > MAXIMUM_SOURCE_SIDE {
+        bail!("the picture is {width} x {height} pixels; the limit is {MAXIMUM_SOURCE_SIDE} on each side");
+    }
+    Ok(())
+}
+
 /// The picture with faint pixels cleared, trimmed, and centered on a
 /// transparent square with premultiplied color.
 fn prepare(picture: &image::RgbaImage, floor: u8) -> anyhow::Result<Linear> {
     let (width, height) = picture.dimensions();
+    check_size(width, height)?;
     let (mut left, mut top, mut right, mut bottom) = (width, height, 0, 0);
     for (x, y, pixel) in picture.enumerate_pixels() {
         if pixel.0[3] >= floor {
@@ -297,7 +314,7 @@ pub fn index(root: &Path) -> anyhow::Result<()> {
                 std::fs::read_dir(folder.join("icons").join(size.to_string()))?
                     .filter_map(Result::ok)
                     .filter_map(|e| e.file_name().into_string().ok())
-                    .filter(|n| Path::new(n).extension().is_some_and(|e| e == "png"))
+                    .filter(|n| is_png(Path::new(n)))
                     .collect();
             names.sort();
             files.extend(names.into_iter().map(|n| format!("icons/{size}/{n}")));
@@ -339,19 +356,43 @@ mod tests {
     #[test]
     fn faint_pixels_do_not_count_toward_the_trim() {
         let square = prepare(&picture(), DEFAULT_ALPHA_FLOOR).unwrap();
-        assert!(square.width() >= 77);
-        let bytes = shrink(&square, 16);
-        assert_eq!(bytes[..4], [0, 0, 0, 0]);
+        // The 70 x 40 shape rises to the 76 pixel minimum fill; a trim that
+        // kept the faint corner pixel would give a 102 pixel canvas.
+        assert_eq!((square.width(), square.height()), (82, 82));
+        assert_eq!(shrink(&square, 16)[..4], [0, 0, 0, 0]);
     }
 
     #[test]
     fn the_shape_is_centered() {
         let square = prepare(&picture(), DEFAULT_ALPHA_FLOOR).unwrap();
+        let opaque = |x: u32, y: u32| square.get_pixel(x, y).0[3] > 0.0;
+        assert!(opaque(6, 21) && opaque(75, 60));
+        assert!(!opaque(5, 21) && !opaque(76, 60));
+        assert!(!opaque(6, 20) && !opaque(75, 61));
         let bytes = shrink(&square, 32);
         let alpha = |x: usize, y: usize| bytes[(y * 32 + x) * 4 + 3];
         let left = (0..32).find(|x| alpha(*x, 16) > 0).unwrap_or(0);
         let right = (0..32).rev().find(|x| alpha(*x, 16) > 0).unwrap_or(0);
         assert!(left.abs_diff(31 - right) <= 1, "{left} {right}");
+        let top = (0..32).find(|y| alpha(16, *y) > 0).unwrap_or(0);
+        let bottom = (0..32).rev().find(|y| alpha(16, *y) > 0).unwrap_or(0);
+        assert!(top > 0 && top.abs_diff(31 - bottom) <= 1, "{top} {bottom}");
+    }
+
+    #[test]
+    fn a_huge_source_is_refused_before_any_arithmetic() {
+        assert!(check_size(72_000_000, 1).is_err());
+        assert!(check_size(1, u32::MAX).is_err());
+        assert!(check_size(MAXIMUM_SOURCE_SIDE, MAXIMUM_SOURCE_SIDE).is_ok());
+    }
+
+    #[test]
+    fn the_png_extension_matches_in_any_case() {
+        assert!(is_png(Path::new("a.png")));
+        assert!(is_png(Path::new("a.PNG")));
+        assert!(is_png(Path::new("a.Png")));
+        assert!(!is_png(Path::new("a.jpg")));
+        assert!(!is_png(Path::new("png")));
     }
 
     #[test]
