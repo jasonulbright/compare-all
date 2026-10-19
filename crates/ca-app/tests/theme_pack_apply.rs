@@ -8,6 +8,7 @@ use ca_app::App;
 use ca_session::options::Rgb;
 use ca_ui::testing::{context, raw_input};
 use ca_ui::theme::slots::to_stored;
+use ca_ui::theme::Variant;
 use std::time::{Duration, Instant};
 
 /// Run frames in `ctx` until `ready` holds or the budget runs out.
@@ -76,4 +77,60 @@ fn a_chosen_theme_pack_applies_without_a_restart() {
         "the default look never came back"
     );
     assert!(ca_ui::pack::active(&ctx).is_none());
+}
+
+fn select(app: &mut App, id: &str) {
+    let mut options = app.options().options_or_default();
+    id.clone_into(&mut options.appearance.theme_pack);
+    app.apply_options(options);
+}
+
+fn active_is(ctx: &egui::Context, id: &str) -> bool {
+    ca_ui::pack::active(ctx).is_some_and(|pack| pack.id() == id)
+}
+
+#[test]
+fn the_mode_follows_the_pack_and_returns_to_the_system_choice_when_the_pack_goes() {
+    let dir = tempfile::tempdir().unwrap();
+    let settings = dir.path().join("settings");
+    let journals = dir.path().join("journals");
+    let packs = settings.join("packs");
+    std::fs::create_dir_all(&journals).unwrap();
+    for (name, modes) in [("darkonly", r#"["dark"]"#), ("both", r#"["light","dark"]"#)] {
+        std::fs::create_dir_all(packs.join(name)).unwrap();
+        std::fs::write(
+            packs.join(name).join("pack.json"),
+            format!(
+                r#"{{"format":1,"id":"{name}","name":"{name}","version":"1","modes":{modes}}}"#
+            ),
+        )
+        .unwrap();
+    }
+    let mut app = App::from_startup_in(Startup::Home, &context(), settings, journals);
+    let ctx = egui::Context::default();
+    ctx.set_theme(egui::Theme::Light);
+    assert!(run_frames(&mut app, &ctx, |app| app.options().is_ready()));
+    assert!(run_frames(&mut app, &ctx, |_| {
+        let catalog = ca_ui::pack::catalog(&ctx);
+        catalog.find("darkonly").is_some() && catalog.find("both").is_some()
+    }));
+    assert_eq!(app.resolved_options().variant(), Variant::Light);
+
+    select(&mut app, "darkonly");
+    assert!(run_frames(&mut app, &ctx, |_| active_is(&ctx, "darkonly")));
+    let _ = ctx.run(raw_input(), |ctx| app.frame(ctx));
+    assert_eq!(app.resolved_options().variant(), Variant::Dark);
+    assert!(ctx.style().visuals.dark_mode);
+
+    select(&mut app, "both");
+    assert!(run_frames(&mut app, &ctx, |_| active_is(&ctx, "both")));
+    let _ = ctx.run(raw_input(), |ctx| app.frame(ctx));
+    assert_eq!(app.resolved_options().variant(), Variant::Light);
+
+    select(&mut app, "darkonly");
+    assert!(run_frames(&mut app, &ctx, |_| active_is(&ctx, "darkonly")));
+    select(&mut app, "");
+    assert!(run_frames(&mut app, &ctx, |_| ca_ui::pack::active(&ctx).is_none()));
+    let _ = ctx.run(raw_input(), |ctx| app.frame(ctx));
+    assert_eq!(app.resolved_options().variant(), Variant::Light);
 }

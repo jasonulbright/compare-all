@@ -60,6 +60,8 @@ pub struct OptionsDialog {
     capturing: bool,
     conflict: Option<String>,
     selected_entry: Option<usize>,
+    /// Colors of the theme pack in force, read when the color pages draw.
+    pack_colors: Option<ca_session::options::PaletteOptions>,
 }
 
 impl OptionsDialog {
@@ -82,7 +84,13 @@ impl OptionsDialog {
             capturing: false,
             conflict: None,
             selected_entry: None,
+            pack_colors: None,
         }
+    }
+
+    /// Show the colors of a theme pack under the colors edited here.
+    pub fn set_pack_colors(&mut self, colors: Option<ca_session::options::PaletteOptions>) {
+        self.pack_colors = colors;
     }
 
     /// True while the dialog is on screen.
@@ -172,12 +180,19 @@ impl OptionsDialog {
     #[must_use]
     pub fn color(&self, group: ColorGroup, variant: Variant, slot: &str) -> egui::Color32 {
         let dark = matches!(variant, Variant::Dark);
-        slots::color_of(
-            group,
-            variant,
-            self.edited.appearance.palettes.group(group).table(dark),
-            slot,
-        )
+        let own = self.edited.appearance.palettes.group(group).table(dark);
+        let table = match &self.pack_colors {
+            Some(pack) if !own.slots.contains_key(slot) => {
+                let from_pack = pack.group(group).table(dark);
+                if from_pack.slots.contains_key(slot) {
+                    from_pack
+                } else {
+                    own
+                }
+            }
+            _ => own,
+        };
+        slots::color_of(group, variant, table, slot)
     }
 
     /// States a color for one slot.
@@ -539,6 +554,7 @@ impl OptionsDialog {
     }
 
     fn colors_body(&mut self, ui: &mut egui::Ui, page: &OptionPage) {
+        self.pack_colors = crate::pack::active(ui.ctx()).map(|pack| pack.colors().clone());
         let mut group = self.color_group;
         if !page.colors.contains(&group) {
             group = page.colors.first().copied().unwrap_or(ColorGroup::Text);
@@ -1218,6 +1234,31 @@ mod tests {
         assert_eq!(to_stored(tables.main.same_line), Rgb::new(1, 2, 3));
         let light = super::preview_tables(dialog.options(), Variant::Light);
         assert_eq!(light.main.same_line, crate::theme::LIGHT.same_line);
+    }
+
+    #[test]
+    fn the_color_page_shows_pack_colors_under_the_colors_set_here() {
+        let mut dialog = dialog();
+        let mut pack = ca_session::options::PaletteOptions::default();
+        for slot in ["same_line", "important_line"] {
+            pack.group_mut(ColorGroup::Text)
+                .table_mut(true)
+                .set(slot, Rgb::new(10, 20, 30));
+        }
+        dialog.set_pack_colors(Some(pack));
+        dialog.set_color(
+            ColorGroup::Text,
+            Variant::Dark,
+            "important_line",
+            crate::theme::slots::to_color(Rgb::new(1, 2, 3)),
+        );
+        let shown = |dialog: &OptionsDialog, slot| {
+            to_stored(dialog.color(ColorGroup::Text, Variant::Dark, slot))
+        };
+        assert_eq!(shown(&dialog, "same_line"), Rgb::new(10, 20, 30));
+        assert_eq!(shown(&dialog, "important_line"), Rgb::new(1, 2, 3));
+        dialog.set_pack_colors(None);
+        assert_ne!(shown(&dialog, "same_line"), Rgb::new(10, 20, 30));
     }
 
     #[test]

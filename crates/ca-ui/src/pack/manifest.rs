@@ -240,12 +240,29 @@ pub fn check_path(path: &str) -> Result<(), PackError> {
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
     };
-    if path.chars().count() > MAX_PATH_CHARS || !path.split('/').all(plain) {
+    if path.chars().count() > MAX_PATH_CHARS
+        || !path.split('/').all(plain)
+        || path.split('/').any(is_device_name)
+    {
         return Err(PackError::new(format!(
             "The file path \"{path}\" is not a plain relative path."
         )));
     }
     Ok(())
+}
+
+/// A Windows device name, which names a device whatever the extension or case.
+fn is_device_name(component: &str) -> bool {
+    let stem = component
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || stem
+            .strip_prefix("COM")
+            .or_else(|| stem.strip_prefix("LPT"))
+            .is_some_and(|digit| matches!(digit.as_bytes(), [b'1'..=b'9']))
 }
 
 fn check_colors(colors: &PaletteOptions) -> Result<(), PackError> {

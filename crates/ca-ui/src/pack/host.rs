@@ -169,6 +169,13 @@ impl PackHost {
     fn select(&mut self, ctx: &egui::Context, wanted: &str) {
         if let Some(loading) = &self.loading {
             match loading.receiver.try_recv() {
+                Ok(Ok(pack)) if pack.id() != loading.id => {
+                    let id = loading.id.clone();
+                    self.loading = None;
+                    self.failed
+                        .insert(id, "The pack changed after it was listed.".to_owned());
+                    self.scan = ScanState::Idle;
+                }
                 Ok(Ok(pack)) => {
                     let id = loading.id.clone();
                     self.loading = None;
@@ -358,17 +365,29 @@ fn refused(name: &str, error: &PackError, built_in: bool) -> PackEntry {
     }
 }
 
+/// Directory entries examined in one scan. A folder with more entries is read
+/// only up to this many, in the order the file system lists them.
+pub const MAX_SCANNED_ENTRIES: usize = 1024;
+
 /// The pack folders inside `directory`, in name order, without following links.
-fn installed_folders(directory: &Path) -> Vec<PathBuf> {
+///
+/// At most `MAX_SCANNED_ENTRIES` entries are read, and the list never holds
+/// more than `MAX_INSTALLED_PACKS` plus one path.
+pub fn installed_folders(directory: &Path) -> Vec<PathBuf> {
     let Ok(listing) = std::fs::read_dir(directory) else {
         return Vec::new();
     };
-    let mut folders: Vec<PathBuf> = listing
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
-        .map(|entry| entry.path())
-        .collect();
+    let mut folders: Vec<PathBuf> = Vec::new();
+    for entry in listing.take(MAX_SCANNED_ENTRIES).filter_map(Result::ok) {
+        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        folders.push(entry.path());
+        if folders.len() > MAX_INSTALLED_PACKS {
+            folders.sort();
+            folders.truncate(MAX_INSTALLED_PACKS);
+        }
+    }
     folders.sort();
-    folders.truncate(MAX_INSTALLED_PACKS);
     folders
 }
