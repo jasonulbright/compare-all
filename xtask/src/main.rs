@@ -11,6 +11,7 @@
 mod icon;
 mod notices;
 mod package;
+mod packart;
 mod resource;
 mod update_manifest;
 mod version;
@@ -33,11 +34,13 @@ fn main() -> anyhow::Result<()> {
         Some("icon") => icon::run(root)?,
         Some("package") => package::run(root)?,
         Some("notices") => notices::run(root)?,
+        Some("pack-icons") => packart::icons(&std::env::args().skip(2).collect::<Vec<_>>())?,
+        Some("pack-index") => packart::index(root)?,
         Some("update-manifest") => {
             update_manifest::run(&std::env::args().skip(2).collect::<Vec<_>>())?;
         }
         _ => anyhow::bail!(
-            "usage: cargo xtask <bump|version|build|icon|package|notices|update-manifest>"
+            "usage: cargo xtask <bump|version|build|icon|package|notices|pack-icons|pack-index|update-manifest>"
         ),
     }
     Ok(())
