@@ -1902,6 +1902,7 @@ fn folder_files(dir: &Path) -> Vec<(String, Vec<u8>)> {
     files
 }
 
+#[cfg(windows)]
 #[test]
 fn the_elevated_step_installs_its_own_checked_copy_and_removes_it() {
     use ca_update::install::{install_from, Checks};
@@ -1935,6 +1936,7 @@ fn the_elevated_step_installs_its_own_checked_copy_and_removes_it() {
     assert!(staging.asset_path(&record).exists());
 }
 
+#[cfg(windows)]
 #[test]
 fn a_staged_installer_replaced_after_the_copy_is_not_what_is_installed() {
     use ca_update::install::{install_from, Checks};
@@ -1959,6 +1961,7 @@ fn a_staged_installer_replaced_after_the_copy_is_not_what_is_installed() {
     assert_eq!(*installed.lock().unwrap(), msi_bytes());
 }
 
+#[cfg(windows)]
 #[test]
 fn a_failed_install_puts_the_program_file_back() {
     use ca_update::install::{install_from, Checks};
@@ -2568,6 +2571,7 @@ fn the_elevated_step_reads_only_a_local_staging_folder_inside_a_profile() {
     assert_eq!(accepted_staging(&linked.join("updates"), &profiles), None);
 }
 
+#[cfg(windows)]
 #[test]
 fn profile_folders_expand_only_the_system_folders() {
     use ca_update::system::expand_system_folders;
