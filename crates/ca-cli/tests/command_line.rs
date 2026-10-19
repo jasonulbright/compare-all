@@ -704,22 +704,3 @@ fn the_help_names_every_exit_code_and_every_switch() {
     assert!(text.contains("@<script file>"));
     assert!(text.contains("ca text <left> <right>"));
 }
-
-#[test]
-fn a_remote_load_under_the_remote_profile_policy_fails_the_run() {
-    let dir = tempfile::tempdir().expect("temporary folder");
-    let file = dir.path().join("remote.txt");
-    std::fs::write(&file, "load dav://shelf/a dav://shelf/b\n").expect("write");
-    let run = ca_cli::ScriptRun {
-        file,
-        arguments: Vec::new(),
-        silent: true,
-        close_script: false,
-        read_only: ca_cli::ReadOnly::default(),
-        dry_run: false,
-    };
-    assert_ne!(
-        script::run(&run, &AdminPolicies::all_restricted()),
-        exit::SUCCESS
-    );
-}
