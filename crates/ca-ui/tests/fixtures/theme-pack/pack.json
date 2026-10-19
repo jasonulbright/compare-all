@@ -1,0 +1,18 @@
+{
+  "format": 1,
+  "id": "fixture-dark",
+  "name": "Fixture Dark",
+  "version": "1.0.0",
+  "modes": ["dark"],
+  "colors": {
+    "text": {
+      "dark": { "slots": { "same_line": "#102030", "important_line": "#401010" } }
+    }
+  },
+  "icons": {
+    "sizes": [16, 24, 32, 48],
+    "files": {
+      "stop": { "24": "special/stop-24.png" }
+    }
+  }
+}

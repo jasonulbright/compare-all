@@ -119,16 +119,40 @@ impl Icon {
         ))
     }
 
-    /// Paint a tinted mask on whole pixel edges.
+    /// Paint the icon on whole pixel edges.
+    ///
+    /// A pack in force that supplies this icon paints its full-color image
+    /// untinted; only the tint's opacity applies. Every other icon is a mask
+    /// painted in the tint.
     pub fn paint(self, painter: &egui::Painter, rect: egui::Rect, tint: egui::Color32) {
-        if let Some(texture) = self.texture(painter.ctx(), rect.height()) {
+        let ctx = painter.ctx();
+        let height = rect.height();
+        let rect = rect.round_to_pixels(ctx.pixels_per_point());
+        let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
+        if let Some(texture) = self.pack_texture(ctx, height) {
             painter.image(
                 texture.id(),
-                rect.round_to_pixels(painter.ctx().pixels_per_point()),
-                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
-                tint,
+                rect,
+                uv,
+                egui::Color32::from_white_alpha(tint.a()),
             );
+            return;
         }
+        if let Some(texture) = self.texture(ctx, height) {
+            painter.image(texture.id(), rect, uv, tint);
+        }
+    }
+
+    /// The full-color image of the pack in force, when it has one.
+    fn pack_texture(self, ctx: &egui::Context, size_pt: f32) -> Option<egui::TextureHandle> {
+        let pack = crate::pack::active(ctx)?;
+        let target = size_pt * ctx.pixels_per_point();
+        if !target.is_finite() || target <= 0.0 || target > 512.0 {
+            return None;
+        }
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let px = target.round().max(1.0) as u32;
+        pack.texture(ctx, self, px)
     }
 
     /// Allocate a decorative icon without introducing a control.

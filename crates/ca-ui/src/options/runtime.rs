@@ -8,7 +8,7 @@
 use crate::command::ShortcutTable;
 use crate::theme::slots::Tables;
 use crate::theme::Variant;
-use ca_session::options::ProgramOptions;
+use ca_session::options::{PaletteOptions, ProgramOptions};
 use ca_session::AdminPolicies;
 use std::sync::Arc;
 
@@ -44,7 +44,25 @@ impl AppOptions {
     /// Resolves a stored document into the tables and the routing a frame uses.
     #[must_use]
     pub fn resolve(stored: ProgramOptions, variant: Variant, policies: AdminPolicies) -> Self {
-        let tables = Tables::resolve(variant, &stored.appearance.palettes);
+        Self::resolve_with_pack(stored, variant, policies, None)
+    }
+
+    /// Like [`Self::resolve`], with the colors of a theme pack under the colors
+    /// the document states itself.
+    #[must_use]
+    pub fn resolve_with_pack(
+        stored: ProgramOptions,
+        variant: Variant,
+        policies: AdminPolicies,
+        pack_colors: Option<&PaletteOptions>,
+    ) -> Self {
+        let tables = match pack_colors {
+            Some(pack) => Tables::resolve(
+                variant,
+                &crate::pack::layered(pack, &stored.appearance.palettes),
+            ),
+            None => Tables::resolve(variant, &stored.appearance.palettes),
+        };
         let shortcuts = ShortcutTable::from_options(&stored.commands);
         Self {
             stored,

@@ -22,6 +22,7 @@ pub mod icon;
 pub mod icons;
 pub mod launch;
 pub mod options;
+pub mod pack;
 pub mod paths;
 pub mod rediff;
 pub mod report;
