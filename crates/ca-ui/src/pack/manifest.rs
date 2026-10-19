@@ -229,6 +229,9 @@ fn check_text(field: &str, value: &str, limit: usize) -> Result<(), PackError> {
 
 /// A path that stays inside the pack folder: forward slashes, plain names,
 /// no drive, no parent step.
+///
+/// # Errors
+/// A message naming the path when it is not plain.
 pub fn check_path(path: &str) -> Result<(), PackError> {
     let plain = |component: &str| {
         !component.is_empty()

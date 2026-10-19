@@ -277,7 +277,7 @@ fn an_icon_file_that_breaks_a_limit_refuses_the_pack() {
 
 #[test]
 fn icon_files_past_the_total_limit_refuse_the_pack() {
-    let junk = [0u8; 127 * 1024];
+    let junk = vec![0u8; 127 * 1024];
     let mut bytes = png(16, RED);
     bytes.extend_from_slice(&junk);
     let mut files = MemoryFiles::new();
@@ -332,7 +332,7 @@ fn a_directory_source_does_not_follow_a_link_out_of_the_folder() {
 
 static BUILT_IN_FILES: [(&str, &[u8]); 0] = [];
 static BUILT_IN: [BuiltinPack; 1] = [BuiltinPack {
-    manifest: br##"{"format":1,"id":"built-in-one","name":"Built In One","version":"1","modes":["light","dark"]}"##,
+    manifest: br#"{"format":1,"id":"built-in-one","name":"Built In One","version":"1","modes":["light","dark"]}"#,
     files: &BUILT_IN_FILES,
 }];
 

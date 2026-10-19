@@ -915,6 +915,10 @@ pub struct App {
     options: OptionsHandle,
     /// What the options resolved to this frame.
     resolved: Arc<AppOptions>,
+    /// The theme packs found and the one in force.
+    packs: ca_ui::pack::PackHost,
+    /// A theme pack sets the egui theme instead of the system.
+    pack_sets_theme: bool,
     /// The options dialog, while it is open.
     options_dialog: Option<OptionsDialog>,
     /// The restore factory defaults wizard, while it is open.
@@ -1069,6 +1073,11 @@ impl App {
             store,
             options: OptionsHandle::open_in(settings_directory.clone(), Arc::new(|| {})),
             resolved: Arc::new(AppOptions::default()),
+            packs: ca_ui::pack::PackHost::new(
+                settings_directory.join("packs"),
+                ca_ui::pack::BUILTIN,
+            ),
+            pack_sets_theme: false,
             options_dialog: None,
             restore: None,
             tab_sessions: Vec::new(),
@@ -1470,14 +1479,44 @@ impl App {
     ///
     /// The dialog's own copy wins while a preview is asked for, so a color
     /// change is judged in the open views before it is committed.
-    fn resolve_options(&self, ctx: &egui::Context) -> AppOptions {
+    ///
+    /// The selected theme pack, once loaded, adds its colors under the stored
+    /// ones and may fix the mode. While it loads, the previous look stays.
+    fn resolve_options(&mut self, ctx: &egui::Context) -> AppOptions {
         let stored = match self.options_dialog.as_ref() {
             Some(dialog) if dialog.previews() => dialog.options().clone(),
             _ => self.options.options_or_default(),
         };
-        let variant =
-            Variant::from_dark_mode(stored.appearance.wants_dark(ctx.style().visuals.dark_mode));
-        AppOptions::resolve(stored, variant, self.policies)
+        let pack = self.packs.update(ctx, &stored.appearance.theme_pack);
+        let system_dark = if self.pack_sets_theme {
+            ctx.system_theme()
+                .map_or(ctx.style().visuals.dark_mode, |theme| {
+                    theme == egui::Theme::Dark
+                })
+        } else {
+            ctx.style().visuals.dark_mode
+        };
+        let wants_dark = stored.appearance.wants_dark(system_dark);
+        let dark = pack
+            .as_ref()
+            .map_or(wants_dark, |pack| pack.modes().dark_for(wants_dark));
+        if pack.is_some() {
+            ctx.set_theme(if dark {
+                egui::Theme::Dark
+            } else {
+                egui::Theme::Light
+            });
+            self.pack_sets_theme = true;
+        } else if self.pack_sets_theme {
+            ctx.set_theme(egui::ThemePreference::System);
+            self.pack_sets_theme = false;
+        }
+        AppOptions::resolve_with_pack(
+            stored,
+            Variant::from_dark_mode(dark),
+            self.policies,
+            pack.as_ref().map(|pack| pack.colors()),
+        )
     }
 
     /// Take what the options dialog produced.

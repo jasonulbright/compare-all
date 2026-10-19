@@ -625,4 +625,16 @@ mod tests {
         appearance.theme = ThemeChoice::from_id("light");
         assert!(!appearance.wants_dark(true));
     }
+
+    #[test]
+    fn the_theme_pack_is_stored_by_identifier_and_defaults_to_none() {
+        let appearance = AppearanceOptions::default();
+        assert_eq!(appearance.theme_pack, "");
+        let read: AppearanceOptions = serde_json::from_str(r#"{"themePack":"sample"}"#).unwrap();
+        assert_eq!(read.theme_pack, "sample");
+        let written = serde_json::to_value(&read).unwrap();
+        assert_eq!(written["themePack"], "sample");
+        let older: AppearanceOptions = serde_json::from_str("{}").unwrap();
+        assert_eq!(older.theme_pack, "");
+    }
 }

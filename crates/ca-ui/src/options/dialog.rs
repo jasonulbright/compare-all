@@ -434,6 +434,9 @@ impl OptionsDialog {
                 if page.name == "Archive Types" {
                     crate::widgets::wrapped_text(ui, ARCHIVE_PAGE_NOTE);
                 }
+                if page.name == "Appearance" {
+                    self.pack_body(ui);
+                }
             }
             PageKind::Colors => {
                 ui.separator();
@@ -442,6 +445,59 @@ impl OptionsDialog {
             PageKind::Commands => self.commands_body(ui),
             PageKind::Toolbars => self.toolbars_body(ui),
             PageKind::OpenWith => self.open_with_body(ui),
+        }
+    }
+
+    /// The theme pack list: one button per usable pack, named by the pack.
+    fn pack_body(&mut self, ui: &mut egui::Ui) {
+        let catalog = crate::pack::catalog(ui.ctx());
+        ui.separator();
+        ui.label(egui::RichText::new("Theme pack").strong());
+        if !catalog.scanned {
+            ui.label("Looking for theme packs.");
+            return;
+        }
+        let current = self.edited.appearance.theme_pack.clone();
+        let mut chosen: Option<String> = None;
+        for entry in &catalog.entries {
+            ui.horizontal_wrapped(|ui| {
+                if let Some(problem) = &entry.problem {
+                    ui.add_enabled(false, egui::Label::new(entry.name.as_str()));
+                    crate::widgets::wrapped_text(ui, &format!("Not usable. {problem}"));
+                    return;
+                }
+                if ui
+                    .selectable_label(entry.id == current, entry.name.as_str())
+                    .clicked()
+                {
+                    chosen = Some(entry.id.clone());
+                }
+                let source = if entry.built_in {
+                    "built in"
+                } else {
+                    "installed"
+                };
+                ui.weak(format!("{}, {source}", entry.modes.label()));
+            });
+        }
+        if !current.is_empty() && catalog.find(&current).is_none_or(|e| e.problem.is_some()) {
+            crate::widgets::wrapped_text(
+                ui,
+                "The selected theme pack is not usable. The default look is in use.",
+            );
+        } else if let Some(entry) = catalog.find(&current) {
+            if !entry.modes.offers_choice() {
+                crate::widgets::wrapped_text(
+                    ui,
+                    &format!(
+                        "This pack is {}. The Theme setting does not apply.",
+                        entry.modes.label()
+                    ),
+                );
+            }
+        }
+        if let Some(id) = chosen {
+            self.edited.appearance.theme_pack = id;
         }
     }
 
