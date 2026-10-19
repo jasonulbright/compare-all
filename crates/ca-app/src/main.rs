@@ -167,7 +167,12 @@ fn run_window(
                     return Err("the start data was already used".into());
                 };
                 renderer::record_active(chosen);
-                eprintln!("{}", renderer::support_line());
+                ca_app::startup::mark_window_started();
+                std::thread::spawn(|| {
+                    let line = renderer::support_line();
+                    eprintln!("{line}");
+                    drop(ca_app::startup::write_report(&line));
+                });
                 let repaint = creation.egui_ctx.clone();
                 let variant = Variant::from_dark_mode(creation.egui_ctx.style().visuals.dark_mode);
                 let context = ViewContext {
@@ -205,10 +210,20 @@ fn run_window(
     }
 }
 
-/// Write `text` to the error stream and show it in a message box, which needs
-/// no graphics driver.
+/// Write `text` to the error stream and to the start-up report file, then
+/// show it in a message box, which needs no graphics driver.
+///
+/// The message box can fail to appear, such as on Linux without a dialog
+/// program, so the error stream names the file that holds the text.
 fn report_fatal(text: &str) {
     eprintln!("{text}");
+    match ca_app::startup::write_report(text) {
+        Ok(path) => eprintln!("The same text is in {}", path.display()),
+        Err(error) => eprintln!(
+            "The text could not be written to {}: {error}",
+            ca_app::startup::report_path().display()
+        ),
+    }
     rfd::MessageDialog::new()
         .set_level(rfd::MessageLevel::Error)
         .set_title("Compare All")
@@ -216,11 +231,19 @@ fn report_fatal(text: &str) {
         .show();
 }
 
-/// A panic ends the process without unwinding, so the hook is the only place
-/// that can tell the user why the window is gone.
+/// The default hook still prints the panic. The message box applies only
+/// where nothing else tells the user why the program stops: before the window
+/// started, or in a build that aborts on a panic.
 fn install_panic_hook() {
-    std::panic::set_hook(Box::new(|info| {
-        report_fatal(&renderer::panic_message(&info.to_string()));
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        previous(info);
+        if ca_app::startup::shows_fatal_box(
+            ca_app::startup::window_started(),
+            cfg!(panic = "abort"),
+        ) {
+            report_fatal(&renderer::panic_message(&info.to_string()));
+        }
     }));
 }
 

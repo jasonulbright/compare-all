@@ -14,6 +14,7 @@ pub mod registry;
 pub mod renderer;
 mod session_save;
 pub mod shell;
+pub mod startup;
 pub mod tree;
 pub mod update;
 
