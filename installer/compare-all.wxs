@@ -15,8 +15,13 @@
       Compressed="yes"
       InstallerVersion="500">
 
-    <!-- A later version replaces an earlier one of the same scope in place. -->
+    <!--
+      A later version replaces an earlier one of the same scope in place. The
+      earlier product is removed inside the install transaction, so a failed
+      install restores it with its files, including the repair source below.
+    -->
     <MajorUpgrade
+        Schedule="afterInstallInitialize"
         DowngradeErrorMessage="A newer version of Compare All is already installed. Remove it first to install this version."
         AllowSameVersionUpgrades="no" />
 
@@ -47,7 +52,7 @@
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="INSTALLFOLDER" Name="compare-all" />
       <Directory Id="PACKAGEROOT" Name="compare-all-package">
-        <Directory Id="PACKAGEFOLDER" Name="$(var.FullVersion)" />
+        <Directory Id="PACKAGEFOLDER" Name="$(var.ProductVersion)" />
       </Directory>
     </StandardDirectory>
     <StandardDirectory Id="ProgramMenuFolder" />
@@ -83,7 +88,9 @@
       <!--
         The automatic update keeps the installer copy of its version here, the
         source that Windows Installer uses for a repair. Only this version's
-        folder is removed, so an upgrade does not remove the copy it runs from.
+        folder is removed, so an upgrade does not remove the copy it runs from. The
+        folder name is the ProductVersion, which the updater reads from the
+        verified package.
       -->
       <Component Id="PackageCopy" Directory="PACKAGEFOLDER" Condition="ALLUSERS=1" Bitness="always64">
         <RegistryValue Root="HKMU" Key="Software\compare-all" Name="PackageFolder" Type="string" Value="[PACKAGEFOLDER]" KeyPath="yes" />
