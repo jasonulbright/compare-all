@@ -1,5 +1,77 @@
 [
   {
+    "version": "0.3.1",
+    "name": "gpu-alloc-types",
+    "sha256": "f774bf68151714985324d90adbd59e8f271b7ba518608d871b6ba16464692879",
+    "kind": "license",
+    "file": "f774bf68151714985324d90adbd59e8f271b7ba518608d871b6ba16464692879.txt",
+    "source": "https://raw.githubusercontent.com/zakarumych/gpu-alloc/7ddd1fe576fcfc503347eb97e476a47581479f22/license/MIT"
+  },
+  {
+    "version": "0.6.2",
+    "name": "gpu-alloc",
+    "sha256": "f774bf68151714985324d90adbd59e8f271b7ba518608d871b6ba16464692879",
+    "kind": "license",
+    "file": "f774bf68151714985324d90adbd59e8f271b7ba518608d871b6ba16464692879.txt",
+    "source": "https://raw.githubusercontent.com/zakarumych/gpu-alloc/61020bdcb4eb04fca6bbf748aeb9570e859236e0/license/MIT"
+  },
+  {
+    "version": "0.2.0",
+    "name": "gpu-descriptor-types",
+    "sha256": "5226e27d5fbc683db56c52853cdb9d15b69abadb525a60f95c862c2dbd77cdc8",
+    "kind": "license",
+    "file": "5226e27d5fbc683db56c52853cdb9d15b69abadb525a60f95c862c2dbd77cdc8.txt",
+    "source": "https://raw.githubusercontent.com/zakarumych/gpu-descriptor/9f2fb9546591322e7b77ee1e79385e01effd85e4/license/MIT"
+  },
+  {
+    "version": "0.3.2",
+    "name": "gpu-descriptor",
+    "sha256": "5226e27d5fbc683db56c52853cdb9d15b69abadb525a60f95c862c2dbd77cdc8",
+    "kind": "license",
+    "file": "5226e27d5fbc683db56c52853cdb9d15b69abadb525a60f95c862c2dbd77cdc8.txt",
+    "source": "https://raw.githubusercontent.com/zakarumych/gpu-descriptor/bb28b4e55b742e0ea3e7a0968e7ee6287ba0e06a/license/MIT"
+  },
+  {
+    "version": "0.0.6",
+    "name": "malloc_buf",
+    "sha256": "aced7b57e474a63edb5a724954222bf7659c01ceef0e648a03af799582991db7",
+    "kind": "license",
+    "file": "aced7b57e474a63edb5a724954222bf7659c01ceef0e648a03af799582991db7.txt",
+    "source": "https://raw.githubusercontent.com/SSheldon/malloc_buf/d9a3e539642bd90e07df458d226b19cdfa606863/LICENSE"
+  },
+  {
+    "version": "24.0.0",
+    "name": "naga",
+    "sha256": "c7fea58d1cfe49634cd92e54fc10a9d871f4b275321a4cd8c09e449122caaeb4",
+    "kind": "license",
+    "file": "c7fea58d1cfe49634cd92e54fc10a9d871f4b275321a4cd8c09e449122caaeb4.txt",
+    "source": "https://raw.githubusercontent.com/gfx-rs/wgpu/dc1e50e08cd4a5c8d6c3e8a180e93535d40bec4a/LICENSE.MIT"
+  },
+  {
+    "version": "24.0.4",
+    "name": "wgpu-hal",
+    "sha256": "c7fea58d1cfe49634cd92e54fc10a9d871f4b275321a4cd8c09e449122caaeb4",
+    "kind": "license",
+    "file": "c7fea58d1cfe49634cd92e54fc10a9d871f4b275321a4cd8c09e449122caaeb4.txt",
+    "source": "https://raw.githubusercontent.com/gfx-rs/wgpu/993fc39b07e8a4418a15043265298d7bc016d059/LICENSE.MIT"
+  },
+  {
+    "version": "0.5.1",
+    "name": "type-map",
+    "sha256": "b47fb719a40d9ef9c8e3be525c41ce129c46d613cfc96a91bddd7c19dcebf7a1",
+    "kind": "license",
+    "file": "b47fb719a40d9ef9c8e3be525c41ce129c46d613cfc96a91bddd7c19dcebf7a1.txt",
+    "source": "https://raw.githubusercontent.com/kardeiz/type-map/d3ab3e642736d87f3fa8b1e6c8f13a93fcfb72e1/LICENSE-MIT"
+  },
+  {
+    "version": "0.1.6",
+    "name": "block",
+    "sha256": "24df2f33b48c9e756a4f864f882c1ab07a159b6c2b790f45af2e8162499b6719",
+    "kind": "declaration",
+    "file": "24df2f33b48c9e756a4f864f882c1ab07a159b6c2b790f45af2e8162499b6719.txt",
+    "source": "https://raw.githubusercontent.com/SSheldon/rust-block/47178790cfc9d4a8b092051d8b413b78bd31254a/Cargo.toml"
+  },
+  {
     "version": "0.5.1",
     "name": "block2",
     "sha256": "e353f37b12aefbb9f9b29490e837cfee05d9bda70804b3562839a3285c1df1e5",

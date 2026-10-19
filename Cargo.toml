@@ -65,7 +65,7 @@ imara-diff = "0.1"
 blake3 = "1"
 jwalk = "0.8"
 clap = { version = "4", features = ["derive"] }
-eframe = "0.31"
+eframe = { version = "0.31", features = ["wgpu"] }
 egui = "0.31"
 resvg = { version = "0.48.1", default-features = false }
 ropey = { version = "1", default-features = false }
