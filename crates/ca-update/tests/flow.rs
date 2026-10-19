@@ -1917,10 +1917,12 @@ fn the_elevated_step_installs_its_own_checked_copy_and_keeps_it() {
     };
     let staged_before = folder_files(staging.dir());
     let seen = Mutex::new(None);
+    let packages = tempfile::tempdir().unwrap();
+    let packages = packages.path().join("pkg");
     let code = install_from(
         &staging,
         work.path(),
-        work.path(),
+        &packages,
         Some(&program),
         &checks,
         &|command| {
@@ -1932,12 +1934,15 @@ fn the_elevated_step_installs_its_own_checked_copy_and_keeps_it() {
     );
     assert_eq!(code, 0);
     let (copy, bytes, program_in_place) = seen.lock().unwrap().take().unwrap();
-    assert_eq!(copy.parent(), Some(work.path()));
+    assert_eq!(copy.parent(), Some(packages.join("26.10.7").as_path()));
     assert_eq!(bytes, msi_bytes());
     // The install folder holds a program file at every moment.
     assert_eq!(program_in_place.as_deref(), Some(b"old exe".as_slice()));
     assert_eq!(names(install.path()), ["compare-all.exe"]);
     assert!(copy.exists());
+    assert_eq!(names(&packages), ["26.10.7"]);
+    // Only the set-aside program file is left in the work folder.
+    assert_eq!(std::fs::read_dir(work.path()).unwrap().count(), 1);
     // The elevated step writes nothing in the staging folder of the user.
     assert_eq!(folder_files(staging.dir()), staged_before);
     assert!(staging.asset_path(&record).exists());
@@ -1957,10 +1962,12 @@ fn a_staged_installer_replaced_after_the_copy_is_not_what_is_installed() {
         running: &running(),
     };
     let installed = Mutex::new(Vec::new());
+    let packages = tempfile::tempdir().unwrap();
+    let packages = packages.path().join("pkg");
     let code = install_from(
         &staging,
         work.path(),
-        work.path(),
+        &packages,
         Some(&program),
         &checks,
         &|command| {
@@ -1987,10 +1994,12 @@ fn a_failed_install_puts_the_program_file_back() {
         signer_name: SIGNER,
         running: &running(),
     };
+    let packages = tempfile::tempdir().unwrap();
+    let packages = packages.path().join("pkg");
     let code = install_from(
         &staging,
         work.path(),
-        work.path(),
+        &packages,
         Some(&program),
         &checks,
         &|_| Some(1603),
@@ -1998,48 +2007,183 @@ fn a_failed_install_puts_the_program_file_back() {
     assert_eq!(code, 1603);
     assert_eq!(std::fs::read(&program).unwrap(), b"old exe");
     assert_eq!(names(install.path()), ["compare-all.exe"]);
-    // Only the installer copy is left; the caller removes its folder.
-    assert_eq!(names(work.path()), [msi_name(NEXT)]);
+    // A failed install leaves no installer copy.
+    assert!(!packages.exists());
+    assert_eq!(std::fs::read_dir(work.path()).unwrap().count(), 0);
+}
+
+fn installer_version(text: &str) -> ca_update::InstallerVersion {
+    ca_update::InstallerVersion::parse(text).unwrap()
+}
+
+/// A package folder of the installed build, `26.10.1`, with a repair source.
+fn installed_package_folder(packages: &Path) -> std::path::PathBuf {
+    let folder = packages.join("26.10.1");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join("source.msi"), b"installed source").unwrap();
+    folder
 }
 
 #[test]
 fn a_package_folder_keeps_only_the_installed_version() {
-    use ca_update::install::{finish_package_folder, PACKAGE_FOLDER};
+    use ca_update::install::{remove_other_package_folders, remove_package_folder};
     let parent = tempfile::tempdir().unwrap();
-    let root = parent.path().join(PACKAGE_FOLDER);
-    let (old, new) = ("2026.10.19.0007", "2026.10.19.0008");
-    for version in [old, new] {
-        std::fs::create_dir_all(root.join(version)).unwrap();
-        std::fs::write(root.join(version).join("a.msi"), b"x").unwrap();
+    let packages = parent.path().join("packages");
+    for name in ["26.10.7", "26.10.8", "26.10.9"] {
+        std::fs::create_dir_all(packages.join(name)).unwrap();
+        std::fs::write(packages.join(name).join("a.msi"), b"x").unwrap();
     }
-    let version = Version::parse(new).unwrap();
-    finish_package_folder(parent.path(), &version, false);
-    assert!(root.join(old).exists());
-    assert!(!root.join(new).exists());
-    std::fs::create_dir_all(root.join(new)).unwrap();
-    finish_package_folder(parent.path(), &version, true);
-    assert!(!root.join(old).exists());
-    assert!(root.join(new).exists());
-    std::fs::remove_dir_all(root.join(new)).unwrap();
-    finish_package_folder(parent.path(), &version, false);
-    assert!(!root.exists());
+    std::fs::write(packages.join("stray.msi"), b"x").unwrap();
+    remove_package_folder(&packages, &installer_version("26.10.9"));
+    assert_eq!(names(&packages), ["26.10.7", "26.10.8", "stray.msi"]);
+    remove_other_package_folders(&packages, &installer_version("26.10.8"));
+    assert_eq!(names(&packages), ["26.10.8"]);
+    remove_package_folder(&packages, &installer_version("26.10.8"));
+    assert!(!packages.exists());
+    // Nothing to remove is not an error.
+    remove_other_package_folders(&packages, &installer_version("26.10.8"));
+    remove_package_folder(&packages, &installer_version("26.10.8"));
 }
 
-#[cfg(windows)]
 #[test]
 fn a_package_folder_is_open_to_administrators_and_the_system_only() {
-    use ca_update::install::{prepare_package_folder, work_folder_access_is_exact, PACKAGE_FOLDER};
+    use ca_update::install::prepare_package_folder;
     let parent = tempfile::tempdir().unwrap();
-    let version = Version::parse("2026.10.19.0008").unwrap();
-    let stale = parent.path().join(PACKAGE_FOLDER).join("2026.10.19.0008");
+    let packages = parent.path().join("packages");
+    let stale = packages.join("26.10.8");
     std::fs::create_dir_all(&stale).unwrap();
     std::fs::write(stale.join("left.msi"), b"x").unwrap();
-    let folder = prepare_package_folder(parent.path(), &version).unwrap();
+    let folder = prepare_package_folder(&packages, &installer_version("26.10.8")).unwrap();
     assert_eq!(folder, stale);
     assert_eq!(std::fs::read_dir(&folder).unwrap().count(), 0);
-    for path in [folder.as_path(), folder.parent().unwrap()] {
+    #[cfg(windows)]
+    for path in [folder.as_path(), packages.as_path()] {
         let read = ca_update::access::read_sddls(&[path]).unwrap();
-        assert!(work_folder_access_is_exact(&read[0]), "{read:?}");
+        assert!(
+            ca_update::install::work_folder_access_is_exact(&read[0]),
+            "{read:?}"
+        );
+    }
+}
+
+/// A change to the staged files.
+type Tamper = fn(&Staging);
+
+/// The package folder of the installed build keeps its repair source when a
+/// staged package or record names the installed build.
+#[test]
+fn a_staged_package_of_the_installed_version_leaves_its_package_folder_alone() {
+    use ca_update::install::{install_from, Checks, REFUSED};
+    let signer = FakeSigner::signed_by(SIGNER);
+    let current = running();
+    let cases: [(&str, Tamper); 3] = [
+        ("older package under a newer record", older_package),
+        ("record of the installed version", |staging| {
+            restage(staging, CURRENT, &msi_package(UPGRADE_CODE, "26.10.1"));
+        }),
+        (
+            "record and package of the installed product version",
+            |staging| {
+                restage(
+                    staging,
+                    "2026.10.20.0001",
+                    &msi_package(UPGRADE_CODE, "26.10.1"),
+                );
+            },
+        ),
+    ];
+    for (name, tamper) in cases {
+        let (_server, _keep, staging, work, _install) = elevated_setup();
+        tamper(&staging);
+        let parent = tempfile::tempdir().unwrap();
+        let packages = parent.path().join("packages");
+        let installed = installed_package_folder(&packages);
+        let checks = Checks {
+            signer: &signer,
+            signer_name: SIGNER,
+            running: &current,
+        };
+        let code = install_from(&staging, work.path(), &packages, None, &checks, &|_| {
+            Some(0)
+        });
+        assert_eq!(code, REFUSED, "{name}");
+        assert_eq!(names(&packages), ["26.10.1"], "{name}");
+        assert_eq!(
+            std::fs::read(installed.join("source.msi")).unwrap(),
+            b"installed source",
+            "{name}"
+        );
+    }
+}
+
+/// The folder takes its name from the checked package. A record that only
+/// agrees with the package on year, month and build does not name it.
+#[test]
+fn the_package_folder_is_named_by_the_checked_package() {
+    use ca_update::install::{install_from, Checks};
+    let signer = FakeSigner::signed_by(SIGNER);
+    let (_server, _keep, staging, work, _install) = elevated_setup();
+    restage(&staging, "2026.10.02.0007", &msi_bytes());
+    let parent = tempfile::tempdir().unwrap();
+    let packages = parent.path().join("packages");
+    let checks = Checks {
+        signer: &signer,
+        signer_name: SIGNER,
+        running: &running(),
+    };
+    let copy = Mutex::new(None);
+    let code = install_from(
+        &staging,
+        work.path(),
+        &packages,
+        None,
+        &checks,
+        &|command| {
+            *copy.lock().unwrap() = Some(command.get_args().nth(1).unwrap().to_owned());
+            Some(0)
+        },
+    );
+    assert_eq!(code, 0);
+    assert_eq!(names(&packages), ["26.10.7"]);
+    let copy = copy.lock().unwrap().take().unwrap();
+    assert!(Path::new(&copy).starts_with(packages.join("26.10.7")));
+}
+
+/// After a success only the folder of the new version stays. After a
+/// failure only the folder of the installed version stays.
+#[test]
+fn the_installer_copy_of_the_installed_version_stays_until_a_new_install_succeeds() {
+    use ca_update::install::{install_from, Checks};
+    let signer = FakeSigner::signed_by(SIGNER);
+    for (result, expected) in [(1603, "26.10.1"), (0, "26.10.7")] {
+        let (_server, _keep, staging, work, _install) = elevated_setup();
+        let parent = tempfile::tempdir().unwrap();
+        let packages = parent.path().join("packages");
+        installed_package_folder(&packages);
+        // A folder that a crashed step left.
+        std::fs::create_dir_all(packages.join("26.10.5")).unwrap();
+        let checks = Checks {
+            signer: &signer,
+            signer_name: SIGNER,
+            running: &running(),
+        };
+        let seen = Mutex::new(Vec::new());
+        let code = install_from(&staging, work.path(), &packages, None, &checks, &|_| {
+            *seen.lock().unwrap() = names(&packages);
+            Some(result)
+        });
+        assert_eq!(code, result);
+        // The installer runs while the installed source still exists.
+        assert!(seen.lock().unwrap().contains(&"26.10.1".to_owned()));
+        if result == 0 {
+            assert_eq!(names(&packages), [expected]);
+        } else {
+            assert_eq!(names(&packages), ["26.10.1", "26.10.5"]);
+            assert_eq!(
+                std::fs::read(packages.join("26.10.1").join("source.msi")).unwrap(),
+                b"installed source"
+            );
+        }
     }
 }
 
@@ -2136,10 +2280,12 @@ fn the_install_folder_keeps_a_program_file_the_installer_can_replace() {
             )
         };
         let seen = Mutex::new(None);
+        let packages = tempfile::tempdir().unwrap();
+        let packages = packages.path().join("pkg");
         let code = install_from(
             &staging,
             work.path(),
-            work.path(),
+            &packages,
             Some(&program),
             &checks,
             &|_| {
@@ -2277,10 +2423,12 @@ fn an_install_whose_program_cannot_be_set_aside_does_not_start() {
         running: &running(),
     };
     let started = AtomicBool::new(false);
+    let packages = tempfile::tempdir().unwrap();
+    let packages = packages.path().join("pkg");
     let code = install_from(
         &staging,
         work.path(),
-        work.path(),
+        &packages,
         Some(&program),
         &checks,
         &|_| {
@@ -2291,6 +2439,7 @@ fn an_install_whose_program_cannot_be_set_aside_does_not_start() {
     assert_eq!(code, KEPT);
     assert!(!started.load(Ordering::SeqCst));
     assert_eq!(std::fs::read(&program).unwrap(), b"old exe");
+    assert!(!packages.exists());
     assert_eq!(std::fs::read_dir(work.path()).unwrap().count(), 0);
 
     let record = staging.read_record().unwrap();
@@ -2328,10 +2477,12 @@ fn an_update_put_off_at_every_close_ends_in_the_warning() {
         running: &running(),
     };
     let held = pin(&program, true);
+    let packages = tempfile::tempdir().unwrap();
+    let packages = packages.path().join("pkg");
     let code = install_from(
         &staging,
         work.path(),
-        work.path(),
+        &packages,
         Some(&program),
         &checks,
         &|_| Some(0),
@@ -2553,10 +2704,12 @@ fn the_elevated_step_refuses_a_staged_installer_that_fails_a_check() {
             running: installed,
         };
         let ran = AtomicBool::new(false);
+        let packages = tempfile::tempdir().unwrap();
+        let packages = packages.path().join("pkg");
         let code = install_from(
             &staging,
             work.path(),
-            work.path(),
+            &packages,
             Some(&program),
             &checks,
             &|_| {
@@ -2569,6 +2722,7 @@ fn the_elevated_step_refuses_a_staged_installer_that_fails_a_check() {
         assert_eq!(std::fs::read(&program).unwrap(), b"old exe", "{name}");
         assert_eq!(folder_files(staging.dir()), before, "{name}");
         assert_eq!(std::fs::read_dir(work.path()).unwrap().count(), 0, "{name}");
+        assert!(!packages.exists(), "{name}");
     }
 }
 
@@ -2716,10 +2870,12 @@ fn the_elevated_step_reads_no_staged_file_through_a_link() {
             signer_name: SIGNER,
             running: &running(),
         };
+        let packages = tempfile::tempdir().unwrap();
+        let packages = packages.path().join("pkg");
         let code = install_from(
             &staging,
             work.path(),
-            work.path(),
+            &packages,
             Some(&program),
             &checks,
             &|_| Some(0),
