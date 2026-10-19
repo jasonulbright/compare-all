@@ -1,3 +1,15 @@
+# v2026.10.19.0008
+
+## 3 administrator policies now take effect
+
+### Fixes
+
+- Read administrator policies from the registry or /etc/compare-all.conf at startup.
+- Apply administrator policies to command-line scripts.
+- Turn every restriction on when an existing policy source cannot be read.
+
+Full changelog: CHANGELOG.md
+
 # v2026.10.19.0007
 
 ## 9 dependency security advisories fixed
