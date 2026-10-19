@@ -203,7 +203,13 @@ fn run(
     match read_and_merge(paths, options, decoding, cancel, &progress) {
         Ok(Some(mut data)) => {
             if let Some(earlier) = earlier {
-                data.pairing = Some(data.model.pair_with(&earlier.layout, earlier.swapped));
+                let Some(pairing) =
+                    data.model
+                        .pair_with_cancellable(&earlier.layout, earlier.swapped, cancel)
+                else {
+                    return;
+                };
+                data.pairing = Some(pairing);
             }
             emitter.send(MergeMessage::Ready(Box::new(data)));
         }
