@@ -236,6 +236,8 @@ impl Default for FontOptions {
 pub struct AppearanceOptions {
     /// Which color table the window uses.
     pub theme: ThemeChoice,
+    /// Identifier of the theme pack in use. Empty selects the built-in look.
+    pub theme_pack: String,
     /// Apply a pending color or font change to the open views at once.
     pub enable_preview: bool,
     /// The colors each view kind states for itself.

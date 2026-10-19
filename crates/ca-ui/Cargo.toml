@@ -24,6 +24,7 @@ serde_json.workspace = true
 egui = { workspace = true, features = ["accesskit"] }
 rfd.workspace = true
 resvg.workspace = true
+image = { version = "0.25", default-features = false, features = ["png"] }
 unicode-segmentation.workspace = true
 
 [dev-dependencies]

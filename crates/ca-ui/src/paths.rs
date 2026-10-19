@@ -73,6 +73,12 @@ pub fn journal_directory() -> PathBuf {
     settings_directory().join("journals")
 }
 
+/// Folder the installed theme packs live in, one subfolder per pack.
+#[must_use]
+pub fn packs_directory() -> PathBuf {
+    settings_directory().join("packs")
+}
+
 /// Folder the copies a tab reads from are made in, such as a file extracted
 /// from an archive.
 ///
