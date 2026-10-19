@@ -290,8 +290,22 @@ mod tests {
         assert!(root.path().join("from-an-older-build").is_dir());
         assert!(root.path().join("loose.txt").is_file());
         drop(held);
-        assert_eq!(super::sweep_temporary_in(root.path(), own), 1);
+        assert_eq!(sweep_after_release(root.path(), own), 1);
         assert!(!live.exists());
+    }
+
+    /// A child process that another test forks inherits the open lock file
+    /// until it executes its program, and the lock outlives the close in this
+    /// process for that time. The sweep is repeated until the lock is gone.
+    fn sweep_after_release(root: &std::path::Path, own: &str) -> usize {
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let deleted = super::sweep_temporary_in(root, own);
+            if deleted > 0 || std::time::Instant::now() >= end {
+                return deleted;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     #[test]

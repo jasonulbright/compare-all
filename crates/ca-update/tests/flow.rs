@@ -1561,6 +1561,20 @@ fn an_elevation_that_cannot_start_is_a_declined_elevation() {
 }
 
 #[test]
+fn a_restore_that_failed_gives_a_reason_with_the_system_error() {
+    use ca_update::apply::installer_result;
+    use ca_update::install::{not_restored_code, not_restored_os_error};
+    let code = not_restored_code(&std::io::Error::from_raw_os_error(5));
+    assert_eq!(not_restored_os_error(code), Some(5));
+    let reason = installer_result(Some(code)).unwrap_err();
+    assert!(reason.contains("system error 5"), "{reason}");
+    let none = not_restored_code(&std::io::Error::other("no code"));
+    assert_eq!(not_restored_os_error(none), Some(0));
+    assert_eq!(not_restored_os_error(1603), None);
+    assert_eq!(not_restored_os_error(ca_update::install::KEPT), None);
+}
+
+#[test]
 fn every_elevation_that_did_not_happen_keeps_the_update() {
     use ca_update::apply::{installer_result, ELEVATION_DECLINED};
     let declined = Err(ELEVATION_DECLINED.to_owned());
@@ -2004,7 +2018,12 @@ fn a_failed_install_puts_the_program_file_back() {
         &checks,
         &|_| Some(1603),
     );
-    assert_eq!(code, 1603);
+    assert_eq!(
+        code,
+        1603,
+        "restore os error {:?}",
+        ca_update::install::not_restored_os_error(code)
+    );
     assert_eq!(std::fs::read(&program).unwrap(), b"old exe");
     assert_eq!(names(install.path()), ["compare-all.exe"]);
     // A failed install leaves no installer copy.
@@ -2297,16 +2316,70 @@ fn the_install_folder_keeps_a_program_file_the_installer_can_replace() {
         );
         let during = seen.lock().unwrap().take();
         let after = state();
+        let report = if code == result && after == (true, result != 0) {
+            String::new()
+        } else {
+            restore_report(code, &program, work.path(), &mut child)
+        };
         let _ = child.kill();
         let _ = child.wait();
-        assert_eq!(code, result);
+        assert_eq!(code, result, "{report}");
         assert_eq!(during, Some((true, false)), "{result}");
         assert_eq!(names(install.path()), ["compare-all.exe"], "{result}");
         // After a success the installer has replaced the unused copy and the
         // running file is in the work folder; after a failure the running
         // file is back under its name.
-        assert_eq!(after, (true, result != 0), "{result}");
+        assert_eq!(after, (true, result != 0), "{result}: {report}");
     }
+}
+
+/// What a failed restore of the running program file left: the decoded
+/// restore error and, for the install folder and the work folder, the
+/// entries, the write-open result and the access list.
+#[cfg(windows)]
+fn restore_report(
+    code: i32,
+    program: &Path,
+    work: &Path,
+    child: &mut std::process::Child,
+) -> String {
+    use std::fmt::Write as _;
+    let mut report = format!("exit code {code:#x}");
+    if let Some(os) = ca_update::install::not_restored_os_error(code) {
+        let error = std::io::Error::from_raw_os_error(i32::from(os));
+        let _ = write!(
+            report,
+            "; restore error {:?}, os {os}: {error}",
+            error.kind()
+        );
+    }
+    let _ = write!(report, "; child {:?}", child.try_wait());
+    for folder in [program.parent().unwrap_or(program), work] {
+        let mut entries = Vec::new();
+        for entry in std::fs::read_dir(folder).into_iter().flatten().flatten() {
+            let opened = std::fs::OpenOptions::new().write(true).open(entry.path());
+            entries.push(format!(
+                "{} len {:?} write-open {:?}",
+                entry.file_name().to_string_lossy(),
+                entry.metadata().map(|m| m.len()),
+                opened.map(|_| ()).map_err(|e| (e.kind(), e.raw_os_error())),
+            ));
+        }
+        let _ = write!(report, "; {}: {entries:?}", folder.display());
+        if let Ok(root) = ca_update::system::system_root() {
+            if let Ok(output) = ca_io::host_command::host_command(root.join(r"System32\icacls.exe"))
+                .arg(folder)
+                .output()
+            {
+                let _ = write!(
+                    report,
+                    "; icacls {}",
+                    String::from_utf8_lossy(&output.stdout).replace(['\r', '\n'], " ")
+                );
+            }
+        }
+    }
+    report
 }
 
 /// A scanner can hold the unused copy without delete sharing for longer than
@@ -2350,13 +2423,21 @@ fn a_failed_install_waits_out_a_long_hold_on_the_unused_program_copy() {
         },
     );
     let restored = in_use(&program);
+    let report = if restored && code == 1603 {
+        String::new()
+    } else {
+        restore_report(code, &program, work.path(), &mut child)
+    };
     let _ = child.kill();
     let _ = child.wait();
     if let Some(thread) = holder.lock().unwrap().take() {
         thread.join().unwrap();
     }
-    assert_eq!(code, 1603);
-    assert!(restored, "the running file is not back under its name");
+    assert_eq!(code, 1603, "{report}");
+    assert!(
+        restored,
+        "the running file is not back under its name: {report}"
+    );
 }
 
 /// An interruption at any step of the set-aside leaves the complete program

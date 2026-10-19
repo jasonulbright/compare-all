@@ -268,7 +268,12 @@ pub fn installer_result(code: Option<i32>) -> Result<(), String> {
         Some(crate::install::NOT_PREPARED) => {
             Err("the install for every user could not be prepared".to_owned())
         }
-        Some(code) => Err(format!("the installer ended with code {code}")),
+        Some(code) => match crate::install::not_restored_os_error(code) {
+            Some(os) => Err(format!(
+                "the installer failed and the running program file could not be put back (system error {os})"
+            )),
+            None => Err(format!("the installer ended with code {code}")),
+        },
         None => Err("the installer was stopped".to_owned()),
     }
 }

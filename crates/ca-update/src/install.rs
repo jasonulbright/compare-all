@@ -66,6 +66,33 @@ pub const KEPT: i32 = 0x1000_0003;
 /// result.
 pub const NOT_APPLICABLE: i32 = 0x1000_0004;
 
+/// Exit code base: the installer failed and the running program file could
+/// not be put back under its name. The low 16 bits hold the operating system
+/// error of the last attempt, zero when it had none.
+pub const NOT_RESTORED: i32 = 0x1001_0000;
+
+/// The exit code for a restore that failed with `error`.
+#[must_use]
+pub fn not_restored_code(error: &std::io::Error) -> i32 {
+    let os = error
+        .raw_os_error()
+        .and_then(|raw| u16::try_from(raw).ok())
+        .unwrap_or(0);
+    NOT_RESTORED | i32::from(os)
+}
+
+/// The operating system error inside an exit code made by
+/// [`not_restored_code`]: `Some(0)` when the error had none, `None` when
+/// `code` is another code.
+#[must_use]
+pub fn not_restored_os_error(code: i32) -> Option<u16> {
+    if code & !0xFFFF == NOT_RESTORED {
+        u16::try_from(code & 0xFFFF).ok()
+    } else {
+        None
+    }
+}
+
 /// True when the install folder of `program` and `program` itself are closed
 /// to accounts other than administrators, the system and the installer
 /// service, and no such account can move the install folder away: every
@@ -273,8 +300,8 @@ fn is_inside(path: &Path, folder: &Path) -> bool {
 }
 
 /// The entry point of the elevated program. Returns the exit code: the code
-/// of the installer, [`REFUSED`], [`NOT_PREPARED`], [`KEPT`] or
-/// [`NOT_APPLICABLE`].
+/// of the installer, [`REFUSED`], [`NOT_PREPARED`], [`KEPT`],
+/// [`NOT_APPLICABLE`] or a code of [`not_restored_code`].
 #[must_use]
 pub fn install_main(staging: &Path, checks: &Checks<'_>) -> i32 {
     let Ok(program) = std::env::current_exe() else {
@@ -521,7 +548,9 @@ pub fn install_from(
         remove_package_folder(packages, &product);
         if let Some((program, moved)) = aside {
             // Replaces the unused copy; a running file may be renamed.
-            let _ = rename_retrying(&moved, program, RESTORE_ATTEMPTS);
+            if let Err(error) = rename_retrying(&moved, program, RESTORE_ATTEMPTS) {
+                return not_restored_code(&error);
+            }
         }
     }
     code.unwrap_or(NOT_PREPARED)
