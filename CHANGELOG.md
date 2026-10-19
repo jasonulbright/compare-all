@@ -1,3 +1,14 @@
+# v2026.10.19.0010
+
+## 1 new setting: Theme pack in Options > Appearance
+
+### Features
+
+- Add a Theme pack choice that sets icons, colors and light or dark mode together.
+- Load theme packs from the per-user packs folder.
+
+Full changelog: CHANGELOG.md
+
 # v2026.10.19.0009
 
 ## 2 install problems fixed: start without OpenGL 2.0, repair after an update
