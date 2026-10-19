@@ -1,3 +1,17 @@
+# v2026.10.19.0009
+
+## 2 install problems fixed: start without OpenGL 2.0, repair after an update
+
+### Fixes
+
+- Start with software drawing when OpenGL 2.0 is not available.
+- Show why the program cannot start, in a message and in startup.txt.
+- Keep a valid repair source after an automatic update for all users.
+- Keep the previous version when an upgrade fails partway.
+- Report a program file that cannot be put back after a failed install.
+
+Full changelog: CHANGELOG.md
+
 # v2026.10.19.0008
 
 ## 3 administrator policies now take effect
