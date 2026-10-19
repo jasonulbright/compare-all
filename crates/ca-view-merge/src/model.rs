@@ -1066,7 +1066,7 @@ fn align_cancellable<T: Eq + std::hash::Hash>(
         }
         while olds.start < olds.end && news.start < news.end && old[olds.start] == new[news.start] {
             handled += 1;
-            if handled % CANCEL_POLL_INTERVAL == 0 && cancel.is_cancelled() {
+            if handled.is_multiple_of(CANCEL_POLL_INTERVAL) && cancel.is_cancelled() {
                 return None;
             }
             pairs.push((olds.start, news.start));
@@ -1078,7 +1078,7 @@ fn align_cancellable<T: Eq + std::hash::Hash>(
             && old[olds.end - 1] == new[news.end - 1]
         {
             handled += 1;
-            if handled % CANCEL_POLL_INTERVAL == 0 && cancel.is_cancelled() {
+            if handled.is_multiple_of(CANCEL_POLL_INTERVAL) && cancel.is_cancelled() {
                 return None;
             }
             olds.end -= 1;
@@ -1092,14 +1092,14 @@ fn align_cancellable<T: Eq + std::hash::Hash>(
         let mut seen: HashMap<&T, (Vec<usize>, usize)> = HashMap::new();
         for index in olds.clone() {
             handled += 1;
-            if handled % CANCEL_POLL_INTERVAL == 0 && cancel.is_cancelled() {
+            if handled.is_multiple_of(CANCEL_POLL_INTERVAL) && cancel.is_cancelled() {
                 return None;
             }
             seen.entry(&old[index]).or_default().0.push(index);
         }
         for index in news.clone() {
             handled += 1;
-            if handled % CANCEL_POLL_INTERVAL == 0 && cancel.is_cancelled() {
+            if handled.is_multiple_of(CANCEL_POLL_INTERVAL) && cancel.is_cancelled() {
                 return None;
             }
             if let Some(entry) = seen.get_mut(&new[index]) {
@@ -2112,7 +2112,7 @@ impl MergeModel {
         } else {
             let mut old_prints: Vec<Fingerprint> = Vec::with_capacity(earlier.ranges.len());
             for (index, (left, center, right)) in earlier.ranges.iter().enumerate() {
-                if index % CANCEL_POLL_INTERVAL == 0 && cancel.is_cancelled() {
+                if index.is_multiple_of(CANCEL_POLL_INTERVAL) && cancel.is_cancelled() {
                     return None;
                 }
                 let (left, center, right) = fingerprint_of(&earlier.inputs, left, center, right);
@@ -2124,7 +2124,7 @@ impl MergeModel {
             }
             let mut new_prints: Vec<Fingerprint> = Vec::with_capacity(self.sections.len());
             for (index, section) in self.sections.iter().enumerate() {
-                if index % CANCEL_POLL_INTERVAL == 0 && cancel.is_cancelled() {
+                if index.is_multiple_of(CANCEL_POLL_INTERVAL) && cancel.is_cancelled() {
                     return None;
                 }
                 new_prints.push(self.fingerprint(section));
@@ -3547,9 +3547,10 @@ mod tests {
     /// common line.
     fn many_conflicts(count: usize) -> MergeModel {
         let build = |prefix: &str| -> String {
-            (0..count)
+            let pieces: Vec<String> = (0..count)
                 .map(|index| format!("a{index}\nb{index}\nc{index}\nd{index}\n{prefix}{index}\n"))
-                .collect()
+                .collect();
+            pieces.concat()
         };
         model(&build("L"), &build("b"), &build("R"))
     }
@@ -3568,7 +3569,7 @@ mod tests {
         };
         let full = later
             .pair_with_cancellable(&layout, false, &counter)
-            .expect("an unraised flag lets pairing finish");
+            .unwrap();
         assert!(!full.pairs.is_empty());
         let looks = counter.looks.load(std::sync::atomic::Ordering::Relaxed);
         assert!(looks > 8, "{looks} {}", later.sections().len());
