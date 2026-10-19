@@ -64,7 +64,10 @@ jobs:
           MERGE_DRIVER_CASES: "60"
 
   # Runs the randomized merge drivers at their full case counts. Release
-  # mode keeps the full counts within a short run.
+  # mode keeps the full counts within a short run. The whole workspace is
+  # built so that dependency features match the other jobs; a build of the
+  # merge crate alone links the system Wayland library, which this runner
+  # does not have.
   merge-drivers:
     name: check (merge drivers)
     if: >-
@@ -82,7 +85,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@9376cdc5a5e25b16da71af47712785cf06b0d6d4 # 1.94.1
       - run: >-
-          cargo test --release -p ca-view-merge --lib --
+          cargo test --release --workspace --lib --
           tests::randomized_merge_driver tests::merge_edit_driver tests::frame_undo_probes
         env:
           CARGO_PROFILE_RELEASE_LTO: "off"
