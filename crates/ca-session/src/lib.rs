@@ -27,7 +27,12 @@ pub use options::{
     OptionsLoad, ProgramOptions, RestoreCategory, RestoreSelection, OPTIONS_FILE,
     OPTIONS_SCHEMA_VERSION,
 };
-pub use policy::{AdminPolicies, InMemoryPolicySource, PolicyError, PolicyKey, PolicyLoader};
+pub use policy::{
+    load_system_policies, AdminPolicies, FilePolicySource, InMemoryPolicySource, PolicyError,
+    PolicyKey, PolicyLoader,
+};
+#[cfg(windows)]
+pub use policy::{RegistryPolicySource, POLICY_REGISTRY_PATH};
 pub use settings::{SessionSettings, SessionSettingsOverride};
 pub use share::{
     ExportSelection, ImportFailure, ImportOptions, ImportReport, SettingsPackage, SharedSessions,

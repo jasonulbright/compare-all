@@ -73,6 +73,31 @@ select More info, then Run anyway. On macOS, Gatekeeper can stop an unsigned
 program. To continue, open the program from Finder with Control-click, then
 select Open.
 
+## Administration
+
+An administrator can set policies. The program reads them once at start. A
+change takes effect at the next start. The program never writes them.
+
+| Policy                  | Effect                                                                  |
+| ----------------------- | ----------------------------------------------------------------------- |
+| `DisableCheckForUpdates` | No update check runs. The update command and option are hidden.        |
+| `DisableRemoteProfiles` | Remote storage profiles are unavailable.                                |
+| `DisableSavedPasswords` | Passwords stay in memory. No control offers to save one.                |
+
+On Windows, set each policy as a `REG_DWORD` value with the name of the policy
+under one of these keys:
+
+- `HKEY_LOCAL_MACHINE\SOFTWARE\Policies\compare-all`
+- `HKEY_CURRENT_USER\SOFTWARE\Policies\compare-all`
+
+A non-zero value enables the policy. A policy that is enabled in either key is
+in force. A value of 0 in the user key does not clear a value in the machine
+key. A value of another type is ignored.
+
+On Linux and macOS, write one `Name=yes` or `Name=no` line for each policy in
+`/etc/compare-all.conf`. A `#` starts a comment. The program ignores unknown
+names and lines it cannot read. A missing file sets no policy.
+
 ## Build from source
 
 1. Install `rustup`. The file `rust-toolchain.toml` sets the Rust version.

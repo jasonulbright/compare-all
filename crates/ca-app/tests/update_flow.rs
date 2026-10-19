@@ -9,7 +9,7 @@ use ca_app::shell::UpdateNotice;
 use ca_app::update::{finish_at_exit, ExitHook, Source};
 use ca_app::{App, VERSION};
 use ca_session::options::LaunchCommand;
-use ca_session::{AdminPolicies, PolicyKey};
+use ca_session::{AdminPolicies, PolicyKey, PolicyLoader};
 use ca_ui::command::Command;
 use ca_ui::launch::Spawner;
 use ca_ui::testing::probe::Probe;
@@ -177,6 +177,22 @@ fn no_call_is_made_when_the_policy_is_set() {
     let mut keys = BTreeMap::new();
     keys.insert(PolicyKey::DisableCheckForUpdates, true);
     app.set_policies(AdminPolicies::from_keys(&keys));
+    assert!(run_frames(&mut app, |app| app.options().is_ready()));
+    quiet_frames(&mut app, 40);
+    assert_eq!(asked.load(Ordering::SeqCst), 0);
+    assert!(!app.accepts(Command::CheckForUpdates));
+}
+
+#[test]
+fn a_policy_file_that_disables_checks_stops_the_call_and_hides_the_command() {
+    let dir = tempfile::tempdir().unwrap();
+    let conf = dir.path().join("compare-all.conf");
+    std::fs::write(&conf, "DisableCheckForUpdates=yes\n").unwrap();
+    let policies = ca_session::FilePolicySource::new(&conf).load().unwrap();
+    let (server, asked) = release_server(next_version().to_string(), 404);
+    let mut app = app_in(dir.path());
+    app.update_from(source(&server, &dir.path().join("stage"), None));
+    app.set_policies(policies);
     assert!(run_frames(&mut app, |app| app.options().is_ready()));
     quiet_frames(&mut app, 40);
     assert_eq!(asked.load(Ordering::SeqCst), 0);
