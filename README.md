@@ -101,8 +101,9 @@ names and lines it cannot read. A missing file sets no policy.
 If the policy store exists but the program cannot read it, every policy is in
 force. On Linux and macOS this happens when `/etc/compare-all.conf` exists and
 the program cannot open or read it. On Windows this happens when a policy key
-exists and the program cannot open it, or cannot read a value for lack of
-access. A missing key is not an error. The program reports the reason once:
+exists and the program cannot open it, or cannot read a value for a reason
+other than a missing value or a value of another type. A missing key is not an
+error. The program reports the reason once:
 the desktop program shows a message after the window opens, and `ca` writes a
 line to the error stream. `ca` applies the policies to scripts. With
 `DisableRemoteProfiles`, a script cannot load a remote location, and the run

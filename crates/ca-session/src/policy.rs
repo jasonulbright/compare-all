@@ -165,7 +165,7 @@ pub const POLICY_REGISTRY_PATH: &str = "SOFTWARE\\Policies\\compare-all";
 /// force, so a per-user value of zero never clears a machine value of one. A
 /// missing key, a missing value, and a value of another type count as not set.
 /// A key that exists but cannot be opened, or a value that cannot be read for
-/// lack of access, is an error.
+/// reason other than absence or a different type, is an error.
 #[cfg(windows)]
 #[derive(Debug, Clone)]
 pub struct RegistryPolicySource {
@@ -196,6 +196,19 @@ impl RegistryPolicySource {
     }
 }
 
+/// `ERROR_BAD_FILE_TYPE`, which the registry reader reports for a value whose
+/// type is not `REG_DWORD`.
+#[cfg(windows)]
+const WRONG_VALUE_TYPE: i32 = 222;
+
+/// Whether a failed value read stops the load. An absent value and a value of
+/// another type than `REG_DWORD` count as not set; any other failure means the
+/// policy cannot be known.
+#[cfg(windows)]
+fn value_error_is_fatal(error: &std::io::Error) -> bool {
+    error.kind() != std::io::ErrorKind::NotFound && error.raw_os_error() != Some(WRONG_VALUE_TYPE)
+}
+
 #[cfg(windows)]
 impl PolicyLoader for RegistryPolicySource {
     fn load(&self) -> Result<AdminPolicies, PolicyError> {
@@ -218,13 +231,13 @@ impl PolicyLoader for RegistryPolicySource {
                     Ok(value) if value != 0 => {
                         enabled.insert(*policy, true);
                     }
-                    Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                    Err(error) if value_error_is_fatal(&error) => {
                         return Err(PolicyError::Unreadable(format!(
                             "{path}: {}: {error}",
                             policy.name()
                         )));
                     }
-                    _ => {}
+                    Ok(_) | Err(_) => {}
                 }
             }
         }
@@ -500,6 +513,22 @@ mod tests {
             fn drop(&mut self) {
                 self.remove();
             }
+        }
+
+        #[test]
+        fn only_an_absent_value_or_another_type_counts_as_not_set() {
+            use std::io::{Error, ErrorKind};
+            assert!(!value_error_is_fatal(&Error::from(ErrorKind::NotFound)));
+            assert!(!value_error_is_fatal(&Error::from_raw_os_error(2)));
+            assert!(!value_error_is_fatal(&Error::from_raw_os_error(
+                WRONG_VALUE_TYPE
+            )));
+            assert!(value_error_is_fatal(&Error::from(
+                ErrorKind::PermissionDenied
+            )));
+            assert!(value_error_is_fatal(&Error::from(ErrorKind::InvalidData)));
+            assert!(value_error_is_fatal(&Error::from_raw_os_error(1450)));
+            assert!(value_error_is_fatal(&Error::other("read failed")));
         }
 
         #[test]
