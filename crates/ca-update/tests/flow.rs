@@ -1904,7 +1904,7 @@ fn folder_files(dir: &Path) -> Vec<(String, Vec<u8>)> {
 
 #[cfg(windows)]
 #[test]
-fn the_elevated_step_installs_its_own_checked_copy_and_removes_it() {
+fn the_elevated_step_installs_its_own_checked_copy_and_keeps_it() {
     use ca_update::install::{install_from, Checks};
     let (_server, _keep, staging, work, install) = elevated_setup();
     let record = staging.read_record().unwrap();
@@ -1917,12 +1917,19 @@ fn the_elevated_step_installs_its_own_checked_copy_and_removes_it() {
     };
     let staged_before = folder_files(staging.dir());
     let seen = Mutex::new(None);
-    let code = install_from(&staging, work.path(), Some(&program), &checks, &|command| {
-        let copy = std::path::PathBuf::from(command.get_args().nth(1).unwrap());
-        let bytes = std::fs::read(&copy).unwrap();
-        *seen.lock().unwrap() = Some((copy, bytes, std::fs::read(&program).ok()));
-        Some(0)
-    });
+    let code = install_from(
+        &staging,
+        work.path(),
+        work.path(),
+        Some(&program),
+        &checks,
+        &|command| {
+            let copy = std::path::PathBuf::from(command.get_args().nth(1).unwrap());
+            let bytes = std::fs::read(&copy).unwrap();
+            *seen.lock().unwrap() = Some((copy, bytes, std::fs::read(&program).ok()));
+            Some(0)
+        },
+    );
     assert_eq!(code, 0);
     let (copy, bytes, program_in_place) = seen.lock().unwrap().take().unwrap();
     assert_eq!(copy.parent(), Some(work.path()));
@@ -1930,7 +1937,7 @@ fn the_elevated_step_installs_its_own_checked_copy_and_removes_it() {
     // The install folder holds a program file at every moment.
     assert_eq!(program_in_place.as_deref(), Some(b"old exe".as_slice()));
     assert_eq!(names(install.path()), ["compare-all.exe"]);
-    assert!(!copy.exists());
+    assert!(copy.exists());
     // The elevated step writes nothing in the staging folder of the user.
     assert_eq!(folder_files(staging.dir()), staged_before);
     assert!(staging.asset_path(&record).exists());
@@ -1950,13 +1957,20 @@ fn a_staged_installer_replaced_after_the_copy_is_not_what_is_installed() {
         running: &running(),
     };
     let installed = Mutex::new(Vec::new());
-    let code = install_from(&staging, work.path(), Some(&program), &checks, &|command| {
-        // The file of the user is swapped between the check and the install.
-        std::fs::write(&staged, b"other installer").unwrap();
-        let copy = std::path::PathBuf::from(command.get_args().nth(1).unwrap());
-        *installed.lock().unwrap() = std::fs::read(copy).unwrap();
-        Some(0)
-    });
+    let code = install_from(
+        &staging,
+        work.path(),
+        work.path(),
+        Some(&program),
+        &checks,
+        &|command| {
+            // The file of the user is swapped between the check and the install.
+            std::fs::write(&staged, b"other installer").unwrap();
+            let copy = std::path::PathBuf::from(command.get_args().nth(1).unwrap());
+            *installed.lock().unwrap() = std::fs::read(copy).unwrap();
+            Some(0)
+        },
+    );
     assert_eq!(code, 0);
     assert_eq!(*installed.lock().unwrap(), msi_bytes());
 }
@@ -1973,13 +1987,60 @@ fn a_failed_install_puts_the_program_file_back() {
         signer_name: SIGNER,
         running: &running(),
     };
-    let code = install_from(&staging, work.path(), Some(&program), &checks, &|_| {
-        Some(1603)
-    });
+    let code = install_from(
+        &staging,
+        work.path(),
+        work.path(),
+        Some(&program),
+        &checks,
+        &|_| Some(1603),
+    );
     assert_eq!(code, 1603);
     assert_eq!(std::fs::read(&program).unwrap(), b"old exe");
     assert_eq!(names(install.path()), ["compare-all.exe"]);
-    assert_eq!(std::fs::read_dir(work.path()).unwrap().count(), 0);
+    // Only the installer copy is left; the caller removes its folder.
+    assert_eq!(names(work.path()), [msi_name(NEXT)]);
+}
+
+#[test]
+fn a_package_folder_keeps_only_the_installed_version() {
+    use ca_update::install::{finish_package_folder, PACKAGE_FOLDER};
+    let parent = tempfile::tempdir().unwrap();
+    let root = parent.path().join(PACKAGE_FOLDER);
+    let (old, new) = ("2026.10.19.0007", "2026.10.19.0008");
+    for version in [old, new] {
+        std::fs::create_dir_all(root.join(version)).unwrap();
+        std::fs::write(root.join(version).join("a.msi"), b"x").unwrap();
+    }
+    let version = Version::parse(new).unwrap();
+    finish_package_folder(parent.path(), &version, false);
+    assert!(root.join(old).exists());
+    assert!(!root.join(new).exists());
+    std::fs::create_dir_all(root.join(new)).unwrap();
+    finish_package_folder(parent.path(), &version, true);
+    assert!(!root.join(old).exists());
+    assert!(root.join(new).exists());
+    std::fs::remove_dir_all(root.join(new)).unwrap();
+    finish_package_folder(parent.path(), &version, false);
+    assert!(!root.exists());
+}
+
+#[cfg(windows)]
+#[test]
+fn a_package_folder_is_open_to_administrators_and_the_system_only() {
+    use ca_update::install::{prepare_package_folder, work_folder_access_is_exact, PACKAGE_FOLDER};
+    let parent = tempfile::tempdir().unwrap();
+    let version = Version::parse("2026.10.19.0008").unwrap();
+    let stale = parent.path().join(PACKAGE_FOLDER).join("2026.10.19.0008");
+    std::fs::create_dir_all(&stale).unwrap();
+    std::fs::write(stale.join("left.msi"), b"x").unwrap();
+    let folder = prepare_package_folder(parent.path(), &version).unwrap();
+    assert_eq!(folder, stale);
+    assert_eq!(std::fs::read_dir(&folder).unwrap().count(), 0);
+    for path in [folder.as_path(), folder.parent().unwrap()] {
+        let read = ca_update::access::read_sddls(&[path]).unwrap();
+        assert!(work_folder_access_is_exact(&read[0]), "{read:?}");
+    }
 }
 
 /// Start a copy of a system program that runs for a while as `program`.
@@ -2075,10 +2136,17 @@ fn the_install_folder_keeps_a_program_file_the_installer_can_replace() {
             )
         };
         let seen = Mutex::new(None);
-        let code = install_from(&staging, work.path(), Some(&program), &checks, &|_| {
-            *seen.lock().unwrap() = Some(state());
-            Some(result)
-        });
+        let code = install_from(
+            &staging,
+            work.path(),
+            work.path(),
+            Some(&program),
+            &checks,
+            &|_| {
+                *seen.lock().unwrap() = Some(state());
+                Some(result)
+            },
+        );
         let during = seen.lock().unwrap().take();
         let after = state();
         let _ = child.kill();
@@ -2209,10 +2277,17 @@ fn an_install_whose_program_cannot_be_set_aside_does_not_start() {
         running: &running(),
     };
     let started = AtomicBool::new(false);
-    let code = install_from(&staging, work.path(), Some(&program), &checks, &|_| {
-        started.store(true, Ordering::SeqCst);
-        Some(0)
-    });
+    let code = install_from(
+        &staging,
+        work.path(),
+        work.path(),
+        Some(&program),
+        &checks,
+        &|_| {
+            started.store(true, Ordering::SeqCst);
+            Some(0)
+        },
+    );
     assert_eq!(code, KEPT);
     assert!(!started.load(Ordering::SeqCst));
     assert_eq!(std::fs::read(&program).unwrap(), b"old exe");
@@ -2253,7 +2328,14 @@ fn an_update_put_off_at_every_close_ends_in_the_warning() {
         running: &running(),
     };
     let held = pin(&program, true);
-    let code = install_from(&staging, work.path(), Some(&program), &checks, &|_| Some(0));
+    let code = install_from(
+        &staging,
+        work.path(),
+        work.path(),
+        Some(&program),
+        &checks,
+        &|_| Some(0),
+    );
     drop(held);
     assert_eq!(code, KEPT);
     assert_eq!(std::fs::read(&program).unwrap(), b"old exe");
@@ -2471,10 +2553,17 @@ fn the_elevated_step_refuses_a_staged_installer_that_fails_a_check() {
             running: installed,
         };
         let ran = AtomicBool::new(false);
-        let code = install_from(&staging, work.path(), Some(&program), &checks, &|_| {
-            ran.store(true, Ordering::SeqCst);
-            Some(0)
-        });
+        let code = install_from(
+            &staging,
+            work.path(),
+            work.path(),
+            Some(&program),
+            &checks,
+            &|_| {
+                ran.store(true, Ordering::SeqCst);
+                Some(0)
+            },
+        );
         assert_eq!(code, REFUSED, "{name}");
         assert!(!ran.load(Ordering::SeqCst), "{name}");
         assert_eq!(std::fs::read(&program).unwrap(), b"old exe", "{name}");
@@ -2627,7 +2716,14 @@ fn the_elevated_step_reads_no_staged_file_through_a_link() {
             signer_name: SIGNER,
             running: &running(),
         };
-        let code = install_from(&staging, work.path(), Some(&program), &checks, &|_| Some(0));
+        let code = install_from(
+            &staging,
+            work.path(),
+            work.path(),
+            Some(&program),
+            &checks,
+            &|_| Some(0),
+        );
         assert_eq!(code, REFUSED, "record: {record}");
     }
 }

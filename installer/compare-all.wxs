@@ -46,6 +46,9 @@
 
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="INSTALLFOLDER" Name="compare-all" />
+      <Directory Id="PACKAGEROOT" Name="compare-all-package">
+        <Directory Id="PACKAGEFOLDER" Name="$(var.FullVersion)" />
+      </Directory>
     </StandardDirectory>
     <StandardDirectory Id="ProgramMenuFolder" />
     <StandardDirectory Id="DesktopFolder" />
@@ -75,6 +78,18 @@
       <Component Id="VersionMarker" Directory="INSTALLFOLDER" Bitness="always64">
         <RegistryValue Root="HKMU" Key="Software\compare-all" Name="Version" Type="string" Value="$(var.FullVersion)" KeyPath="yes" />
         <RegistryValue Root="HKMU" Key="Software\compare-all" Name="InstallFolder" Type="string" Value="[INSTALLFOLDER]" />
+      </Component>
+
+      <!--
+        The automatic update keeps the installer copy of its version here, the
+        source that Windows Installer uses for a repair. Only this version's
+        folder is removed, so an upgrade does not remove the copy it runs from.
+      -->
+      <Component Id="PackageCopy" Directory="PACKAGEFOLDER" Condition="ALLUSERS=1" Bitness="always64">
+        <RegistryValue Root="HKMU" Key="Software\compare-all" Name="PackageFolder" Type="string" Value="[PACKAGEFOLDER]" KeyPath="yes" />
+        <RemoveFile Id="RemovePackageCopy" Name="*" On="uninstall" />
+        <RemoveFolder Id="RemovePackageFolder" Directory="PACKAGEFOLDER" On="uninstall" />
+        <RemoveFolder Id="RemovePackageRoot" Directory="PACKAGEROOT" On="uninstall" />
       </Component>
 
       <Feature Id="CommandLine" Title="Command line" Level="1">

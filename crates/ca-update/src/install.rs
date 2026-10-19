@@ -3,10 +3,12 @@
 //! The helper starts the installed program, which only administrators can
 //! change, through the standard elevation prompt with [`INSTALL_ARGUMENT`],
 //! so the prompt names the signed program. The elevated program copies the
-//! staged installer into a new folder that only administrators and the
-//! system can open, checks the copy again, runs the system installer on that
-//! copy and removes the folder. It writes nothing in the staging folder: that
-//! folder belongs to the user.
+//! staged installer into a folder that only administrators and the system
+//! can open, checks the copy again and runs the system installer on that
+//! copy. Windows Installer records the folder of the copy as the source for
+//! a later repair, so after a successful install the copy stays in a folder
+//! of its own for that version; the copies of other versions are removed.
+//! It writes nothing in the staging folder: that folder belongs to the user.
 
 use crate::mode::{detect, InstallMode};
 use crate::signature::SignatureVerifier;
@@ -32,6 +34,11 @@ pub const PRODUCT_NAME: &str = "Compare All";
 /// Name prefix of the folders the elevated step creates in the program files
 /// folder.
 pub const WORK_FOLDER_PREFIX: &str = "compare-all-update-";
+
+/// Name of the folder in the program files folder that holds one folder for
+/// each installed version with its installer copy. The name must not start
+/// with [`WORK_FOLDER_PREFIX`]: a sweep removes those folders.
+pub const PACKAGE_FOLDER: &str = "compare-all-package";
 
 /// The name the running program file gets in the work folder while the
 /// installer runs.
@@ -291,16 +298,31 @@ pub fn install_main(staging: &Path, checks: &Checks<'_>) -> i32 {
     let Some(staging) = accepted_staging(staging, &crate::system::profile_folders()) else {
         return NOT_APPLICABLE;
     };
+    let staging = Staging::new(staging);
+    let Some(version) = staging
+        .peek_record()
+        .and_then(|record| record.parsed_version())
+    else {
+        return REFUSED;
+    };
     let Ok(work) = prepare_work_folder(&parent) else {
         return KEPT;
     };
-    let code = install_from(
-        &Staging::new(staging),
-        work.path(),
-        Some(&program),
-        checks,
-        &run_installer,
-    );
+    let code = match prepare_package_folder(&parent, &version) {
+        Ok(package) => {
+            let code = install_from(
+                &staging,
+                work.path(),
+                &package,
+                Some(&program),
+                checks,
+                &run_installer,
+            );
+            finish_package_folder(&parent, &version, matches!(code, 0 | 1641 | 3010));
+            code
+        }
+        Err(_) => KEPT,
+    };
     let path = work.path().to_path_buf();
     drop(work);
     if std::fs::remove_dir_all(&path).is_err() {
@@ -309,8 +331,66 @@ pub fn install_main(staging: &Path, checks: &Checks<'_>) -> i32 {
     code
 }
 
-/// Copy the staged installer of `staging` into `work`, check the copy and run
-/// the command from [`installer_command`] through `run`. `program`, when
+/// Create the folder for the installer copy of `version`, open to
+/// administrators and the system only, below [`PACKAGE_FOLDER`] in `parent`.
+/// A folder of the same version that an earlier step left is removed first.
+/// The installer registers this folder as the source of the product, so a
+/// repair reads the copy from it.
+///
+/// # Errors
+/// Returns why a folder could not be created or restricted.
+pub fn prepare_package_folder(parent: &Path, version: &Version) -> Result<PathBuf, String> {
+    let root = parent.join(PACKAGE_FOLDER);
+    restricted_folder(&root)?;
+    let folder = root.join(version.to_string());
+    if folder.exists() {
+        std::fs::remove_dir_all(&folder)
+            .map_err(|error| format!("cannot remove {}: {error}", folder.display()))?;
+    }
+    restricted_folder(&folder)?;
+    Ok(folder)
+}
+
+fn restricted_folder(path: &Path) -> Result<(), String> {
+    match std::fs::create_dir(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(format!("cannot create {}: {error}", path.display())),
+    }
+    restrict_to_administrators(path)
+}
+
+/// After an install: when it `succeeded`, remove every folder below
+/// [`PACKAGE_FOLDER`] except the one of `version`; otherwise remove only the
+/// one of `version`. A folder that cannot be removed is tried again by the
+/// next step. The root is removed when it is empty.
+pub fn finish_package_folder(parent: &Path, version: &Version, succeeded: bool) {
+    let root = parent.join(PACKAGE_FOLDER);
+    let current = version.to_string();
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        // A failed install leaves the product, and the source it
+        // registered, as it was.
+        let is_current = entry.file_name().to_string_lossy() == current;
+        if is_current == succeeded {
+            continue;
+        }
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            let _ = std::fs::remove_dir_all(entry.path());
+        } else {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+    // Fails while a folder remains.
+    let _ = std::fs::remove_dir(&root);
+}
+
+/// Copy the staged installer of `staging` into `package`, check the copy and
+/// run the command from [`installer_command`] through `run`. The copy stays
+/// in `package` once the installer has run, whatever its result; the caller
+/// decides what stays. `work` holds the scratch files. `program`, when
 /// given, is the running program file: it keeps only a name in `work` while
 /// the installer runs and an unused copy takes its place, so the installer
 /// finds no program file in use, and it goes back when the install fails.
@@ -321,6 +401,7 @@ pub fn install_main(staging: &Path, checks: &Checks<'_>) -> i32 {
 pub fn install_from(
     staging: &Staging,
     work: &Path,
+    package: &Path,
     program: Option<&Path>,
     checks: &Checks<'_>,
     run: &dyn Fn(Command) -> Option<i32>,
@@ -334,7 +415,7 @@ pub fn install_from(
     if version <= *checks.running || record.kind() != Some(AssetKind::Msi) {
         return REFUSED;
     }
-    let copy = work.join(&record.asset);
+    let copy = package.join(&record.asset);
     if copy_at_most(&staging.asset_path(&record), &copy, record.size).is_err() {
         let _ = std::fs::remove_file(&copy);
         return REFUSED;
@@ -370,7 +451,6 @@ pub fn install_from(
     };
     let code = run(installer_command(&copy));
     drop(held);
-    let _ = std::fs::remove_file(&copy);
     if let Some((program, moved)) = aside {
         if !matches!(code, Some(0 | 1641 | 3010)) {
             // Replaces the unused copy; a running file may be renamed.
