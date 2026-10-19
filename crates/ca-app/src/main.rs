@@ -3,12 +3,13 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 use ca_app::cli;
+use ca_app::renderer::{self, Outcome, Renderer, StartFailure};
 use ca_app::shell::{DEFAULT_WINDOW_SIZE, MINIMUM_WINDOW_SIZE};
 use ca_app::App;
 use ca_ui::options::AppOptions;
 use ca_ui::theme::{palette, Variant};
 use ca_ui::view::ViewContext;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Longest time the process waits at exit for the copies of closed tabs to go.
 const EXIT_DELETE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -68,6 +69,7 @@ fn main() -> eframe::Result {
         );
         std::process::exit(code);
     }
+    install_panic_hook();
     // A version request is answered before the settings directory is
     // resolved, so it writes nothing and needs no display. On Windows this
     // binary has no console to print to, so the request stays a refused
@@ -83,7 +85,11 @@ fn main() -> eframe::Result {
     // Windows this binary has no console attached, so anything written to the
     // error stream goes nowhere.
     let stored = cli::stored_options().unwrap_or_default();
-    let startup = cli::parse(std::env::args_os().skip(1), &|path| {
+    let (preference, program_arguments) = renderer::take_preference(
+        std::env::args_os().skip(1).collect(),
+        std::env::var(renderer::ENVIRONMENT).ok().as_deref(),
+    );
+    let startup = cli::parse(program_arguments, &|path| {
         cli::probe_with(path, Some(&stored.archives))
     });
     // An automatic merge that finishes answers through its exit code alone and
@@ -105,38 +111,8 @@ fn main() -> eframe::Result {
     // A merge started by another program answers through the exit code, so the
     // value has to outlive the window that decided it.
     let status = Arc::new(std::sync::atomic::AtomicI32::new(0));
-    let reported = Arc::clone(&status);
     let update_exit = Arc::new(ca_app::update::ExitHook::default());
-    let update_hook = Arc::clone(&update_exit);
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size(DEFAULT_WINDOW_SIZE)
-            .with_min_inner_size(MINIMUM_WINDOW_SIZE)
-            .with_icon(Arc::new(ca_app::icon::window_icon())),
-        ..eframe::NativeOptions::default()
-    };
-    let policy_load = ca_session::load_system_policies_reported();
-    let policies = policy_load.policies;
-    let policy_warning = policy_load.warning;
-    let outcome = eframe::run_native(
-        &ca_app::product_title(),
-        options,
-        Box::new(move |creation| {
-            let repaint = creation.egui_ctx.clone();
-            let variant = Variant::from_dark_mode(creation.egui_ctx.style().visuals.dark_mode);
-            let context = ViewContext {
-                options: Arc::new(AppOptions::resolve(stored, variant, policies)),
-                palette: palette(variant),
-                notify: Arc::new(move || repaint.request_repaint()),
-            };
-            let mut app = App::from_startup(startup, &context);
-            app.set_policies(policies);
-            app.set_policy_warning(policy_warning.clone());
-            app.report_exit_to(reported);
-            app.apply_updates_on_exit(update_hook);
-            Ok(Box::new(app))
-        }),
-    );
+    let outcome = run_window(preference, startup, stored, &status, &update_exit);
     // A delete worker still running at process exit dies with the process and
     // leaves its copies behind until the sweep of the next start.
     ca_ui::view::wait_for_temporary_deletes(EXIT_DELETE_WAIT);
@@ -149,6 +125,103 @@ fn main() -> eframe::Result {
         exit(code);
     }
     outcome
+}
+
+/// Start the window on each permitted back end in order and return how it ended.
+fn run_window(
+    preference: renderer::Preference,
+    startup: cli::Startup,
+    stored: ca_session::ProgramOptions,
+    status: &Arc<std::sync::atomic::AtomicI32>,
+    update_exit: &Arc<ca_app::update::ExitHook>,
+) -> eframe::Result {
+    let policy_load = ca_session::load_system_policies_reported();
+    let policies = policy_load.policies;
+    let policy_warning = policy_load.warning;
+    // The first start attempt that reaches the application creator takes the
+    // data; a later back end can start only when no earlier one got that far.
+    let pending = Arc::new(Mutex::new(Some((startup, stored))));
+    let mut window_error: Option<eframe::Error> = None;
+    let outcome = renderer::start_in_order(preference, &mut |chosen| {
+        let options = eframe::NativeOptions {
+            viewport: egui::ViewportBuilder::default()
+                .with_inner_size(DEFAULT_WINDOW_SIZE)
+                .with_min_inner_size(MINIMUM_WINDOW_SIZE)
+                .with_icon(Arc::new(ca_app::icon::window_icon())),
+            renderer: match chosen {
+                Renderer::Glow => eframe::Renderer::Glow,
+                Renderer::Wgpu => eframe::Renderer::Wgpu,
+            },
+            ..eframe::NativeOptions::default()
+        };
+        let slot = Arc::clone(&pending);
+        let reported = Arc::clone(status);
+        let update_hook = Arc::clone(update_exit);
+        let policy_warning = policy_warning.clone();
+        let result = eframe::run_native(
+            &ca_app::product_title(),
+            options,
+            Box::new(move |creation| {
+                let taken = slot.lock().ok().and_then(|mut guard| guard.take());
+                let Some((startup, stored)) = taken else {
+                    return Err("the start data was already used".into());
+                };
+                renderer::record_active(chosen);
+                eprintln!("{}", renderer::support_line());
+                let repaint = creation.egui_ctx.clone();
+                let variant = Variant::from_dark_mode(creation.egui_ctx.style().visuals.dark_mode);
+                let context = ViewContext {
+                    options: Arc::new(AppOptions::resolve(stored, variant, policies)),
+                    palette: palette(variant),
+                    notify: Arc::new(move || repaint.request_repaint()),
+                };
+                let mut app = App::from_startup(startup, &context);
+                app.set_policies(policies);
+                app.set_policy_warning(policy_warning);
+                app.report_exit_to(reported);
+                app.apply_updates_on_exit(update_hook);
+                Ok(Box::new(app))
+            }),
+        );
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let failure = StartFailure {
+                    message: error.to_string(),
+                    application_ran: pending.lock().map_or(true, |guard| guard.is_none()),
+                };
+                window_error = Some(error);
+                Err(failure)
+            }
+        }
+    });
+    match outcome {
+        Outcome::Finished(_) => Ok(()),
+        Outcome::Failed(..) => window_error.map_or(Ok(()), Err),
+        Outcome::Unavailable(refusals) => {
+            report_fatal(&renderer::unavailable_message(&refusals));
+            exit(1)
+        }
+    }
+}
+
+/// Write `text` to the error stream and show it in a message box, which needs
+/// no graphics driver.
+fn report_fatal(text: &str) {
+    eprintln!("{text}");
+    rfd::MessageDialog::new()
+        .set_level(rfd::MessageLevel::Error)
+        .set_title("Compare All")
+        .set_description(text)
+        .show();
+}
+
+/// A panic ends the process without unwinding, so the hook is the only place
+/// that can tell the user why the window is gone.
+fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        report_fatal(&renderer::panic_message(&info.to_string()));
+    }));
 }
 
 /// End the process with `code`, deleting the private settings folder of this

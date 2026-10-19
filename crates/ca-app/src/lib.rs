@@ -11,6 +11,7 @@ pub mod home;
 pub mod icon;
 pub mod profiles;
 pub mod registry;
+pub mod renderer;
 mod session_save;
 pub mod shell;
 pub mod tree;

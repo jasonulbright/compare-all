@@ -31,10 +31,12 @@ ca-view-table.workspace = true
 ca-view-text.workspace = true
 eframe.workspace = true
 egui.workspace = true
+rfd.workspace = true
 serde_json.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.56"
+wgpu = { version = "24", default-features = false, features = ["dx12", "wgsl"] }
 
 [dev-dependencies]
 ca-vfs = { workspace = true, features = ["testing"] }
