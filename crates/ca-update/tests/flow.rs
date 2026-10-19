@@ -2208,16 +2208,29 @@ fn the_installer_copy_of_the_installed_version_stays_until_a_new_install_succeed
     }
 }
 
-/// Start a copy of a system program that runs for a while as `program`.
+/// Start a copy of a system program as `program`. It reads its standard
+/// input, which stays open until the child is killed, so it runs for as long
+/// as the test needs it.
 #[cfg(windows)]
 fn run_as(program: &Path) -> std::process::Child {
     let root = ca_update::system::system_root().unwrap();
-    std::fs::copy(root.join(r"System32\PING.EXE"), program).unwrap();
+    std::fs::copy(root.join(r"System32\sort.exe"), program).unwrap();
     ca_io::host_command::host_command(program)
-        .args(["-n", "120", "127.0.0.1"])
+        .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .spawn()
         .unwrap()
+}
+
+/// A running image is the only thing that makes `in_use` true, so the child
+/// must still run when the test reads that result.
+#[cfg(windows)]
+fn assert_running(child: &mut std::process::Child) {
+    assert!(
+        matches!(child.try_wait(), Ok(None)),
+        "the child exited: {:?}",
+        child.try_wait()
+    );
 }
 
 /// True when a write-open of `path` gives a sharing or lock violation for
@@ -2315,6 +2328,7 @@ fn the_install_folder_keeps_a_program_file_the_installer_can_replace() {
             },
         );
         let during = seen.lock().unwrap().take();
+        assert_running(&mut child);
         let after = state();
         let report = if code == result && after == (true, result != 0) {
             String::new()
@@ -2422,6 +2436,7 @@ fn a_failed_install_waits_out_a_long_hold_on_the_unused_program_copy() {
             Some(1603)
         },
     );
+    assert_running(&mut child);
     let restored = in_use(&program);
     let report = if restored && code == 1603 {
         String::new()
