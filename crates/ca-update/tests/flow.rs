@@ -2309,6 +2309,56 @@ fn the_install_folder_keeps_a_program_file_the_installer_can_replace() {
     }
 }
 
+/// A scanner can hold the unused copy without delete sharing for longer than
+/// the set-aside waits; a failed install still puts the running file back.
+#[cfg(windows)]
+#[test]
+fn a_failed_install_waits_out_a_long_hold_on_the_unused_program_copy() {
+    use ca_update::install::{install_from, Checks};
+    use std::os::windows::fs::OpenOptionsExt;
+    const SHARE_READ_WRITE: u32 = 3;
+    let signer = FakeSigner::signed_by(SIGNER);
+    let checks = Checks {
+        signer: &signer,
+        signer_name: SIGNER,
+        running: &running(),
+    };
+    let (_server, _keep, staging, work, install) = elevated_setup();
+    let program = install.path().join("compare-all.exe");
+    std::fs::remove_file(&program).unwrap();
+    let mut child = run_as(&program);
+    let packages = tempfile::tempdir().unwrap();
+    let packages = packages.path().join("pkg");
+    let holder = Mutex::new(None);
+    let code = install_from(
+        &staging,
+        work.path(),
+        &packages,
+        Some(&program),
+        &checks,
+        &|_| {
+            let held = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(SHARE_READ_WRITE)
+                .open(&program)
+                .unwrap();
+            *holder.lock().unwrap() = Some(std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_secs(5));
+                drop(held);
+            }));
+            Some(1603)
+        },
+    );
+    let restored = in_use(&program);
+    let _ = child.kill();
+    let _ = child.wait();
+    if let Some(thread) = holder.lock().unwrap().take() {
+        thread.join().unwrap();
+    }
+    assert_eq!(code, 1603);
+    assert!(restored, "the running file is not back under its name");
+}
+
 /// An interruption at any step of the set-aside leaves the complete program
 /// file under its name.
 #[cfg(windows)]

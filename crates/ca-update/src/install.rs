@@ -521,7 +521,7 @@ pub fn install_from(
         remove_package_folder(packages, &product);
         if let Some((program, moved)) = aside {
             // Replaces the unused copy; a running file may be renamed.
-            let _ = rename_retrying(&moved, program);
+            let _ = rename_retrying(&moved, program, RESTORE_ATTEMPTS);
         }
     }
     code.unwrap_or(NOT_PREPARED)
@@ -567,7 +567,7 @@ pub fn set_aside_observed(
     let fresh = work.join(STANDBY_NAME);
     let prepared = copy_flushed(program, &fresh).is_ok()
         && own_by_administrators(&fresh).is_ok()
-        && rename_retrying(&fresh, &standby).is_ok()
+        && rename_retrying(&fresh, &standby, SET_ASIDE_ATTEMPTS).is_ok()
         && inherit_access_list(&standby).is_ok();
     if !prepared {
         let _ = std::fs::remove_file(&fresh);
@@ -576,7 +576,7 @@ pub fn set_aside_observed(
         return Err(KEPT);
     }
     after_step();
-    if rename_retrying(&standby, program).is_err() {
+    if rename_retrying(&standby, program, SET_ASIDE_ATTEMPTS).is_err() {
         let _ = std::fs::remove_file(&standby);
         let _ = std::fs::remove_file(&moved);
         return Err(KEPT);
@@ -598,15 +598,24 @@ pub fn link_failure_code(error: &std::io::Error) -> i32 {
     }
 }
 
+/// Attempts, 100 ms apart, to move the unused program copy into place.
+const SET_ASIDE_ATTEMPTS: u32 = 30;
+
+/// Attempts, 100 ms apart, to put the running program file back. A failed
+/// install leaves an unused copy under the program name until this succeeds,
+/// and a loaded machine can keep a scanner on that copy for longer than the
+/// set-aside waits.
+const RESTORE_ATTEMPTS: u32 = 600;
+
 /// Rename `from` over `to`. A file scanner opens a new program file for a
-/// short time without delete sharing; that refusal is waited out.
-fn rename_retrying(from: &Path, to: &Path) -> std::io::Result<()> {
-    const ATTEMPTS: u32 = 30;
+/// short time without delete sharing; that refusal is waited out for at most
+/// `attempts` tries.
+fn rename_retrying(from: &Path, to: &Path, attempts: u32) -> std::io::Result<()> {
     let mut attempt = 1;
     loop {
         match std::fs::rename(from, to) {
             Ok(()) => return Ok(()),
-            Err(_) if attempt < ATTEMPTS => {
+            Err(_) if attempt < attempts => {
                 attempt += 1;
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
