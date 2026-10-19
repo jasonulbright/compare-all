@@ -92,7 +92,7 @@ console window with `--renderer=glow` or `--renderer=software`.
   stream.
 - If the system has no home folder and no runtime folder, the settings folder
   is temporary. The program deletes it, and `startup.txt` with it, when it
-  ends. Read the error stream from a console window, which names the folder.
+  closes normally. After an internal error the folder can remain. Read the error stream from a console window, which names the folder.
 - A release build ends at once on an internal error after the window opened,
   and shows the failure in a message box.
 - On Linux without `zenity`, no message box appears. The reasons are in
