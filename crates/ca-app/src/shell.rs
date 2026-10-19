@@ -5603,6 +5603,9 @@ mod tests {
         .with_output(Some(root.join("output").join(rel)))
     }
 
+    /// Frames until `done`, then a few more so a result handed out in the
+    /// last one reaches every tab. A file on disk does not mean `done`: a
+    /// save writes it before its result is sent.
     fn frames_until(app: &mut App, done: impl Fn(&App) -> bool) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         while !done(app) && std::time::Instant::now() < deadline {
@@ -5625,9 +5628,10 @@ mod tests {
         app.open(&text_merge_request(root, "both.txt"), &context);
         wait_until_ready(&mut app, 1);
         app.run(Command::SaveFile, &context);
+        assert!(app.tabs[1].is_busy(), "the save never started");
         app.active = 0;
         let written = root.join("output").join("both.txt");
-        frames_until(&mut app, |_| written.exists());
+        frames_until(&mut app, |app| !app.tabs[1].is_busy());
         assert!(written.exists());
         assert_eq!(app.active, 0, "the Text Merge tab came to the front");
         assert_eq!(
@@ -5696,8 +5700,10 @@ mod tests {
         app.open(&text_merge_request(root, "both.txt"), &context);
         wait_until_ready(&mut app, 1);
         app.run(Command::SaveFile, &context);
+        assert!(app.tabs[1].is_busy(), "the save never started");
         let written = root.join("output").join("both.txt");
-        frames_until(&mut app, |_| written.exists());
+        frames_until(&mut app, |app| !app.tabs[1].is_busy());
+        assert!(written.exists());
         app.open(&text_merge_request(root, "clash.txt"), &context);
         wait_until_ready(&mut app, 2);
         let codes: Vec<_> = (0..3).map(|index| app.tabs[index].exit_code()).collect();
