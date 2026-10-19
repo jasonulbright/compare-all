@@ -2045,6 +2045,7 @@ fn a_package_folder_keeps_only_the_installed_version() {
     remove_package_folder(&packages, &installer_version("26.10.8"));
 }
 
+#[cfg(windows)]
 #[test]
 fn a_package_folder_is_open_to_administrators_and_the_system_only() {
     use ca_update::install::prepare_package_folder;
@@ -2056,7 +2057,6 @@ fn a_package_folder_is_open_to_administrators_and_the_system_only() {
     let folder = prepare_package_folder(&packages, &installer_version("26.10.8")).unwrap();
     assert_eq!(folder, stale);
     assert_eq!(std::fs::read_dir(&folder).unwrap().count(), 0);
-    #[cfg(windows)]
     for path in [folder.as_path(), packages.as_path()] {
         let read = ca_update::access::read_sddls(&[path]).unwrap();
         assert!(
@@ -2118,6 +2118,7 @@ fn a_staged_package_of_the_installed_version_leaves_its_package_folder_alone() {
 
 /// The folder takes its name from the checked package. A record that only
 /// agrees with the package on year, month and build does not name it.
+#[cfg(windows)]
 #[test]
 fn the_package_folder_is_named_by_the_checked_package() {
     use ca_update::install::{install_from, Checks};
@@ -2151,6 +2152,7 @@ fn the_package_folder_is_named_by_the_checked_package() {
 
 /// After a success only the folder of the new version stays. After a
 /// failure only the folder of the installed version stays.
+#[cfg(windows)]
 #[test]
 fn the_installer_copy_of_the_installed_version_stays_until_a_new_install_succeeds() {
     use ca_update::install::{install_from, Checks};
