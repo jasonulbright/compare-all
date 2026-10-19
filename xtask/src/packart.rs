@@ -55,6 +55,7 @@ pub fn icons(arguments: &[String]) -> anyhow::Result<()> {
     if names.is_empty() {
         bail!("{source} holds no PNG file");
     }
+    refuse_colliding_outputs(&names)?;
     for size in SIZES {
         std::fs::create_dir_all(destination.join(size.to_string()))?;
     }
@@ -83,6 +84,25 @@ pub fn icons(arguments: &[String]) -> anyhow::Result<()> {
 fn is_png(path: &Path) -> bool {
     path.extension()
         .is_some_and(|e| e.eq_ignore_ascii_case("png"))
+}
+
+/// Fails when two inputs would write the same output file, comparing stems
+/// without case so the check holds on a case-insensitive destination.
+fn refuse_colliding_outputs(names: &[PathBuf]) -> anyhow::Result<()> {
+    let mut seen: std::collections::HashMap<String, &PathBuf> = std::collections::HashMap::new();
+    for path in names {
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if let Some(first) = seen.insert(stem.to_lowercase(), path) {
+            bail!(
+                "{} and {} write the same output file",
+                first.display(),
+                path.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 fn check_size(width: u32, height: u32) -> anyhow::Result<()> {
@@ -384,6 +404,15 @@ mod tests {
         assert!(check_size(72_000_000, 1).is_err());
         assert!(check_size(1, u32::MAX).is_err());
         assert!(check_size(MAXIMUM_SOURCE_SIDE, MAXIMUM_SOURCE_SIDE).is_ok());
+    }
+
+    #[test]
+    fn inputs_with_the_same_output_name_are_refused() {
+        let paths = |list: &[&str]| list.iter().map(PathBuf::from).collect::<Vec<_>>();
+        assert!(refuse_colliding_outputs(&paths(&["d/a.png", "d/b.png"])).is_ok());
+        let error = refuse_colliding_outputs(&paths(&["d/foo.PNG", "d/foo.png"])).unwrap_err();
+        assert!(error.to_string().contains("foo.PNG") && error.to_string().contains("foo.png"));
+        assert!(refuse_colliding_outputs(&paths(&["d/Foo.png", "d/foo.png"])).is_err());
     }
 
     #[test]
