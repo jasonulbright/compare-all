@@ -73,6 +73,16 @@ select More info, then Run anyway. On macOS, Gatekeeper can stop an unsigned
 program. To continue, open the program from Finder with Control-click, then
 select Open.
 
+## Troubleshooting
+
+Each start writes one line to the file `startup.txt` in the settings folder.
+The line names the version and the graphics back end that draws the window.
+If no back end starts, or the program stops on an internal error before the
+window opens, the file holds the reason instead, and the program also writes
+it to the error stream. Send the file when you ask for support. To pick a back
+end, use `--renderer=glow`, `--renderer=software`, or `--renderer=auto`, or
+set the environment variable `COMPARE_ALL_RENDERER`.
+
 ## Administration
 
 An administrator can set policies. The program reads them once at start. A
