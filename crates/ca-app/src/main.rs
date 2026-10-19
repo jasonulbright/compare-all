@@ -171,7 +171,19 @@ fn run_window(
                 std::thread::spawn(|| {
                     let line = renderer::support_line();
                     eprintln!("{line}");
-                    drop(ca_app::startup::write_report(&line));
+                    match ca_app::startup::write_routine_report(&line) {
+                        Ok(Some(path)) => {
+                            eprintln!("The line above is also in {}", path.display());
+                            if let Some(notice) = ca_ui::paths::settings_notice() {
+                                eprintln!("{notice}");
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) => eprintln!(
+                            "The line above could not be written to {}: {error}",
+                            ca_app::startup::report_path().display()
+                        ),
+                    }
                 });
                 let repaint = creation.egui_ctx.clone();
                 let variant = Variant::from_dark_mode(creation.egui_ctx.style().visuals.dark_mode);
@@ -217,8 +229,13 @@ fn run_window(
 /// program, so the error stream names the file that holds the text.
 fn report_fatal(text: &str) {
     eprintln!("{text}");
-    match ca_app::startup::write_report(text) {
-        Ok(path) => eprintln!("The same text is in {}", path.display()),
+    match ca_app::startup::write_fatal_report(text) {
+        Ok(path) => {
+            eprintln!("The same text is in {}", path.display());
+            if let Some(notice) = ca_ui::paths::settings_notice() {
+                eprintln!("{notice}");
+            }
+        }
         Err(error) => eprintln!(
             "The text could not be written to {}: {error}",
             ca_app::startup::report_path().display()

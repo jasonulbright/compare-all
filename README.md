@@ -83,6 +83,21 @@ it to the error stream. Send the file when you ask for support. To pick a back
 end, use `--renderer=glow`, `--renderer=software`, or `--renderer=auto`, or
 set the environment variable `COMPARE_ALL_RENDERER`.
 
+The program also writes the same text to the error stream. To read it, start
+the program from a console window. To test one back end, start it from a
+console window with `--renderer=glow` or `--renderer=software`.
+
+- If the settings folder cannot be written, such as a read-only portable
+  folder, the file is not written. The reasons are then only on the error
+  stream.
+- If the system has no home folder and no runtime folder, the settings folder
+  is temporary. The program deletes it, and `startup.txt` with it, when it
+  ends. Read the error stream from a console window, which names the folder.
+- A release build ends at once on an internal error after the window opened,
+  and shows the failure in a message box.
+- On Linux without `zenity`, no message box appears. The reasons are in
+  `startup.txt` and on the error stream.
+
 ## Administration
 
 An administrator can set policies. The program reads them once at start. A
