@@ -2,6 +2,7 @@
 
 #![allow(clippy::unwrap_used)]
 
+#[cfg(windows)]
 #[test]
 fn the_program_file_carries_its_version_for_the_updater() {
     let bytes = std::fs::read(env!("CARGO_BIN_EXE_ca")).unwrap();
