@@ -467,6 +467,32 @@ fn a_locked_leftover_with_an_old_pack_is_kept() {
 }
 
 #[test]
+fn a_folder_with_no_lock_file_is_removed_after_the_cleanup_takes_its_lock() {
+    let setup = setup();
+    let folder = setup.packs.join(".incoming-66-1");
+    std::fs::create_dir_all(folder.join("files")).unwrap();
+    std::fs::write(folder.join("files/x"), b"x").unwrap();
+    assert!(!folder.join("lock").exists());
+    remote::clean_leftovers(&setup.packs);
+    assert!(!folder.exists());
+}
+
+#[test]
+fn a_lock_another_handle_created_after_the_listing_protects_the_folder() {
+    let setup = setup();
+    let folder = setup.packs.join(".incoming-66-2");
+    std::fs::create_dir_all(folder.join("old")).unwrap();
+    std::fs::write(folder.join("old/pack.json"), b"user pack").unwrap();
+    std::fs::write(folder.join("id"), "neon").unwrap();
+    // No lock file existed; the other install creates and takes it now.
+    let held = lock_of(&folder);
+    remote::clean_leftovers(&setup.packs);
+    assert!(folder.join("old/pack.json").is_file());
+    assert!(!setup.packs.join("neon").exists());
+    drop(held);
+}
+
+#[test]
 fn a_work_folder_that_vanishes_fails_the_install_and_keeps_the_old_pack() {
     let setup = setup();
     let first = serve_pack(&setup.transport, "neon", "Neon", good_zip("neon", "Neon"));

@@ -253,14 +253,17 @@ impl Work {
                     COUNTER.fetch_add(1, Ordering::Relaxed)
                 )
             }),
+            &|_| {},
         )
     }
 
     /// Create a work folder under the first of at most five `names` that is
-    /// free.
+    /// free. `between` runs after the folder exists and before its lock file
+    /// is opened, the moment a cleanup in another process can act on it.
     fn create_named(
         directory: &Path,
         names: impl Iterator<Item = String>,
+        between: &dyn Fn(&Path),
     ) -> Result<Self, InstallError> {
         let failed = |what: &str, error: std::io::Error| {
             InstallError::refused(format!("The {what} cannot be created: {error}."))
@@ -277,8 +280,10 @@ impl Work {
                 }
                 Err(error) => return Err(failed("working folder", error)),
             }
-            // A cleanup that ran between the two steps removes the folder;
-            // the open then fails and the install takes a new name.
+            between(&path);
+            // A cleanup that took the lock first makes the lock step fail;
+            // one that deleted the folder makes the open fail. The install
+            // then takes a new name.
             let lock = std::fs::OpenOptions::new()
                 .create(true)
                 .truncate(false)
@@ -363,21 +368,28 @@ fn read_recorded_id(folder: &Path) -> Option<String> {
     index::valid_id(id).then(|| id.to_owned())
 }
 
-/// Delete a leftover work folder when its lock is free. The lock stays taken
-/// while the content is deleted. A folder with no lock file is abandoned.
+/// Delete a leftover work folder, never without holding its lock.
+///
+/// The cleanup opens `lock`, creating it when missing, and takes it. A
+/// folder whose lock is held, or whose lock cannot be opened, is skipped. An
+/// install that creates its folder after the listing finds the lock file
+/// already taken by the cleanup, fails its own lock step and uses a new name.
+/// Every decision below is made after the lock is held.
 ///
 /// A folder with an `old` pack is deleted only when the pack it replaced is
 /// in the packs folder; when that pack is missing, `old` is moved back first.
 /// A folder whose id record is missing or invalid is kept.
 fn remove_if_unlocked(directory: &Path, folder: &Path) {
-    let held = std::fs::OpenOptions::new()
+    let Ok(held) = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
         .write(true)
         .open(folder.join(LOCK_FILE))
-        .ok();
-    if let Some(file) = &held {
-        if file.try_lock().is_err() {
-            return;
-        }
+    else {
+        return;
+    };
+    if held.try_lock().is_err() {
+        return;
     }
     let old = folder.join(OLD_FOLDER);
     if std::fs::symlink_metadata(&old).is_ok() {
@@ -389,19 +401,17 @@ fn remove_if_unlocked(directory: &Path, folder: &Path) {
             return;
         }
     }
-    if let Some(_file) = &held {
-        if let Ok(children) = std::fs::read_dir(folder) {
-            for child in children.filter_map(Result::ok) {
-                if child.file_name() == LOCK_FILE {
-                    continue;
-                }
-                let path = child.path();
-                let _ = if child.file_type().is_ok_and(|kind| kind.is_dir()) {
-                    std::fs::remove_dir_all(&path)
-                } else {
-                    std::fs::remove_file(&path)
-                };
+    if let Ok(children) = std::fs::read_dir(folder) {
+        for child in children.filter_map(Result::ok) {
+            if child.file_name() == LOCK_FILE {
+                continue;
             }
+            let path = child.path();
+            let _ = if child.file_type().is_ok_and(|kind| kind.is_dir()) {
+                std::fs::remove_dir_all(&path)
+            } else {
+                std::fs::remove_file(&path)
+            };
         }
     }
     drop(held);
@@ -688,12 +698,35 @@ mod tests {
         std::fs::create_dir(&taken).unwrap();
         std::fs::write(taken.join("keep"), b"x").unwrap();
         let names = [".incoming-1-1", ".incoming-1-2"].map(str::to_owned);
-        let work = Work::create_named(dir.path(), names.into_iter()).unwrap();
+        let work = Work::create_named(dir.path(), names.into_iter(), &|_| {}).unwrap();
         assert_eq!(work.path, dir.path().join(".incoming-1-2"));
         assert!(
             taken.join("keep").is_file(),
             "the taken folder is untouched"
         );
+    }
+
+    #[test]
+    fn the_install_takes_the_next_name_when_a_cleanup_locked_the_first_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let names = [".incoming-5-1", ".incoming-5-2"].map(str::to_owned);
+        let held = std::cell::RefCell::new(None);
+        let work = Work::create_named(dir.path(), names.into_iter(), &|folder| {
+            // The cleanup lists the new folder, creates its lock file and
+            // takes the lock before the install opens it.
+            if folder.ends_with(".incoming-5-1") {
+                let file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .write(true)
+                    .open(folder.join(LOCK_FILE))
+                    .unwrap();
+                file.try_lock().unwrap();
+                *held.borrow_mut() = Some(file);
+            }
+        })
+        .unwrap();
+        assert_eq!(work.path, dir.path().join(".incoming-5-2"));
     }
 
     #[test]
@@ -703,7 +736,7 @@ mod tests {
         for name in &names[..5] {
             std::fs::create_dir(dir.path().join(name)).unwrap();
         }
-        assert!(Work::create_named(dir.path(), names.into_iter()).is_err());
+        assert!(Work::create_named(dir.path(), names.into_iter(), &|_| {}).is_err());
         assert!(!dir.path().join(".incoming-2-5").exists());
     }
 }
