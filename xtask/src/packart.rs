@@ -303,18 +303,30 @@ fn index_colors(rgba: &[u8], size: u32) -> Option<Indexed> {
     })
 }
 
+/// Pack folders embedded when `pack-index` gets no argument. Other folders
+/// under `assets/packs` are shipped as files only.
+const DEFAULT_EMBEDDED: [&str; 2] = ["bold-outline", "luminous-dark"];
+
 /// Writes `crates/ca-ui/src/pack/builtin_files.rs`: one manifest constant and
-/// one file-list constant for each folder under `assets/packs`.
-pub fn index(root: &Path) -> anyhow::Result<()> {
+/// one file-list constant for each named folder under `assets/packs`, or for
+/// the default embedded folders when `ids` is empty.
+pub fn index(root: &Path, ids: &[String]) -> anyhow::Result<()> {
     let packs = root.join("assets").join("packs");
     let mut folders: Vec<PathBuf> = Vec::new();
-    for entry in std::fs::read_dir(&packs).context("cannot read assets/packs")? {
-        let path = entry?.path();
-        if path.is_dir() {
-            folders.push(path);
+    let names: Vec<&str> = if ids.is_empty() {
+        DEFAULT_EMBEDDED.to_vec()
+    } else {
+        ids.iter().map(String::as_str).collect()
+    };
+    for name in names {
+        let path = packs.join(name);
+        if !path.is_dir() {
+            bail!("{} is not a pack folder", path.display());
         }
+        folders.push(path);
     }
     folders.sort();
+    folders.dedup();
     let mut out = String::from(
         "//! Embedded files of the built-in packs. Written by `cargo xtask pack-index`.\n\n",
     );

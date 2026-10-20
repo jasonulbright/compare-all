@@ -1,0 +1,96 @@
+{
+  "format": 1,
+  "id": "soft-puff",
+  "name": "Soft Puff",
+  "version": "1.0.0",
+  "modes": ["light"],
+  "colors": {
+    "text": {
+      "light": {
+        "slots": {
+          "same_line": "#FCFCFC",
+          "same_text": "#1D2229",
+          "same_line_other": "#F4F5F6",
+          "same_text_other": "#31373D",
+          "stripe": "#F1F2F4",
+          "selection": "#DAE0E7",
+          "gutter_background": "#EAECEF",
+          "gutter_text": "#555A60",
+          "chrome": "#E0E3E7",
+          "toolbar": "#ECEEF1",
+          "separator": "#B3B8BE",
+          "separator_strong": "#7F868E",
+          "thumbnail_background": "#E0E3E7",
+          "thumbnail_marker": "#1D2229",
+          "thumbnail_caret": "#5C738B",
+          "settings_overridden": "#323D49",
+          "notice_info": "#3F4D5C",
+          "syntax_plain": "#1D2229",
+          "syntax_identifier": "#1D2229"
+        }
+      }
+    },
+    "folder": {
+      "light": {
+        "slots": {
+          "folder_background": "#FCFCFC",
+          "stripe": "#F1F2F4",
+          "folder_selection": "#DAE0E7",
+          "folder_selection_edge": "#8495A8",
+          "folder_header_background": "#E0E3E7",
+          "folder_header_text": "#1D2229",
+          "center_column": "#EAECEF",
+          "folder_same": "#1D2229",
+          "folder_unknown": "#555A60"
+        }
+      }
+    },
+    "hex": {
+      "light": {
+        "slots": {
+          "background": "#FCFCFC",
+          "pane_focused": "#FCFCFC",
+          "pane_other": "#F4F5F6",
+          "same_text": "#1D2229",
+          "address_text": "#4B5057",
+          "address_background": "#EAECEF",
+          "separator": "#B3B8BE",
+          "caret": "#5C738B",
+          "selection": "#DAE0E7",
+          "thumbnail_background": "#E0E3E7",
+          "thumbnail_marker": "#1D2229",
+          "thumbnail_caret": "#5C738B",
+          "gap_background": "#EAECEF"
+        }
+      }
+    },
+    "table": {
+      "light": {
+        "slots": {
+          "background": "#FCFCFC",
+          "panel": "#F4F5F6",
+          "grid_line": "#CDD1D5",
+          "stripe": "#F1F2F4",
+          "header_background": "#E0E3E7",
+          "header_text": "#1D2229",
+          "header_hover": "#D2D7DC",
+          "gutter_background": "#EAECEF",
+          "gutter_text": "#4B5057",
+          "separator": "#B3B8BE",
+          "same_background": "#FCFCFC",
+          "same_text": "#1D2229",
+          "gap_background": "#EAECEF",
+          "current_cell_border": "#5C738B",
+          "selection": "#DAE0E7",
+          "thumbnail_background": "#E0E3E7",
+          "thumbnail_marker": "#1D2229",
+          "details_background": "#F4F5F6",
+          "details_text": "#1D2229"
+        }
+      }
+    }
+  },
+  "icons": {
+    "sizes": [16, 24, 32, 48]
+  }
+}
