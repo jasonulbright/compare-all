@@ -17,6 +17,8 @@ ico = "0.5.0"
 resvg.workspace = true
 image = { version = "0.25", default-features = false, features = ["png"] }
 png = "0.18"
+zip = { version = "9.0", default-features = false, features = ["deflate-flate2"] }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
 [lints]
 workspace = true

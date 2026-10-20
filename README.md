@@ -108,6 +108,7 @@ change takes effect at the next start. The program never writes them.
 | `DisableCheckForUpdates` | No update check runs. The update command and option are hidden.        |
 | `DisableRemoteProfiles` | Remote storage profiles are unavailable.                                |
 | `DisableSavedPasswords` | Passwords stay in memory. No control offers to save one.                |
+| `DisableThemePackDownloads` | The Get more packs button is off. No theme pack is downloaded. Installed theme packs keep working. |
 
 On Windows, set each policy as a `REG_DWORD` value with the name of the policy
 under one of these keys:

@@ -7,6 +7,7 @@
 
 use super::schema::{self, OptionField, OptionPage, PageKind, ARCHIVE_PAGE_NOTE, POLICY_REASON};
 use crate::command::{bindings, Command, Keystroke, MenuView, ShortcutTable};
+use crate::pack::remote::PackServices;
 use crate::settings::field::{FieldShape, FieldValue};
 use crate::theme::slots::{self, to_color, to_stored};
 use crate::theme::{Palette, Variant};
@@ -62,6 +63,7 @@ pub struct OptionsDialog {
     selected_entry: Option<usize>,
     /// Colors of the theme pack in force, read when the color pages draw.
     pack_colors: Option<ca_session::options::PaletteOptions>,
+    browser: crate::pack::browser::PackBrowser,
 }
 
 impl OptionsDialog {
@@ -85,7 +87,19 @@ impl OptionsDialog {
             conflict: None,
             selected_entry: None,
             pack_colors: None,
+            browser: crate::pack::browser::PackBrowser::new(instance),
         }
+    }
+
+    /// Say where the pack browser gets packs from. Without it the "Get more
+    /// packs" button stays off.
+    pub fn set_pack_services(&mut self, services: Option<std::sync::Arc<PackServices>>) {
+        self.browser.set_services(services);
+    }
+
+    /// The release page the person asked the pack browser to open, once.
+    pub fn take_page_request(&mut self) -> Option<String> {
+        self.browser.take_page_request()
     }
 
     /// Show the colors of a theme pack under the colors edited here.
@@ -418,7 +432,9 @@ impl OptionsDialog {
                 }
             });
         ui.separator();
-        self.footer(ui)
+        let outcome = self.footer(ui);
+        self.browser.show(ui.ctx());
+        outcome
     }
 
     fn page_strip(&mut self, ui: &mut egui::Ui) {
@@ -468,6 +484,7 @@ impl OptionsDialog {
         let catalog = crate::pack::catalog(ui.ctx());
         ui.separator();
         ui.label(egui::RichText::new("Theme pack").strong());
+        self.get_more_packs(ui);
         if !catalog.scanned {
             ui.label("Looking for theme packs.");
             return;
@@ -514,6 +531,24 @@ impl OptionsDialog {
         if let Some(id) = chosen {
             self.edited.appearance.theme_pack = id;
         }
+    }
+
+    /// The button that opens the pack browser, off when an administrator
+    /// policy turns downloads off.
+    fn get_more_packs(&mut self, ui: &mut egui::Ui) {
+        let blocked = self.policies.theme_pack_downloads_disabled();
+        ui.horizontal_wrapped(|ui| {
+            let enabled = !blocked && self.browser.available();
+            if ui
+                .add_enabled(enabled, egui::Button::new(crate::pack::browser::OPEN_LABEL))
+                .clicked()
+            {
+                self.browser.open(ui.ctx());
+            }
+            if blocked {
+                ui.weak(crate::pack::browser::POLICY_TEXT);
+            }
+        });
     }
 
     /// One labeled control, with the reason when it takes no edit.

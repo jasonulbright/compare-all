@@ -9,6 +9,7 @@ pub mod cli;
 pub mod explorer;
 pub mod home;
 pub mod icon;
+pub mod packs;
 pub mod profiles;
 pub mod registry;
 pub mod renderer;
