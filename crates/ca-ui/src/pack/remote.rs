@@ -256,7 +256,14 @@ impl Work {
                 COUNTER.fetch_add(1, Ordering::Relaxed)
             );
             let path = directory.join(&name);
-            std::fs::create_dir(&path).map_err(|error| failed("working folder", error))?;
+            match std::fs::create_dir(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    last = Some(error);
+                    continue;
+                }
+                Err(error) => return Err(failed("working folder", error)),
+            }
             // A cleanup that ran between the two steps removes the folder;
             // the open then fails and the install takes a new name.
             let lock = std::fs::OpenOptions::new()
@@ -320,19 +327,36 @@ pub fn clean_leftovers(directory: &Path) {
         }
         let path = entry.path();
         if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-            remove_if_unlocked(&path);
+            remove_if_unlocked(directory, &path);
         } else {
             let _ = std::fs::remove_file(&path);
         }
     }
 }
 
+/// File inside a work folder that names the pack whose earlier version sits in
+/// the `old` folder.
+const ID_FILE: &str = "id";
+
+/// The pack id the work folder records, when the file holds a valid one.
+fn read_recorded_id(folder: &Path) -> Option<String> {
+    let path = folder.join(ID_FILE);
+    let meta = std::fs::symlink_metadata(&path).ok()?;
+    if !meta.is_file() || meta.len() > 128 {
+        return None;
+    }
+    let text = std::fs::read_to_string(&path).ok()?;
+    let id = text.trim();
+    index::valid_id(id).then(|| id.to_owned())
+}
+
 /// Delete a leftover work folder when its lock is free. The lock stays taken
 /// while the content is deleted. A folder with no lock file is abandoned.
-fn remove_if_unlocked(folder: &Path) {
-    if folder.join(OLD_FOLDER).exists() {
-        return;
-    }
+///
+/// A folder with an `old` pack is deleted only when the pack it replaced is
+/// in the packs folder; when that pack is missing, `old` is moved back first.
+/// A folder whose id record is missing or invalid is kept.
+fn remove_if_unlocked(directory: &Path, folder: &Path) {
     let held = std::fs::OpenOptions::new()
         .write(true)
         .open(folder.join(LOCK_FILE))
@@ -341,6 +365,18 @@ fn remove_if_unlocked(folder: &Path) {
         if file.try_lock().is_err() {
             return;
         }
+    }
+    let old = folder.join(OLD_FOLDER);
+    if std::fs::symlink_metadata(&old).is_ok() {
+        let Some(id) = read_recorded_id(folder) else {
+            return;
+        };
+        let target = directory.join(id);
+        if std::fs::symlink_metadata(&target).is_err() && std::fs::rename(&old, &target).is_err() {
+            return;
+        }
+    }
+    if let Some(_file) = &held {
         if let Ok(children) = std::fs::read_dir(folder) {
             for child in children.filter_map(Result::ok) {
                 if child.file_name() == LOCK_FILE {
@@ -531,6 +567,9 @@ fn move_into_place(
         Err(error) => Err(moved(error)),
         Ok(meta) if meta.is_dir() && read_marker(&target).is_some() => {
             let old = work.path.join(OLD_FOLDER);
+            // A crash after the first rename leaves the record the cleanup
+            // needs to put the earlier pack back.
+            std::fs::write(work.path.join(ID_FILE), id).map_err(moved)?;
             std::fs::rename(&target, &old).map_err(moved)?;
             if let Err(error) = std::fs::rename(files, &target) {
                 if std::fs::rename(&old, &target).is_err() {
@@ -622,4 +661,27 @@ fn hex(bytes: &[u8]) -> String {
         let _ = write!(out, "{byte:02x}");
         out
     })
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_work_folder_name_that_is_taken_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let next = COUNTER.load(Ordering::Relaxed);
+        let taken = dir
+            .path()
+            .join(format!("{TEMPORARY_PREFIX}{}-{next}", std::process::id()));
+        std::fs::create_dir(&taken).unwrap();
+        std::fs::write(taken.join("keep"), b"x").unwrap();
+        let work = Work::create(dir.path()).unwrap();
+        assert_ne!(work.path, taken);
+        assert!(
+            taken.join("keep").is_file(),
+            "the taken folder is untouched"
+        );
+    }
 }
