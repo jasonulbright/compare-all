@@ -313,9 +313,14 @@ impl Work {
         ))
     }
 
-    /// Fails when the folder or its lock file is gone.
+    /// Fails when the folder is gone or its lock file is no longer the file
+    /// this install holds the lock on.
     fn check_alive(&self) -> Result<(), InstallError> {
-        if self.path.join(LOCK_FILE).is_file() {
+        let alive = self
+            .lock
+            .as_ref()
+            .is_some_and(|held| names_held_file(held, &self.path.join(LOCK_FILE)));
+        if alive {
             Ok(())
         } else {
             Err(InstallError::refused(
@@ -419,7 +424,8 @@ fn remove_if_unlocked_with(directory: &Path, folder: &Path, released: &dyn Fn())
 /// before the lock is released; afterwards only the lock file and the empty
 /// folder are removed, each without recursion, so an install that took the
 /// lock in between keeps whatever it wrote. A folder that is not empty stays
-/// for the next cleanup. `released` runs after the lock is released.
+/// for the next cleanup. `released` runs after the lock is released and the
+/// lock file is unlinked.
 fn delete_holding_lock(folder: &Path, held: std::fs::File, released: &dyn Fn()) {
     if let Ok(children) = std::fs::read_dir(folder) {
         for child in children.filter_map(Result::ok) {
@@ -434,11 +440,40 @@ fn delete_holding_lock(folder: &Path, held: std::fs::File, released: &dyn Fn()) 
             };
         }
     }
-    // An open handle blocks the delete on Windows.
+    // The lock file is unlinked only while its lock is held, and only when
+    // the path still names the file that is held. On Unix a lock on an
+    // unlinked file would protect nothing: a later open of the path makes a
+    // new file that anyone can lock. On Windows the unlink of an open file
+    // leaves a delete-pending name that cannot be opened until the handle
+    // closes.
+    let lock_path = folder.join(LOCK_FILE);
+    if names_held_file(&held, &lock_path) {
+        let _ = std::fs::remove_file(&lock_path);
+    }
     drop(held);
     released();
-    let _ = std::fs::remove_file(folder.join(LOCK_FILE));
     let _ = std::fs::remove_dir(folder);
+}
+
+/// True when `path` names the file `held` is open on.
+///
+/// Unix compares device and inode. On Windows a name that exists is the held
+/// file, because the name of a file that was unlinked while open is
+/// delete-pending and cannot be reopened.
+fn names_held_file(held: &std::fs::File, path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match (held.metadata(), std::fs::metadata(path)) {
+            (Ok(open), Ok(named)) => open.dev() == named.dev() && open.ino() == named.ino(),
+            _ => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = held;
+        path.is_file()
+    }
 }
 
 /// Download, check and install the pack of `entry` into `directory`.
@@ -776,6 +811,37 @@ mod tests {
             std::fs::read(folder.join("old/pack.json")).unwrap(),
             b"user pack"
         );
+    }
+
+    #[test]
+    fn a_work_folder_whose_lock_file_was_unlinked_fails_the_alive_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let names = [".incoming-7-1".to_owned()];
+        let work = Work::create_named(dir.path(), names.into_iter(), &|_| {}).unwrap();
+        work.check_alive().unwrap();
+        // Another cleanup unlinks the lock file it believed abandoned. On
+        // Windows the unlink of an open file may be refused; then the file
+        // is still the held one and the check passes.
+        let unlinked = std::fs::remove_file(work.path.join(LOCK_FILE)).is_ok();
+        if unlinked {
+            assert!(work.check_alive().is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_new_lock_file_at_the_same_path_does_not_pass_for_the_held_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let names = [".incoming-8-1".to_owned()];
+        let work = Work::create_named(dir.path(), names.into_iter(), &|_| {}).unwrap();
+        // Cleanup A unlinks the lock file; cleanup B then creates a new one at
+        // the path, locks it and deletes the children.
+        std::fs::create_dir(work.path.join("files")).unwrap();
+        std::fs::remove_file(work.path.join(LOCK_FILE)).unwrap();
+        remove_if_unlocked(dir.path(), &work.path);
+        assert!(!work.path.join("files").exists(), "B held its own lock");
+        // The install has not moved anything yet: it fails safe here.
+        assert!(work.check_alive().is_err());
     }
 
     #[test]
