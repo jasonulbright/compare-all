@@ -57,12 +57,21 @@ fn build(root: &Path) -> anyhow::Result<()> {
         .current_dir(root)
         .arg("build")
         .args(build_arguments(std::env::args().skip(2).collect()))
-        .env(version::BUILD_DATE_VAR, version::today_iso())
+        .env(version::BUILD_DATE_VAR, build_date())
         .status()?;
     if !status.success() {
         anyhow::bail!("cargo build failed");
     }
     Ok(())
+}
+
+/// The build date for the build scripts: an existing `CA_BUILD_DATE` wins so a
+/// caller can pin the date; otherwise today in UTC.
+fn build_date() -> String {
+    std::env::var(version::BUILD_DATE_VAR)
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(version::today_iso)
 }
 
 fn build_arguments(mut arguments: Vec<String>) -> Vec<String> {
