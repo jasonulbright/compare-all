@@ -466,6 +466,74 @@ fn a_locked_leftover_with_an_old_pack_is_kept() {
     drop(held);
 }
 
+fn hold_id_lock(setup: &Setup, id: &str) -> std::fs::File {
+    std::fs::create_dir_all(&setup.packs).unwrap();
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(remote::id_lock_path(&setup.packs, id))
+        .unwrap();
+    file.try_lock().unwrap();
+    file
+}
+
+#[test]
+fn recovery_skips_a_folder_while_another_process_holds_the_id_lock() {
+    let setup = setup();
+    let folder = replaced_leftover(&setup, Some("neon"));
+    let held = hold_id_lock(&setup, "neon");
+    remote::clean_leftovers(&setup.packs);
+    assert!(folder.join("old/pack.json").is_file(), "folder kept");
+    assert!(!setup.packs.join("neon").exists(), "nothing restored");
+    drop(held);
+    remote::clean_leftovers(&setup.packs);
+    assert!(!folder.exists());
+    assert_eq!(
+        std::fs::read(setup.packs.join("neon/pack.json")).unwrap(),
+        b"earlier"
+    );
+}
+
+#[test]
+fn installs_of_one_id_take_turns() {
+    let setup = setup();
+    let entry = serve_pack(&setup.transport, "neon", "Neon", good_zip("neon", "Neon"));
+    // Another instance is in the swap of this id.
+    let held = hold_id_lock(&setup, "neon");
+    let services = Arc::clone(&setup.services);
+    let cancel = Arc::clone(&setup.cancel);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let result = remote::install(&services, &entry, &cancel);
+        let _ = sender.send(result.is_ok());
+    });
+    assert!(
+        receiver
+            .recv_timeout(std::time::Duration::from_millis(500))
+            .is_err(),
+        "the second install waits for the id lock"
+    );
+    assert!(!setup.packs.join("neon").exists());
+    drop(held);
+    assert!(receiver
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .unwrap());
+    worker.join().unwrap();
+    assert_eq!(listing(&setup.packs), ["neon"]);
+}
+
+#[test]
+fn the_id_lock_file_is_not_a_pack() {
+    let setup = setup();
+    let entry = serve_pack(&setup.transport, "neon", "Neon", good_zip("neon", "Neon"));
+    install(&setup, &entry).unwrap();
+    assert!(remote::id_lock_path(&setup.packs, "neon").is_file());
+    let folders = ca_ui::pack::host::installed_folders(&setup.packs);
+    assert_eq!(folders.len(), 1);
+    assert!(folders[0].ends_with("neon"));
+}
+
 #[test]
 fn a_folder_with_no_lock_file_is_removed_after_the_cleanup_takes_its_lock() {
     let setup = setup();

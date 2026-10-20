@@ -165,6 +165,12 @@ pub fn listing(directory: &Path) -> Vec<String> {
             listing
                 .filter_map(Result::ok)
                 .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .filter(|name| {
+                    !(name.starts_with('.')
+                        && std::path::Path::new(name)
+                            .extension()
+                            .is_some_and(|e| e == "lock"))
+                })
                 .collect()
         })
         .unwrap_or_default();

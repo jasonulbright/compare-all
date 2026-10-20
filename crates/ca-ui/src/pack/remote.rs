@@ -405,16 +405,51 @@ fn remove_if_unlocked_with(directory: &Path, folder: &Path, released: &dyn Fn())
         return;
     }
     let old = folder.join(OLD_FOLDER);
+    // Held until the folder is deleted, so no install of the same id swaps
+    // between the decision and the delete.
+    let mut _id_lock = None;
     if std::fs::symlink_metadata(&old).is_ok() {
         let Some(id) = read_recorded_id(folder) else {
             return;
         };
-        let target = directory.join(id);
+        let Ok(Some(guard)) = lock_id(directory, &id, false) else {
+            return;
+        };
+        let target = directory.join(&id);
         if std::fs::symlink_metadata(&target).is_err() && std::fs::rename(&old, &target).is_err() {
             return;
         }
+        _id_lock = Some(guard);
     }
     delete_holding_lock(folder, held, released);
+}
+
+/// The lock file that serializes work on pack `id` in the packs folder. It is
+/// a dot-file, never deleted, and not a pack folder.
+#[must_use]
+pub fn id_lock_path(directory: &Path, id: &str) -> PathBuf {
+    directory.join(format!(".{id}.lock"))
+}
+
+/// Take the lock of pack `id`. With `wait` the call blocks until the lock is
+/// free; without it the result is `None` when another holder has it.
+///
+/// `id` must pass the pack id rule, so the file name cannot leave the folder.
+fn lock_id(directory: &Path, id: &str, wait: bool) -> std::io::Result<Option<std::fs::File>> {
+    if !index::valid_id(id) {
+        return Err(std::io::Error::other("not a pack identifier"));
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(id_lock_path(directory, id))?;
+    if wait {
+        file.lock()?;
+        Ok(Some(file))
+    } else {
+        Ok(file.try_lock().is_ok().then_some(file))
+    }
 }
 
 /// Delete the content of a work folder while its lock is held, then the lock
@@ -641,6 +676,12 @@ fn move_into_place(
     let moved = |error: std::io::Error| {
         InstallError::refused(format!("The pack cannot be put in place: {error}."))
     };
+    // Installs of one id in several processes take turns: the target is
+    // observed, replaced and, on failure, restored under this lock. The wait
+    // runs on the install's worker thread. The lock is taken after the work
+    // folder lock and never the other way round while waiting, so no cycle
+    // forms.
+    let _id_lock = lock_id(directory, id, true).map_err(moved)?;
     match std::fs::symlink_metadata(&target) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             std::fs::rename(files, &target).map_err(moved)
