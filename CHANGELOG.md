@@ -1,3 +1,21 @@
+# v2026.10.20.0011
+
+## 11 theme packs: 2 built in, 9 to download
+
+### Features
+
+- Add the Luminous Dark and Bold Outline theme packs to the program.
+- Add Get more packs in Options > Appearance to install 9 more packs.
+- Check the size and SHA-256 of each downloaded pack before install.
+- Remove a downloaded pack from the same dialog.
+- Add the DisableThemePackDownloads policy to turn pack downloads off.
+
+### Dependencies
+
+- Update the SSH library to 0.64.1.
+
+Full changelog: CHANGELOG.md
+
 # v2026.10.19.0010
 
 ## 1 new setting: Theme pack in Options > Appearance
