@@ -35,12 +35,12 @@ fn main() -> anyhow::Result<()> {
         Some("package") => package::run(root)?,
         Some("notices") => notices::run(root)?,
         Some("pack-icons") => packart::icons(&std::env::args().skip(2).collect::<Vec<_>>())?,
-        Some("pack-index") => packart::index(root)?,
+        Some("pack-index") => packart::index(root, &std::env::args().skip(2).collect::<Vec<_>>())?,
         Some("update-manifest") => {
             update_manifest::run(&std::env::args().skip(2).collect::<Vec<_>>())?;
         }
         _ => anyhow::bail!(
-            "usage: cargo xtask <bump|version|build|icon|package|notices|pack-icons|pack-index|update-manifest>"
+            "usage: cargo xtask <bump|version|build|icon|package|notices|pack-icons|pack-index [id...]|update-manifest>"
         ),
     }
     Ok(())

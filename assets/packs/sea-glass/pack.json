@@ -1,0 +1,96 @@
+{
+  "format": 1,
+  "id": "sea-glass",
+  "name": "Sea Glass",
+  "version": "1.0.0",
+  "modes": ["light"],
+  "colors": {
+    "text": {
+      "light": {
+        "slots": {
+          "same_line": "#FFFFFF",
+          "same_text": "#182A33",
+          "same_line_other": "#F5F8FA",
+          "same_text_other": "#2C3F47",
+          "stripe": "#F2F6F8",
+          "selection": "#D7E8EF",
+          "gutter_background": "#EBF0F3",
+          "gutter_text": "#516169",
+          "chrome": "#E0E8EC",
+          "toolbar": "#EDF2F5",
+          "separator": "#B0BFC6",
+          "separator_strong": "#798F99",
+          "thumbnail_background": "#E0E8EC",
+          "thumbnail_marker": "#182A33",
+          "thumbnail_caret": "#418DAB",
+          "settings_overridden": "#254B5B",
+          "notice_info": "#2F5F71",
+          "syntax_plain": "#182A33",
+          "syntax_identifier": "#182A33"
+        }
+      }
+    },
+    "folder": {
+      "light": {
+        "slots": {
+          "folder_background": "#FFFFFF",
+          "stripe": "#F2F6F8",
+          "folder_selection": "#D7E8EF",
+          "folder_selection_edge": "#72A8BF",
+          "folder_header_background": "#E0E8EC",
+          "folder_header_text": "#182A33",
+          "center_column": "#EBF0F3",
+          "folder_same": "#182A33",
+          "folder_unknown": "#516169"
+        }
+      }
+    },
+    "hex": {
+      "light": {
+        "slots": {
+          "background": "#FFFFFF",
+          "pane_focused": "#FFFFFF",
+          "pane_other": "#F5F8FA",
+          "same_text": "#182A33",
+          "address_text": "#475860",
+          "address_background": "#EBF0F3",
+          "separator": "#B0BFC6",
+          "caret": "#418DAB",
+          "selection": "#D7E8EF",
+          "thumbnail_background": "#E0E8EC",
+          "thumbnail_marker": "#182A33",
+          "thumbnail_caret": "#418DAB",
+          "gap_background": "#EBF0F3"
+        }
+      }
+    },
+    "table": {
+      "light": {
+        "slots": {
+          "background": "#FFFFFF",
+          "panel": "#F5F8FA",
+          "grid_line": "#CBD7DC",
+          "stripe": "#F2F6F8",
+          "header_background": "#E0E8EC",
+          "header_text": "#182A33",
+          "header_hover": "#CFDDE4",
+          "gutter_background": "#EBF0F3",
+          "gutter_text": "#475860",
+          "separator": "#B0BFC6",
+          "same_background": "#FFFFFF",
+          "same_text": "#182A33",
+          "gap_background": "#EBF0F3",
+          "current_cell_border": "#418DAB",
+          "selection": "#D7E8EF",
+          "thumbnail_background": "#E0E8EC",
+          "thumbnail_marker": "#182A33",
+          "details_background": "#F5F8FA",
+          "details_text": "#182A33"
+        }
+      }
+    }
+  },
+  "icons": {
+    "sizes": [16, 24, 32, 48]
+  }
+}
