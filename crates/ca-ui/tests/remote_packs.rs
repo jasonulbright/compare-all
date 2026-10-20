@@ -404,6 +404,68 @@ fn a_folder_another_handle_holds_locked_stays_until_the_lock_is_free() {
     assert!(!stale.exists(), "a folder with a free lock is removed");
 }
 
+/// A work folder left by an install that replaced pack `neon`: the earlier
+/// version in `old`, and `id` when `id` is given.
+fn replaced_leftover(setup: &Setup, id: Option<&str>) -> std::path::PathBuf {
+    let folder = setup.packs.join(".incoming-88-1");
+    std::fs::create_dir_all(folder.join("old")).unwrap();
+    std::fs::write(folder.join("old/pack.json"), b"earlier").unwrap();
+    std::fs::write(folder.join("lock"), b"").unwrap();
+    if let Some(id) = id {
+        std::fs::write(folder.join("id"), id).unwrap();
+    }
+    folder
+}
+
+#[test]
+fn a_leftover_after_a_finished_swap_is_removed() {
+    let setup = setup();
+    let folder = replaced_leftover(&setup, Some("neon"));
+    std::fs::create_dir_all(setup.packs.join("neon")).unwrap();
+    std::fs::write(setup.packs.join("neon/pack.json"), b"new").unwrap();
+    remote::clean_leftovers(&setup.packs);
+    assert!(!folder.exists());
+    assert_eq!(
+        std::fs::read(setup.packs.join("neon/pack.json")).unwrap(),
+        b"new"
+    );
+}
+
+#[test]
+fn a_leftover_from_a_crash_between_the_renames_restores_the_pack() {
+    let setup = setup();
+    let folder = replaced_leftover(&setup, Some("neon"));
+    remote::clean_leftovers(&setup.packs);
+    assert!(!folder.exists());
+    assert_eq!(
+        std::fs::read(setup.packs.join("neon/pack.json")).unwrap(),
+        b"earlier"
+    );
+}
+
+#[test]
+fn a_leftover_with_an_old_pack_and_no_valid_id_is_kept() {
+    let setup = setup();
+    let folder = replaced_leftover(&setup, None);
+    remote::clean_leftovers(&setup.packs);
+    assert!(folder.join("old/pack.json").is_file());
+    std::fs::write(folder.join("id"), "../escape").unwrap();
+    remote::clean_leftovers(&setup.packs);
+    assert!(folder.join("old/pack.json").is_file());
+    assert_eq!(listing(&setup.packs), [".incoming-88-1"]);
+}
+
+#[test]
+fn a_locked_leftover_with_an_old_pack_is_kept() {
+    let setup = setup();
+    let folder = replaced_leftover(&setup, Some("neon"));
+    let held = lock_of(&folder);
+    remote::clean_leftovers(&setup.packs);
+    assert!(folder.join("old/pack.json").is_file());
+    assert!(!setup.packs.join("neon").exists());
+    drop(held);
+}
+
 #[test]
 fn a_work_folder_that_vanishes_fails_the_install_and_keeps_the_old_pack() {
     let setup = setup();
