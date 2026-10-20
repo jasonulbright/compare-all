@@ -308,14 +308,27 @@ fn index_colors(rgba: &[u8], size: u32) -> Option<Indexed> {
 const DEFAULT_EMBEDDED: [&str; 2] = ["bold-outline", "luminous-dark"];
 
 /// The default embedded folders plus `ids`, sorted and without repeats.
-fn embedded_names(ids: &[String]) -> Vec<&str> {
+///
+/// An id must follow the pack id rule: 1 to 64 characters of a-z, 0-9 and
+/// `-`. A folder name in another case would resolve to the same folder on a
+/// case-insensitive file system and yield two constants with one name.
+fn embedded_names(ids: &[String]) -> anyhow::Result<Vec<&str>> {
+    for id in ids {
+        let valid = (1..=64).contains(&id.len())
+            && id
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+        if !valid {
+            bail!("\"{id}\" is not a pack id: use 1 to 64 characters of a-z, 0-9 and -");
+        }
+    }
     let mut names: Vec<&str> = DEFAULT_EMBEDDED
         .into_iter()
         .chain(ids.iter().map(String::as_str))
         .collect();
     names.sort_unstable();
     names.dedup();
-    names
+    Ok(names)
 }
 
 /// Writes `crates/ca-ui/src/pack/builtin_files.rs`: one manifest constant and
@@ -324,7 +337,7 @@ fn embedded_names(ids: &[String]) -> Vec<&str> {
 pub fn index(root: &Path, ids: &[String]) -> anyhow::Result<()> {
     let packs = root.join("assets").join("packs");
     let mut folders: Vec<PathBuf> = Vec::new();
-    for name in embedded_names(ids) {
+    for name in embedded_names(ids)? {
         let path = packs.join(name);
         if !path.is_dir() {
             bail!("{} is not a pack folder", path.display());
@@ -384,10 +397,29 @@ mod tests {
     fn the_default_packs_stay_embedded_when_ids_are_given() {
         let ids = ["neon-tile".to_owned(), "bold-outline".to_owned()];
         assert_eq!(
-            embedded_names(&ids),
+            embedded_names(&ids).unwrap(),
             ["bold-outline", "luminous-dark", "neon-tile"]
         );
-        assert_eq!(embedded_names(&[]), ["bold-outline", "luminous-dark"]);
+        assert_eq!(
+            embedded_names(&[]).unwrap(),
+            ["bold-outline", "luminous-dark"]
+        );
+    }
+
+    #[test]
+    fn an_id_outside_the_pack_id_rule_is_refused() {
+        for bad in [
+            "LUMINOUS-DARK",
+            "",
+            "a_b",
+            "a/b",
+            "..",
+            "é",
+            &"a".repeat(65),
+        ] {
+            assert!(embedded_names(&[bad.to_owned()]).is_err(), "{bad:?}");
+        }
+        assert!(embedded_names(&["a".repeat(64)]).is_ok());
     }
 
     fn picture() -> image::RgbaImage {
