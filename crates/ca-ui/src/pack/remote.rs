@@ -290,18 +290,21 @@ impl Work {
                 .write(true)
                 .open(path.join(LOCK_FILE))
                 .and_then(|file| file.try_lock().map_err(std::io::Error::from).map(|()| file));
+            // A folder this install does not hold the lock of is never
+            // deleted here; the cleanup that holds it removes it.
             match lock {
                 Ok(file) => {
-                    return Ok(Self {
+                    let work = Self {
                         path,
                         lock: Some(file),
                         keep: std::cell::Cell::new(false),
-                    })
+                    };
+                    match work.check_alive() {
+                        Ok(()) => return Ok(work),
+                        Err(error) => last = Some(std::io::Error::other(error.message.clone())),
+                    }
                 }
-                Err(error) => {
-                    let _ = std::fs::remove_dir_all(&path);
-                    last = Some(error);
-                }
+                Err(error) => last = Some(error),
             }
         }
         Err(failed(
@@ -324,10 +327,9 @@ impl Work {
 
 impl Drop for Work {
     fn drop(&mut self) {
-        // An open handle blocks the delete on Windows.
-        drop(self.lock.take());
-        if !self.keep.get() {
-            let _ = std::fs::remove_dir_all(&self.path);
+        match self.lock.take() {
+            Some(held) if !self.keep.get() => delete_holding_lock(&self.path, held, &|| {}),
+            _ => {}
         }
     }
 }
@@ -380,6 +382,12 @@ fn read_recorded_id(folder: &Path) -> Option<String> {
 /// in the packs folder; when that pack is missing, `old` is moved back first.
 /// A folder whose id record is missing or invalid is kept.
 fn remove_if_unlocked(directory: &Path, folder: &Path) {
+    remove_if_unlocked_with(directory, folder, &|| {});
+}
+
+/// [`remove_if_unlocked`] with a hook that runs after the lock is released
+/// and before the lock file and the folder are unlinked.
+fn remove_if_unlocked_with(directory: &Path, folder: &Path, released: &dyn Fn()) {
     let Ok(held) = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -401,6 +409,18 @@ fn remove_if_unlocked(directory: &Path, folder: &Path) {
             return;
         }
     }
+    delete_holding_lock(folder, held, released);
+}
+
+/// Delete the content of a work folder while its lock is held, then the lock
+/// file and the folder itself.
+///
+/// This is the only place a work folder is deleted. The recursive deletes run
+/// before the lock is released; afterwards only the lock file and the empty
+/// folder are removed, each without recursion, so an install that took the
+/// lock in between keeps whatever it wrote. A folder that is not empty stays
+/// for the next cleanup. `released` runs after the lock is released.
+fn delete_holding_lock(folder: &Path, held: std::fs::File, released: &dyn Fn()) {
     if let Ok(children) = std::fs::read_dir(folder) {
         for child in children.filter_map(Result::ok) {
             if child.file_name() == LOCK_FILE {
@@ -414,8 +434,11 @@ fn remove_if_unlocked(directory: &Path, folder: &Path) {
             };
         }
     }
+    // An open handle blocks the delete on Windows.
     drop(held);
-    let _ = std::fs::remove_dir_all(folder);
+    released();
+    let _ = std::fs::remove_file(folder.join(LOCK_FILE));
+    let _ = std::fs::remove_dir(folder);
 }
 
 /// Download, check and install the pack of `entry` into `directory`.
@@ -727,6 +750,32 @@ mod tests {
         })
         .unwrap();
         assert_eq!(work.path, dir.path().join(".incoming-5-2"));
+    }
+
+    #[test]
+    fn an_install_that_locks_after_the_cleanup_decided_keeps_what_it_wrote() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join(".incoming-6-1");
+        std::fs::create_dir(&folder).unwrap();
+        let install_lock = std::cell::RefCell::new(None);
+        remove_if_unlocked_with(dir.path(), &folder, &|| {
+            // The install opens the lock the cleanup just released, takes
+            // it, and moves the user's pack into `old`.
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(folder.join(LOCK_FILE))
+                .unwrap();
+            file.try_lock().unwrap();
+            *install_lock.borrow_mut() = Some(file);
+            std::fs::create_dir(folder.join(OLD_FOLDER)).unwrap();
+            std::fs::write(folder.join("old/pack.json"), b"user pack").unwrap();
+        });
+        assert_eq!(
+            std::fs::read(folder.join("old/pack.json")).unwrap(),
+            b"user pack"
+        );
     }
 
     #[test]
