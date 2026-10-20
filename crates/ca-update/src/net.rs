@@ -335,21 +335,29 @@ impl HttpTransport {
         url: &str,
         overall: Duration,
         idle: Option<Duration>,
-    ) -> Result<ureq::http::Response<ureq::Body>, String> {
+    ) -> Result<ureq::http::Response<ureq::Body>, TransferError> {
         self.agent_for(url, overall, idle)?
             .get(url)
             .call()
-            .map_err(|error| error.to_string())
+            .map_err(|error| TransferError {
+                status: match error {
+                    ureq::Error::StatusCode(code) => Some(code),
+                    _ => None,
+                },
+                message: error.to_string(),
+            })
     }
-}
 
-impl Transport for HttpTransport {
-    fn get_document(
+    /// [`Transport::get_document`] with the HTTP status of a refusal kept.
+    ///
+    /// # Errors
+    /// Why the document could not be read.
+    pub fn fetch_document(
         &self,
         url: &str,
         max_bytes: u64,
         cancel: &Arc<AtomicBool>,
-    ) -> Result<Vec<u8>, String> {
+    ) -> Result<Vec<u8>, TransferError> {
         let this = self.clone();
         let url = url.to_owned();
         let overall = self.timeout;
@@ -362,13 +370,17 @@ impl Transport for HttpTransport {
         })
     }
 
-    fn download(
+    /// [`Transport::download`] with the HTTP status of a refusal kept.
+    ///
+    /// # Errors
+    /// Why the transfer failed.
+    pub fn fetch_file(
         &self,
         url: &str,
         destination: &Path,
         max_bytes: u64,
         cancel: &Arc<AtomicBool>,
-    ) -> Result<Fetched, String> {
+    ) -> Result<Fetched, TransferError> {
         let this = self.clone();
         let url = url.to_owned();
         let destination = destination.to_path_buf();
@@ -383,7 +395,9 @@ impl Transport for HttpTransport {
                 .content_length()
                 .is_some_and(|declared| declared > max_bytes)
             {
-                return Err("the server announces a file larger than any release".to_owned());
+                return Err("the server announces a file larger than any release"
+                    .to_owned()
+                    .into());
             }
             let mut reader = response.into_body().into_reader();
             let mut file = std::fs::File::create(&destination)
@@ -395,6 +409,53 @@ impl Transport for HttpTransport {
                 bytes,
             })
         })
+    }
+}
+
+/// Why a transfer failed, with the HTTP status when the server refused it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransferError {
+    /// The server's HTTP status, when it answered with an error status.
+    pub status: Option<u16>,
+    /// The reason in words.
+    pub message: String,
+}
+
+impl From<String> for TransferError {
+    fn from(message: String) -> Self {
+        Self {
+            status: None,
+            message,
+        }
+    }
+}
+
+impl std::fmt::Display for TransferError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl Transport for HttpTransport {
+    fn get_document(
+        &self,
+        url: &str,
+        max_bytes: u64,
+        cancel: &Arc<AtomicBool>,
+    ) -> Result<Vec<u8>, String> {
+        self.fetch_document(url, max_bytes, cancel)
+            .map_err(|error| error.message)
+    }
+
+    fn download(
+        &self,
+        url: &str,
+        destination: &Path,
+        max_bytes: u64,
+        cancel: &Arc<AtomicBool>,
+    ) -> Result<Fetched, String> {
+        self.fetch_file(url, destination, max_bytes, cancel)
+            .map_err(|error| error.message)
     }
 }
 
@@ -430,12 +491,12 @@ impl Progress {
 /// blocks is not interrupted from outside; a download agent limits each wait
 /// for data to `idle` and the whole request to `deadline`, so the abandoned
 /// thread ends and closes its connection shortly after.
-fn cancellable<T: Send + 'static>(
+fn cancellable<T: Send + 'static, E: From<String> + Send + 'static>(
     cancel: &Arc<AtomicBool>,
     idle: Option<Duration>,
     deadline: Option<Duration>,
-    work: impl FnOnce(Arc<AtomicBool>, Progress) -> Result<T, String> + Send + 'static,
-) -> Result<T, String> {
+    work: impl FnOnce(Arc<AtomicBool>, Progress) -> Result<T, E> + Send + 'static,
+) -> Result<T, E> {
     let (sender, receiver) = std::sync::mpsc::channel();
     let stop = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&stop);
@@ -450,19 +511,19 @@ fn cancellable<T: Send + 'static>(
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 if cancel.load(Ordering::Relaxed) {
                     stop.store(true, Ordering::Relaxed);
-                    return Err("the transfer was cancelled".to_owned());
+                    return Err("the transfer was cancelled".to_owned().into());
                 }
                 if idle.is_some_and(|limit| progress.idle() > limit) {
                     stop.store(true, Ordering::Relaxed);
-                    return Err("the transfer stopped receiving data".to_owned());
+                    return Err("the transfer stopped receiving data".to_owned().into());
                 }
                 if deadline.is_some_and(|limit| progress.start.elapsed() > limit) {
                     stop.store(true, Ordering::Relaxed);
-                    return Err("the download took longer than allowed".to_owned());
+                    return Err("the download took longer than allowed".to_owned().into());
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                return Err("the transfer ended without a result".to_owned());
+                return Err("the transfer ended without a result".to_owned().into());
             }
         }
     }
