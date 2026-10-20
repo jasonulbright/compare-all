@@ -3234,7 +3234,7 @@ impl App {
                 if let Some(state) = self.explorer.installed {
                     shown.startup.shell_integration = state.any();
                 }
-                self.options_dialog = Some(OptionsDialog::new(&shown, self.policies, instance));
+                self.options_dialog = Some(self.new_options_dialog(&shown, instance));
             }
             Command::RestoreFactoryDefaults => {
                 let instance = self.instance();
@@ -3286,6 +3286,29 @@ impl App {
                 }
             }
         }
+    }
+
+    /// An options dialog whose pack browser reads the releases this window
+    /// updates from.
+    fn new_options_dialog(
+        &self,
+        shown: &ca_session::options::ProgramOptions,
+        instance: u64,
+    ) -> OptionsDialog {
+        let mut dialog = OptionsDialog::new(shown, self.policies, instance);
+        let endpoints = self
+            .update
+            .source
+            .as_ref()
+            .map_or_else(ca_update::flow::Endpoints::github, |source| {
+                source.endpoints.clone()
+            });
+        dialog.set_pack_services(Some(crate::packs::services(
+            &self.settings_directory,
+            &endpoints,
+            VERSION,
+        )));
+        dialog
     }
 
     fn apply(&mut self, actions: Vec<ViewAction>, context: &ViewContext) {
@@ -3635,6 +3658,13 @@ impl App {
         let mut options_outcome = None;
         if let Some(dialog) = self.options_dialog.as_mut() {
             options_outcome = dialog.show(ctx, &palette);
+            if let Some(page) = dialog.take_page_request() {
+                self.launches.push(ca_ui::launch::open_url_with_system(
+                    &page,
+                    Arc::clone(&self.spawner),
+                    Arc::clone(&context.notify),
+                ));
+            }
         }
         if let Some(produced) = options_outcome {
             let wanted = produced.options.startup.shell_integration;

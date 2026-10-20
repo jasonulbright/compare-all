@@ -26,6 +26,9 @@ rfd.workspace = true
 resvg.workspace = true
 image = { version = "0.25", default-features = false, features = ["png"] }
 unicode-segmentation.workspace = true
+sha2 = "0.11"
+zip = { version = "9.0", default-features = false, features = ["deflate-flate2"] }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
 [dev-dependencies]
 tempfile.workspace = true

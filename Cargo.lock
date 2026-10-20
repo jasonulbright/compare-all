@@ -1082,6 +1082,7 @@ dependencies = [
  "ca-session",
  "ca-text",
  "egui",
+ "flate2",
  "image",
  "objc2-app-kit 0.3.2",
  "objc2-foundation 0.3.2",
@@ -1090,9 +1091,11 @@ dependencies = [
  "rfd",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "unicode-segmentation",
  "winapi-util",
+ "zip",
 ]
 
 [[package]]
@@ -7230,6 +7233,7 @@ name = "xtask"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "flate2",
  "ico",
  "image",
  "png 0.18.1",
@@ -7238,6 +7242,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
+ "zip",
 ]
 
 [[package]]

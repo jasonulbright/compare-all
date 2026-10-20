@@ -6,10 +6,13 @@
 //! look is the default pack and needs no files: any icon a pack does not supply
 //! is painted from the built-in set.
 
+pub mod browser;
 mod builtin_files;
 pub mod host;
+pub mod index;
 pub mod load;
 pub mod manifest;
+pub mod remote;
 
 use ca_session::options::{ColorGroup, PaletteOptions};
 use std::sync::Arc;
@@ -138,6 +141,21 @@ pub fn active(ctx: &egui::Context) -> Option<Arc<LoadedPack>> {
 /// Publish the list of known packs for the options dialog to read.
 pub fn install_catalog(ctx: &egui::Context, catalog: Arc<Catalog>) {
     ctx.data_mut(|data| data.insert_temp(catalog_key(), catalog));
+}
+
+fn rescan_key() -> egui::Id {
+    egui::Id::new("theme-pack-rescan")
+}
+
+/// Ask the pack host to look for packs again on its next update.
+pub fn request_rescan(ctx: &egui::Context) {
+    ctx.data_mut(|data| data.insert_temp(rescan_key(), true));
+    ctx.request_repaint();
+}
+
+pub(crate) fn take_rescan_request(ctx: &egui::Context) -> bool {
+    ctx.data_mut(|data| data.remove_temp::<bool>(rescan_key()))
+        .unwrap_or(false)
 }
 
 /// The list of known packs, empty until the first scan finishes.

@@ -136,6 +136,9 @@ impl PackHost {
     /// names no usable pack selects the built-in look. All reading and
     /// decoding runs on worker threads; this call only checks for results.
     pub fn update(&mut self, ctx: &egui::Context, wanted: &str) -> Option<Arc<LoadedPack>> {
+        if super::take_rescan_request(ctx) {
+            self.rescan();
+        }
         self.poll_scan(ctx);
         if matches!(self.scan, ScanState::Done) {
             self.select(ctx, wanted);
@@ -390,6 +393,13 @@ pub fn installed_folders(directory: &Path) -> Vec<PathBuf> {
     let mut folders: Vec<PathBuf> = Vec::new();
     for entry in listing.take(MAX_SCANNED_ENTRIES).filter_map(Result::ok) {
         if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(super::remote::TEMPORARY_PREFIX)
+        {
             continue;
         }
         folders.push(entry.path());

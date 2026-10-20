@@ -305,7 +305,7 @@ fn index_colors(rgba: &[u8], size: u32) -> Option<Indexed> {
 
 /// Pack folders that `BUILTIN` always references. Other folders under
 /// `assets/packs` are shipped as files unless named on the command line.
-const DEFAULT_EMBEDDED: [&str; 2] = ["bold-outline", "luminous-dark"];
+pub(crate) const DEFAULT_EMBEDDED: [&str; 2] = ["bold-outline", "luminous-dark"];
 
 /// The default embedded folders plus `ids`, sorted and without repeats.
 ///

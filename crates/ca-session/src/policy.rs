@@ -28,6 +28,9 @@ pub enum PolicyKey {
     /// Keep passwords in memory only and hide every control offering to save
     /// one.
     DisableSavedPasswords,
+    /// Turn off the pack browser that downloads theme packs. Installed packs
+    /// keep working.
+    DisableThemePackDownloads,
 }
 
 impl PolicyKey {
@@ -36,6 +39,7 @@ impl PolicyKey {
         PolicyKey::DisableCheckForUpdates,
         PolicyKey::DisableRemoteProfiles,
         PolicyKey::DisableSavedPasswords,
+        PolicyKey::DisableThemePackDownloads,
     ];
 
     /// The name the policy carries in the machine-wide store.
@@ -45,6 +49,7 @@ impl PolicyKey {
             PolicyKey::DisableCheckForUpdates => "DisableCheckForUpdates",
             PolicyKey::DisableRemoteProfiles => "DisableRemoteProfiles",
             PolicyKey::DisableSavedPasswords => "DisableSavedPasswords",
+            PolicyKey::DisableThemePackDownloads => "DisableThemePackDownloads",
         }
     }
 
@@ -60,10 +65,15 @@ impl PolicyKey {
 
 /// Resolved policies. Every field is off unless a policy store enables it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "one flag per documented policy key"
+)]
 pub struct AdminPolicies {
     check_for_updates_disabled: bool,
     remote_profiles_disabled: bool,
     saved_passwords_disabled: bool,
+    theme_pack_downloads_disabled: bool,
 }
 
 impl AdminPolicies {
@@ -75,6 +85,7 @@ impl AdminPolicies {
             check_for_updates_disabled: get(PolicyKey::DisableCheckForUpdates),
             remote_profiles_disabled: get(PolicyKey::DisableRemoteProfiles),
             saved_passwords_disabled: get(PolicyKey::DisableSavedPasswords),
+            theme_pack_downloads_disabled: get(PolicyKey::DisableThemePackDownloads),
         }
     }
 
@@ -86,6 +97,7 @@ impl AdminPolicies {
             check_for_updates_disabled: true,
             remote_profiles_disabled: true,
             saved_passwords_disabled: true,
+            theme_pack_downloads_disabled: true,
         }
     }
 
@@ -96,6 +108,7 @@ impl AdminPolicies {
             PolicyKey::DisableCheckForUpdates => self.check_for_updates_disabled,
             PolicyKey::DisableRemoteProfiles => self.remote_profiles_disabled,
             PolicyKey::DisableSavedPasswords => self.saved_passwords_disabled,
+            PolicyKey::DisableThemePackDownloads => self.theme_pack_downloads_disabled,
         }
     }
 
@@ -115,6 +128,12 @@ impl AdminPolicies {
     #[must_use]
     pub fn saved_passwords_disabled(&self) -> bool {
         self.saved_passwords_disabled
+    }
+
+    /// The pack browser may not download theme packs.
+    #[must_use]
+    pub fn theme_pack_downloads_disabled(&self) -> bool {
+        self.theme_pack_downloads_disabled
     }
 }
 
@@ -412,6 +431,7 @@ mod tests {
              DisableCheckForUpdates=yes\n\
              DisableRemoteProfiles = no\n\
              DisableSavedPasswords=1  # trailing comment\n\
+             DisableThemePackDownloads=yes\n\
              NotAPolicy=yes\n\
              malformed line\n",
         )
@@ -420,6 +440,7 @@ mod tests {
 
         assert!(policies.check_for_updates_disabled());
         assert!(!policies.remote_profiles_disabled());
+        assert!(policies.theme_pack_downloads_disabled());
         assert!(policies.saved_passwords_disabled());
     }
 
@@ -552,12 +573,16 @@ mod tests {
             root.key()
                 .set_value("DisableSavedPasswords", &0u32)
                 .unwrap();
+            root.key()
+                .set_value("DisableThemePackDownloads", &1u32)
+                .unwrap();
             let policies = RegistryPolicySource::with_locations(vec![root.location()])
                 .load()
                 .unwrap();
             assert!(policies.check_for_updates_disabled());
             assert!(policies.remote_profiles_disabled());
             assert!(!policies.saved_passwords_disabled());
+            assert!(policies.theme_pack_downloads_disabled());
         }
 
         #[test]
