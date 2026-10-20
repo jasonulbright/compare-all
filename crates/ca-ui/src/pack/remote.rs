@@ -244,17 +244,30 @@ const OLD_FOLDER: &str = "old";
 
 impl Work {
     fn create(directory: &Path) -> Result<Self, InstallError> {
+        Self::create_named(
+            directory,
+            std::iter::repeat_with(|| {
+                format!(
+                    "{TEMPORARY_PREFIX}{}-{}",
+                    std::process::id(),
+                    COUNTER.fetch_add(1, Ordering::Relaxed)
+                )
+            }),
+        )
+    }
+
+    /// Create a work folder under the first of at most five `names` that is
+    /// free.
+    fn create_named(
+        directory: &Path,
+        names: impl Iterator<Item = String>,
+    ) -> Result<Self, InstallError> {
         let failed = |what: &str, error: std::io::Error| {
             InstallError::refused(format!("The {what} cannot be created: {error}."))
         };
         std::fs::create_dir_all(directory).map_err(|error| failed("packs folder", error))?;
         let mut last = None;
-        for _ in 0..5 {
-            let name = format!(
-                "{TEMPORARY_PREFIX}{}-{}",
-                std::process::id(),
-                COUNTER.fetch_add(1, Ordering::Relaxed)
-            );
+        for name in names.take(5) {
             let path = directory.join(&name);
             match std::fs::create_dir(&path) {
                 Ok(()) => {}
@@ -671,17 +684,26 @@ mod tests {
     #[test]
     fn a_work_folder_name_that_is_taken_is_skipped() {
         let dir = tempfile::tempdir().unwrap();
-        let next = COUNTER.load(Ordering::Relaxed);
-        let taken = dir
-            .path()
-            .join(format!("{TEMPORARY_PREFIX}{}-{next}", std::process::id()));
+        let taken = dir.path().join(".incoming-1-1");
         std::fs::create_dir(&taken).unwrap();
         std::fs::write(taken.join("keep"), b"x").unwrap();
-        let work = Work::create(dir.path()).unwrap();
-        assert_ne!(work.path, taken);
+        let names = [".incoming-1-1", ".incoming-1-2"].map(str::to_owned);
+        let work = Work::create_named(dir.path(), names.into_iter()).unwrap();
+        assert_eq!(work.path, dir.path().join(".incoming-1-2"));
         assert!(
             taken.join("keep").is_file(),
             "the taken folder is untouched"
         );
+    }
+
+    #[test]
+    fn five_taken_names_fail_the_install_without_touching_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let names: Vec<String> = (0..6).map(|n| format!(".incoming-2-{n}")).collect();
+        for name in &names[..5] {
+            std::fs::create_dir(dir.path().join(name)).unwrap();
+        }
+        assert!(Work::create_named(dir.path(), names.into_iter()).is_err());
+        assert!(!dir.path().join(".incoming-2-5").exists());
     }
 }
