@@ -1544,7 +1544,7 @@ Apache License
 
 ## Apache License 2.0 (Apache-2.0)
 
-Used by: `ab_glyph 0.2.32`, `ab_glyph_rasterizer 0.1.10`, `accesskit_winit 0.23.1`, `blake3 1.8.7`, `codespan-reporting 0.11.1`, `constant_time_eq 0.4.2`, `constant_time_eq 0.6.1`, `owned_ttf_parser 0.25.1`, `pageant 0.2.3`, `russh 0.63.3`, `russh-cryptovec 0.62.0`, `russh-util 0.52.0`, `spirv 0.3.0+sdk-1.3.268.0`
+Used by: `ab_glyph 0.2.32`, `ab_glyph_rasterizer 0.1.10`, `accesskit_winit 0.23.1`, `blake3 1.8.7`, `codespan-reporting 0.11.1`, `constant_time_eq 0.4.2`, `constant_time_eq 0.6.1`, `owned_ttf_parser 0.25.1`, `pageant 0.2.3`, `russh 0.64.1`, `russh-cryptovec 0.62.0`, `russh-util 0.52.0`, `spirv 0.3.0+sdk-1.3.268.0`
 
 ```text
 Apache License
