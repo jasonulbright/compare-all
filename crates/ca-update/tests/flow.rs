@@ -1284,6 +1284,41 @@ fn the_elevation_prompt_starts_the_installed_program_and_not_the_installer() {
         .any(|(k, _)| k.eq_ignore_ascii_case("TEMP") || k.eq_ignore_ascii_case("TMP")));
 }
 
+#[test]
+fn a_refused_transfer_reports_the_http_status() {
+    let server = Server::start();
+    server.serve("/gone", 410, "text/plain", b"x".to_vec());
+    let transport = HttpTransport::new(
+        "compare-all/test".to_owned(),
+        ProxyConfig::direct(),
+        Duration::from_secs(5),
+    )
+    .allowing_plain_http();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let missing = transport
+        .fetch_document(&format!("{}/absent", server.base), 100, &cancel)
+        .unwrap_err();
+    assert_eq!(missing.status, Some(404));
+    let gone = transport
+        .fetch_document(&format!("{}/gone", server.base), 100, &cancel)
+        .unwrap_err();
+    assert_eq!(gone.status, Some(410));
+    let dir = tempfile::tempdir().unwrap();
+    let file = transport
+        .fetch_file(
+            &format!("{}/absent", server.base),
+            &dir.path().join("f"),
+            100,
+            &cancel,
+        )
+        .unwrap_err();
+    assert_eq!(file.status, Some(404));
+    let refused = transport
+        .fetch_document("http://127.0.0.1:1/x", 100, &cancel)
+        .unwrap_err();
+    assert_eq!(refused.status, None);
+}
+
 /// A server that sends the headers at once and then the body in small pieces.
 fn trickle_server(
     body: Vec<u8>,

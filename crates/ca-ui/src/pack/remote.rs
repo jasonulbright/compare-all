@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 /// Prefix of the temporary folders an install works in, inside the packs
 /// folder.
@@ -223,66 +223,140 @@ impl std::fmt::Display for InstallError {
     }
 }
 
-static ACTIVE: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// File inside a work folder that its install holds locked for its whole
+/// life. A cleanup in any process deletes a leftover folder only when it can
+/// take this lock itself.
+const LOCK_FILE: &str = "lock";
 
 /// A temporary folder inside the packs folder. Dropping it deletes it, so a
 /// failed install leaves nothing behind.
 struct Work {
     path: PathBuf,
-    name: String,
+    lock: Option<std::fs::File>,
+    /// Set when the folder holds the only copy of an earlier pack version.
+    keep: std::cell::Cell<bool>,
 }
+
+/// Folder inside a work folder that holds the pack being replaced.
+const OLD_FOLDER: &str = "old";
 
 impl Work {
     fn create(directory: &Path) -> Result<Self, InstallError> {
-        std::fs::create_dir_all(directory).map_err(|error| {
-            InstallError::refused(format!("The packs folder cannot be created: {error}."))
-        })?;
-        let name = format!(
-            "{TEMPORARY_PREFIX}{}-{}",
-            std::process::id(),
-            COUNTER.fetch_add(1, Ordering::Relaxed)
-        );
-        let path = directory.join(&name);
-        std::fs::create_dir(&path).map_err(|error| {
-            InstallError::refused(format!("The working folder cannot be created: {error}."))
-        })?;
-        if let Ok(mut active) = ACTIVE.lock() {
-            active.insert(name.clone());
+        let failed = |what: &str, error: std::io::Error| {
+            InstallError::refused(format!("The {what} cannot be created: {error}."))
+        };
+        std::fs::create_dir_all(directory).map_err(|error| failed("packs folder", error))?;
+        let mut last = None;
+        for _ in 0..5 {
+            let name = format!(
+                "{TEMPORARY_PREFIX}{}-{}",
+                std::process::id(),
+                COUNTER.fetch_add(1, Ordering::Relaxed)
+            );
+            let path = directory.join(&name);
+            std::fs::create_dir(&path).map_err(|error| failed("working folder", error))?;
+            // A cleanup that ran between the two steps removes the folder;
+            // the open then fails and the install takes a new name.
+            let lock = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(path.join(LOCK_FILE))
+                .and_then(|file| file.try_lock().map_err(std::io::Error::from).map(|()| file));
+            match lock {
+                Ok(file) => {
+                    return Ok(Self {
+                        path,
+                        lock: Some(file),
+                        keep: std::cell::Cell::new(false),
+                    })
+                }
+                Err(error) => {
+                    let _ = std::fs::remove_dir_all(&path);
+                    last = Some(error);
+                }
+            }
         }
-        Ok(Self { path, name })
+        Err(failed(
+            "working folder",
+            last.unwrap_or_else(|| std::io::Error::other("no folder name was free")),
+        ))
+    }
+
+    /// Fails when the folder or its lock file is gone.
+    fn check_alive(&self) -> Result<(), InstallError> {
+        if self.path.join(LOCK_FILE).is_file() {
+            Ok(())
+        } else {
+            Err(InstallError::refused(
+                "The working folder was removed while the pack was installed. Nothing was changed.",
+            ))
+        }
     }
 }
 
 impl Drop for Work {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-        if let Ok(mut active) = ACTIVE.lock() {
-            active.remove(&self.name);
+        // An open handle blocks the delete on Windows.
+        drop(self.lock.take());
+        if !self.keep.get() {
+            let _ = std::fs::remove_dir_all(&self.path);
         }
     }
 }
 
 /// Delete the temporary folders that earlier runs left in the packs folder.
-/// A folder an install of this process still uses is kept.
+/// A folder whose lock an install holds, in this or another process, is kept.
 pub fn clean_leftovers(directory: &Path) {
     let Ok(listing) = std::fs::read_dir(directory) else {
         return;
     };
-    let active = ACTIVE.lock().map(|set| set.clone()).unwrap_or_default();
     for entry in listing.filter_map(Result::ok) {
         let name = entry.file_name().to_string_lossy().into_owned();
-        if !name.starts_with(TEMPORARY_PREFIX) || active.contains(&name) {
+        if !name.starts_with(TEMPORARY_PREFIX) {
             continue;
         }
         let path = entry.path();
-        let is_folder = entry.file_type().is_ok_and(|kind| kind.is_dir());
-        let _ = if is_folder {
-            std::fs::remove_dir_all(&path)
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            remove_if_unlocked(&path);
         } else {
-            std::fs::remove_file(&path)
-        };
+            let _ = std::fs::remove_file(&path);
+        }
     }
+}
+
+/// Delete a leftover work folder when its lock is free. The lock stays taken
+/// while the content is deleted. A folder with no lock file is abandoned.
+fn remove_if_unlocked(folder: &Path) {
+    if folder.join(OLD_FOLDER).exists() {
+        return;
+    }
+    let held = std::fs::OpenOptions::new()
+        .write(true)
+        .open(folder.join(LOCK_FILE))
+        .ok();
+    if let Some(file) = &held {
+        if file.try_lock().is_err() {
+            return;
+        }
+        if let Ok(children) = std::fs::read_dir(folder) {
+            for child in children.filter_map(Result::ok) {
+                if child.file_name() == LOCK_FILE {
+                    continue;
+                }
+                let path = child.path();
+                let _ = if child.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    std::fs::remove_dir_all(&path)
+                } else {
+                    std::fs::remove_file(&path)
+                };
+            }
+        }
+    }
+    drop(held);
+    let _ = std::fs::remove_dir_all(folder);
 }
 
 /// Download, check and install the pack of `entry` into `directory`.
@@ -331,7 +405,8 @@ pub fn install(
     }
     write_file(&files.join(MARKER_FILE), entry.sha256.as_bytes())
         .map_err(|error| InstallError::refused(format!("The pack cannot be marked: {error}.")))?;
-    move_into_place(directory, &entry.id, &files, &work.path)
+    work.check_alive()?;
+    move_into_place(directory, &entry.id, &files, &work)
 }
 
 fn check_download(zip: &Path, entry: &IndexEntry) -> Result<(), InstallError> {
@@ -443,7 +518,7 @@ fn move_into_place(
     directory: &Path,
     id: &str,
     files: &Path,
-    work: &Path,
+    work: &Work,
 ) -> Result<(), InstallError> {
     let target = directory.join(id);
     let moved = |error: std::io::Error| {
@@ -455,10 +530,16 @@ fn move_into_place(
         }
         Err(error) => Err(moved(error)),
         Ok(meta) if meta.is_dir() && read_marker(&target).is_some() => {
-            let old = work.join("old");
+            let old = work.path.join(OLD_FOLDER);
             std::fs::rename(&target, &old).map_err(moved)?;
             if let Err(error) = std::fs::rename(files, &target) {
-                let _ = std::fs::rename(&old, &target);
+                if std::fs::rename(&old, &target).is_err() {
+                    work.keep.set(true);
+                    return Err(InstallError::refused(format!(
+                        "The pack cannot be put in place: {error}. The earlier version could not be restored; it is in {}.",
+                        old.display()
+                    )));
+                }
                 return Err(moved(error));
             }
             Ok(())

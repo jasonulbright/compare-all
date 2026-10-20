@@ -314,6 +314,133 @@ fn leftover_temporary_folders_are_removed_and_other_folders_stay() {
     assert_eq!(listing(&setup.packs), ["keep"]);
 }
 
+/// Runs `hook` after each file download, as another process would act while an
+/// install is between its steps.
+struct HookTransport {
+    inner: Arc<FakeTransport>,
+    hook: Box<dyn Fn() + Send + Sync>,
+}
+
+impl ca_ui::pack::remote::PackTransport for HookTransport {
+    fn document(
+        &self,
+        url: &str,
+        max_bytes: u64,
+        cancel: &Arc<AtomicBool>,
+    ) -> Result<Vec<u8>, FetchError> {
+        self.inner.document(url, max_bytes, cancel)
+    }
+
+    fn file(
+        &self,
+        url: &str,
+        destination: &std::path::Path,
+        max_bytes: u64,
+        cancel: &Arc<AtomicBool>,
+    ) -> Result<(), FetchError> {
+        let result = self.inner.file(url, destination, max_bytes, cancel);
+        (self.hook)();
+        result
+    }
+}
+
+fn hooked(setup: &Setup, hook: Box<dyn Fn() + Send + Sync>) -> PackServices {
+    use ca_ui::pack::remote::PackTransport;
+    PackServices {
+        transport: Arc::new(HookTransport {
+            inner: Arc::clone(&setup.transport),
+            hook,
+        }) as Arc<dyn PackTransport>,
+        locations: locations(),
+        directory: setup.packs.clone(),
+    }
+}
+
+fn lock_of(folder: &std::path::Path) -> std::fs::File {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(folder.join("lock"))
+        .unwrap();
+    file.try_lock().unwrap();
+    file
+}
+
+#[test]
+fn a_cleanup_from_another_instance_leaves_a_live_install_alone() {
+    let setup = setup();
+    let entry = serve_pack(&setup.transport, "neon", "Neon", good_zip("neon", "Neon"));
+    let packs = setup.packs.clone();
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let record = Arc::clone(&seen);
+    let services = hooked(
+        &setup,
+        Box::new(move || {
+            // The cleanup of a second instance runs while this install holds
+            // its work folder: the folder and the downloaded zip must stay.
+            remote::clean_leftovers(&packs);
+            record.lock().unwrap().push(listing(&packs));
+        }),
+    );
+    remote::install(&services, &entry, &setup.cancel).unwrap();
+    let during = seen.lock().unwrap()[0].clone();
+    assert_eq!(during.len(), 1, "{during:?}");
+    assert!(during[0].starts_with(".incoming-"));
+    assert_eq!(listing(&setup.packs), ["neon"]);
+}
+
+#[test]
+fn a_folder_another_handle_holds_locked_stays_until_the_lock_is_free() {
+    let setup = setup();
+    let stale = setup.packs.join(".incoming-77-1");
+    std::fs::create_dir_all(stale.join("files")).unwrap();
+    std::fs::write(stale.join("files/x"), b"x").unwrap();
+    let held = lock_of(&stale);
+    remote::clean_leftovers(&setup.packs);
+    assert!(stale.join("files/x").is_file(), "a held folder is kept");
+    drop(held);
+    remote::clean_leftovers(&setup.packs);
+    assert!(!stale.exists(), "a folder with a free lock is removed");
+}
+
+#[test]
+fn a_work_folder_that_vanishes_fails_the_install_and_keeps_the_old_pack() {
+    let setup = setup();
+    let first = serve_pack(&setup.transport, "neon", "Neon", good_zip("neon", "Neon"));
+    install(&setup, &first).unwrap();
+    let second = serve_pack(
+        &setup.transport,
+        "neon",
+        "Neon Two",
+        zip_of(&[
+            ("pack.json", manifest("neon", "Neon Two")),
+            ("icons/16/next-difference.png", png(16)),
+        ]),
+    );
+    let packs = setup.packs.clone();
+    let services = hooked(
+        &setup,
+        Box::new(move || {
+            for entry in std::fs::read_dir(&packs).unwrap().flatten() {
+                if entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".incoming-")
+                {
+                    let _ = std::fs::remove_dir_all(entry.path());
+                }
+            }
+        }),
+    );
+    assert!(remote::install(&services, &second, &setup.cancel).is_err());
+    assert_eq!(listing(&setup.packs), ["neon"]);
+    assert_eq!(
+        remote::installed_by_browser(&setup.packs)["neon"],
+        first.sha256
+    );
+}
+
 #[test]
 fn a_temporary_folder_is_not_listed_as_a_pack() {
     let setup = setup();
