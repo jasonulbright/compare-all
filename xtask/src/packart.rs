@@ -303,22 +303,28 @@ fn index_colors(rgba: &[u8], size: u32) -> Option<Indexed> {
     })
 }
 
-/// Pack folders embedded when `pack-index` gets no argument. Other folders
-/// under `assets/packs` are shipped as files only.
+/// Pack folders that `BUILTIN` always references. Other folders under
+/// `assets/packs` are shipped as files unless named on the command line.
 const DEFAULT_EMBEDDED: [&str; 2] = ["bold-outline", "luminous-dark"];
 
+/// The default embedded folders plus `ids`, sorted and without repeats.
+fn embedded_names(ids: &[String]) -> Vec<&str> {
+    let mut names: Vec<&str> = DEFAULT_EMBEDDED
+        .into_iter()
+        .chain(ids.iter().map(String::as_str))
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    names
+}
+
 /// Writes `crates/ca-ui/src/pack/builtin_files.rs`: one manifest constant and
-/// one file-list constant for each named folder under `assets/packs`, or for
-/// the default embedded folders when `ids` is empty.
+/// one file-list constant for each default embedded folder and each folder
+/// named in `ids` under `assets/packs`.
 pub fn index(root: &Path, ids: &[String]) -> anyhow::Result<()> {
     let packs = root.join("assets").join("packs");
     let mut folders: Vec<PathBuf> = Vec::new();
-    let names: Vec<&str> = if ids.is_empty() {
-        DEFAULT_EMBEDDED.to_vec()
-    } else {
-        ids.iter().map(String::as_str).collect()
-    };
-    for name in names {
+    for name in embedded_names(ids) {
         let path = packs.join(name);
         if !path.is_dir() {
             bail!("{} is not a pack folder", path.display());
@@ -373,6 +379,16 @@ pub fn index(root: &Path, ids: &[String]) -> anyhow::Result<()> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_default_packs_stay_embedded_when_ids_are_given() {
+        let ids = ["neon-tile".to_owned(), "bold-outline".to_owned()];
+        assert_eq!(
+            embedded_names(&ids),
+            ["bold-outline", "luminous-dark", "neon-tile"]
+        );
+        assert_eq!(embedded_names(&[]), ["bold-outline", "luminous-dark"]);
+    }
 
     fn picture() -> image::RgbaImage {
         let mut picture = image::RgbaImage::new(128, 128);
