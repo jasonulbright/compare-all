@@ -202,6 +202,8 @@ mod tests {
             taken.get("picture").map(|held| held.layout.as_str()),
             Some("summary")
         );
-        assert!(take_records().is_empty());
+        // Other tests close dialogs of other kinds into the same process-wide
+        // store, so only the kind this test recorded is checked.
+        assert!(!take_records().contains_key("picture"));
     }
 }
