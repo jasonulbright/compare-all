@@ -104,6 +104,7 @@ pub fn zip_of(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
         let mut writer = zip::ZipWriter::new(&mut cursor);
         let options = zip::write::SimpleFileOptions::default()
             .compression_method(zip::CompressionMethod::Deflated)
+            .last_modified_time(zip::DateTime::default())
             .unix_permissions(0o644);
         for (name, bytes) in entries {
             writer.start_file(*name, options).unwrap();
