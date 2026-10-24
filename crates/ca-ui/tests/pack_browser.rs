@@ -59,6 +59,7 @@ impl Harness {
             egui::CentralPanel::default().show(ctx, |ui| {
                 let _ = dialog.borrow_mut().body(ui, &table);
             });
+            dialog.borrow_mut().show_pack_browser(ctx);
         };
         painted_texts(&self.probe.frame(Vec::new(), &mut run))
     }
@@ -86,6 +87,7 @@ impl Harness {
             egui::CentralPanel::default().show(ctx, |ui| {
                 let _ = dialog.borrow_mut().body(ui, &table);
             });
+            dialog.borrow_mut().show_pack_browser(ctx);
         };
         self.probe.click(label, &mut run).unwrap();
     }
@@ -250,6 +252,7 @@ fn a_policy_turns_the_button_off_and_says_why() {
         egui::CentralPanel::default().show(ctx, |ui| {
             let _ = dialog.borrow_mut().body(ui, &table);
         });
+        dialog.borrow_mut().show_pack_browser(ctx);
     };
     let button = h.probe.find(OPEN_LABEL).unwrap();
     h.probe.press_at(button.rect.center(), &mut run);

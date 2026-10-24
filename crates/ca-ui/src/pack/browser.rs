@@ -36,6 +36,23 @@ const MAX_PREVIEW_ALLOC: u64 = 8 << 20;
 const PREVIEW_WIDTH: f32 = 132.0;
 /// Height the preview image is drawn at.
 const PREVIEW_HEIGHT: f32 = 68.0;
+/// Height of one row with its separator: the preview, the item spacing above
+/// and below it, and the separator line.
+const ROW_HEIGHT: f32 = PREVIEW_HEIGHT + 12.0;
+/// Rows the window shows without a scroll bar at its default size.
+const DEFAULT_ROWS: f32 = 10.0;
+/// Height of the title bar, the frame margins and the Close button.
+const CHROME_HEIGHT: f32 = 100.0;
+/// Space kept free below the default window on a short screen.
+const SCREEN_MARGIN: f32 = 40.0;
+/// Width of the window at its default size.
+const DEFAULT_WIDTH: f32 = 560.0;
+
+/// Height the window opens at: room for the default row count, or the screen
+/// less a margin when the screen is shorter. A smaller window scrolls the list.
+fn default_height(screen_height: f32) -> f32 {
+    (ROW_HEIGHT * DEFAULT_ROWS + CHROME_HEIGHT).min((screen_height - SCREEN_MARGIN).max(120.0))
+}
 
 /// The accessible name of the button of the pack `name`.
 #[must_use]
@@ -249,7 +266,8 @@ impl PackBrowser {
             .open(&mut open)
             .collapsible(false)
             .resizable(true)
-            .default_width(560.0)
+            .default_width(DEFAULT_WIDTH)
+            .default_height(default_height(ctx.screen_rect().height()))
             .show(ctx, |ui| close = self.body(ui));
         if !open || close {
             self.close();
