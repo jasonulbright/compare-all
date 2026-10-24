@@ -870,3 +870,249 @@ fn an_earlier_failure_is_dropped_once_the_version_is_installed() {
     assert!(app.update_notice().is_none());
     assert!(Staging::new(staging_path).read_warning().is_none());
 }
+
+/// The work area of a 1920 by 1040 monitor whose taskbar takes the bottom 40.
+#[allow(clippy::unnecessary_wraps)]
+fn work_area(_outer: egui::Rect, _pixels_per_point: f32) -> Option<egui::Rect> {
+    Some(egui::Rect::from_min_size(
+        egui::Pos2::ZERO,
+        egui::vec2(1920.0, 1040.0),
+    ))
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Shown {
+    Newer,
+    Ready,
+    NotDownloaded,
+    NotInstalled,
+}
+
+impl Shown {
+    const ALL: [Self; 4] = [
+        Self::Newer,
+        Self::Ready,
+        Self::NotDownloaded,
+        Self::NotInstalled,
+    ];
+
+    /// The button labels the notice carries, and the one that is pressed.
+    fn buttons(self) -> (&'static [&'static str], &'static str) {
+        match self {
+            Self::Newer => (&["Open Release Page"], "Open Release Page"),
+            Self::Ready => (&["Restart to update"], "Restart to update"),
+            Self::NotDownloaded | Self::NotInstalled => (&["OK", "Cancel"], "OK"),
+        }
+    }
+}
+
+/// An app that shows the update notice of `shown`, the server behind it, and
+/// the commands its Open With spawner recorded.
+fn app_showing(dir: &Path, shown: Shown) -> (App, HttpTestServer, Arc<Mutex<Vec<LaunchCommand>>>) {
+    let staging = dir.join("stage");
+    let version = next_version();
+    let mode = Some(InstallMode::Installed { machine: false });
+    let status = if matches!(shown, Shown::NotDownloaded) {
+        403
+    } else {
+        404
+    };
+    let (server, _) = release_server(version.to_string(), status);
+    match shown {
+        Shown::Ready => {
+            stage_fake(&staging, &version);
+            check_just_done(dir);
+        }
+        Shown::NotInstalled => {
+            write_warning(&staging, &server, &version);
+            Staging::new(staging.clone()).write_apply_failure("cannot place ca.exe: access denied");
+            check_just_done(dir);
+        }
+        Shown::Newer | Shown::NotDownloaded => {}
+    }
+    let mut app = app_in(dir);
+    app.update_from(source(&server, &staging, mode));
+    let opened = Arc::new(Mutex::new(Vec::new()));
+    app.set_spawner(Arc::new(Recorder(Arc::clone(&opened))));
+    app.use_work_area_source(work_area);
+    if matches!(shown, Shown::Newer) {
+        assert!(run_frames(&mut app, |app| app.options().is_ready()));
+        let mut options = app.options().options_or_default();
+        options.tweaks.check_for_updates = false;
+        app.apply_options(options);
+        assert!(run_frames(&mut app, App::launch_update_check_done));
+        app.run(Command::CheckForUpdates, &context());
+    }
+    assert!(run_frames(&mut app, |app| app.update_notice().is_some()));
+    (app, server, opened)
+}
+
+/// The state of a native window whose client area starts at `corner` and has
+/// the size of the egui screen.
+fn window_at(corner: egui::Pos2, size: egui::Vec2) -> egui::ViewportInfo {
+    let inner = egui::Rect::from_min_size(corner, size);
+    let outer = egui::Rect::from_min_max(
+        inner.min - egui::vec2(8.0, 31.0),
+        inner.max + egui::vec2(8.0, 8.0),
+    );
+    egui::ViewportInfo {
+        inner_rect: Some(inner),
+        outer_rect: Some(outer),
+        ..egui::ViewportInfo::default()
+    }
+}
+
+#[test]
+fn every_update_button_stays_inside_the_part_of_the_window_that_shows() {
+    let size = egui::vec2(800.0, 600.0);
+    // Client area corners that leave the bottom, the right edge or both
+    // partly below or beyond the 1920 by 1040 work area.
+    let corners = [
+        egui::pos2(100.0, 700.0),
+        egui::pos2(1320.0, 100.0),
+        egui::pos2(1320.0, 700.0),
+    ];
+    for shown in Shown::ALL {
+        for corner in corners {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut app, _server, _opened) = app_showing(dir.path(), shown);
+            let visible = egui::Rect::from_min_max(
+                egui::Pos2::ZERO,
+                egui::pos2(
+                    (1920.0 - corner.x).min(size.x),
+                    (1040.0 - corner.y).min(size.y),
+                ),
+            );
+            let mut probe = Probe::new(size.x, size.y);
+            probe.set_viewport(window_at(corner, size));
+            let mut run = |ctx: &egui::Context| app.frame(ctx);
+            probe.idle(&mut run);
+            probe.idle(&mut run);
+            probe.idle(&mut run);
+            for label in shown.buttons().0 {
+                let control = probe.find(label).unwrap();
+                assert!(
+                    visible.contains_rect(control.rect),
+                    "{shown:?} at {corner:?}: {label:?} is at {:?}, visible area is {visible:?}",
+                    control.rect
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn every_update_button_answers_a_click_in_a_small_window_that_hangs_off_screen() {
+    let size = egui::vec2(640.0, 400.0);
+    let corner = egui::pos2(1400.0, 800.0);
+    for shown in Shown::ALL {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, _server, opened) = app_showing(dir.path(), shown);
+        let mut probe = Probe::new(size.x, size.y);
+        probe.set_viewport(window_at(corner, size));
+        {
+            let mut run = |ctx: &egui::Context| app.frame(ctx);
+            probe.idle(&mut run);
+            probe.idle(&mut run);
+            probe.idle(&mut run);
+            for label in shown.buttons().0 {
+                assert!(probe.find(label).is_ok(), "{shown:?}: no {label:?}");
+            }
+            probe.click(shown.buttons().1, &mut run).unwrap();
+            probe.idle(&mut run);
+        }
+        match shown {
+            Shown::Ready => assert!(run_frames(&mut app, App::is_closing)),
+            Shown::Newer | Shown::NotDownloaded | Shown::NotInstalled => {
+                assert!(
+                    run_frames(&mut app, |_| !opened.lock().unwrap().is_empty()),
+                    "{shown:?}: the release page did not open"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn the_cancel_button_closes_the_notice_in_a_window_that_hangs_off_screen() {
+    let size = egui::vec2(640.0, 400.0);
+    let dir = tempfile::tempdir().unwrap();
+    let (mut app, _server, opened) = app_showing(dir.path(), Shown::NotDownloaded);
+    let mut probe = Probe::new(size.x, size.y);
+    probe.set_viewport(window_at(egui::pos2(1400.0, 800.0), size));
+    {
+        let mut run = |ctx: &egui::Context| app.frame(ctx);
+        probe.idle(&mut run);
+        probe.idle(&mut run);
+        probe.idle(&mut run);
+        probe.click("Cancel", &mut run).unwrap();
+        probe.idle(&mut run);
+    }
+    assert!(app.update_notice().is_none());
+    assert!(opened.lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_window_that_opens_below_the_work_area_is_asked_to_move_up_once() {
+    let size = egui::vec2(1280.0, 800.0);
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app_in(dir.path());
+    app.use_work_area_source(work_area);
+    let mut probe = Probe::new(size.x, size.y);
+    probe.set_viewport(window_at(egui::pos2(242.0, 265.0), size));
+    let mut run = |ctx: &egui::Context| app.frame(ctx);
+    let output = probe.frame(Vec::new(), &mut run);
+    let commands = &output.viewport_output[&egui::ViewportId::ROOT].commands;
+    // The outer rectangle is 839 tall and starts at 234; it must end at 1040.
+    assert!(
+        commands.contains(&egui::ViewportCommand::OuterPosition(egui::pos2(
+            234.0,
+            1040.0 - 839.0
+        ))),
+        "{commands:?}"
+    );
+    assert!(!commands
+        .iter()
+        .any(|command| matches!(command, egui::ViewportCommand::InnerSize(_))));
+    probe.set_viewport(window_at(egui::pos2(242.0, 232.0), size));
+    let output = probe.frame(Vec::new(), &mut run);
+    let commands = &output.viewport_output[&egui::ViewportId::ROOT].commands;
+    assert!(
+        !commands
+            .iter()
+            .any(|command| matches!(command, egui::ViewportCommand::OuterPosition(_))),
+        "{commands:?}"
+    );
+}
+
+#[test]
+fn a_window_taller_than_the_work_area_is_asked_to_shrink() {
+    let size = egui::vec2(1280.0, 800.0);
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app_in(dir.path());
+    app.use_work_area_source(|_, _| {
+        Some(egui::Rect::from_min_size(
+            egui::pos2(1920.0, 0.0),
+            egui::vec2(1366.0, 728.0),
+        ))
+    });
+    let mut probe = Probe::new(size.x, size.y);
+    probe.set_viewport(window_at(egui::pos2(2000.0, 100.0), size));
+    let mut run = |ctx: &egui::Context| app.frame(ctx);
+    let output = probe.frame(Vec::new(), &mut run);
+    let commands = &output.viewport_output[&egui::ViewportId::ROOT].commands;
+    // Outer height 839 against 728 cuts 111; the client area keeps the rest.
+    assert!(
+        commands.contains(&egui::ViewportCommand::InnerSize(egui::vec2(
+            1280.0,
+            800.0 - 111.0
+        ))),
+        "{commands:?}"
+    );
+    assert!(
+        commands.contains(&egui::ViewportCommand::OuterPosition(egui::pos2(
+            1990.0, 0.0
+        ))),
+        "{commands:?}"
+    );
+}

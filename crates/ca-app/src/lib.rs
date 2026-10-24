@@ -18,6 +18,7 @@ pub mod shell;
 pub mod startup;
 pub mod tree;
 pub mod update;
+pub mod window_fit;
 
 pub use shell::{App, VERSION};
 

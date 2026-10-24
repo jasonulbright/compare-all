@@ -890,6 +890,7 @@ dependencies = [
  "tempfile",
  "wgpu",
  "winreg",
+ "winsafe",
 ]
 
 [[package]]

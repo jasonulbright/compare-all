@@ -973,6 +973,10 @@ pub struct App {
     launches: Vec<Job<ca_ui::launch::LaunchMessage>>,
     /// The update check and what it found.
     update: UpdateState,
+    /// Brings the window inside the work area of its monitor.
+    window_fit: crate::window_fit::WindowFit,
+    /// Where the work area of a monitor comes from. A test states one of its own.
+    work_area: crate::window_fit::WorkAreaSource,
     /// The remote connection profile manager.
     profiles: Option<crate::profiles::ProfileManager>,
     /// The file manager menu and the worker that reads or changes it.
@@ -1108,6 +1112,8 @@ impl App {
             spawner: Arc::new(ca_ui::launch::SystemSpawner),
             launches: Vec::new(),
             update: UpdateState::default(),
+            window_fit: crate::window_fit::WindowFit::default(),
+            work_area: crate::window_fit::work_area_of,
             profiles: None,
             explorer: ExplorerState::default(),
             tabs: Vec::new(),
@@ -1576,9 +1582,13 @@ impl App {
             return;
         };
         let mut open = true;
+        let hidden = self.hidden_edges(ctx);
         egui::Window::new("Administrator Policy")
             .id(egui::Id::new("policy-notice"))
-            .anchor(egui::Align2::LEFT_BOTTOM, [12.0, -132.0])
+            .anchor(
+                egui::Align2::LEFT_BOTTOM,
+                [12.0 + hidden.left, -132.0 - hidden.bottom],
+            )
             .collapsible(false)
             .resizable(false)
             .open(&mut open)
@@ -1951,6 +1961,51 @@ impl App {
         ));
     }
 
+    /// Use `source` to look up the work area of a monitor.
+    pub fn use_work_area_source(&mut self, source: crate::window_fit::WorkAreaSource) {
+        self.work_area = source;
+    }
+
+    /// The edges of the egui screen rectangle that lie outside the work area.
+    ///
+    /// A corner notice moves in by these amounts, so it stays inside the part
+    /// of the window that shows when the system window is partly off screen.
+    fn hidden_edges(&self, ctx: &egui::Context) -> crate::window_fit::Insets {
+        let (inner, outer) = ctx.input(|input| {
+            let info = input.viewport();
+            (info.inner_rect, info.outer_rect)
+        });
+        let (Some(inner), Some(outer)) = (inner, outer) else {
+            return crate::window_fit::Insets::default();
+        };
+        let Some(area) = (self.work_area)(outer, ctx.pixels_per_point()) else {
+            return crate::window_fit::Insets::default();
+        };
+        crate::window_fit::visible_client(inner, area)
+            .map_or_else(crate::window_fit::Insets::default, |visible| {
+                crate::window_fit::Insets::between(ctx.screen_rect(), visible)
+            })
+    }
+
+    /// Ask the window to move inside the work area after it opens and after
+    /// it returns from minimized, maximized or full screen.
+    fn fit_window(&mut self, ctx: &egui::Context) {
+        let source = self.work_area;
+        let pixels_per_point = ctx.pixels_per_point();
+        let fit = ctx.input(|input| {
+            self.window_fit
+                .plan(input.viewport(), |outer| source(outer, pixels_per_point))
+        });
+        let Some(fit) = fit else {
+            return;
+        };
+        if let Some(size) = fit.inner_size {
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(fit.position));
+        ctx.request_repaint();
+    }
+
     /// Draw the update notice in a corner of the window. It blocks nothing.
     fn draw_update_notice(&mut self, ctx: &egui::Context, context: &ViewContext) {
         let Some(notice) = self.update.notice.clone() else {
@@ -1960,9 +2015,13 @@ impl App {
         let mut visit = false;
         let mut restart = false;
         let mut dismiss = false;
+        let hidden = self.hidden_edges(ctx);
         egui::Window::new("Check for Updates")
             .id(egui::Id::new("update-notice"))
-            .anchor(egui::Align2::RIGHT_BOTTOM, [-12.0, -12.0])
+            .anchor(
+                egui::Align2::RIGHT_BOTTOM,
+                [-12.0 - hidden.right, -12.0 - hidden.bottom],
+            )
             .collapsible(false)
             .resizable(false)
             .open(&mut open)
@@ -2026,9 +2085,13 @@ impl App {
             return;
         };
         let mut open = true;
+        let hidden = self.hidden_edges(ctx);
         egui::Window::new("Load Workspace")
             .id(egui::Id::new("workspace-notice"))
-            .anchor(egui::Align2::LEFT_BOTTOM, [12.0, -12.0])
+            .anchor(
+                egui::Align2::LEFT_BOTTOM,
+                [12.0 + hidden.left, -12.0 - hidden.bottom],
+            )
             .collapsible(false)
             .resizable(false)
             .open(&mut open)
@@ -2665,9 +2728,13 @@ impl App {
             return;
         };
         let mut open = true;
+        let hidden = self.hidden_edges(ctx);
         egui::Window::new("Session Settings")
             .id(egui::Id::new("settings-notice"))
-            .anchor(egui::Align2::LEFT_BOTTOM, [12.0, -72.0])
+            .anchor(
+                egui::Align2::LEFT_BOTTOM,
+                [12.0 + hidden.left, -72.0 - hidden.bottom],
+            )
             .collapsible(false)
             .resizable(false)
             .open(&mut open)
@@ -3838,6 +3905,7 @@ impl App {
     /// Split out from the eframe entry point so a frame can be run headless.
     pub fn frame(&mut self, ctx: &egui::Context) {
         ca_ui::theme::chrome::install(ctx);
+        self.fit_window(ctx);
         let repaint = ctx.clone();
         self.options.poll();
         let resolved = Arc::new(self.resolve_options(ctx));

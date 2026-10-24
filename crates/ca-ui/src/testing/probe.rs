@@ -135,6 +135,7 @@ pub struct Probe {
     size: egui::Vec2,
     time: f64,
     controls: Vec<Control>,
+    viewport: Option<egui::ViewportInfo>,
 }
 
 impl Probe {
@@ -148,7 +149,13 @@ impl Probe {
             size: egui::vec2(width, height),
             time: 0.0,
             controls: Vec::new(),
+            viewport: None,
         }
+    }
+
+    /// Report `info` as the state of the native window in every later frame.
+    pub fn set_viewport(&mut self, info: egui::ViewportInfo) {
+        self.viewport = Some(info);
     }
 
     /// The context the frames run in.
@@ -164,11 +171,14 @@ impl Probe {
         run: &mut impl FnMut(&egui::Context),
     ) -> egui::FullOutput {
         self.time += FRAME_SECONDS;
-        let input = egui::RawInput {
+        let mut input = egui::RawInput {
             events,
             time: Some(self.time),
             ..super::sized_input(self.size.x, self.size.y)
         };
+        if let Some(info) = &self.viewport {
+            input.viewports.insert(egui::ViewportId::ROOT, info.clone());
+        }
         let output = self.ctx.run(input, |ctx| run(ctx));
         self.controls = controls(&output);
         output
