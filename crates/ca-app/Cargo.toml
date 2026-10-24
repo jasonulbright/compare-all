@@ -36,6 +36,7 @@ serde_json.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.56"
+winsafe = { version = "0.0.24", features = ["user"] }
 wgpu = { version = "24", default-features = false, features = ["dx12", "wgsl"] }
 
 [dev-dependencies]
