@@ -372,6 +372,7 @@ impl OptionsDialog {
     #[must_use]
     pub fn accept(&mut self) -> OptionsOutcome {
         self.open = false;
+        self.browser.close();
         self.committed = self.edited.clone();
         OptionsOutcome {
             options: Box::new(self.edited.clone()),
@@ -386,6 +387,7 @@ impl OptionsDialog {
     #[must_use]
     pub fn cancel(&mut self) -> OptionsOutcome {
         self.open = false;
+        self.browser.close();
         self.edited = self.committed.clone();
         OptionsOutcome {
             options: Box::new(self.committed.clone()),
@@ -414,7 +416,19 @@ impl OptionsDialog {
         if !open && outcome.is_none() {
             outcome = Some(self.cancel());
         }
+        self.show_pack_browser(ctx);
         outcome
+    }
+
+    /// Draw the pack browser as a window of its own. It does nothing while the
+    /// browser is closed.
+    ///
+    /// The browser is never drawn from inside the closure of another window:
+    /// a window opened there becomes a child of the parent in the
+    /// accessibility tree. The caller of `body` draws it after the panel that
+    /// holds the page.
+    pub fn show_pack_browser(&mut self, ctx: &egui::Context) {
+        self.browser.show(ctx);
     }
 
     /// Draw the dialog into a panel rather than a window, for a headless frame.
@@ -432,9 +446,7 @@ impl OptionsDialog {
                 }
             });
         ui.separator();
-        let outcome = self.footer(ui);
-        self.browser.show(ui.ctx());
-        outcome
+        self.footer(ui)
     }
 
     fn page_strip(&mut self, ui: &mut egui::Ui) {
