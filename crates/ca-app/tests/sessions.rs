@@ -36,6 +36,21 @@ fn settle(app: &mut App, ctx: &egui::Context) {
     );
 }
 
+/// Run frames until the options document has been read.
+///
+/// The workspace named for the start opens in the first frame that sees both
+/// documents, and each document is read on a worker of its own, so the store
+/// being ready does not mean the options are.
+fn settle_options(app: &mut App, ctx: &egui::Context) {
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            let _ = ctx.run(sized_input(1_280.0, 800.0), |ctx| app.frame(ctx));
+            app.options().is_ready()
+        }),
+        "the options document was never read"
+    );
+}
+
 /// Confirm through real dialog frames, including focus acquisition. Session
 /// commands only request this dialog and do not change the tree themselves.
 fn confirm_session_save(app: &mut App, ctx: &egui::Context) {
@@ -334,7 +349,7 @@ fn a_workspace_named_for_the_start_reopens_when_the_window_opens() {
     let mut reopened = window(dir.path());
     let ctx = egui::Context::default();
     settle(&mut reopened, &ctx);
-    let _ = ctx.run(sized_input(1_280.0, 800.0), |ctx| reopened.frame(ctx));
+    settle_options(&mut reopened, &ctx);
     assert_eq!(
         reopened.tab_count(),
         1,
