@@ -128,33 +128,52 @@ impl Insets {
 }
 
 /// What to ask of the window to bring it inside the work area.
+///
+/// The requests apply in field order: the smallest size first, so the system
+/// accepts the size that follows.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Fit {
-    /// The outer position to move to.
-    pub position: Pos2,
+    /// The smallest inner size to set, where it differs from the one set.
+    pub minimum_inner_size: Option<Vec2>,
     /// The inner size to resize to, where the window is larger than the area.
     pub inner_size: Option<Vec2>,
+    /// The outer position to move to, where the window lies partly outside.
+    pub position: Option<Pos2>,
 }
 
 /// Tracks when the window needs a fit: after it opens and after it comes back
 /// from minimized, maximized or full screen. A window the user drags partly
 /// off screen later stays where the user puts it.
+///
+/// The system keeps a window at or above its smallest size. Where the work
+/// area leaves less client room than that size, the smallest size drops to
+/// the room there is, and it returns to `minimum` once the room is back.
 #[derive(Debug)]
 pub struct WindowFit {
     wanted: bool,
     attempts: u8,
-}
-
-impl Default for WindowFit {
-    fn default() -> Self {
-        Self {
-            wanted: true,
-            attempts: 0,
-        }
-    }
+    minimum: Vec2,
+    minimum_set: Vec2,
 }
 
 impl WindowFit {
+    /// A planner for a window created with `minimum` as its smallest inner size.
+    #[must_use]
+    pub const fn new(minimum: Vec2) -> Self {
+        Self {
+            wanted: true,
+            attempts: 0,
+            minimum,
+            minimum_set: minimum,
+        }
+    }
+
+    /// The smallest inner size the room in `area` allows, at most `minimum`.
+    fn minimum_for(&self, outer: Rect, inner: Rect, area: Rect) -> Vec2 {
+        let room = area.size() - (outer.size() - inner.size());
+        Vec2::new(self.minimum.x.min(room.x), self.minimum.y.min(room.y)).max(Vec2::splat(1.0))
+    }
+
     /// The next request for this frame, from the state the window reports.
     ///
     /// `area` returns the work area for the outer rectangle it receives.
@@ -171,7 +190,8 @@ impl WindowFit {
             self.attempts = 0;
             return None;
         }
-        if !self.wanted {
+        let lowered = (self.minimum_set - self.minimum).abs().max_elem() > TOLERANCE;
+        if !self.wanted && !lowered {
             return None;
         }
         let (outer, inner) = (info.outer_rect?, info.inner_rect?);
@@ -179,12 +199,15 @@ impl WindowFit {
             self.wanted = false;
             return None;
         };
+        let minimum = self.minimum_for(outer, inner, area);
+        let minimum_inner_size =
+            ((minimum - self.minimum_set).abs().max_elem() > TOLERANCE).then_some(minimum);
         let fitted = fit_into(outer, area);
         let moved = (fitted.min - outer.min).abs().max_elem() > TOLERANCE;
         let shrunk = (outer.size() - fitted.size()).max_elem() > TOLERANCE;
-        if !moved && !shrunk {
+        if !self.wanted || (!moved && !shrunk) {
             self.wanted = false;
-            return None;
+            return self.request(minimum_inner_size, None, None);
         }
         self.attempts += 1;
         if self.attempts >= MAXIMUM_ATTEMPTS {
@@ -192,11 +215,27 @@ impl WindowFit {
         }
         let inner_size = shrunk.then(|| {
             let cut = outer.size() - fitted.size();
-            (inner.size() - cut).max(Vec2::splat(1.0))
+            (inner.size() - cut).max(minimum)
         });
+        self.request(minimum_inner_size, inner_size, moved.then_some(fitted.min))
+    }
+
+    fn request(
+        &mut self,
+        minimum_inner_size: Option<Vec2>,
+        inner_size: Option<Vec2>,
+        position: Option<Pos2>,
+    ) -> Option<Fit> {
+        if minimum_inner_size.is_none() && inner_size.is_none() && position.is_none() {
+            return None;
+        }
+        if let Some(minimum) = minimum_inner_size {
+            self.minimum_set = minimum;
+        }
         Some(Fit {
-            position: fitted.min,
+            minimum_inner_size,
             inner_size,
+            position,
         })
     }
 }
@@ -211,6 +250,10 @@ mod tests {
     }
 
     const WORK: fn() -> Rect = || rect(0.0, 0.0, 1920.0, 1040.0);
+
+    fn fit_for_tests() -> WindowFit {
+        WindowFit::new(Vec2::new(640.0, 400.0))
+    }
 
     #[test]
     fn a_window_inside_the_area_stays() {
@@ -333,14 +376,14 @@ mod tests {
 
     #[test]
     fn the_first_frame_moves_a_window_that_hangs_below_the_area() {
-        let mut fit = WindowFit::default();
+        let mut fit = fit_for_tests();
         let outer = rect(234.0, 234.0, 1296.0, 839.0);
         let state = info(outer, Vec2::new(8.0, 31.0));
         let step = fit.plan(&state, |_| Some(WORK())).unwrap();
-        assert_eq!(step.position, Pos2::new(234.0, 201.0));
+        assert_eq!(step.position, Some(Pos2::new(234.0, 201.0)));
         assert_eq!(step.inner_size, None);
         let settled = info(
-            Rect::from_min_size(step.position, outer.size()),
+            Rect::from_min_size(step.position.unwrap(), outer.size()),
             Vec2::new(8.0, 31.0),
         );
         assert_eq!(fit.plan(&settled, |_| Some(WORK())), None);
@@ -349,7 +392,7 @@ mod tests {
 
     #[test]
     fn a_window_larger_than_the_area_is_resized_by_the_amount_cut() {
-        let mut fit = WindowFit::default();
+        let mut fit = fit_for_tests();
         let outer = rect(0.0, 0.0, 1296.0, 839.0);
         let state = info(outer, Vec2::new(8.0, 31.0));
         let area = rect(0.0, 0.0, 1366.0, 728.0);
@@ -363,7 +406,7 @@ mod tests {
 
     #[test]
     fn a_restore_from_maximized_asks_for_a_new_fit() {
-        let mut fit = WindowFit::default();
+        let mut fit = fit_for_tests();
         let inside = info(rect(100.0, 100.0, 800.0, 600.0), Vec2::new(8.0, 31.0));
         assert_eq!(fit.plan(&inside, |_| Some(WORK())), None);
         let mut maximized = inside.clone();
@@ -371,12 +414,12 @@ mod tests {
         assert_eq!(fit.plan(&maximized, |_| Some(WORK())), None);
         let hanging = info(rect(900.0, 700.0, 1296.0, 839.0), Vec2::new(8.0, 31.0));
         let step = fit.plan(&hanging, |_| Some(WORK())).unwrap();
-        assert_eq!(step.position, Pos2::new(624.0, 201.0));
+        assert_eq!(step.position, Some(Pos2::new(624.0, 201.0)));
     }
 
     #[test]
     fn a_restore_from_minimized_asks_for_a_new_fit() {
-        let mut fit = WindowFit::default();
+        let mut fit = fit_for_tests();
         let inside = info(rect(100.0, 100.0, 800.0, 600.0), Vec2::new(8.0, 31.0));
         assert_eq!(fit.plan(&inside, |_| Some(WORK())), None);
         let minimized = ViewportInfo {
@@ -390,7 +433,7 @@ mod tests {
 
     #[test]
     fn a_window_the_user_drags_off_screen_later_is_left_alone() {
-        let mut fit = WindowFit::default();
+        let mut fit = fit_for_tests();
         let inside = info(rect(100.0, 100.0, 800.0, 600.0), Vec2::new(8.0, 31.0));
         assert_eq!(fit.plan(&inside, |_| Some(WORK())), None);
         let dragged = info(rect(1800.0, 900.0, 800.0, 600.0), Vec2::new(8.0, 31.0));
@@ -399,7 +442,7 @@ mod tests {
 
     #[test]
     fn a_refused_size_does_not_repeat_without_end() {
-        let mut fit = WindowFit::default();
+        let mut fit = fit_for_tests();
         let state = info(rect(0.0, 0.0, 1296.0, 839.0), Vec2::new(8.0, 31.0));
         let area = rect(0.0, 0.0, 1366.0, 728.0);
         let sent = (0..20)
@@ -410,7 +453,7 @@ mod tests {
 
     #[test]
     fn the_plan_waits_for_a_frame_that_reports_the_window() {
-        let mut fit = WindowFit::default();
+        let mut fit = fit_for_tests();
         let unknown = ViewportInfo::default();
         assert_eq!(fit.plan(&unknown, |_| Some(WORK())), None);
         let hanging = info(rect(234.0, 234.0, 1296.0, 839.0), Vec2::new(8.0, 31.0));
@@ -419,10 +462,119 @@ mod tests {
 
     #[test]
     fn no_work_area_ends_the_wait_without_a_request() {
-        let mut fit = WindowFit::default();
+        let mut fit = fit_for_tests();
         let hanging = info(rect(234.0, 234.0, 1296.0, 839.0), Vec2::new(8.0, 31.0));
         assert_eq!(fit.plan(&hanging, |_| None), None);
         assert_eq!(fit.plan(&hanging, |_| Some(WORK())), None);
+    }
+
+    const DECORATION: Vec2 = Vec2::new(16.0, 31.0);
+
+    fn window(outer: Rect) -> ViewportInfo {
+        info(outer, Vec2::new(8.0, 31.0))
+    }
+
+    #[test]
+    fn a_work_area_shorter_than_the_minimum_lowers_the_minimum_height() {
+        let mut fit = fit_for_tests();
+        let area = rect(0.0, 0.0, 1920.0, 350.0);
+        let state = window(rect(100.0, 100.0, 800.0, 600.0));
+        let step = fit.plan(&state, |_| Some(area)).unwrap();
+        // The client area has 350 - 31 points of height.
+        assert_eq!(step.minimum_inner_size, Some(Vec2::new(640.0, 319.0)));
+        assert_eq!(step.inner_size, Some(Vec2::new(784.0, 319.0)));
+        assert_eq!(step.position, Some(Pos2::new(100.0, 0.0)));
+    }
+
+    #[test]
+    fn a_work_area_narrower_than_the_minimum_lowers_the_minimum_width() {
+        let mut fit = fit_for_tests();
+        let area = rect(0.0, 0.0, 600.0, 1040.0);
+        let state = window(rect(100.0, 100.0, 800.0, 600.0));
+        let step = fit.plan(&state, |_| Some(area)).unwrap();
+        assert_eq!(step.minimum_inner_size, Some(Vec2::new(584.0, 400.0)));
+        assert_eq!(step.inner_size, Some(Vec2::new(584.0, 569.0)));
+        assert_eq!(step.position, Some(Pos2::new(0.0, 100.0)));
+    }
+
+    #[test]
+    fn a_work_area_below_the_minimum_in_both_axes_lowers_both_and_keeps_the_origin() {
+        let mut fit = fit_for_tests();
+        let area = rect(-1920.0, 40.0, 500.0, 300.0);
+        let state = window(rect(-1500.0, 200.0, 800.0, 600.0));
+        let step = fit.plan(&state, |_| Some(area)).unwrap();
+        assert_eq!(
+            step.minimum_inner_size,
+            Some(Vec2::new(500.0, 300.0) - DECORATION)
+        );
+        assert_eq!(step.inner_size, Some(Vec2::new(500.0, 300.0) - DECORATION));
+        assert_eq!(step.position, Some(Pos2::new(-1920.0, 40.0)));
+    }
+
+    #[test]
+    fn a_work_area_exactly_the_minimum_keeps_the_minimum() {
+        let mut fit = fit_for_tests();
+        let area = rect(0.0, 0.0, 640.0 + DECORATION.x, 400.0 + DECORATION.y);
+        let state = window(rect(100.0, 100.0, 800.0, 600.0));
+        let step = fit.plan(&state, |_| Some(area)).unwrap();
+        assert_eq!(step.minimum_inner_size, None);
+        assert_eq!(step.inner_size, Some(Vec2::new(640.0, 400.0)));
+        let settled = window(rect(0.0, 0.0, area.width(), area.height()));
+        assert_eq!(fit.plan(&settled, |_| Some(area)), None);
+    }
+
+    #[test]
+    fn a_window_that_fits_a_small_area_asks_nothing_more() {
+        let mut fit = fit_for_tests();
+        let area = rect(0.0, 0.0, 500.0, 300.0);
+        let state = window(rect(100.0, 100.0, 800.0, 600.0));
+        assert!(fit.plan(&state, |_| Some(area)).is_some());
+        let settled = window(rect(0.0, 0.0, 500.0, 300.0));
+        for _ in 0..10 {
+            assert_eq!(fit.plan(&settled, |_| Some(area)), None);
+        }
+    }
+
+    #[test]
+    fn a_larger_monitor_brings_the_minimum_back_once() {
+        let mut fit = fit_for_tests();
+        let small = rect(0.0, 0.0, 500.0, 300.0);
+        let state = window(rect(100.0, 100.0, 800.0, 600.0));
+        assert!(fit.plan(&state, |_| Some(small)).is_some());
+        let settled = window(rect(0.0, 0.0, 500.0, 300.0));
+        assert_eq!(fit.plan(&settled, |_| Some(small)), None);
+        let moved = window(rect(2000.0, 100.0, 500.0, 300.0));
+        let large = rect(1920.0, 0.0, 1920.0, 1040.0);
+        let step = fit.plan(&moved, |_| Some(large)).unwrap();
+        assert_eq!(
+            step,
+            Fit {
+                minimum_inner_size: Some(Vec2::new(640.0, 400.0)),
+                inner_size: None,
+                position: None,
+            }
+        );
+        assert_eq!(fit.plan(&moved, |_| Some(large)), None);
+    }
+
+    #[test]
+    fn a_restore_on_a_small_monitor_lowers_the_minimum_again() {
+        let mut fit = fit_for_tests();
+        let large = rect(0.0, 0.0, 1920.0, 1040.0);
+        let small = rect(1920.0, 0.0, 500.0, 300.0);
+        assert_eq!(
+            fit.plan(&window(rect(10.0, 10.0, 800.0, 600.0)), |_| Some(large)),
+            None
+        );
+        let maximized = ViewportInfo {
+            maximized: Some(true),
+            ..ViewportInfo::default()
+        };
+        assert_eq!(fit.plan(&maximized, |_| Some(small)), None);
+        let step = fit
+            .plan(&window(rect(1950.0, 10.0, 800.0, 600.0)), |_| Some(small))
+            .unwrap();
+        assert!(step.minimum_inner_size.is_some());
     }
 
     #[cfg(windows)]

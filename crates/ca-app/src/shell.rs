@@ -1112,7 +1112,7 @@ impl App {
             spawner: Arc::new(ca_ui::launch::SystemSpawner),
             launches: Vec::new(),
             update: UpdateState::default(),
-            window_fit: crate::window_fit::WindowFit::default(),
+            window_fit: crate::window_fit::WindowFit::new(egui::Vec2::from(MINIMUM_WINDOW_SIZE)),
             work_area: crate::window_fit::work_area_of,
             profiles: None,
             explorer: ExplorerState::default(),
@@ -1999,10 +1999,15 @@ impl App {
         let Some(fit) = fit else {
             return;
         };
+        if let Some(size) = fit.minimum_inner_size {
+            ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(size));
+        }
         if let Some(size) = fit.inner_size {
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
         }
-        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(fit.position));
+        if let Some(position) = fit.position {
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(position));
+        }
         ctx.request_repaint();
     }
 
