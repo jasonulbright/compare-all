@@ -1116,3 +1116,51 @@ fn a_window_taller_than_the_work_area_is_asked_to_shrink() {
         "{commands:?}"
     );
 }
+
+#[test]
+fn a_work_area_below_the_minimum_size_lowers_the_minimum_before_the_resize() {
+    let size = egui::vec2(1280.0, 800.0);
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app_in(dir.path());
+    // A 1920 by 1080 monitor at 300 percent scale leaves about 640 by 347
+    // points, which is below the 400 point minimum height.
+    app.use_work_area_source(|_, _| {
+        Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(640.0, 347.0),
+        ))
+    });
+    let mut probe = Probe::new(size.x, size.y);
+    probe.set_viewport(window_at(egui::pos2(50.0, 50.0), size));
+    let mut run = |ctx: &egui::Context| app.frame(ctx);
+    let output = probe.frame(Vec::new(), &mut run);
+    let commands = &output.viewport_output[&egui::ViewportId::ROOT].commands;
+    // The frame is 16 wide and 39 tall, so the client area has 624 by 308.
+    let room = egui::vec2(624.0, 308.0);
+    let lowered = commands
+        .iter()
+        .position(|command| *command == egui::ViewportCommand::MinInnerSize(room));
+    let resized = commands
+        .iter()
+        .position(|command| *command == egui::ViewportCommand::InnerSize(room));
+    assert!(lowered.is_some(), "{commands:?}");
+    assert!(lowered < resized, "{commands:?}");
+    assert!(
+        commands.contains(&egui::ViewportCommand::OuterPosition(egui::Pos2::ZERO)),
+        "{commands:?}"
+    );
+
+    // Once the system has applied the request, nothing more is asked.
+    probe.set_viewport(window_at(egui::pos2(8.0, 31.0), room));
+    let output = probe.frame(Vec::new(), &mut run);
+    let commands = &output.viewport_output[&egui::ViewportId::ROOT].commands;
+    assert!(
+        !commands.iter().any(|command| matches!(
+            command,
+            egui::ViewportCommand::MinInnerSize(_)
+                | egui::ViewportCommand::InnerSize(_)
+                | egui::ViewportCommand::OuterPosition(_)
+        )),
+        "{commands:?}"
+    );
+}
