@@ -267,9 +267,30 @@ fn a_screen_too_short_for_the_list_scrolls_inside_the_screen() {
     assert!(screen_rect.contains_rect(window), "{window:?}");
     let close = screen.probe.find(CLOSE_LABEL).unwrap();
     assert!(window.contains_rect(close.rect), "Close is out of reach");
-    let last = screen
-        .probe
-        .find(&format!("Install Pack{}", PACKS - 1))
-        .unwrap();
+    let first = screen.probe.find("Install Pack0").unwrap();
+    let last_label = format!("Install Pack{}", PACKS - 1);
+    let last = screen.probe.find(&last_label).unwrap();
     assert!(!window.contains_rect(last.rect), "the list does not scroll");
+    let over_list = first.rect.center() - egui::vec2(150.0, 0.0);
+    let _ = screen.frame(vec![egui::Event::PointerMoved(over_list)]);
+    for _ in 0..30 {
+        let _ = screen.frame(vec![egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, -120.0),
+            modifiers: egui::Modifiers::default(),
+        }]);
+    }
+    let window = screen.window(BROWSER).rect;
+    let last = screen.probe.find(&last_label).unwrap();
+    assert!(
+        window.contains_rect(last.rect),
+        "the wheel did not bring the last pack into the window {window:?}: {:?}",
+        last.rect
+    );
+    let first = screen.probe.find("Install Pack0").unwrap();
+    assert!(
+        !window.contains_rect(first.rect),
+        "the first pack stayed in view: {:?}",
+        first.rect
+    );
 }
