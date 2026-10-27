@@ -85,7 +85,7 @@ pub struct TableSettings {
 pub struct SideFacts {
     /// Label of the encoding the bytes were decoded with.
     pub encoding: String,
-    /// True when decoding needed replacement characters.
+    /// True when decoding omitted or replaced malformed input.
     pub had_errors: bool,
     /// Short description of the field syntax that was used.
     pub syntax: String,

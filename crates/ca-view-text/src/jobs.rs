@@ -167,7 +167,7 @@ pub struct SidePayload {
     pub eol: String,
     /// True when the file holds more than one line ending style.
     pub mixed_eol: bool,
-    /// True when decoding needed replacement characters.
+    /// True when decoding omitted or replaced malformed input.
     pub had_errors: bool,
 }
 

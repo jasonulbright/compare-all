@@ -1064,8 +1064,7 @@ impl MergeView {
                     self.saving_revision = None;
                     self.saving_conflicts = None;
                     self.question = Some(Question::AcceptLoss(
-                        "The output includes replacement characters from an input that did not decode cleanly."
-                            .to_owned(),
+                        "An input had decoding errors, so the output may be incomplete.".to_owned(),
                     ));
                 }
                 MergeSaveMessage::Done {

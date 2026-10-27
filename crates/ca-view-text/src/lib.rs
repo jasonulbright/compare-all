@@ -3443,7 +3443,8 @@ impl TextView {
         }
         if self.data.left.had_errors || self.data.right.had_errors {
             fields.push(
-                "Invalid byte sequences were replaced; text comparison may be incomplete".into(),
+                "Some input sequences were omitted or replaced; text comparison may be incomplete"
+                    .into(),
             );
         }
         if let Some(taken) = self.load_time {

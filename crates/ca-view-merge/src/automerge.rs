@@ -112,7 +112,7 @@ pub fn run(paths: &MergePaths, stored: &TextMergeSettings, switches: Switches) -
     if output::contains_lossy_input(&model, &data.sources) {
         return Finish::done(
             EXIT_ERROR,
-            "The output includes replacement characters from an input that did not decode cleanly. It was not written.",
+            "An input had decoding errors, so the output may be incomplete. It was not written.",
         );
     }
     let outcome = output::save(
