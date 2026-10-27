@@ -1,14 +1,9 @@
 //! Encoding detection, decoding and re-encoding.
 //!
-//! Detection order is byte order mark, then a BOM-less UTF-16 sniff, then a
-//! whole-buffer UTF-8 validity check, then statistical detection over the
-//! whole buffer, then the caller supplied fallback for empty input. An explicit override short
-//! circuits all of it.
-//!
-//! [`decode`] records everything [`encode_file`] needs to reproduce the original
-//! bytes, so loading and saving a file that was not edited is byte identical.
+//! [`decode`] identifies the encoding, byte order mark and honored end-of-file
+//! trailer used by [`encode_file`]. It flags malformed input so callers can
+//! preserve original bytes or protect a lossy edit.
 
-use std::borrow::Cow;
 use std::fmt;
 
 use encoding_rs as enc;
@@ -185,14 +180,14 @@ impl Default for DecodeOptions {
 /// Decoded text plus everything needed to rebuild the original bytes.
 #[derive(Clone, Debug)]
 pub struct Decoded {
-    /// The decoded text, with any byte order mark removed.
+    /// The decoded text, with any recognized byte order mark removed.
     pub text: String,
     /// The encoding and byte order mark state the text came from.
     pub spec: EncodingSpec,
     /// Which detection step chose the encoding.
     pub source: DetectionSource,
-    /// True when the input held sequences the encoding cannot represent and
-    /// replacement characters were substituted. Such input does not round trip.
+    /// True when the input held sequences the encoding could not represent and
+    /// decoding omitted or replaced them. Such input does not round trip.
     pub had_errors: bool,
     /// Bytes from an honored end of file marker onward, preserved verbatim.
     pub trailer: Vec<u8>,
@@ -205,15 +200,12 @@ const UTF16_SNIFF_WINDOW: usize = 4096;
 /// sniff, as a numerator over a denominator.
 const UTF16_NUL_RATIO: (usize, usize) = (3, 10);
 
-/// Returns the encoding a byte order mark names, with its length in bytes.
-fn bom_of(bytes: &[u8]) -> Option<(TextEncoding, usize)> {
-    // The UTF-32LE mark starts with the UTF-16LE mark, so it must be tested first.
-    if bytes.starts_with(&[0xFF, 0xFE, 0x00, 0x00]) {
-        return Some((TextEncoding::Utf32Le, 4));
-    }
-    if bytes.starts_with(&[0x00, 0x00, 0xFE, 0xFF]) {
-        return Some((TextEncoding::Utf32Be, 4));
-    }
+/// BOMs recognized during automatic text detection.
+///
+/// Automatic detection recognizes UTF-8 and UTF-16 marks. In particular,
+/// `FF FE 00 00` is treated as a UTF-16LE mark followed by two NUL bytes, and
+/// `00 00 FE FF` is not recognized as a mark.
+fn detected_bom_of(bytes: &[u8]) -> Option<(TextEncoding, usize)> {
     if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
         return Some((TextEncoding::Utf8, 3));
     }
@@ -224,6 +216,20 @@ fn bom_of(bytes: &[u8]) -> Option<(TextEncoding, usize)> {
         return Some((TextEncoding::Utf16Be, 2));
     }
     None
+}
+
+/// Returns the byte length of a mark that matches an already selected
+/// encoding. This preserves explicit UTF-32 overrides without auto-detecting
+/// UTF-32 marks.
+fn bom_len_for(bytes: &[u8], encoding: TextEncoding) -> Option<usize> {
+    match encoding {
+        TextEncoding::Utf8 if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) => Some(3),
+        TextEncoding::Utf16Le if bytes.starts_with(&[0xFF, 0xFE]) => Some(2),
+        TextEncoding::Utf16Be if bytes.starts_with(&[0xFE, 0xFF]) => Some(2),
+        TextEncoding::Utf32Le if bytes.starts_with(&[0xFF, 0xFE, 0x00, 0x00]) => Some(4),
+        TextEncoding::Utf32Be if bytes.starts_with(&[0x00, 0x00, 0xFE, 0xFF]) => Some(4),
+        _ => None,
+    }
 }
 
 /// Guesses UTF-16 for bytes that carry no byte order mark.
@@ -238,7 +244,7 @@ fn bom_of(bytes: &[u8]) -> Option<(TextEncoding, usize)> {
 /// other side carries none, and the window decodes as UTF-16 without errors.
 #[must_use]
 pub fn sniff_utf16(bytes: &[u8]) -> Option<TextEncoding> {
-    if bom_of(bytes).is_some() || bytes.len() < 4 {
+    if detected_bom_of(bytes).is_some() || bytes.len() < 4 {
         return None;
     }
     let limit = UTF16_SNIFF_WINDOW.min(bytes.len()) & !1;
@@ -285,7 +291,7 @@ pub fn sniff_utf16(bytes: &[u8]) -> Option<TextEncoding> {
 #[must_use]
 pub fn detect(bytes: &[u8], options: &DecodeOptions) -> Detection {
     if let Some(forced) = options.forced {
-        let bom = bom_of(bytes).is_some_and(|(e, _)| e == forced);
+        let bom = bom_len_for(bytes, forced).is_some();
         return Detection {
             spec: EncodingSpec {
                 encoding: forced,
@@ -294,7 +300,7 @@ pub fn detect(bytes: &[u8], options: &DecodeOptions) -> Detection {
             source: DetectionSource::Override,
         };
     }
-    if let Some((encoding, _)) = bom_of(bytes) {
+    if let Some((encoding, _)) = detected_bom_of(bytes) {
         return Detection {
             spec: EncodingSpec {
                 encoding,
@@ -339,7 +345,7 @@ pub fn decode(bytes: &[u8], options: &DecodeOptions) -> Decoded {
     let detection = detect(bytes, options);
     let spec = detection.spec;
     let body = if spec.bom {
-        let skip = bom_of(bytes).map_or(0, |(_, len)| len);
+        let skip = bom_len_for(bytes, spec.encoding).unwrap_or(0);
         &bytes[skip..]
     } else {
         bytes
@@ -378,12 +384,11 @@ fn end_of_file_marker(body: &[u8]) -> Option<usize> {
         .map(|offset| start + offset)
 }
 
+/// Decodes the body after its byte order mark and any honored trailer are
+/// removed. The flag reports whether malformed input changed the displayed text.
 fn decode_body(body: &[u8], encoding: TextEncoding) -> (String, bool) {
     match encoding {
-        TextEncoding::Utf8 => match String::from_utf8_lossy(body) {
-            Cow::Borrowed(s) => (s.to_owned(), false),
-            Cow::Owned(s) => (s, true),
-        },
+        TextEncoding::Utf8 => decode_utf8(body),
         TextEncoding::Legacy(e) => {
             let (text, had_errors) = e.decode_without_bom_handling(body);
             (text.into_owned(), had_errors)
@@ -397,6 +402,34 @@ fn decode_body(body: &[u8], encoding: TextEncoding) -> (String, bool) {
     }
 }
 
+/// Decodes UTF-8 while omitting malformed byte sequences. The error flag lets
+/// callers retain their existing protection for edits made to lossy input.
+fn decode_utf8(body: &[u8]) -> (String, bool) {
+    let mut remaining = body;
+    let mut text = String::with_capacity(body.len());
+    let mut had_errors = false;
+    while !remaining.is_empty() {
+        match std::str::from_utf8(remaining) {
+            Ok(valid) => {
+                text.push_str(valid);
+                break;
+            }
+            Err(error) => {
+                let valid_up_to = error.valid_up_to();
+                text.push_str(&String::from_utf8_lossy(&remaining[..valid_up_to]));
+                let invalid_len = error
+                    .error_len()
+                    .unwrap_or(remaining.len().saturating_sub(valid_up_to));
+                had_errors = true;
+                remaining = &remaining[valid_up_to.saturating_add(invalid_len)..];
+            }
+        }
+    }
+    (text, had_errors)
+}
+
+/// Replaces unpaired surrogates and an odd trailing byte, and reports either
+/// condition in the returned flag.
 fn decode_utf16(body: &[u8], big_endian: bool) -> (String, bool) {
     let mut units = Vec::with_capacity(body.len() / 2);
     for pair in body.chunks_exact(2) {
@@ -423,6 +456,8 @@ fn decode_utf16(body: &[u8], big_endian: bool) -> (String, bool) {
     (text, had_errors)
 }
 
+/// Replaces invalid Unicode scalars and trailing bytes, and reports either
+/// condition in the returned flag.
 fn decode_utf32(body: &[u8], big_endian: bool) -> (String, bool) {
     let mut had_errors = !body.len().is_multiple_of(4);
     let mut text = String::with_capacity(body.len() / 4);
@@ -559,11 +594,48 @@ mod tests {
     }
 
     #[test]
-    fn utf32_bom_is_not_read_as_utf16() {
+    fn utf32le_bom_is_detected_as_the_utf16le_prefix() {
         let bytes = b"\xFF\xFE\x00\x00A\x00\x00\x00";
         let d = decode(bytes, &DecodeOptions::default());
+        assert_eq!(d.spec.encoding, TextEncoding::Utf16Le);
+        assert!(d.spec.bom);
+        assert_eq!(d.text, "\0A\0");
+    }
+
+    #[test]
+    fn utf32be_bom_is_not_auto_detected_as_a_bom() {
+        let bytes = b"\x00\x00\xFE\xFF\x00\x00\x00A";
+        let d = decode(bytes, &DecodeOptions::default());
+        assert_eq!(d.source, DetectionSource::Statistical);
+        assert_eq!(d.spec.encoding, TextEncoding::Legacy(enc::WINDOWS_1252));
+        assert_eq!(d.text, "\0\0þÿ\0\0\0A");
+    }
+
+    #[test]
+    fn explicit_utf32_override_still_strips_its_bom() {
+        let bytes = b"\xFF\xFE\x00\x00A\x00\x00\x00";
+        let options = DecodeOptions {
+            forced: Some(TextEncoding::Utf32Le),
+            ..DecodeOptions::default()
+        };
+        let d = decode(bytes, &options);
         assert_eq!(d.spec.encoding, TextEncoding::Utf32Le);
+        assert!(d.spec.bom);
         assert_eq!(d.text, "A");
+    }
+
+    #[test]
+    fn utf8_bom_drops_malformed_bytes_and_marks_the_decode_lossy() {
+        let d = decode(b"\xEF\xBB\xBFcaf\xE9", &DecodeOptions::default());
+        assert_eq!(d.text, "caf");
+        assert!(d.had_errors);
+    }
+
+    #[test]
+    fn utf8_double_leading_bom_preserves_the_second_mark_as_content() {
+        let d = decode(b"\xEF\xBB\xBF\xEF\xBB\xBFhello", &DecodeOptions::default());
+        assert_eq!(d.text, "\u{FEFF}hello");
+        assert!(d.spec.bom);
     }
 
     #[test]

@@ -316,10 +316,8 @@ fn a_lossy_save_still_asks_about_a_change_made_on_disk_meanwhile() {
     // first still holds, so the save completes.
     harness.view.answer_prompt(true);
     harness.until(|view| !view.is_saving() && !view.pane(Side::Left).is_modified());
-    assert_eq!(
-        std::fs::read_to_string(&harness.left_path).unwrap(),
-        "x\u{FFFD}(\n"
-    );
+    // The malformed UTF-8 byte is omitted from the decoded buffer.
+    assert_eq!(std::fs::read_to_string(&harness.left_path).unwrap(), "x(\n");
 }
 
 /// Reload reads both files again, so an edit that is not written raises the

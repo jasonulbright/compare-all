@@ -14,7 +14,7 @@
 
 use crate::jobs::Sources;
 use crate::model::MergeModel;
-use ca_text::{EditSnapshot, LineRange, LoadedText, TextBuffer};
+use ca_text::{EditSnapshot, LineRange, LoadedText, TextBuffer, TextEncoding};
 use ca_ui::save::text::SaveConsent;
 use ca_ui::save::{Baseline, FileSystem, SaveOutcome};
 use std::path::Path;
@@ -346,10 +346,12 @@ pub fn to_bytes(
     encoded(model, template, markers).to_bytes()
 }
 
-/// True when a replacement character in the composed output may come from a
-/// source that did not decode cleanly and therefore needs explicit consent.
+/// True when decode errors may make the composed output lossy and require consent.
 #[must_use]
 pub fn contains_lossy_input(model: &MergeModel, sources: &Sources) -> bool {
+    if sources_had_omitted_utf8(sources) {
+        return true;
+    }
     let has_lossy_source = sources_had_decode_errors(sources);
     has_lossy_source
         && model.output_lines().iter().any(|line| {
@@ -382,13 +384,27 @@ pub(crate) fn sources_had_decode_errors(sources: &Sources) -> bool {
         || sources.right.had_errors
 }
 
-/// Whether the text a save will write needs consent for decoded replacements.
+/// Whether UTF-8 decoding omitted malformed bytes from any source.
+#[must_use]
+pub(crate) fn sources_had_omitted_utf8(sources: &Sources) -> bool {
+    let omitted =
+        |source: &LoadedText| source.had_errors && source.spec.encoding == TextEncoding::Utf8;
+    omitted(&sources.left)
+        || sources.center.as_ref().is_some_and(omitted)
+        || omitted(&sources.right)
+}
+
+/// Whether text from lossy sources needs consent before a save.
 ///
 /// The UI save worker calls this on its snapshot so the frame thread never
 /// walks every output line to answer the consent question.
 #[must_use]
-pub(crate) fn contains_lossy_replacement(text: &str, has_lossy_source: bool) -> bool {
-    has_lossy_source && text.contains('\u{fffd}')
+pub(crate) fn needs_loss_consent(
+    text: &str,
+    has_lossy_source: bool,
+    has_omitted_utf8: bool,
+) -> bool {
+    has_omitted_utf8 || (has_lossy_source && text.contains('\u{fffd}'))
 }
 
 fn encoded(

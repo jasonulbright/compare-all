@@ -112,7 +112,7 @@ pub fn run(paths: &MergePaths, stored: &TextMergeSettings, switches: Switches) -
     if output::contains_lossy_input(&model, &data.sources) {
         return Finish::done(
             EXIT_ERROR,
-            "The output includes replacement characters from an input that did not decode cleanly. It was not written.",
+            "An input had decoding errors, so the output may be incomplete. It was not written.",
         );
     }
     let outcome = output::save(
@@ -199,6 +199,22 @@ mod tests {
             std::fs::read_to_string(dir.path().join("out.txt")).unwrap(),
             "A\nb\nc\nd\ne\nF\n"
         );
+    }
+
+    #[test]
+    fn malformed_utf8_input_is_refused_even_when_its_bytes_were_omitted() {
+        let dir = tempfile::tempdir().unwrap();
+        let clean = "a\nb(\n";
+        let paths = paths(dir.path(), clean, clean, clean);
+        std::fs::write(&paths.left, b"\xEF\xBB\xBFa\nb\xF0(\n").unwrap();
+
+        let finish = run(&paths, &TextMergeSettings::default(), Switches::default());
+
+        assert_eq!(code(&finish), EXIT_ERROR);
+        assert!(
+            matches!(finish, Finish::Done { ref message, .. } if message.contains("decoding errors"))
+        );
+        assert!(!dir.path().join("out.txt").exists());
     }
 
     #[test]
