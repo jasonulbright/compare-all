@@ -971,6 +971,60 @@ fn an_accessibility_gutter_arrow_click_copies_its_section_with_a_selection() {
 }
 
 #[test]
+fn an_arrow_keeps_its_section_start_visible_when_clicked_near_the_bottom() {
+    use egui::accesskit::{Action, ActionRequest};
+    use std::fmt::Write as _;
+
+    let mut left = String::new();
+    let mut right = String::new();
+    for line in 0..50 {
+        let _ = writeln!(left, "same {line}");
+        let _ = writeln!(right, "same {line}");
+    }
+    for line in 0..80 {
+        let _ = writeln!(left, "left {line}");
+        let _ = writeln!(right, "right {line}");
+    }
+    let mut fixture = Fixture::new(&left, &right);
+    let section = fixture.view.data.model.sections()[0].clone();
+    let section_start = section.start as usize;
+    fixture.view.scroll_to_position(section_start + 30);
+    fixture.frame(Vec::new());
+    assert!(
+        fixture.view.scroll.first_row() > section_start,
+        "the section starts above the viewport"
+    );
+    let arrow = fixture
+        .view
+        .arrows
+        .iter()
+        .find(|arrow| arrow.side == Side::Left)
+        .expect("a visible row of the section has a gutter arrow");
+    let target = fixture
+        .view
+        .id
+        .with(("arrow", arrow.section, arrow.side == Side::Right))
+        .value()
+        .into();
+
+    fixture.frame(vec![egui::Event::AccessKitActionRequest(ActionRequest {
+        action: Action::Click,
+        target,
+        data: None,
+    })]);
+
+    let visible = fixture.view.scroll.visible(
+        fixture.view.viewport_height,
+        fixture.view.row_height(),
+        fixture.view.visible.len(),
+    );
+    assert!(
+        visible.contains(&section_start),
+        "the current section row is visible after the arrow click"
+    );
+}
+
+#[test]
 fn launch_target_uses_each_panes_caret_line_across_gap_rows() {
     let mut fixture = Fixture::new("a\nc\n", "a\nb\nc\n");
     let left_row = fixture

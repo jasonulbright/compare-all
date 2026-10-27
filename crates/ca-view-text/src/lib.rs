@@ -3842,7 +3842,7 @@ impl TextView {
         }
         let arrow_copy = self.paint_arrows(ui, &clip, &font, palette);
         if let Some((rows, to)) = arrow_copy {
-            self.caret = rows.start;
+            self.go_to_row(rows.start);
             self.copy_rows_to(to, rows);
         }
         self.pane_pointer(
