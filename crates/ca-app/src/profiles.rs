@@ -1079,6 +1079,43 @@ mod tests {
     }
 
     #[test]
+    fn plaintext_auth_compatibility_checkbox_toggles_by_accessible_label() {
+        let folder = tempfile::tempdir().unwrap();
+        let mut manager = ProfileManager::open(folder.path(), Arc::new(|| {}));
+        wait_for_job(&mut manager);
+        manager.draft.service =
+            ServiceProfile::WebDav(ca_vfs::remote::profile::WebDavProfile::default());
+        let manager = std::cell::RefCell::new(manager);
+
+        let label = "Allow authentication over plain HTTP (legacy compatibility)";
+        let mut probe = ca_ui::testing::probe::Probe::new(1_400.0, 900.0);
+        let mut draw = |ctx: &egui::Context| {
+            egui::CentralPanel::default().show(ctx, |_| {
+                manager.borrow_mut().show(ctx);
+            });
+        };
+        probe.idle(&mut draw);
+        probe.idle(&mut draw);
+        assert_eq!(probe.find(label).unwrap().toggled, Some(false));
+        assert!(matches!(
+            &manager.borrow().draft.service,
+            ServiceProfile::WebDav(profile) if !profile.allow_plaintext_credentials
+        ));
+
+        probe.click(label, &mut draw).unwrap();
+        assert!(matches!(
+            &manager.borrow().draft.service,
+            ServiceProfile::WebDav(profile) if profile.allow_plaintext_credentials
+        ));
+
+        probe.click(label, &mut draw).unwrap();
+        assert!(matches!(
+            &manager.borrow().draft.service,
+            ServiceProfile::WebDav(profile) if !profile.allow_plaintext_credentials
+        ));
+    }
+
+    #[test]
     fn profile_names_cannot_escape_the_profiles_folder() {
         for name in ["", "..", ".hidden", "a..b", "../outside", "a/b", "a\\b"] {
             assert!(validate_name(name).is_err(), "{name:?}");
