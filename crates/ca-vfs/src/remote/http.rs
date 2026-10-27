@@ -538,7 +538,8 @@ impl HttpClient {
             .as_ref()
             .is_some_and(|credentials| credentials.scheme != HttpAuthScheme::None);
         let has_plaintext_sensitive_auth_header = headers.iter().any(|(name, value)| {
-            name.eq_ignore_ascii_case("authorization")
+            (name.eq_ignore_ascii_case("authorization")
+                || name.eq_ignore_ascii_case("proxy-authorization"))
                 && is_plaintext_sensitive_authorization(value)
         });
         let allows_plaintext = self
@@ -1287,6 +1288,32 @@ mod tests {
             client.send("GET", &url, &headers, RequestBody::Empty, &Cancel::new(),),
             Err(VfsError::Tls { .. })
         ));
+    }
+
+    #[test]
+    fn caller_supplied_proxy_authorization_headers_are_refused_over_http_by_default() {
+        let client = HttpClient::new(
+            &crate::remote::tls::TlsOptions::default(),
+            None,
+            std::time::Duration::from_secs(1),
+        )
+        .unwrap();
+        let url = Url::parse("http://127.0.0.1:0/file").unwrap();
+
+        for authorization_value in [
+            "Basic cHJveHk6c2VjcmV0",
+            "Digest username=\"proxy\", response=\"abc\"",
+        ] {
+            let headers = vec![(
+                "Proxy-Authorization".to_owned(),
+                authorization_value.to_owned(),
+            )];
+
+            assert!(matches!(
+                client.send("GET", &url, &headers, RequestBody::Empty, &Cancel::new(),),
+                Err(VfsError::Tls { .. })
+            ));
+        }
     }
 
     #[test]
