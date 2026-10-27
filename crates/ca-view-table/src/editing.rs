@@ -1776,7 +1776,7 @@ mod tests {
 
     #[test]
     fn a_lossy_load_asks_before_an_edited_save() {
-        // 0xFF is not valid UTF-8, so the load needs a replacement character.
+        // 0xFF is not valid UTF-8, so the load is marked lossy.
         let source = b"id,name\n1,A\xFFn\n";
         let (_dir, left, right) = files(source, source);
         let mut view = TableView::new(left.clone(), right, &context(), 14);
@@ -1829,9 +1829,7 @@ mod tests {
         settle(&mut view);
         assert_eq!(view.prompt, None, "a question was asked a second time");
         assert!(!view.is_modified(Side::Left));
-        assert_eq!(
-            std::fs::read_to_string(&left).unwrap(),
-            "id,name\n9,A\u{FFFD}n\n"
-        );
+        // Malformed UTF-8 was omitted when the table loaded the saved output.
+        assert_eq!(std::fs::read_to_string(&left).unwrap(), "id,name\n9,An\n");
     }
 }

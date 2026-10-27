@@ -329,9 +329,10 @@ fn a_lossy_save_still_asks_about_a_change_made_on_disk_meanwhile() {
     frames.until(&mut view, |view| {
         !view.is_saving() && !view.pane().is_modified()
     });
+    // The malformed UTF-8 byte is omitted from the decoded buffer.
     assert_eq!(
         std::fs::read(&path).unwrap(),
-        [0xEF, 0xBB, 0xBF, b'x', 0xEF, 0xBF, 0xBD, b'(', b'\n']
+        [0xEF, 0xBB, 0xBF, b'x', b'(', b'\n']
     );
 }
 

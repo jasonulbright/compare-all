@@ -118,7 +118,7 @@ fn build_notices(data: &TableData) -> Vec<String> {
     for (label, side) in [("Left", &data.left), ("Right", &data.right)] {
         if side.facts.had_errors {
             notices.push(format!(
-                "{label} file: some bytes could not be decoded and were replaced."
+                "{label} file: some input sequences were omitted or replaced during decoding."
             ));
         }
         if !side.facts.warnings.is_empty() {

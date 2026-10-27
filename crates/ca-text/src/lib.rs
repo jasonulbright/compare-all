@@ -61,8 +61,7 @@ pub enum SaveError {
         /// The encoding that cannot represent it.
         encoding: TextEncoding,
     },
-    /// The load needed replacement characters, so the buffer no longer holds the
-    /// bytes the file did and an edited save would destroy them.
+    /// Decoding errors prevent an edited save from reproducing the source bytes.
     #[error("the file did not decode cleanly, so an edited save cannot reproduce its bytes")]
     LossyLoad,
 }
@@ -78,13 +77,14 @@ pub struct LoadedText {
     pub source: DetectionSource,
     /// Line ending statistics as loaded.
     pub eol: EolSummary,
-    /// True when decoding needed replacement characters, so saving is lossy.
+    /// True when decoding omits or replaces malformed input.
+    /// Editing and saving such a load may not reproduce the source bytes.
     pub had_errors: bool,
     /// Bytes past an honored end of file marker, preserved verbatim.
     trailer: Arc<[u8]>,
-    /// The bytes as loaded, kept only when decoding was lossy. Re-encoding the
-    /// decoded text would write replacement characters over content the buffer
-    /// never held, so an unedited save replays these instead.
+    /// Original bytes retained only when decoding reports errors. Re-encoding
+    /// cannot restore malformed input that decoding omits or replaces, so an
+    /// unedited save replays the original bytes.
     original: Option<Arc<[u8]>>,
 }
 
@@ -170,8 +170,9 @@ impl LoadedText {
     /// Encodes the current buffer content, accepting the losses [`LoadedText::to_bytes`] refuses.
     ///
     /// A character the encoding cannot represent becomes a numeric character
-    /// reference, and a buffer loaded with replacement characters writes those
-    /// replacement characters out.
+    /// reference. Malformed UTF-8 bytes are omitted during decoding and cannot
+    /// be restored. Other decoding errors represented by U+FFFD are encoded as
+    /// replacement characters.
     #[must_use]
     pub fn to_bytes_lossy(&self) -> Vec<u8> {
         encode_file(&self.buffer.text(), self.spec, &self.trailer).bytes
@@ -201,7 +202,7 @@ mod tests {
     }
 
     #[test]
-    fn lossy_loads_compare_the_retained_bytes_instead_of_replacement_text() {
+    fn lossy_loads_compare_retained_bytes_when_decoded_text_matches() {
         let options = DecodeOptions {
             forced: Some(TextEncoding::Utf8),
             ..DecodeOptions::default()
@@ -213,6 +214,20 @@ mod tests {
         assert_eq!(left.buffer.text(), different.buffer.text());
         assert!(!left.original_bytes_equal(&different));
         assert!(left.original_bytes_equal(&same));
+    }
+
+    #[test]
+    fn malformed_utf8_is_preserved_until_a_lossy_save_is_accepted() {
+        let bytes = b"\xEF\xBB\xBFcaf\xE9";
+        let mut loaded = LoadedText::load(bytes, &DecodeOptions::default());
+
+        assert_eq!(loaded.buffer.text(), "caf");
+        assert!(loaded.had_errors);
+        assert_eq!(loaded.to_bytes().unwrap(), bytes);
+
+        loaded.buffer.insert(0, "x");
+        assert!(matches!(loaded.to_bytes(), Err(SaveError::LossyLoad)));
+        assert_eq!(loaded.to_bytes_lossy(), b"\xEF\xBB\xBFxcaf");
     }
 
     #[test]
