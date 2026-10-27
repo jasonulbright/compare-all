@@ -1223,7 +1223,7 @@ impl RecordsView {
             return;
         };
         let messages = job.drain();
-        if job.is_finished() || !messages.is_empty() {
+        if job.is_finished() {
             self.edit.work = None;
         }
         for message in messages {

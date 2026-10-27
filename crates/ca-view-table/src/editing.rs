@@ -691,7 +691,7 @@ impl TableView {
         };
         let messages = job.drain();
         let finished = job.is_finished();
-        if finished || !messages.is_empty() {
+        if finished {
             self.save_job = None;
         }
         for message in messages {
@@ -1018,7 +1018,7 @@ impl TableView {
         };
         let messages = job.drain();
         let finished = job.is_finished();
-        if finished || !messages.is_empty() {
+        if finished {
             self.search_job = None;
         }
         for message in messages {
@@ -1112,7 +1112,7 @@ impl TableView {
         };
         let messages = job.drain();
         let finished = job.is_finished();
-        if finished || !messages.is_empty() {
+        if finished {
             self.replace_job = None;
         }
         for message in messages {
