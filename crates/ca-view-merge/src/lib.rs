@@ -1739,6 +1739,7 @@ impl MergeView {
         }
         let conflicts = self.data.model.totals().conflicts_remaining;
         let has_lossy_source = output::sources_had_decode_errors(&self.data.sources);
+        let has_omitted_utf8 = output::sources_had_omitted_utf8(&self.data.sources);
         if conflicts > 0 && !self.accept_markers && !has_lossy_source {
             self.question = Some(Question::SaveWithConflicts);
             return;
@@ -1779,9 +1780,9 @@ impl MergeView {
                     _ => None,
                 };
                 let output_to_write = marked.as_deref().unwrap_or(&saved_output);
-                if !consent.accept_loss
-                    && output::contains_lossy_replacement(output_to_write, has_lossy_source)
-                {
+                let needs_loss_consent =
+                    output::needs_loss_consent(output_to_write, has_lossy_source, has_omitted_utf8);
+                if !consent.accept_loss && needs_loss_consent {
                     emitter.send(MergeSaveMessage::NeedsLossConsent);
                     return;
                 }
@@ -4834,6 +4835,31 @@ mod tests {
             &ca_text::DecodeOptions::default(),
         );
         assert!(saved.buffer.text().contains('\u{fffd}'));
+    }
+
+    #[test]
+    fn saving_with_malformed_utf8_input_requires_consent_without_a_replacement() {
+        let malformed = b"\xEF\xBB\xBFa\nb\xF0(\n";
+        let clean = b"\xEF\xBB\xBFa\nb(\n";
+        let (mut view, dir) = open_bytes(malformed, Some(clean), clean);
+        run_until_ready(&mut view);
+        assert!(view.data.sources.left.had_errors);
+        assert!(!view.output_text().contains('\u{fffd}'));
+
+        view.run(Command::SaveFile);
+        assert!(view.save_job.is_some());
+        wait_for_save(&mut view);
+        assert!(matches!(view.question(), Some(Question::AcceptLoss(_))));
+        assert!(!dir.path().join("out.txt").exists());
+
+        view.answer(true);
+        wait_for_save(&mut view);
+        assert!(dir.path().join("out.txt").exists());
+        let saved = ca_text::LoadedText::load(
+            &std::fs::read(dir.path().join("out.txt")).unwrap(),
+            &ca_text::DecodeOptions::default(),
+        );
+        assert_eq!(saved.buffer.text(), "a\nb(\n");
     }
 
     #[test]

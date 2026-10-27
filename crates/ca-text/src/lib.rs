@@ -61,8 +61,7 @@ pub enum SaveError {
         /// The encoding that cannot represent it.
         encoding: TextEncoding,
     },
-    /// The load had decoding errors, so an edited save cannot reproduce the
-    /// source bytes from the decoded buffer.
+    /// Decoding errors prevent an edited save from reproducing the source bytes.
     #[error("the file did not decode cleanly, so an edited save cannot reproduce its bytes")]
     LossyLoad,
 }
@@ -78,14 +77,14 @@ pub struct LoadedText {
     pub source: DetectionSource,
     /// Line ending statistics as loaded.
     pub eol: EolSummary,
-    /// True when malformed input was omitted or replaced during decoding.
+    /// True when decoding omits or replaces malformed input.
     /// Editing and saving such a load may not reproduce the source bytes.
     pub had_errors: bool,
     /// Bytes past an honored end of file marker, preserved verbatim.
     trailer: Arc<[u8]>,
-    /// The bytes as loaded, kept only when decoding was lossy. Re-encoding the
-    /// decoded text cannot restore omitted bytes or malformed sequences that
-    /// were replaced, so an unedited save replays these instead.
+    /// Original bytes retained only when decoding reports errors. Re-encoding
+    /// cannot restore malformed input that decoding omits or replaces, so an
+    /// unedited save replays the original bytes.
     original: Option<Arc<[u8]>>,
 }
 

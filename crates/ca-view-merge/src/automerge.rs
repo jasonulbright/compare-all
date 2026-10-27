@@ -202,6 +202,22 @@ mod tests {
     }
 
     #[test]
+    fn malformed_utf8_input_is_refused_even_when_its_bytes_were_omitted() {
+        let dir = tempfile::tempdir().unwrap();
+        let clean = "a\nb(\n";
+        let paths = paths(dir.path(), clean, clean, clean);
+        std::fs::write(&paths.left, b"\xEF\xBB\xBFa\nb\xF0(\n").unwrap();
+
+        let finish = run(&paths, &TextMergeSettings::default(), Switches::default());
+
+        assert_eq!(code(&finish), EXIT_ERROR);
+        assert!(
+            matches!(finish, Finish::Done { ref message, .. } if message.contains("decoding errors"))
+        );
+        assert!(!dir.path().join("out.txt").exists());
+    }
+
+    #[test]
     fn a_conflict_without_force_writes_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let (left, center, right) = CONFLICT;
