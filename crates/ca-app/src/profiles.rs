@@ -1079,9 +1079,11 @@ mod tests {
     }
 
     #[test]
-    fn plaintext_auth_compatibility_checkbox_toggles_by_accessible_label() {
-        let folder = tempfile::tempdir().unwrap();
-        let mut manager = ProfileManager::open(folder.path(), Arc::new(|| {}));
+    fn plaintext_authentication_compatibility_checkbox_toggles_by_accessible_label() {
+        let mut manager =
+            ProfileManager::open_with_loader(std::path::Path::new("."), Arc::new(|| {}), |_| {
+                (Vec::new(), None)
+            });
         wait_for_job(&mut manager);
         manager.draft.service =
             ServiceProfile::WebDav(ca_vfs::remote::profile::WebDavProfile::default());
@@ -1089,9 +1091,9 @@ mod tests {
 
         let label = "Allow authentication over plain HTTP (legacy compatibility)";
         let mut probe = ca_ui::testing::probe::Probe::new(1_400.0, 900.0);
-        let mut draw = |ctx: &egui::Context| {
-            egui::CentralPanel::default().show(ctx, |_| {
-                manager.borrow_mut().show(ctx);
+        let mut draw = |context: &egui::Context| {
+            egui::CentralPanel::default().show(context, |_| {
+                manager.borrow_mut().show(context);
             });
         };
         probe.idle(&mut draw);
