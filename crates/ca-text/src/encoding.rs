@@ -1,9 +1,5 @@
 //! Encoding detection, decoding and re-encoding.
 //!
-//! Detection order is explicit override, recognized byte order mark, empty
-//! input fallback, BOM-less UTF-16 sniff, whole-buffer UTF-8 validity, then
-//! statistical detection over the whole buffer.
-//!
 //! [`decode`] identifies the encoding, byte order mark and honored end-of-file
 //! trailer used by [`encode_file`]. It flags malformed input so callers can
 //! preserve original bytes or protect a lossy edit.
@@ -388,6 +384,8 @@ fn end_of_file_marker(body: &[u8]) -> Option<usize> {
         .map(|offset| start + offset)
 }
 
+/// Decodes the body after its byte order mark and any honored trailer are
+/// removed. The flag reports whether malformed input changed the displayed text.
 fn decode_body(body: &[u8], encoding: TextEncoding) -> (String, bool) {
     match encoding {
         TextEncoding::Utf8 => decode_utf8(body),
@@ -430,6 +428,8 @@ fn decode_utf8(body: &[u8]) -> (String, bool) {
     (text, had_errors)
 }
 
+/// Replaces unpaired surrogates and an odd trailing byte, and reports either
+/// condition in the returned flag.
 fn decode_utf16(body: &[u8], big_endian: bool) -> (String, bool) {
     let mut units = Vec::with_capacity(body.len() / 2);
     for pair in body.chunks_exact(2) {
@@ -456,6 +456,8 @@ fn decode_utf16(body: &[u8], big_endian: bool) -> (String, bool) {
     (text, had_errors)
 }
 
+/// Replaces invalid Unicode scalars and trailing bytes, and reports either
+/// condition in the returned flag.
 fn decode_utf32(body: &[u8], big_endian: bool) -> (String, bool) {
     let mut had_errors = !body.len().is_multiple_of(4);
     let mut text = String::with_capacity(body.len() / 4);
