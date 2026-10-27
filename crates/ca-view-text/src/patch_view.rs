@@ -408,7 +408,7 @@ impl TextPatchView {
         if let Some((job, picking)) = self.picker.as_mut() {
             let picking = *picking;
             let messages = job.drain();
-            if job.is_finished() || !messages.is_empty() {
+            if job.is_finished() {
                 self.picker = None;
             }
             for message in messages {

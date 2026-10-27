@@ -1024,22 +1024,19 @@ impl MergeView {
             return;
         };
         let messages = job.drain();
-        let mut finished = job.is_finished();
+        let finished = job.is_finished();
         for message in messages {
             match message {
                 MergeMessage::Progress(step) => self.status = Status::Running(step),
                 MergeMessage::Failed(reason) => {
                     self.status = Status::Failed(reason);
                     self.failed = true;
-                    finished = true;
                 }
                 MergeMessage::Cancelled => {
                     self.status = Status::Cancelled;
-                    finished = true;
                 }
                 MergeMessage::Ready(data) => {
                     self.adopt(*data);
-                    finished = true;
                 }
             }
         }
@@ -1054,15 +1051,14 @@ impl MergeView {
             return;
         };
         let messages = job.drain();
-        let mut finished = job.is_finished();
+        let finished = job.is_finished();
         for message in messages {
             match message {
-                MergeSaveMessage::Cancelled => finished = true,
+                MergeSaveMessage::Cancelled => {}
                 MergeSaveMessage::NeedsConflictConsent => {
                     self.saving_revision = None;
                     self.saving_conflicts = None;
                     self.question = Some(Question::SaveWithConflicts);
-                    finished = true;
                 }
                 MergeSaveMessage::NeedsLossConsent => {
                     self.saving_revision = None;
@@ -1071,7 +1067,6 @@ impl MergeView {
                         "The output includes replacement characters from an input that did not decode cleanly."
                             .to_owned(),
                     ));
-                    finished = true;
                 }
                 MergeSaveMessage::Done {
                     outcome,
@@ -1079,7 +1074,6 @@ impl MergeView {
                     marks,
                 } => {
                     self.finish_save(*outcome, output, marks);
-                    finished = true;
                 }
             }
         }
@@ -3334,6 +3328,20 @@ mod tests {
         };
         let view = MergeView::over(paths, ca_ui::view::Titles::default(), &context(), 7);
         (view, dir)
+    }
+
+    #[test]
+    fn a_progress_message_keeps_the_merge_job_running() {
+        let (mut view, _dir) = open("left\n", Some("base\n"), "right\n");
+        let (job, held) =
+            ca_ui::testing::job_held_after(vec![super::MergeMessage::Progress("Checking inputs")]);
+        view.job = Some(job);
+
+        view.drain_jobs();
+
+        assert!(view.job.is_some());
+        assert_eq!(view.status, super::Status::Running("Checking inputs"));
+        drop(held);
     }
 
     #[test]
