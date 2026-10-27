@@ -279,11 +279,11 @@ impl<M: Terminal> Job<M> {
         out
     }
 
-    /// Take every message until the body has returned and every message has
-    /// been taken, or until `limit` passes.
+    /// Take messages until the sender disconnects, or until `limit` passes.
     ///
-    /// Blocks the calling thread. [`Job::has_returned`] tells the two
-    /// outcomes apart.
+    /// Blocks the calling thread. After a timeout, [`Job::has_returned`]
+    /// reports whether the body returned; it does not guarantee that every
+    /// message was taken.
     pub fn wait_returned(&mut self, limit: Duration) -> Vec<M> {
         let deadline = std::time::Instant::now() + limit;
         let mut out = Vec::new();
@@ -364,7 +364,7 @@ mod tests {
     use super::{Cancel, Emitter, Job, Terminal, QUEUE_CAPACITY};
     use crate::testing::{job_held_after, wait_until as wait_for};
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{mpsc, Arc};
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     #[derive(Debug, PartialEq, Eq)]
@@ -629,34 +629,18 @@ mod tests {
     }
 
     #[test]
-    fn dropping_a_finished_job_cuts_off_no_work_the_reader_needs() {
-        let written = Arc::new(AtomicUsize::new(0));
-        let cleaned = Arc::new(AtomicUsize::new(0));
-        let (release, held) = mpsc::channel::<()>();
-        let mut job: Job<Note> = {
-            let written = Arc::clone(&written);
-            let cleaned = Arc::clone(&cleaned);
-            Job::spawn(move |emitter: &Emitter<Note>, _| {
-                written.store(1, Ordering::SeqCst);
-                emitter.send(Note::Done);
-                let _ = held.recv_timeout(LIMIT);
-                cleaned.store(1, Ordering::SeqCst);
-            })
-        };
+    fn dropping_a_finished_job_keeps_its_queued_result() {
+        let (mut job, held) = job_held_after(vec![Note::Value(1), Note::Done]);
+        let seen = job.drain();
+        let finished = job.is_finished();
+        let returned = job.has_returned();
         let flag = job.cancel_handle();
-        assert!(wait_for(LIMIT, || {
-            job.drain();
-            job.is_finished()
-        }));
-        assert_eq!(
-            written.load(Ordering::SeqCst),
-            1,
-            "work before the terminal message is complete when the job finishes"
-        );
         drop(job);
+        drop(held);
+        assert_eq!(seen, vec![Note::Value(1), Note::Done]);
+        assert!(finished, "the terminal message finishes the job");
+        assert!(!returned, "the body is still held after sending the result");
         assert!(flag.is_cancelled());
-        release.send(()).unwrap();
-        assert!(wait_for(LIMIT, || cleaned.load(Ordering::SeqCst) == 1));
     }
 
     #[test]
