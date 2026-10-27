@@ -2204,6 +2204,20 @@ impl TextView {
         let Some(rows) = chosen else {
             return;
         };
+        self.copy_rows_to(to, rows);
+    }
+
+    /// Copy these exact rows to `to`, without allowing a selection to replace
+    /// the range chosen by a row-based control such as a gutter arrow.
+    fn copy_rows_to(&mut self, to: Side, rows: std::ops::Range<usize>) {
+        if self.pane(to).is_read_only() {
+            return;
+        }
+        if !self.rows_current() {
+            self.message = Some(self.rows_message());
+            return;
+        }
+        let from = to.other();
         let Some(plan) = sidecopy::plan(&self.data.model, rows, from) else {
             return;
         };
@@ -2819,7 +2833,7 @@ impl TextView {
         painter: &egui::Painter,
         _font: &egui::FontId,
         palette: &Palette,
-    ) -> Option<(usize, Side)> {
+    ) -> Option<(std::ops::Range<usize>, Side)> {
         if self.structural_summary().is_some() {
             return None;
         }
@@ -2870,13 +2884,15 @@ impl TextView {
                 let _ = response.on_hover_text(reason);
             }
             if clicked {
-                let start = self
+                let rows = self
                     .data
                     .model
                     .sections()
                     .get(arrow.section as usize)
-                    .map_or(self.caret, |range| range.start as usize);
-                copy = Some((start, arrow.side.other()));
+                    .map(|range| range.start as usize..range.end as usize);
+                if let Some(rows) = rows {
+                    copy = Some((rows, arrow.side.other()));
+                }
             }
         }
         copy
@@ -3825,9 +3841,9 @@ impl TextView {
             }
         }
         let arrow_copy = self.paint_arrows(ui, &clip, &font, palette);
-        if let Some((row, to)) = arrow_copy {
-            self.caret = row;
-            self.copy_to(to, false);
+        if let Some((rows, to)) = arrow_copy {
+            self.go_to_row(rows.start);
+            self.copy_rows_to(to, rows);
         }
         self.pane_pointer(
             ui,
@@ -5225,15 +5241,15 @@ impl SessionView for TextView {
         if self.left_path.as_os_str().is_empty() {
             return None;
         }
-        let line = u32::try_from(self.caret.saturating_add(1)).ok();
-        let side = |path: &std::path::Path| LaunchSide {
+        let side = |side: Side, path: &std::path::Path| LaunchSide {
             path: path.to_path_buf(),
             base: path.parent().map(std::path::Path::to_path_buf),
-            line,
+            line: Some(self.pane(side).caret().line.saturating_add(1)),
         };
         Some(ca_ui::launch::LaunchTarget::files(LaunchContext {
-            first: side(&self.left_path),
-            second: (!self.right_path.as_os_str().is_empty()).then(|| side(&self.right_path)),
+            first: side(Side::Left, &self.left_path),
+            second: (!self.right_path.as_os_str().is_empty())
+                .then(|| side(Side::Right, &self.right_path)),
         }))
     }
 

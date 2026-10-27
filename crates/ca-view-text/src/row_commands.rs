@@ -939,3 +939,113 @@ fn navigation_shows_the_start_of_the_line_it_moves_to() {
     fixture.view.run(Command::NextSection);
     assert!(fixture.view.horizontal.abs() < f32::EPSILON);
 }
+
+#[test]
+fn an_accessibility_gutter_arrow_click_copies_its_section_with_a_selection() {
+    use egui::accesskit::{Action, ActionRequest};
+
+    let mut fixture = Fixture::new("a\nB\nc\nD\ne\n", "a\nx\nc\ny\ne\n");
+    fixture.view.left_pane.place(Caret::new(1, 0), false);
+    fixture.view.left_pane.place(Caret::new(1, 1), true);
+    let arrow = fixture
+        .view
+        .arrows
+        .iter()
+        .filter(|arrow| arrow.side == Side::Left)
+        .max_by_key(|arrow| arrow.section)
+        .expect("the second Copy to Right arrow is drawn");
+    let target = fixture
+        .view
+        .id
+        .with(("arrow", arrow.section, arrow.side == Side::Right))
+        .value()
+        .into();
+
+    fixture.frame(vec![egui::Event::AccessKitActionRequest(ActionRequest {
+        action: Action::Click,
+        target,
+        data: None,
+    })]);
+
+    assert_eq!(fixture.text(Side::Right), "a\nx\nc\nD\ne\n");
+}
+
+#[test]
+fn an_arrow_keeps_its_section_start_visible_when_clicked_near_the_bottom() {
+    use egui::accesskit::{Action, ActionRequest};
+    use std::fmt::Write as _;
+
+    let mut left = String::new();
+    let mut right = String::new();
+    for line in 0..50 {
+        let _ = writeln!(left, "same {line}");
+        let _ = writeln!(right, "same {line}");
+    }
+    for line in 0..80 {
+        let _ = writeln!(left, "left {line}");
+        let _ = writeln!(right, "right {line}");
+    }
+    let mut fixture = Fixture::new(&left, &right);
+    let section = fixture.view.data.model.sections()[0].clone();
+    let section_start = section.start as usize;
+    fixture.view.scroll_to_position(section_start + 30);
+    fixture.frame(Vec::new());
+    assert!(
+        fixture.view.scroll.first_row() > section_start,
+        "the section starts above the viewport"
+    );
+    let arrow = fixture
+        .view
+        .arrows
+        .iter()
+        .find(|arrow| arrow.side == Side::Left)
+        .expect("a visible row of the section has a gutter arrow");
+    let target = fixture
+        .view
+        .id
+        .with(("arrow", arrow.section, arrow.side == Side::Right))
+        .value()
+        .into();
+
+    fixture.frame(vec![egui::Event::AccessKitActionRequest(ActionRequest {
+        action: Action::Click,
+        target,
+        data: None,
+    })]);
+
+    let visible = fixture.view.scroll.visible(
+        fixture.view.viewport_height,
+        fixture.view.row_height(),
+        fixture.view.visible.len(),
+    );
+    assert!(
+        visible.contains(&section_start),
+        "the current section row is visible after the arrow click"
+    );
+}
+
+#[test]
+fn launch_target_uses_each_panes_caret_line_across_gap_rows() {
+    let mut fixture = Fixture::new("a\nc\n", "a\nb\nc\n");
+    let left_row = fixture
+        .view
+        .data
+        .model
+        .row_of_left_line(1)
+        .expect("the left caret line is in the row map");
+    assert!(left_row > 1, "the left caret line follows a gap row");
+    fixture.view.caret = left_row;
+    fixture.view.left_pane.place(Caret::new(1, 0), false);
+    fixture.view.right_pane.place(Caret::new(2, 0), false);
+
+    let target = fixture
+        .view
+        .launch_target()
+        .expect("the comparison has named files");
+
+    assert_eq!(target.context.first.line, Some(2));
+    assert_eq!(
+        target.context.second.expect("the right side is named").line,
+        Some(3)
+    );
+}
