@@ -438,7 +438,7 @@ pub struct Credentials {
     pub password: Secret,
     /// Which scheme to offer.
     pub scheme: HttpAuthScheme,
-    /// Allow authentication over a plain connection for legacy servers.
+    /// Compatibility opt-in for legacy servers.
     ///
     /// Basic authentication exposes the password in a reversible encoding.
     /// Digest authentication exposes a response that can be used for offline
