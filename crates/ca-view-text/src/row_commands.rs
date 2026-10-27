@@ -939,3 +939,59 @@ fn navigation_shows_the_start_of_the_line_it_moves_to() {
     fixture.view.run(Command::NextSection);
     assert!(fixture.view.horizontal.abs() < f32::EPSILON);
 }
+
+#[test]
+fn an_accessibility_gutter_arrow_click_copies_its_section_with_a_selection() {
+    use egui::accesskit::{Action, ActionRequest};
+
+    let mut fixture = Fixture::new("a\nB\nc\nD\ne\n", "a\nx\nc\ny\ne\n");
+    fixture.view.left_pane.place(Caret::new(1, 0), false);
+    fixture.view.left_pane.place(Caret::new(1, 1), true);
+    let arrow = fixture
+        .view
+        .arrows
+        .iter()
+        .filter(|arrow| arrow.side == Side::Left)
+        .max_by_key(|arrow| arrow.section)
+        .expect("the second Copy to Right arrow is drawn");
+    let target = fixture
+        .view
+        .id
+        .with(("arrow", arrow.section, arrow.side == Side::Right))
+        .value()
+        .into();
+
+    fixture.frame(vec![egui::Event::AccessKitActionRequest(ActionRequest {
+        action: Action::Click,
+        target,
+        data: None,
+    })]);
+
+    assert_eq!(fixture.text(Side::Right), "a\nx\nc\nD\ne\n");
+}
+
+#[test]
+fn launch_target_uses_each_panes_caret_line_across_gap_rows() {
+    let mut fixture = Fixture::new("a\nc\n", "a\nb\nc\n");
+    let left_row = fixture
+        .view
+        .data
+        .model
+        .row_of_left_line(1)
+        .expect("the left caret line is in the row map");
+    assert!(left_row > 1, "the left caret line follows a gap row");
+    fixture.view.caret = left_row;
+    fixture.view.left_pane.place(Caret::new(1, 0), false);
+    fixture.view.right_pane.place(Caret::new(2, 0), false);
+
+    let target = fixture
+        .view
+        .launch_target()
+        .expect("the comparison has named files");
+
+    assert_eq!(target.context.first.line, Some(2));
+    assert_eq!(
+        target.context.second.expect("the right side is named").line,
+        Some(3)
+    );
+}
