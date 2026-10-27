@@ -386,6 +386,9 @@ pub struct MergeView {
     /// The running merge reads the inputs the other way round from the model
     /// it replaces, so its decisions carry over mirrored.
     swapped: bool,
+    /// The merge's tie order follows the original input identities across
+    /// repeated swaps, keeping section boundaries stable when they are paired.
+    cluster_right_first: bool,
     /// The file panel that is open, if any.
     picker: Option<Job<DialogMessage>>,
     /// The input pane an open panel reads its file into.
@@ -609,6 +612,7 @@ impl MergeView {
             pending_clipboard: None,
             paste_requested: false,
             swapped: false,
+            cluster_right_first: false,
             picker: None,
             picker_target: Pane::Left,
             picker_saves: false,
@@ -1013,6 +1017,7 @@ impl MergeView {
             Some(jobs::Earlier {
                 layout: self.data.model.layout(),
                 swapped: self.swapped,
+                right_first: self.cluster_right_first,
             }),
             Arc::clone(&self.notify),
         ));
@@ -1494,6 +1499,7 @@ impl MergeView {
         let specs = &mut self.session_settings.specs;
         std::mem::swap(&mut specs.left, &mut specs.right);
         self.swapped = true;
+        self.cluster_right_first = !self.cluster_right_first;
         self.start_merge();
     }
 
@@ -6091,6 +6097,36 @@ mod tests {
             .sections()
             .iter()
             .any(|section| section.resolution == super::Resolution::Right));
+    }
+
+    #[test]
+    fn swap_sides_keeps_a_decision_when_a_nearby_change_bridges_the_conflict() {
+        let left = "[l2]\n~\n[l5]\n~\n[u7]\n~\n";
+        let center = "[c1]\n~\n[c3]\n[c4]\n~\n[u7]\n~\n";
+        let right = "[c1]\n~\n[r6]\n~\n[u7]\n~\n";
+        let (mut view, _dir) = open(left, Some(center), right);
+        let left_path = view.paths().left.clone();
+        let right_path = view.paths().right.clone();
+        run_until_ready(&mut view);
+        assert_eq!(view.model().totals().conflicts_remaining, 1);
+
+        view.current = 0;
+        view.run(Command::TakeRightThenLeft);
+        let taken = view.output_text();
+        assert!(taken.contains("[l2]"), "{taken:?}");
+        assert_eq!(view.model().totals().conflicts_remaining, 1);
+
+        view.run(Command::SwapSides);
+        run_until_ready(&mut view);
+        assert_eq!(view.output_text(), taken);
+        assert_eq!(view.model().totals().conflicts_remaining, 1);
+
+        view.run(Command::SwapSides);
+        run_until_ready(&mut view);
+        assert_eq!(view.paths().left, left_path);
+        assert_eq!(view.paths().right, right_path);
+        assert_eq!(view.output_text(), taken);
+        assert_eq!(view.model().totals().conflicts_remaining, 1);
     }
 
     fn save_with_markers(view: &mut MergeView, dir: &tempfile::TempDir) -> String {

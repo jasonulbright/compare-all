@@ -9,7 +9,7 @@
 //! them. Those seams receive a separator. An unterminated line
 //! at the end of the output stays unterminated.
 
-use ca_diff::merge3::{merge3_cancellable, MergeKind, MergeOptions, MergeSide};
+use ca_diff::merge3::{merge3_cancellable_with_order, MergeKind, MergeOptions, MergeSide};
 use ca_diff::{
     classify_hunks, diff_line_slices, diff_line_slices_cancellable, Cancel, HunkKind, Importance,
     LineCompareOptions, RuleSet, WhitespaceClassifier,
@@ -1238,10 +1238,19 @@ impl MergeModel {
         options: &MergeOptions,
         cancel: &dyn Cancel,
     ) -> Result<Self, ca_diff::DiffError> {
+        Self::build_with_order(inputs, options, false, cancel)
+    }
+
+    pub(crate) fn build_with_order(
+        inputs: Inputs,
+        options: &MergeOptions,
+        right_first: bool,
+        cancel: &dyn Cancel,
+    ) -> Result<Self, ca_diff::DiffError> {
         let mut sections = if inputs.two_way {
             two_way_sections(&inputs, &options.compare, cancel)?
         } else {
-            three_way_sections(&inputs, options, cancel)?
+            three_way_sections(&inputs, options, right_first, cancel)?
         };
         // Keep an insertion target when all three inputs are empty. Without
         // one, edits in the output pane have no section to absorb them into.
@@ -2787,12 +2796,14 @@ fn borrowed(lines: &[String]) -> Vec<&str> {
 fn three_way_sections(
     inputs: &Inputs,
     options: &MergeOptions,
+    right_first: bool,
     cancel: &dyn Cancel,
 ) -> Result<Vec<Section>, ca_diff::DiffError> {
     let left = borrowed(&inputs.left);
     let center = borrowed(&inputs.center);
     let right = borrowed(&inputs.right);
-    let result = merge3_cancellable(&left, &center, &right, options, cancel)?;
+    let result =
+        merge3_cancellable_with_order(&left, &center, &right, options, right_first, cancel)?;
     Ok(result
         .regions
         .into_iter()
