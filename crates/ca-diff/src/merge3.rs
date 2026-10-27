@@ -248,8 +248,6 @@ pub fn merge3_cancellable(
     merge3_cancellable_with_order(left, base, right, options, false, cancel)
 }
 
-/// Merge three inputs using the supplied change ordering.
-///
 /// `right_first` processes right-side changes before left-side changes when
 /// they occupy the same ancestor range. A view uses this to preserve the
 /// original clustering order when its left and right inputs have been

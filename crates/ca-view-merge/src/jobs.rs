@@ -114,7 +114,8 @@ pub struct Earlier {
     pub layout: Layout,
     /// True when its left and right inputs were the other way round.
     pub swapped: bool,
-    /// Whether the previous merge's right-side changes were processed first.
+    /// Whether the new merge processes right-side changes first; separate from
+    /// `swapped`, which controls how the earlier layout is paired.
     pub right_first: bool,
 }
 
