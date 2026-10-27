@@ -438,11 +438,11 @@ pub struct Credentials {
     pub password: Secret,
     /// Which scheme to offer.
     pub scheme: HttpAuthScheme,
-    /// Allow the account name and password to travel over a plain connection.
+    /// Allow authentication over a plain connection for legacy servers.
     ///
-    /// Basic authentication carries the password in a reversible encoding, so
-    /// over plain HTTP it is readable by anything on the path. The profile
-    /// states this; nothing sets it implicitly.
+    /// Basic authentication exposes the password in a reversible encoding.
+    /// Digest authentication exposes a response that can be used for offline
+    /// password guessing. The profile states this; nothing sets it implicitly.
     pub allow_plaintext: bool,
 }
 
@@ -522,7 +522,9 @@ impl HttpClient {
     /// # Errors
     /// Returns [`VfsError::Network`] when the server cannot be reached,
     /// [`VfsError::Tls`] when a secure request would be redirected onto a
-    /// plain one, and [`VfsError::Protocol`] for a reply that does not parse.
+    /// plain one, when authentication would be sent over plain HTTP without
+    /// explicit permission, and [`VfsError::Protocol`] for a reply that does
+    /// not parse.
     pub fn send(
         &self,
         method: &str,
@@ -531,6 +533,28 @@ impl HttpClient {
         body: RequestBody<'_>,
         cancel: &Cancel,
     ) -> VfsResult<Response> {
+        let authentication_is_configured = self
+            .credentials
+            .as_ref()
+            .is_some_and(|credentials| credentials.scheme != HttpAuthScheme::None);
+        let has_plaintext_sensitive_auth_header = headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("authorization")
+                && is_plaintext_sensitive_authorization(value)
+        });
+        let allows_plaintext = self
+            .credentials
+            .as_ref()
+            .is_some_and(|credentials| credentials.allow_plaintext);
+        if !url.secure
+            && !allows_plaintext
+            && (authentication_is_configured || has_plaintext_sensitive_auth_header)
+        {
+            return Err(VfsError::tls(concat!(
+                "authentication over plain HTTP is disabled; use https or explicitly allow it ",
+                "for legacy compatibility"
+            )));
+        }
+
         let mut target = url.clone();
         let mut body = body;
         let mut challenge: Option<String> = None;
@@ -725,6 +749,12 @@ impl HttpClient {
                 if credentials.scheme == HttpAuthScheme::Basic {
                     return Ok(None);
                 }
+                if !url.secure && !credentials.allow_plaintext {
+                    return Err(VfsError::tls(concat!(
+                        "Digest authentication requires https unless the profile explicitly ",
+                        "allows authentication over plain HTTP"
+                    )));
+                }
                 let Ok(mut state) = self.digest.lock() else {
                     return Err(VfsError::protocol(
                         "the digest state of this client is unusable".to_owned(),
@@ -758,6 +788,16 @@ impl HttpClient {
         ));
         Ok(Some(format!("Basic {encoded}")))
     }
+}
+
+fn is_plaintext_sensitive_authorization(value: &str) -> bool {
+    value
+        .trim_start()
+        .split_ascii_whitespace()
+        .next()
+        .is_some_and(|scheme| {
+            scheme.eq_ignore_ascii_case("basic") || scheme.eq_ignore_ascii_case("digest")
+        })
 }
 
 /// True for a status that names another address.
@@ -1141,9 +1181,9 @@ mod tests {
     }
 
     #[test]
-    fn an_explicit_digest_profile_still_answers_a_digest_challenge() {
+    fn an_explicit_digest_profile_answers_a_digest_challenge_over_tls() {
         let client = authenticated_client(HttpAuthScheme::Digest, false);
-        let url = Url::parse("http://example.test/file").unwrap();
+        let url = Url::parse("https://example.test/file").unwrap();
 
         assert!(client
             .authorization(
@@ -1153,6 +1193,100 @@ mod tests {
             )
             .unwrap()
             .is_some_and(|header| header.starts_with("Digest ")));
+    }
+
+    #[test]
+    fn digest_authentication_over_http_requires_the_legacy_opt_in() {
+        let client = authenticated_client(HttpAuthScheme::Digest, false);
+        let url = Url::parse("http://example.test/file").unwrap();
+
+        assert!(matches!(
+            client.authorization(
+                "GET",
+                &url,
+                Some("Digest realm=\"test\", qop=\"auth\", nonce=\"abc\""),
+            ),
+            Err(VfsError::Tls { .. })
+        ));
+
+        let opted_in = authenticated_client(HttpAuthScheme::Digest, true);
+        assert!(opted_in
+            .authorization(
+                "GET",
+                &url,
+                Some("Digest realm=\"test\", qop=\"auth\", nonce=\"abc\""),
+            )
+            .unwrap()
+            .is_some_and(|header| header.starts_with("Digest ")));
+    }
+
+    #[test]
+    fn negotiate_profiles_cannot_answer_digest_challenges_over_http_by_default() {
+        let client = authenticated_client(HttpAuthScheme::Negotiate, false);
+        let url = Url::parse("http://example.test/file").unwrap();
+
+        assert!(matches!(
+            client.authorization(
+                "GET",
+                &url,
+                Some("Digest realm=\"test\", qop=\"auth\", nonce=\"abc\""),
+            ),
+            Err(VfsError::Tls { .. })
+        ));
+    }
+
+    #[test]
+    fn plaintext_authentication_is_refused_before_the_request_is_sent() {
+        let client = authenticated_client(HttpAuthScheme::Digest, false);
+        let url = Url::parse("http://127.0.0.1:0/file").unwrap();
+
+        assert!(matches!(
+            client.send(
+                "PUT",
+                &url,
+                &[],
+                RequestBody::Bytes(vec![1, 2, 3]),
+                &Cancel::new(),
+            ),
+            Err(VfsError::Tls { .. })
+        ));
+    }
+
+    #[test]
+    fn caller_supplied_digest_headers_are_refused_over_http_by_default() {
+        let client = HttpClient::new(
+            &crate::remote::tls::TlsOptions::default(),
+            None,
+            std::time::Duration::from_secs(1),
+        )
+        .unwrap();
+        let url = Url::parse("http://127.0.0.1:0/file").unwrap();
+        let headers = vec![(
+            "Authorization".to_owned(),
+            "Digest response=\"abc\"".to_owned(),
+        )];
+
+        assert!(matches!(
+            client.send("GET", &url, &headers, RequestBody::Empty, &Cancel::new(),),
+            Err(VfsError::Tls { .. })
+        ));
+    }
+
+    #[test]
+    fn caller_supplied_basic_headers_are_refused_over_http_by_default() {
+        let client = HttpClient::new(
+            &crate::remote::tls::TlsOptions::default(),
+            None,
+            std::time::Duration::from_secs(1),
+        )
+        .unwrap();
+        let url = Url::parse("http://127.0.0.1:0/file").unwrap();
+        let headers = vec![("Authorization".to_owned(), "Basic dXNlcjpwYXNz".to_owned())];
+
+        assert!(matches!(
+            client.send("GET", &url, &headers, RequestBody::Empty, &Cancel::new(),),
+            Err(VfsError::Tls { .. })
+        ));
     }
 
     #[test]

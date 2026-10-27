@@ -335,6 +335,14 @@ impl ProfileManager {
                             });
                         ui.end_row();
                     });
+                ui.checkbox(
+                    &mut webdav.allow_plaintext_credentials,
+                    "Allow authentication over plain HTTP (legacy compatibility)",
+                );
+                ui.small(concat!(
+                    "HTTP exposes Basic passwords and lets observers ",
+                    "guess Digest passwords offline. Use HTTPS whenever possible."
+                ));
                 secret_note(ui);
             }
             ServiceProfile::S3(s3) => {
