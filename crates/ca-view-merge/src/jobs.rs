@@ -114,6 +114,9 @@ pub struct Earlier {
     pub layout: Layout,
     /// True when its left and right inputs were the other way round.
     pub swapped: bool,
+    /// Whether the new merge processes right-side changes first; separate from
+    /// `swapped`, which controls how the earlier layout is paired.
+    pub right_first: bool,
 }
 
 /// What the worker posts back.
@@ -200,7 +203,8 @@ fn run(
     let progress = |step: &'static str| {
         emitter.send(MergeMessage::Progress(step));
     };
-    match read_and_merge(paths, options, decoding, cancel, &progress) {
+    let right_first = earlier.is_some_and(|earlier| earlier.right_first);
+    match read_and_merge_with_order(paths, options, decoding, right_first, cancel, &progress) {
         Ok(Some(mut data)) => {
             if let Some(earlier) = earlier {
                 let Some(pairing) =
@@ -235,6 +239,17 @@ pub fn read_and_merge(
     cancel: &Cancel,
     progress: &dyn Fn(&'static str),
 ) -> Result<Option<MergeData>, String> {
+    read_and_merge_with_order(paths, options, decoding, false, cancel, progress)
+}
+
+fn read_and_merge_with_order(
+    paths: &MergePaths,
+    options: &EngineOptions,
+    decoding: &MergeDecoding,
+    right_first: bool,
+    cancel: &Cancel,
+    progress: &dyn Fn(&'static str),
+) -> Result<Option<MergeData>, String> {
     progress("Reading files");
     let output_baseline = paths.output.as_deref().map_or(Baseline::Unchecked, |path| {
         Baseline::of(&RealFileSystem, path)
@@ -261,7 +276,8 @@ pub fn read_and_merge(
         two_way: center.is_none(),
     };
     let widest = widest_line(&inputs);
-    let mut model = match MergeModel::build(inputs, &options.merge, cancel) {
+    let mut model = match MergeModel::build_with_order(inputs, &options.merge, right_first, cancel)
+    {
         Ok(model) => model,
         Err(ca_diff::DiffError::Cancelled) => return Ok(None),
         Err(error) => return Err(error.to_string()),
@@ -388,6 +404,7 @@ mod tests {
         let earlier = super::Earlier {
             layout: first.model.layout(),
             swapped: false,
+            right_first: false,
         };
         let second = ready(collect_after(paths, Some(earlier)));
         let pairing = second.pairing.as_ref().expect("a pairing");

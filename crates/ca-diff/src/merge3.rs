@@ -132,6 +132,21 @@ fn changes(hunks: &[Hunk], from_left: bool) -> Vec<SideChange> {
         .collect()
 }
 
+fn ordered_changes(
+    left_hunks: &[Hunk],
+    right_hunks: &[Hunk],
+    right_first: bool,
+) -> Vec<SideChange> {
+    let (first, second) = if right_first {
+        (changes(right_hunks, false), changes(left_hunks, true))
+    } else {
+        (changes(left_hunks, true), changes(right_hunks, false))
+    };
+    let mut all = first;
+    all.extend(second);
+    all
+}
+
 /// Half-open ancestor span a change occupies for overlap testing. A pure
 /// insertion has an empty range, so it is widened to one line to keep it from
 /// slipping between its neighbours.
@@ -145,30 +160,32 @@ fn touch(change: &SideChange) -> Range<u32> {
 /// between an opposing pair, so it is measured once across the gap between
 /// them, not added to each change's own span. Two changes on the same side
 /// join only when their spans actually meet.
-fn overlaps(a: &SideChange, b: &SideChange, separation: u32) -> bool {
+fn overlap_distance(a: &SideChange, b: &SideChange, separation: u32) -> Option<u32> {
     let ra = touch(a);
     let rb = touch(b);
     if ra.start < rb.end && rb.start < ra.end {
-        return true;
+        return Some(0);
     }
     if a.from_left == b.from_left || separation == 0 {
-        return false;
+        return None;
     }
     let gap = if ra.end <= rb.start {
         rb.start - ra.end
     } else {
         ra.start.saturating_sub(rb.end)
     };
-    gap <= separation
+    (gap <= separation).then_some(gap)
 }
 
-fn cluster(mut all: Vec<SideChange>, separation: u32) -> Vec<Vec<SideChange>> {
+fn cluster_in_order(mut all: Vec<SideChange>, separation: u32) -> Vec<Vec<SideChange>> {
     all.sort_by_key(|c| (c.base.start, c.base.end));
     let mut out: Vec<Vec<SideChange>> = Vec::new();
     for change in all {
-        let joins = out
-            .last()
-            .is_some_and(|group| group.iter().any(|m| overlaps(m, &change, separation)));
+        let joins = out.last().is_some_and(|group| {
+            group
+                .iter()
+                .any(|m| overlap_distance(m, &change, separation).is_some())
+        });
         if joins {
             if let Some(group) = out.last_mut() {
                 group.push(change);
@@ -228,6 +245,26 @@ pub fn merge3_cancellable(
     options: &MergeOptions,
     cancel: &dyn Cancel,
 ) -> Result<MergeResult, DiffError> {
+    merge3_cancellable_with_order(left, base, right, options, false, cancel)
+}
+
+/// `right_first` processes right-side changes before left-side changes when
+/// they occupy the same ancestor range. A view uses this to preserve the
+/// original clustering order when its left and right inputs have been
+/// exchanged.
+///
+/// # Errors
+///
+/// Returns [`DiffError::Cancelled`] when the flag is raised before the merge
+/// finishes.
+pub fn merge3_cancellable_with_order(
+    left: &[&str],
+    base: &[&str],
+    right: &[&str],
+    options: &MergeOptions,
+    right_first: bool,
+    cancel: &dyn Cancel,
+) -> Result<MergeResult, DiffError> {
     let base_len = len_u32(base);
     let left_hunks = diff_line_slices_cancellable(base, left, &options.compare, cancel)?;
     let right_hunks = diff_line_slices_cancellable(base, right, &options.compare, cancel)?;
@@ -239,9 +276,8 @@ pub fn merge3_cancellable(
         ConflictScope::ChangedLinesOnly => 0,
         ConflictScope::Separation { lines } => lines,
     };
-    let mut all = changes(&left_hunks, true);
-    all.extend(changes(&right_hunks, false));
-    let groups = cluster(all, separation);
+    let all = ordered_changes(&left_hunks, &right_hunks, right_first);
+    let groups = cluster_in_order(all, separation);
 
     let mut regions: Vec<MergeRegion> = Vec::new();
     let mut output: Vec<String> = Vec::new();
@@ -458,6 +494,43 @@ mod tests {
         let far = merge3_text(left, base, right, &strict);
         assert_eq!(far.conflicts, 0);
         assert_eq!(far.to_text(), "1\nL\n3\nR\n5\n");
+    }
+
+    #[test]
+    fn right_first_order_mirrors_regions_when_inputs_are_swapped() {
+        let left = "[l2]\n~\n[l5]\n~\n[u7]\n~\n";
+        let base = "[c1]\n~\n[c3]\n[c4]\n~\n[u7]\n~\n";
+        let right = "[c1]\n~\n[r6]\n~\n[u7]\n~\n";
+        let left_first = merge3_text(left, base, right, &MergeOptions::default());
+        let swapped_left = split_lines(right);
+        let swapped_base = split_lines(base);
+        let swapped_right = split_lines(left);
+        let right_first = merge3_cancellable_with_order(
+            &swapped_left,
+            &swapped_base,
+            &swapped_right,
+            &MergeOptions::default(),
+            true,
+            &NeverCancel,
+        )
+        .unwrap();
+
+        assert_eq!(left_first.output, right_first.output);
+        assert_eq!(left_first.conflicts, 1);
+        assert_eq!(right_first.conflicts, left_first.conflicts);
+        assert_eq!(right_first.regions.len(), left_first.regions.len());
+        for (forward, reverse) in left_first.regions.iter().zip(&right_first.regions) {
+            let kind = match forward.kind {
+                MergeKind::LeftChange => MergeKind::RightChange,
+                MergeKind::RightChange => MergeKind::LeftChange,
+                kind => kind,
+            };
+            assert_eq!(reverse.kind, kind);
+            assert_eq!(reverse.base, forward.base);
+            assert_eq!(reverse.left, forward.right);
+            assert_eq!(reverse.right, forward.left);
+            assert_eq!(reverse.out, forward.out);
+        }
     }
 
     /// `n` numbered lines, with line `i` carrying `tag` in front of its number.
