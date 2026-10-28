@@ -364,25 +364,25 @@ impl UnixFileType {
     }
 }
 
-/// A set of POSIX file types used by a filter.
+/// Contains only kinds recognized by [`UnixFileType`]; unknown mode bits cannot be added.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct UnixFileTypes(u8);
 
 impl UnixFileTypes {
-    /// An empty set.
+    /// An empty set excludes nothing with `UnixFileTypeIn`.
     #[must_use]
     pub const fn new() -> Self {
         Self(0)
     }
 
-    /// Return a set that also contains `kind`.
+    /// Adding a kind already present leaves the set unchanged.
     #[must_use]
     pub const fn with(mut self, kind: UnixFileType) -> Self {
         self.0 |= kind.set_bit();
         self
     }
 
-    /// True when this set contains `kind`.
+    /// Check membership without reading an entry's mode.
     #[must_use]
     pub const fn contains(self, kind: UnixFileType) -> bool {
         self.0 & kind.set_bit() != 0

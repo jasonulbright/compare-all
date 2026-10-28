@@ -1758,7 +1758,7 @@ fn attrib_filter_sign_selects_only_the_requested_attribute_state() {
 
 #[cfg(unix)]
 #[test]
-fn unixtype_filter_signs_match_the_attribute_filter_contract() {
+fn unixtype_filter_signs_match_the_attribute_filter_contract() -> std::io::Result<()> {
     use std::os::unix::fs::symlink;
 
     let fixture = Fixture::new();
@@ -1768,8 +1768,8 @@ fn unixtype_filter_signs_match_the_attribute_filter_contract() {
     fixture.write("right/plain.txt", "plain");
     fixture.write("left/target.txt", "target");
     fixture.write("right/target.txt", "target");
-    symlink("target.txt", fixture.left().join("link.txt")).expect("left symlink");
-    symlink("target.txt", fixture.right().join("link.txt")).expect("right symlink");
+    symlink("target.txt", fixture.left().join("link.txt"))?;
+    symlink("target.txt", fixture.right().join("link.txt"))?;
 
     let mut session = fixture.session();
     let selected = run(
@@ -1808,11 +1808,12 @@ fn unixtype_filter_signs_match_the_attribute_filter_contract() {
     );
     assert!(selected.is_clean(), "{selected:?}");
     assert_eq!(session.selection, [PathBuf::from("empty.txt")].into(),);
+    Ok(())
 }
 
 #[cfg(unix)]
 #[test]
-fn regular_file_filter_does_not_copy_a_link_to_an_outside_file() {
+fn regular_file_filter_does_not_copy_a_link_to_an_outside_file() -> std::io::Result<()> {
     use std::os::unix::fs::symlink;
 
     let fixture = Fixture::new();
@@ -1821,8 +1822,7 @@ fn regular_file_filter_does_not_copy_a_link_to_an_outside_file() {
     symlink(
         fixture.root().join("secret.txt"),
         fixture.left().join("escape.txt"),
-    )
-    .expect("link to outside file");
+    )?;
 
     let mut session = fixture.session();
     let outcome = run(
@@ -1833,4 +1833,5 @@ fn regular_file_filter_does_not_copy_a_link_to_an_outside_file() {
     assert!(outcome.is_clean(), "{outcome:?}");
     assert_eq!(fixture.read("right/public.txt"), "public");
     assert!(!fixture.exists("right/escape.txt"));
+    Ok(())
 }
