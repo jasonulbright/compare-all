@@ -311,6 +311,16 @@ pub enum UnixFileType {
 }
 
 impl UnixFileType {
+    const ALL: [Self; 7] = [
+        Self::Regular,
+        Self::Directory,
+        Self::Symlink,
+        Self::Block,
+        Self::Character,
+        Self::Fifo,
+        Self::Socket,
+    ];
+
     /// The type a name states, ignoring case.
     #[must_use]
     pub fn parse(name: &str) -> Option<Self> {
@@ -362,6 +372,10 @@ impl UnixFileType {
             None => false,
         }
     }
+
+    fn has_known_type(entry: &Entry) -> bool {
+        Self::ALL.into_iter().any(|kind| kind.matches(entry))
+    }
 }
 
 /// Contains only kinds recognized by [`UnixFileType`]; unknown mode bits cannot be added.
@@ -389,17 +403,9 @@ impl UnixFileTypes {
     }
 
     fn matches(self, entry: &Entry) -> bool {
-        [
-            UnixFileType::Regular,
-            UnixFileType::Directory,
-            UnixFileType::Symlink,
-            UnixFileType::Block,
-            UnixFileType::Character,
-            UnixFileType::Fifo,
-            UnixFileType::Socket,
-        ]
-        .into_iter()
-        .any(|kind| self.contains(kind) && kind.matches(entry))
+        UnixFileType::ALL
+            .into_iter()
+            .any(|kind| self.contains(kind) && kind.matches(entry))
     }
 }
 
@@ -584,7 +590,7 @@ fn excludes(item: OtherFilter, entry: &Entry, context: &FilterContext) -> bool {
         }
         OtherFilter::UnixFileTypeIn(kinds) => kinds.matches(entry),
         OtherFilter::UnixFileTypeNotIn(kinds) => {
-            entry.attributes.unix_mode.is_some() && !kinds.matches(entry)
+            UnixFileType::has_known_type(entry) && !kinds.matches(entry)
         }
     }
 }
@@ -1108,6 +1114,15 @@ mod tests {
             },
         );
         let unknown = entry("unknown", 1, 0, Attributes::default());
+        let unknown_type = entry(
+            "unknown type",
+            1,
+            0,
+            Attributes {
+                unix_mode: Some(0o150_644),
+                ..Attributes::default()
+            },
+        );
         let context = FilterContext::default();
 
         let exclude_named = OtherFilters {
@@ -1120,6 +1135,7 @@ mod tests {
         assert!(!exclude_named.allows(&link, &context));
         assert!(exclude_named.allows(&fifo, &context));
         assert!(exclude_named.allows(&unknown, &context));
+        assert!(exclude_named.allows(&unknown_type, &context));
 
         let exclude_other = OtherFilters {
             items: vec![OtherFilter::UnixFileTypeNotIn(kinds)],
@@ -1131,5 +1147,6 @@ mod tests {
         assert!(exclude_other.allows(&link, &context));
         assert!(!exclude_other.allows(&fifo, &context));
         assert!(exclude_other.allows(&unknown, &context));
+        assert!(exclude_other.allows(&unknown_type, &context));
     }
 }
