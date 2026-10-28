@@ -2255,6 +2255,7 @@ impl FolderView {
         }
     }
 
+    /// Resolve one local comparison root to an absolute filesystem path.
     fn copy_base(&self, side: Side) -> Option<PathBuf> {
         let sides = self.sides.as_ref()?;
         let (source, base) = match side {
@@ -2267,9 +2268,10 @@ impl FolderView {
         std::path::absolute(base).ok()
     }
 
-    fn entry_present_on(&self, side: Side, rel: &Path) -> bool {
+    /// Return whether the compared entry exists on the requested side.
+    fn entry_present_on(&self, side: Side, relative_path: &Path) -> bool {
         self.arena
-            .index_of(rel)
+            .index_of(relative_path)
             .and_then(|index| self.arena.node(index))
             .is_some_and(|node| match side {
                 Side::Left => node.left.is_some(),
@@ -2277,13 +2279,14 @@ impl FolderView {
             })
     }
 
+    /// Report whether the selection contains an existing path on a local side.
     fn has_copyable_selection(&self) -> bool {
         for side in [Side::Left, Side::Right] {
             if self.copy_base(side).is_none() {
                 continue;
             }
-            for rel in self.selection.side(side) {
-                if self.entry_present_on(side, rel) {
+            for relative_path in self.selection.side(side) {
+                if self.entry_present_on(side, relative_path) {
                     return true;
                 }
             }
@@ -2291,15 +2294,16 @@ impl FolderView {
         false
     }
 
+    /// Copy selected paths from local folders to the pending clipboard output.
     fn copy_filenames(&mut self) {
         let mut paths = Vec::with_capacity(self.selection.len());
         for side in [Side::Left, Side::Right] {
             let Some(base) = self.copy_base(side) else {
                 continue;
             };
-            for rel in self.selection.side(side) {
-                if self.entry_present_on(side, rel) {
-                    paths.push(base.join(rel).display().to_string());
+            for relative_path in self.selection.side(side) {
+                if self.entry_present_on(side, relative_path) {
+                    paths.push(base.join(relative_path).display().to_string());
                 }
             }
         }
@@ -4395,25 +4399,26 @@ mod stale_results {
 
     #[test]
     fn copy_filename_resolves_relative_roots_to_absolute_paths() -> std::io::Result<()> {
-        let dir = tempfile::tempdir_in(".")?;
-        let relative_dir = if dir.path().is_absolute() {
-            dir.path()
+        let directory = tempfile::tempdir_in(".")?;
+        let relative_directory = if directory.path().is_absolute() {
+            directory
+                .path()
                 .strip_prefix(std::env::current_dir()?)
                 .map_err(std::io::Error::other)?
                 .to_path_buf()
         } else {
-            dir.path().to_path_buf()
+            directory.path().to_path_buf()
         };
-        let mut view = ready_view(&relative_dir);
+        let mut view = ready_view(&relative_directory);
         assert!(view.left_path.is_relative());
 
         view.run(super::Command::SelectAll);
         view.run(super::Command::CopyFilename);
         let output = clipboard_frame(&mut view);
-        let left = std::path::absolute(relative_dir.join("left").join("same.txt"))?
+        let left = std::path::absolute(relative_directory.join("left").join("same.txt"))?
             .display()
             .to_string();
-        let right = std::path::absolute(relative_dir.join("right").join("same.txt"))?
+        let right = std::path::absolute(relative_directory.join("right").join("same.txt"))?
             .display()
             .to_string();
         assert_eq!(copied(&output), vec![format!("{left}\n{right}")]);
@@ -4425,14 +4430,14 @@ mod stale_results {
         const EMPTY_ZIP: &[u8] = &[
             0x50, 0x4b, 0x05, 0x06, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         ];
-        let dir = tempfile::tempdir()?;
-        let mut view = ready_view(dir.path());
-        let archive_path = dir.path().join("right.zip");
+        let directory = tempfile::tempdir()?;
+        let mut view = ready_view(directory.path());
+        let archive_path = directory.path().join("right.zip");
         std::fs::write(&archive_path, EMPTY_ZIP)?;
         let archive = ca_fs::Source::archive(&archive_path, ca_vfs::ArchiveOptions::default())
             .map_err(std::io::Error::other)?;
         view.sides = Some(crate::jobs::Sides {
-            left: ca_fs::Source::local(dir.path().join("left")),
+            left: ca_fs::Source::local(directory.path().join("left")),
             right: archive,
         });
 
@@ -4440,7 +4445,7 @@ mod stale_results {
         assert!(view.accepts(super::Command::CopyFilename));
         view.run(super::Command::CopyFilename);
         let output = clipboard_frame(&mut view);
-        let left = std::path::absolute(dir.path().join("left").join("same.txt"))?
+        let left = std::path::absolute(directory.path().join("left").join("same.txt"))?
             .display()
             .to_string();
         assert_eq!(copied(&output), vec![left]);
@@ -4449,9 +4454,9 @@ mod stale_results {
 
     #[test]
     fn copy_filename_is_disabled_for_a_selection_on_a_missing_side() -> std::io::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let mut view = ready_view(dir.path());
-        std::fs::remove_file(dir.path().join("left").join("same.txt"))?;
+        let directory = tempfile::tempdir()?;
+        let mut view = ready_view(directory.path());
+        std::fs::remove_file(directory.path().join("left").join("same.txt"))?;
         view.run(super::Command::Recompare);
         assert!(poll_until(&mut view, |view| {
             view.is_ready()
@@ -4461,15 +4466,14 @@ mod stale_results {
                     .and_then(|index| view.arena.node(index))
                     .is_some_and(|node| node.left.is_none() && node.right.is_some())
         }));
-        let index = view
-            .arena
-            .index_of(Path::new("same.txt"))
-            .expect("the right-side entry remains in the comparison");
+        let index = view.arena.index_of(Path::new("same.txt")).ok_or_else(|| {
+            std::io::Error::other("the right-side entry remains in the comparison")
+        })?;
         let position = view
             .rows
             .iter()
             .position(|row| row.node == index)
-            .expect("the right-side entry is visible");
+            .ok_or_else(|| std::io::Error::other("the right-side entry is visible"))?;
         view.selection.click(
             ca_fs::Side::Left,
             position,
