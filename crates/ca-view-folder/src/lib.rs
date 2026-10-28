@@ -2231,8 +2231,8 @@ impl FolderView {
                 relative_path: node.rel.to_string_lossy().replace('\\', "/"),
                 is_dir: node.is_dir,
                 status: ca_ui::report::EntryStatus::from(node.status),
-                left: side_facts(node.left.as_ref(), node.is_dir),
-                right: side_facts(node.right.as_ref(), node.is_dir),
+                left: side_facts(node.left.as_ref()),
+                right: side_facts(node.right.as_ref()),
                 link: None,
             });
         }
@@ -3309,11 +3309,11 @@ fn paint_pane(
         egui::pos2(pane.size.start, y),
         egui::pos2(pane.modified.end, y + row_height),
     ));
-    if !node.is_dir {
+    if let Some(size) = side.display_size() {
         data.text(
             egui::pos2(pane.size.end - 4.0, y + row_height / 2.0),
             egui::Align2::RIGHT_CENTER,
-            ca_ui::format::format_bytes(side.size),
+            ca_ui::format::format_bytes(size),
             font.clone(),
             color,
         );
@@ -3392,12 +3392,12 @@ pub const fn column_label(column: SortColumn) -> &'static str {
 
 /// The display filters offered, in menu order.
 /// What one side of a folder entry holds, as a report reads it.
-fn side_facts(info: Option<&crate::tree::SideInfo>, is_dir: bool) -> ca_ui::report::SideFacts {
+fn side_facts(info: Option<&crate::tree::SideInfo>) -> ca_ui::report::SideFacts {
     match info {
         None => ca_ui::report::SideFacts::absent(),
         Some(side) => ca_ui::report::SideFacts {
             present: true,
-            size: (!is_dir).then_some(side.size),
+            size: side.display_size(),
             timestamp: side.modified.map(ca_ui::report::format_timestamp),
             ..ca_ui::report::SideFacts::default()
         },
