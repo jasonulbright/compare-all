@@ -3845,6 +3845,7 @@ impl SessionView for FolderView {
         }
     }
 
+    /// Keeps declared command states from advertising actions the active view will refuse.
     fn accepts(&self, command: Command) -> bool {
         let idle = matches!(self.stage, Stage::Idle);
         match command {
@@ -4327,7 +4328,6 @@ mod stale_results {
         )
     }
 
-    /// Inspect `CopyText` commands without depending on platform clipboard state.
     fn copied(output: &egui::FullOutput) -> Vec<String> {
         output
             .platform_output
@@ -4341,7 +4341,6 @@ mod stale_results {
     }
 
     #[test]
-    /// Left-first ordering stays stable across both panes, and side restriction narrows the output.
     fn copy_filename_puts_selected_side_paths_on_the_clipboard() -> std::io::Result<()> {
         let dir = tempfile::tempdir()?;
         let mut view = ready_view(dir.path());
@@ -4373,7 +4372,6 @@ mod stale_results {
     }
 
     #[test]
-    /// The sync wrapper must forward both command acceptance and clipboard dispatch.
     fn copy_filename_is_available_in_folder_sync() -> std::io::Result<()> {
         use crate::FolderSyncView;
         use ca_ui::view::SessionView;
