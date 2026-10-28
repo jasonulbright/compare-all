@@ -231,6 +231,11 @@ fn a_selection_survives_a_filter_change() {
 )]
 fn dragging_across_the_split_selects_the_visible_range_on_both_sides() {
     let dir = fixture();
+    for side in ["left", "right"] {
+        let earlier = dir.path().join(side).join("before");
+        std::fs::create_dir_all(&earlier).unwrap();
+        std::fs::write(earlier.join("present.txt"), b"present").unwrap();
+    }
     let mut view = view_over(dir.path());
     assert!(tick_until(&mut view, SessionView::is_ready));
     view.run(Command::ExpandAll);
@@ -333,6 +338,50 @@ fn dragging_across_the_split_selects_the_visible_range_on_both_sides() {
                 .is_some_and(|node| node.rel == Path::new("sub/differs.txt"))
         }),
         "releasing on the sub folder disclosure marker must not collapse it"
+    );
+
+    // Move across the row boundary by only two points so egui still reports a
+    // click. Releasing over the disclosure marker must not collapse the folder
+    // after the range selection has moved to it.
+    assert!(sub_position > 0, "the sub folder has a preceding row");
+    let boundary = body.top() + row_height * sub_position as f32;
+    let disclosure = egui::pos2(body.left() + 8.0, boundary + 1.0);
+    let before_boundary = egui::pos2(disclosure.x, boundary - 1.0);
+    frame_with(
+        &mut view,
+        &ctx,
+        vec![
+            egui::Event::PointerMoved(before_boundary),
+            egui::Event::PointerButton {
+                pos: before_boundary,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ],
+    );
+    frame_with(&mut view, &ctx, vec![egui::Event::PointerMoved(disclosure)]);
+    frame_with(
+        &mut view,
+        &ctx,
+        vec![egui::Event::PointerButton {
+            pos: disclosure,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }],
+    );
+    assert!(
+        ctx.input(|input| input.pointer.primary_clicked()),
+        "the short boundary drag remains classified as a click"
+    );
+    assert!(
+        view.rows().iter().any(|row| {
+            view.arena()
+                .node(row.node)
+                .is_some_and(|node| node.rel == Path::new("sub/differs.txt"))
+        }),
+        "a click-classified drag ending on the disclosure marker must not collapse it"
     );
 
     let start_rel = rows
