@@ -6643,6 +6643,48 @@ mod tests {
     }
 
     #[test]
+    fn picture_compare_can_open_its_local_parent_folders() {
+        let context = context();
+        let files = tempfile::tempdir().unwrap();
+        let left_folder = files.path().join("left");
+        let right_folder = files.path().join("right");
+        std::fs::create_dir(&left_folder).unwrap();
+        std::fs::create_dir(&right_folder).unwrap();
+        let left = left_folder.join("left.png");
+        let right = right_folder.join("right.png");
+        let image = include_bytes!("../../../assets/packs/bold-outline/icons/16/bookmark.png");
+        std::fs::write(&left, image).unwrap();
+        std::fs::write(&right, image).unwrap();
+
+        let (_settings, mut app) = empty_app();
+        assert!(ca_ui::testing::wait_until(
+            std::time::Duration::from_secs(10),
+            || {
+                app.poll_store();
+                app.store().borrow().is_ready()
+            }
+        ));
+        app.open_kind(&SessionKind::PictureCompare, left, right, &context);
+        assert!(ca_ui::testing::wait_until(
+            std::time::Duration::from_secs(20),
+            || {
+                app.tabs[0].tick();
+                app.tabs[0].is_ready()
+            }
+        ));
+        assert!(app.accepts(Command::CompareParentFolders));
+
+        app.run(Command::CompareParentFolders, &context);
+
+        assert_eq!(app.tab_count(), 2);
+        let opened = app.tab_settings(1).unwrap();
+        assert_eq!(opened.kind(), SessionKind::FolderCompare);
+        let specs = specs_of(&opened).unwrap();
+        assert_eq!(specs.0, Some(left_folder));
+        assert_eq!(specs.1, Some(right_folder));
+    }
+
+    #[test]
     fn explorer_shows_a_table_side_through_the_configured_spawner() {
         let context = context();
         let files = tempfile::tempdir().unwrap();
