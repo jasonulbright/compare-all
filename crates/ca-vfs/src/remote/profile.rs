@@ -752,10 +752,9 @@ pub struct WebDavProfile {
     /// covers a whole tree makes a server walk it in full for every folder
     /// opened, so nothing sends one.
     pub recursive_listings: bool,
-    /// Send the account name and password over a plain connection.
-    ///
-    /// Basic authentication carries the password in a reversible encoding, so
-    /// over plain HTTP anything on the path can read it.
+    /// Basic authentication exposes the password in a reversible encoding.
+    /// Digest authentication exposes a response that can be used for offline
+    /// password guessing. HTTPS should be used whenever possible.
     pub allow_plaintext_credentials: bool,
     /// How the connection treats the server's certificate.
     #[serde(skip_serializing_if = "is_default")]
