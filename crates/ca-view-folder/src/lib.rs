@@ -2591,6 +2591,28 @@ impl FolderView {
         }
     }
 
+    fn extend_selection_drag(&mut self, end: Option<(Side, usize)>) {
+        let (Some(drag), Some((end_side, end_position))) = (self.selection_drag.as_mut(), end)
+        else {
+            return;
+        };
+        let endpoint_changed = self
+            .rows
+            .get(end_position)
+            .and_then(|row| self.arena.node(row.node))
+            .is_some_and(|node| node.rel != drag.rel || end_side != drag.side);
+        if drag.moved || endpoint_changed {
+            drag.moved |= self.selection.drag_range(
+                drag.side,
+                &drag.rel,
+                end_side,
+                end_position,
+                &self.rows,
+                &self.arena,
+            );
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     fn tree_ui(&mut self, ui: &mut egui::Ui, palette: &Palette) -> Vec<ViewAction> {
         let full = ui.available_rect_before_wrap();
@@ -2656,57 +2678,13 @@ impl FolderView {
         }
         let mut suppress_click = false;
         if down && !pressed {
-            if let (Some(drag), Some((end_side, end_position))) =
-                (self.selection_drag.as_mut(), pointer_row)
-            {
-                let end_rel = self
-                    .rows
-                    .get(end_position)
-                    .and_then(|row| self.arena.node(row.node))
-                    .map(|node| node.rel.as_path());
-                let endpoint_changed =
-                    end_rel.is_some_and(|rel| rel != drag.rel || end_side != drag.side);
-                if drag.moved || endpoint_changed {
-                    drag.moved |= self.selection.drag_range(
-                        drag.side,
-                        &drag.rel,
-                        end_side,
-                        end_position,
-                        &self.rows,
-                        &self.arena,
-                    );
-                }
-            }
+            self.extend_selection_drag(pointer_row);
         }
         if released {
-            if let (Some(drag), Some((end_side, end_position))) =
-                (self.selection_drag.as_ref(), pointer_row)
-            {
-                let end_rel = self
-                    .rows
-                    .get(end_position)
-                    .and_then(|row| self.arena.node(row.node))
-                    .map(|node| node.rel.as_path());
-                let endpoint_changed =
-                    end_rel.is_some_and(|rel| rel != drag.rel || end_side != drag.side);
-                if drag.moved || endpoint_changed {
-                    let moved = self.selection.drag_range(
-                        drag.side,
-                        &drag.rel,
-                        end_side,
-                        end_position,
-                        &self.rows,
-                        &self.arena,
-                    );
-                    if moved {
-                        if let Some(drag) = self.selection_drag.as_mut() {
-                            drag.moved = true;
-                        }
-                    }
-                }
-                suppress_click =
-                    clicked && self.selection_drag.as_ref().is_some_and(|drag| drag.moved);
-            }
+            self.extend_selection_drag(pointer_row);
+            suppress_click = clicked
+                && pointer_row.is_some()
+                && self.selection_drag.as_ref().is_some_and(|drag| drag.moved);
             self.selection_drag = None;
         } else if !down {
             self.selection_drag = None;
