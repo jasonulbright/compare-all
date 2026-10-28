@@ -453,6 +453,12 @@ fn dragging_across_the_split_selects_the_visible_range_on_both_sides() -> std::i
     );
     frame_with(&mut view, &ctx, vec![egui::Event::PointerMoved(end)]);
     frame_with(&mut view, &ctx, vec![egui::Event::PointerMoved(start)]);
+    assert_eq!(view.selection().side(ca_fs::Side::Left).len(), 1);
+    assert!(view
+        .selection()
+        .side(ca_fs::Side::Left)
+        .contains(&start_rel));
+    assert!(view.selection().side(ca_fs::Side::Right).is_empty());
     frame_with(
         &mut view,
         &ctx,

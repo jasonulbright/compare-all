@@ -2664,8 +2664,10 @@ impl FolderView {
                     .get(end_position)
                     .and_then(|row| self.arena.node(row.node))
                     .map(|node| node.rel.as_path());
-                if end_rel.is_some_and(|rel| rel != drag.rel || end_side != drag.side) {
-                    drag.moved = self.selection.drag_range(
+                let endpoint_changed =
+                    end_rel.is_some_and(|rel| rel != drag.rel || end_side != drag.side);
+                if drag.moved || endpoint_changed {
+                    drag.moved |= self.selection.drag_range(
                         drag.side,
                         &drag.rel,
                         end_side,
