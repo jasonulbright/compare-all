@@ -1467,7 +1467,7 @@ pub fn plain_text() -> FileFormat {
 pub fn c_cpp() -> FileFormat {
     FileFormat::text(
         "C/C++",
-        "*.c;*.cpp;*.cxx;*.cc;*.c++;*.h;*.hpp;*.hxx;*.hh;*.inl",
+        "*.c;*.cpp;*.cxx;*.cc;*.c++;*.h;*.hpp;*.hxx;*.hh;*.inl;*.m",
     )
     .with_description("C and C++ source and header files.")
     .with_grammar(c_family_grammar(C_KEYWORDS, true))

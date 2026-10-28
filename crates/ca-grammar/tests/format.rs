@@ -68,6 +68,7 @@ fn the_stock_registry_routes_familiar_names() {
     for (path, want) in [
         ("main.c", "C/C++"),
         ("main.cpp", "C/C++"),
+        ("main.m", "C/C++"),
         ("Program.cs", "C#"),
         ("Main.java", "Java"),
         ("app.mjs", "JavaScript"),
