@@ -3577,7 +3577,28 @@ impl App {
         ui.menu_button(ACTIONS_MENU, |ui| {
             ui.set_min_width(220.0);
             for state in &actions {
-                if widgets::command_item_in(ui, view, state.command, state.enabled, ACTIONABLE) {
+                if view == MenuView::Merge && state.command == Command::CompareToOutput {
+                    ui.menu_button(state.command.label_in(view), |ui| {
+                        ui.set_min_width(220.0);
+                        for side in [
+                            Command::CompareToOutputLeft,
+                            Command::CompareToOutputCenter,
+                            Command::CompareToOutputRight,
+                        ] {
+                            let enabled = self.line_enabled(side);
+                            let reason = self.line_reason(side, ACTIONABLE);
+                            if widgets::command_item_in(ui, view, side, enabled, reason) {
+                                chosen = Some(side);
+                            }
+                        }
+                    });
+                } else if widgets::command_item_in(
+                    ui,
+                    view,
+                    state.command,
+                    state.enabled,
+                    ACTIONABLE,
+                ) {
                     chosen = Some(state.command);
                 }
             }
@@ -6738,6 +6759,67 @@ mod tests {
         assert!(actions
             .iter()
             .all(|state| state.command.menu() == Menu::Actions));
+    }
+
+    /// Text Merge keeps all three input-to-output comparisons reachable from
+    /// its Actions menu, including the non-default center and right inputs.
+    #[test]
+    fn text_merge_actions_menu_exposes_each_compare_to_output_side() {
+        use ca_ui::testing::probe::Probe;
+        use std::cell::RefCell;
+
+        let context = context();
+        let files = tempfile::tempdir().unwrap();
+        let left = files.path().join("left.txt");
+        let center = files.path().join("center.txt");
+        let right = files.path().join("right.txt");
+        let output = files.path().join("output.txt");
+        std::fs::write(&left, "left\n").unwrap();
+        std::fs::write(&center, "base\n").unwrap();
+        std::fs::write(&right, "right\n").unwrap();
+
+        let (_settings, mut app) = empty_app();
+        assert!(ca_ui::testing::wait_until(
+            std::time::Duration::from_secs(10),
+            || {
+                app.poll_store();
+                app.store().borrow().is_ready()
+            }
+        ));
+        app.open(
+            &OpenRequest::new(SessionKind::TextMerge, left.clone(), right.clone())
+                .with_center(Some(center))
+                .with_output(Some(output.clone())),
+            &context,
+        );
+        assert!(ca_ui::testing::wait_until(
+            std::time::Duration::from_secs(20),
+            || {
+                app.tabs[0].tick();
+                app.tabs[0].is_ready()
+            }
+        ));
+
+        let app = RefCell::new(app);
+        let mut probe = Probe::new(1600.0, 900.0);
+        let mut run = |ctx: &egui::Context| app.borrow_mut().frame(ctx);
+        probe.idle(&mut run);
+        probe.idle(&mut run);
+        probe.click(ACTIONS_MENU, &mut run).unwrap();
+        probe.click("Compare to Output", &mut run).unwrap();
+        for label in ["Left Side", "Center Side", "Right Side"] {
+            let side = probe.find(label).unwrap();
+            assert!(side.enabled, "{label} should be available for this merge");
+        }
+
+        probe.click("Right Side", &mut run).unwrap();
+        assert_eq!(app.borrow().tab_count(), 2);
+        let comparison = app.borrow().tab_settings(1).unwrap();
+        let specs = specs_of(&comparison).unwrap();
+        assert_eq!(comparison.kind(), SessionKind::TextCompare);
+        assert_eq!(specs.0, Some(right));
+        assert_eq!(specs.1, Some(output));
+        assert_eq!(specs.2, None);
     }
 
     #[test]
