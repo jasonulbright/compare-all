@@ -1758,7 +1758,7 @@ fn attrib_filter_sign_selects_only_the_requested_attribute_state() {
 
 #[cfg(unix)]
 #[test]
-fn unixtype_filter_handles_groups_and_none_removes_only_that_filter() {
+fn unixtype_filter_signs_match_the_attribute_filter_contract() {
     use std::os::unix::fs::symlink;
 
     let fixture = Fixture::new();
@@ -1775,12 +1775,12 @@ fn unixtype_filter_handles_groups_and_none_removes_only_that_filter() {
     let selected = run(
         &fixture,
         &mut session,
-        "filter unixtype:-rl\nselect all.files",
+        "filter unixtype:+r\nselect all.files",
     );
     assert!(selected.is_clean(), "{selected:?}");
     assert_eq!(
         session.selection,
-        ["empty.txt", "link.txt", "plain.txt", "target.txt"]
+        ["empty.txt", "plain.txt", "target.txt"]
             .map(PathBuf::from)
             .into(),
     );
@@ -1788,7 +1788,15 @@ fn unixtype_filter_handles_groups_and_none_removes_only_that_filter() {
     let selected = run(
         &fixture,
         &mut session,
-        "filter size:>0 unixtype:+rl\nselect all.files",
+        "filter unixtype:-r\nselect all.files",
+    );
+    assert!(selected.is_clean(), "{selected:?}");
+    assert_eq!(session.selection, [PathBuf::from("link.txt")].into());
+
+    let selected = run(
+        &fixture,
+        &mut session,
+        "filter size:>0 unixtype:-rl\nselect all.files",
     );
     assert!(selected.is_clean(), "{selected:?}");
     assert!(session.selection.is_empty());
@@ -1800,4 +1808,29 @@ fn unixtype_filter_handles_groups_and_none_removes_only_that_filter() {
     );
     assert!(selected.is_clean(), "{selected:?}");
     assert_eq!(session.selection, [PathBuf::from("empty.txt")].into(),);
+}
+
+#[cfg(unix)]
+#[test]
+fn regular_file_filter_does_not_copy_a_link_to_an_outside_file() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = Fixture::new();
+    fixture.write("left/public.txt", "public");
+    fixture.write("secret.txt", "outside source folder");
+    symlink(
+        fixture.root().join("secret.txt"),
+        fixture.left().join("escape.txt"),
+    )
+    .expect("link to outside file");
+
+    let mut session = fixture.session();
+    let outcome = run(
+        &fixture,
+        &mut session,
+        "filter unixtype:+r\nselect all.files\ncopy left->right",
+    );
+    assert!(outcome.is_clean(), "{outcome:?}");
+    assert_eq!(fixture.read("right/public.txt"), "public");
+    assert!(!fixture.exists("right/escape.txt"));
 }

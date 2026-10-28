@@ -449,9 +449,9 @@ impl Session {
                     if let Some(change) = change {
                         let kinds = unix_file_types(change.kinds);
                         self.other_filters.items.push(if change.include {
-                            OtherFilter::UnixFileTypeIn(kinds)
-                        } else {
                             OtherFilter::UnixFileTypeNotIn(kinds)
+                        } else {
+                            OtherFilter::UnixFileTypeIn(kinds)
                         });
                     }
                 }
