@@ -2778,11 +2778,15 @@ impl FolderView {
                     toggle = Some(row.node);
                     continue;
                 }
-                if double_clicked {
+                if double_clicked && !suppress_click {
                     toggle = Some(row.node);
                     continue;
                 }
-            } else if double_clicked && node.left.is_some() && node.right.is_some() {
+            } else if double_clicked
+                && !suppress_click
+                && node.left.is_some()
+                && node.right.is_some()
+            {
                 let request = pair_request(
                     &self.left_path,
                     &self.right_path,

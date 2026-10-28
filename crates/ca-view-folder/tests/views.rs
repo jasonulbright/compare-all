@@ -431,6 +431,68 @@ fn a_short_drag_to_a_disclosure_marker_does_not_collapse_the_folder() -> std::io
     clippy::cast_precision_loss,
     clippy::cast_sign_loss
 )]
+fn a_short_drag_classified_as_a_double_click_does_not_collapse_the_folder() -> std::io::Result<()> {
+    let mut harness = drag_harness()?;
+    let sub_position = harness.sub_position;
+    assert!(sub_position > 0, "the sub folder has a preceding row");
+    let boundary = harness.body.top() + harness.row_height * sub_position as f32;
+    let disclosure = egui::pos2(harness.body.left() + 8.0, boundary + 1.0);
+    let before_boundary = egui::pos2(disclosure.x, boundary - 1.0);
+
+    frame_with(
+        &mut harness.view,
+        &harness.egui_context,
+        vec![
+            egui::Event::PointerMoved(before_boundary),
+            primary_button(before_boundary, true),
+        ],
+    );
+    frame_with(
+        &mut harness.view,
+        &harness.egui_context,
+        vec![primary_button(before_boundary, false)],
+    );
+
+    frame_with(
+        &mut harness.view,
+        &harness.egui_context,
+        vec![
+            egui::Event::PointerMoved(before_boundary),
+            primary_button(before_boundary, true),
+        ],
+    );
+    frame_with(
+        &mut harness.view,
+        &harness.egui_context,
+        vec![egui::Event::PointerMoved(disclosure)],
+    );
+    frame_with(
+        &mut harness.view,
+        &harness.egui_context,
+        vec![primary_button(disclosure, false)],
+    );
+
+    assert!(harness.egui_context.input(|input| {
+        input
+            .pointer
+            .button_double_clicked(egui::PointerButton::Primary)
+    }));
+    assert!(harness.view.rows().iter().any(|row| {
+        harness
+            .view
+            .arena()
+            .node(row.node)
+            .is_some_and(|node| node.rel == Path::new("sub/differs.txt"))
+    }));
+    Ok(())
+}
+
+#[test]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
 fn a_short_drag_to_a_regular_file_row_keeps_the_range() -> std::io::Result<()> {
     let mut harness = drag_harness()?;
     let file_position = harness.rows.iter().position(|row| {
