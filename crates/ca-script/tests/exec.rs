@@ -1788,7 +1788,7 @@ fn unixtype_filter_handles_groups_and_none_removes_only_that_filter() {
     let selected = run(
         &fixture,
         &mut session,
-        "filter size:>0B unixtype:+rl\nselect all.files",
+        "filter size:>0 unixtype:+rl\nselect all.files",
     );
     assert!(selected.is_clean(), "{selected:?}");
     assert!(session.selection.is_empty());
