@@ -6643,18 +6643,19 @@ mod tests {
     }
 
     #[test]
-    fn picture_compare_can_open_its_local_parent_folders() {
+    fn picture_compare_can_open_its_local_parent_folders() -> Result<(), Box<dyn std::error::Error>>
+    {
         let context = context();
-        let files = tempfile::tempdir().unwrap();
+        let files = tempfile::tempdir()?;
         let left_folder = files.path().join("left");
         let right_folder = files.path().join("right");
-        std::fs::create_dir(&left_folder).unwrap();
-        std::fs::create_dir(&right_folder).unwrap();
+        std::fs::create_dir(&left_folder)?;
+        std::fs::create_dir(&right_folder)?;
         let left = left_folder.join("left.png");
         let right = right_folder.join("right.png");
         let image = include_bytes!("../../../assets/packs/bold-outline/icons/16/bookmark.png");
-        std::fs::write(&left, image).unwrap();
-        std::fs::write(&right, image).unwrap();
+        std::fs::write(&left, image)?;
+        std::fs::write(&right, image)?;
 
         let (_settings, mut app) = empty_app();
         assert!(ca_ui::testing::wait_until(
@@ -6682,6 +6683,7 @@ mod tests {
         let specs = specs_of(&opened).unwrap();
         assert_eq!(specs.0, Some(left_folder));
         assert_eq!(specs.1, Some(right_folder));
+        Ok(())
     }
 
     #[test]
