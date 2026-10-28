@@ -534,6 +534,22 @@ impl OtherFilters {
         self.content.is_empty() || self.content_allows(entry)
     }
 
+    /// True when the entry survives every Unix file-type filter.
+    ///
+    /// Paired comparison rows can later be copied from either side, so type
+    /// restrictions must be checked against each present entry in the pair.
+    pub(crate) fn allows_unix_type(&self, entry: &Entry, context: &FilterContext) -> bool {
+        !self.items.iter().any(|item| {
+            matches!(
+                item,
+                OtherFilter::UnixFileTypeIs(_)
+                    | OtherFilter::UnixFileTypeIsNot(_)
+                    | OtherFilter::UnixFileTypeIn(_)
+                    | OtherFilter::UnixFileTypeNotIn(_)
+            ) && excludes(*item, entry, context)
+        })
+    }
+
     /// True when no content exclusion matches.
     ///
     /// A file that cannot be read holds no text, so a "contains" rule leaves it

@@ -1835,3 +1835,31 @@ fn regular_file_filter_does_not_copy_a_link_to_an_outside_file() -> std::io::Res
     assert!(!fixture.exists("right/escape.txt"));
     Ok(())
 }
+
+#[cfg(unix)]
+#[test]
+fn regular_file_filter_does_not_copy_a_right_side_link_paired_with_a_regular_file(
+) -> std::io::Result<()> {
+    use std::os::unix::fs::symlink;
+
+    let fixture = Fixture::new();
+    fixture.write("left/escape.txt", "keep the existing file");
+    fixture.write("left/safe.txt", "old");
+    fixture.write("right/safe.txt", "new");
+    fixture.write("secret.txt", "outside source folder");
+    symlink(
+        fixture.root().join("secret.txt"),
+        fixture.right().join("escape.txt"),
+    )?;
+
+    let mut session = fixture.session();
+    let outcome = run(
+        &fixture,
+        &mut session,
+        "option confirm:yes-to-all\nfilter unixtype:+r\nselect all.files\ncopy right->left",
+    );
+    assert!(outcome.is_clean(), "{outcome:?}");
+    assert_eq!(fixture.read("left/safe.txt"), "new");
+    assert_eq!(fixture.read("left/escape.txt"), "keep the existing file");
+    Ok(())
+}
