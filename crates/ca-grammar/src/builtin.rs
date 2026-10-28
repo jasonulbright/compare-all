@@ -1523,7 +1523,7 @@ pub fn csharp() -> FileFormat {
 /// Java sources.
 #[must_use]
 pub fn java() -> FileFormat {
-    FileFormat::text("Java", "*.java")
+    FileFormat::text("Java", "*.jav;*.java")
         .with_description("Java source files.")
         .with_grammar(c_family_grammar(JAVA_KEYWORDS, false))
         .with_tab_stop(4)
@@ -1662,7 +1662,7 @@ fn markup_grammar(directive: &str) -> Grammar {
 /// HTML documents.
 #[must_use]
 pub fn html() -> FileFormat {
-    FileFormat::text("HTML", "*.html;*.htm;*.xhtml;*.shtml")
+    FileFormat::text("HTML", "*.ascx;*.asp;*.aspx;*.html;*.htm;*.xhtml;*.shtml")
         .with_description(
             "HTML documents. Tagged languages are matched item by item rather than parsed, \
              so nesting is approximated.",
@@ -1729,7 +1729,7 @@ pub fn json() -> FileFormat {
 /// SQL scripts.
 #[must_use]
 pub fn sql() -> FileFormat {
-    FileFormat::text("SQL", "*.sql;*.ddl;*.dml")
+    FileFormat::text("SQL", "*.dsql;*.sql;*.ddl;*.dml")
         .with_description("SQL scripts. Keywords match in any character case.")
         .with_grammar(Grammar::from_items(vec![
             line_comment("--"),
@@ -1884,7 +1884,7 @@ pub fn pascal() -> FileFormat {
 /// Visual Basic sources.
 #[must_use]
 pub fn visual_basic() -> FileFormat {
-    FileFormat::text("Visual Basic", "*.vb;*.vbs;*.bas;*.cls;*.frm;*.ctl")
+    FileFormat::text("Visual Basic", "*.vb;*.vbs;*.bas;*.cls;*.frm;*.ctl;*.vbp")
         .with_description("Visual Basic source files. Keywords match in any character case.")
         .with_grammar(Grammar::from_items(vec![
             line_comment("'"),
