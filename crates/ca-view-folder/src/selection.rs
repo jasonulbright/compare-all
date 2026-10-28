@@ -275,6 +275,26 @@ impl Selection {
         }
     }
 
+    /// Invert the selection among visible rows, considering each side's items independently.
+    pub fn invert_visible(&mut self, rows: &[FlatRow], arena: &Arena) {
+        let mut left = BTreeSet::new();
+        let mut right = BTreeSet::new();
+        for row in rows {
+            let Some(node) = arena.node(row.node) else {
+                continue;
+            };
+            if node.left.is_some() && !self.left.contains(&node.rel) {
+                left.insert(node.rel.clone());
+            }
+            if node.right.is_some() && !self.right.contains(&node.rel) {
+                right.insert(node.rel.clone());
+            }
+        }
+        self.left = left;
+        self.right = right;
+        self.anchor = None;
+    }
+
     /// Narrow an existing selection to one side.
     pub fn restrict_to(&mut self, side: Side) {
         match side {
@@ -452,6 +472,32 @@ mod tests {
         assert_eq!(selection.side(Side::Right).len(), 3);
         selection.restrict_to(Side::Left);
         assert_eq!(selection.side(Side::Right).len(), 0);
+    }
+
+    #[test]
+    fn invert_visible_selects_the_unselected_items_on_each_present_side() {
+        let (arena, rows) = model();
+        let mut selection = Selection::new();
+        selection.click(Side::Left, 0, &rows, &arena, ClickKind::Replace);
+        selection.click(Side::Right, 3, &rows, &arena, ClickKind::Toggle);
+
+        selection.invert_visible(&rows, &arena);
+
+        assert_eq!(selection.side(Side::Left).len(), 2);
+        assert!(selection.contains(Side::Left, Path::new("b.txt")));
+        assert!(selection.contains(Side::Left, Path::new("c.txt")));
+        assert!(!selection.contains(Side::Left, Path::new("a.txt")));
+        assert_eq!(selection.side(Side::Right).len(), 2);
+        assert!(selection.contains(Side::Right, Path::new("a.txt")));
+        assert!(selection.contains(Side::Right, Path::new("b.txt")));
+        assert!(!selection.contains(Side::Right, Path::new("d.txt")));
+
+        selection.invert_visible(&rows, &arena);
+
+        assert_eq!(selection.side(Side::Left).len(), 1);
+        assert!(selection.contains(Side::Left, Path::new("a.txt")));
+        assert_eq!(selection.side(Side::Right).len(), 1);
+        assert!(selection.contains(Side::Right, Path::new("d.txt")));
     }
 
     #[test]

@@ -647,7 +647,7 @@ const FOLDER_MENUS: &[(&str, &[Entry])] = &[
             Entry::Run(Command::SelectAllFiles, SELECTABLE),
             Entry::Run(Command::SelectNewer, SELECTABLE),
             Entry::Run(Command::SelectOrphans, SELECTABLE),
-            Entry::Soon(Command::InvertSelection),
+            Entry::Run(Command::InvertSelection, SELECTABLE),
             Entry::Run(Command::Reload, "The active view reads nothing to reload"),
             Entry::Run(
                 Command::Recompare,
