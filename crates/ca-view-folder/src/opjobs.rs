@@ -1155,8 +1155,33 @@ pub fn spawn_rescan(
 /// The refreshed contents and full-scan totals for one folder.
 struct ScannedSubtree {
     children: Vec<Node>,
-    left_folder_size: Option<u64>,
-    right_folder_size: Option<u64>,
+    left: RescannedSide,
+    right: RescannedSide,
+}
+
+/// Whether a rescanned folder side exists, and its known total when it does.
+#[derive(Clone, Copy)]
+struct RescannedSide {
+    present: Option<bool>,
+    folder_size: Option<u64>,
+}
+
+impl RescannedSide {
+    /// The side's contribution to an ancestor, where a confirmed absence is zero.
+    fn contribution(self) -> Option<u64> {
+        match self.present {
+            Some(false) => Some(0),
+            Some(true) => self.folder_size,
+            None => None,
+        }
+    }
+
+    /// The row's displayed folder total, blank when the side is absent.
+    fn displayed_size(self) -> Option<u64> {
+        self.present
+            .filter(|present| *present)
+            .and(self.folder_size)
+    }
 }
 
 /// Drop any root that already sits under another root in the set.
@@ -1193,17 +1218,20 @@ fn scan_subtree(
         cancel.as_fs(),
         &|_| {},
     ) {
-        Ok(scan) => scan,
+        Ok(scan) => (scan, Some(true)),
         Err(ca_fs::scan::ScanError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-            ca_fs::scan::ScanResult::default()
+            (ca_fs::scan::ScanResult::default(), Some(false))
         }
-        Err(_) => ca_fs::scan::ScanResult {
-            root_incomplete: true,
-            ..ca_fs::scan::ScanResult::default()
-        },
+        Err(_) => (
+            ca_fs::scan::ScanResult {
+                root_incomplete: true,
+                ..ca_fs::scan::ScanResult::default()
+            },
+            None,
+        ),
     };
-    let left = read(left_base);
-    let right = read(right_base);
+    let (left, left_present) = read(left_base);
+    let (right, right_present) = read(right_base);
     let mut tree = ca_fs::align_trees(&left, &right, &options.alignment, cancel.as_fs());
     let mut others = options.other_filters.clone();
     others.left_root = left_base.join(rel);
@@ -1221,8 +1249,14 @@ fn scan_subtree(
     }
     ScannedSubtree {
         children,
-        left_folder_size: tree.facts.left_folder_size,
-        right_folder_size: tree.facts.right_folder_size,
+        left: RescannedSide {
+            present: left_present,
+            folder_size: tree.facts.left_folder_size,
+        },
+        right: RescannedSide {
+            present: right_present,
+            folder_size: tree.facts.right_folder_size,
+        },
     }
 }
 
@@ -1247,8 +1281,8 @@ fn reprefix(node: &mut Node, prefix: &Path) {
 fn splice(tree: &mut Node, rel: &Path, refreshed: ScannedSubtree) {
     if rel.as_os_str().is_empty() {
         tree.children = refreshed.children;
-        tree.facts.left_folder_size = refreshed.left_folder_size;
-        tree.facts.right_folder_size = refreshed.right_folder_size;
+        tree.facts.left_folder_size = refreshed.left.displayed_size();
+        tree.facts.right_folder_size = refreshed.right.displayed_size();
         return;
     }
     let old_sizes = find_mut(tree, rel).map(|node| {
@@ -1266,33 +1300,18 @@ fn splice(tree: &mut Node, rel: &Path, refreshed: ScannedSubtree) {
         )
     });
     if let Some((old_left, old_right)) = old_sizes {
-        let new_contributions = find_mut(tree, rel).map_or(
-            (refreshed.left_folder_size, refreshed.right_folder_size),
-            |node| {
-                (
-                    if node.left.is_some() {
-                        refreshed.left_folder_size
-                    } else {
-                        Some(0)
-                    },
-                    if node.right.is_some() {
-                        refreshed.right_folder_size
-                    } else {
-                        Some(0)
-                    },
-                )
-            },
+        let new_contributions = (
+            refreshed.left.contribution(),
+            refreshed.right.contribution(),
         );
         if let Some(node) = find_mut(tree, rel) {
             node.children = refreshed.children;
-            node.facts.left_folder_size = node.left.as_ref().and(refreshed.left_folder_size);
-            node.facts.right_folder_size = node.right.as_ref().and(refreshed.right_folder_size);
+            node.facts.left_folder_size = refreshed.left.displayed_size();
+            node.facts.right_folder_size = refreshed.right.displayed_size();
         }
         update_ancestor_sizes(tree, rel, (old_left, old_right), new_contributions);
         return;
     }
-    // The folder is new, so it is attached under whichever ancestor the tree
-    // does hold; nothing is invented above it.
     let attached = if let Some(parent) = rel.parent() {
         if let Some(node) = find_mut(tree, parent) {
             node.children.extend(refreshed.children);
@@ -1311,7 +1330,10 @@ fn splice(tree: &mut Node, rel: &Path, refreshed: ScannedSubtree) {
             tree,
             rel,
             (Some(0), Some(0)),
-            (refreshed.left_folder_size, refreshed.right_folder_size),
+            (
+                refreshed.left.contribution(),
+                refreshed.right.contribution(),
+            ),
         );
     }
 }
@@ -1384,7 +1406,7 @@ pub fn affected_roots(plan: &OperationPlan) -> Vec<PathBuf> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::{minimal_roots, splice, Answer, Ask, Question, ScannedSubtree};
+    use super::{minimal_roots, splice, Answer, Ask, Question, RescannedSide, ScannedSubtree};
     use ca_fs::{Node, NodeStatus, PairFacts, StatusFlags};
     use ca_ui::worker::Cancel;
     use std::path::PathBuf;
@@ -1437,8 +1459,14 @@ mod tests {
             std::path::Path::new("parent/child"),
             ScannedSubtree {
                 children: Vec::new(),
-                left_folder_size: Some(15),
-                right_folder_size: Some(15),
+                left: RescannedSide {
+                    present: Some(true),
+                    folder_size: Some(15),
+                },
+                right: RescannedSide {
+                    present: Some(true),
+                    folder_size: Some(15),
+                },
             },
         );
 
@@ -1467,8 +1495,14 @@ mod tests {
             std::path::Path::new("parent/child"),
             ScannedSubtree {
                 children: Vec::new(),
-                left_folder_size: Some(15),
-                right_folder_size: Some(0),
+                left: RescannedSide {
+                    present: Some(true),
+                    folder_size: Some(15),
+                },
+                right: RescannedSide {
+                    present: Some(false),
+                    folder_size: None,
+                },
             },
         );
 
