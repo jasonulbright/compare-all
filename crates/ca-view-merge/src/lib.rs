@@ -153,6 +153,9 @@ const HANDLED: &[Command] = &[
     Command::ToggleCenterPane,
     Command::MergeInfo,
     Command::CompareToOutput,
+    Command::CompareToOutputLeft,
+    Command::CompareToOutputCenter,
+    Command::CompareToOutputRight,
     Command::NextSection,
     Command::PreviousSection,
     Command::NextDifference,
@@ -2664,6 +2667,25 @@ impl MergeView {
         }
         false
     }
+
+    fn compare_to_output(&mut self, command: Command) {
+        let input = match command {
+            Command::CompareToOutputCenter => self.paths.center.clone(),
+            Command::CompareToOutputRight => Some(self.paths.right.clone()),
+            _ => Some(self.paths.left.clone()),
+        };
+        if let (Some(input), Some(output)) = (input, self.paths.output.clone()) {
+            self.pending.push(ViewAction::Open(OpenRequest::new(
+                SessionKind::TextCompare,
+                input,
+                output,
+            )));
+        } else if self.paths.output.is_none() {
+            self.message = Some(NO_OUTPUT.to_owned());
+        } else {
+            self.message = Some(NO_CENTER.to_owned());
+        }
+    }
 }
 
 fn hatch(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
@@ -2783,6 +2805,10 @@ impl SessionView for MergeView {
                 | Command::TakeCenterLine
                 | Command::TakeRightLine
                 | Command::CompareReport
+                | Command::CompareToOutput
+                | Command::CompareToOutputLeft
+                | Command::CompareToOutputCenter
+                | Command::CompareToOutputRight
                 | Command::NextConflict
                 | Command::PreviousConflict
                 | Command::SaveFile
@@ -2819,11 +2845,25 @@ impl SessionView for MergeView {
                 NO_CENTER
             }
             Status::Ready
+                if command == Command::CompareToOutputCenter && self.paths.is_two_way() =>
+            {
+                NO_CENTER
+            }
+            Status::Ready
                 if matches!(command, Command::NextConflict | Command::PreviousConflict) =>
             {
                 NO_CONFLICTS
             }
-            Status::Ready if command == Command::SaveFile && self.paths.output.is_none() => {
+            Status::Ready
+                if matches!(
+                    command,
+                    Command::CompareToOutput
+                        | Command::CompareToOutputLeft
+                        | Command::CompareToOutputCenter
+                        | Command::CompareToOutputRight
+                        | Command::SaveFile
+                ) && self.paths.output.is_none() =>
+            {
                 NO_OUTPUT
             }
             _ if matches!(
@@ -2860,7 +2900,6 @@ impl SessionView for MergeView {
             | Command::Cut
             | Command::Paste
             | Command::MergeInfo
-            | Command::CompareToOutput
             | Command::CompareReport
             | Command::TakeLeftLine
             | Command::TakeRightLine
@@ -2886,6 +2925,12 @@ impl SessionView for MergeView {
             | Command::IncreaseIndent
             | Command::DecreaseIndent
             | Command::ToggleOverwrite => ready,
+            Command::CompareToOutput
+            | Command::CompareToOutputLeft
+            | Command::CompareToOutputRight => ready && self.paths.output.is_some(),
+            Command::CompareToOutputCenter => {
+                ready && self.paths.output.is_some() && self.paths.center.is_some()
+            }
             Command::ToggleConflict => ready && self.conflict_applies(),
             Command::FindNext | Command::FindPrevious => {
                 ready && !self.find.settings.pattern.is_empty()
@@ -3010,17 +3055,10 @@ impl SessionView for MergeView {
             Command::MergeInfo => {
                 self.message = Some(self.status_fields().join("; "));
             }
-            Command::CompareToOutput => {
-                if let Some(output) = self.paths.output.clone() {
-                    self.pending.push(ViewAction::Open(OpenRequest::new(
-                        SessionKind::TextCompare,
-                        self.paths.left.clone(),
-                        output,
-                    )));
-                } else {
-                    self.message = Some(NO_OUTPUT.to_owned());
-                }
-            }
+            Command::CompareToOutput
+            | Command::CompareToOutputLeft
+            | Command::CompareToOutputCenter
+            | Command::CompareToOutputRight => self.compare_to_output(command),
             _ => self.run_review(command),
         }
     }
@@ -3262,6 +3300,7 @@ mod tests {
 
     use super::{Job, MergeSaveMessage, MergeView, Question, EDITING_OFF, GIVEN_BACK};
     use crate::model::{Pane, Resolution};
+    use ca_session::SessionKind;
     use ca_ui::command::Command;
     use ca_ui::editor::Caret;
     use ca_ui::testing::{context, raw_input};
@@ -3334,6 +3373,57 @@ mod tests {
         };
         let view = MergeView::over(paths, ca_ui::view::Titles::default(), &context(), 7);
         (view, dir)
+    }
+
+    #[test]
+    fn compare_to_output_uses_the_selected_input_side() {
+        use ca_ui::view::{OpenRequest, ViewAction};
+
+        let (mut view, _dir) = open("left\n", Some("center\n"), "right\n");
+        run_until_ready(&mut view);
+        let output = view.paths.output.clone().unwrap();
+        let choices = [
+            (Command::CompareToOutputLeft, view.paths.left.clone()),
+            (
+                Command::CompareToOutputCenter,
+                view.paths.center.clone().unwrap(),
+            ),
+            (Command::CompareToOutputRight, view.paths.right.clone()),
+        ];
+
+        for (command, input) in choices {
+            view.pending.clear();
+            view.run(command);
+            assert_eq!(
+                view.pending,
+                vec![ViewAction::Open(OpenRequest::new(
+                    SessionKind::TextCompare,
+                    input,
+                    output.clone(),
+                ))]
+            );
+        }
+    }
+
+    #[test]
+    fn compare_to_output_disables_missing_center_and_output_choices() {
+        let (mut two_way, _dir) = open("left\n", None, "right\n");
+        run_until_ready(&mut two_way);
+        assert!(!SessionView::accepts(
+            &two_way,
+            Command::CompareToOutputCenter
+        ));
+        assert_eq!(
+            SessionView::refusal(&two_way, Command::CompareToOutputCenter),
+            Some(super::NO_CENTER)
+        );
+
+        two_way.paths.output = None;
+        assert!(!SessionView::accepts(&two_way, Command::CompareToOutput));
+        assert_eq!(
+            SessionView::refusal(&two_way, Command::CompareToOutput),
+            Some(super::NO_OUTPUT)
+        );
     }
 
     #[test]
