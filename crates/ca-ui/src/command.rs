@@ -323,6 +323,9 @@ commands! {
     ToggleCenterPane, "Center Pane", Actions, None, "Show or hide the ancestor pane.";
     MergeInfo, "Text Merge Info", Actions, None, "Show what the merge found.";
     CompareToOutput, "Compare to Output", Actions, None, "Open a comparison of one input against the output.";
+    CompareToOutputLeft, "Left Side", Hidden, None, "Compare the left input with the output.";
+    CompareToOutputCenter, "Center Side", Hidden, None, "Compare the center input with the output.";
+    CompareToOutputRight, "Right Side", Hidden, None, "Compare the right input with the output.";
     MergeFolders, "Merge", Actions, None, "Write the merge result of the selection into the output folder.";
     CopyToOutput, "Copy to Output", Actions, None, "Copy the selection from the active input into the output folder.";
     OpenTextMerge, "Open in Text Merge", Actions, None, "Open the current file in a three way text merge.";
