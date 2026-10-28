@@ -302,7 +302,7 @@ commands! {
     Touch, "Touch", Actions, None, "Write timestamps to the selection.";
     Exclude, "Exclude", Actions, None, "Add the selection to the session's name filters.";
     NewFolder, "New Folder", Actions, None, "Create one folder.";
-    CopyFilename, "Copy Filename", Actions, None, "Put the selected paths on the clipboard.";
+    CopyFilename, "Copy Filename", Actions, None, "Copy absolute paths from local folders; archive entries are skipped.";
     RefreshSelection, "Refresh Selection", Actions, None, "Read the selected items again.";
     Synchronize, "Synchronize", Actions, None, "Reconcile the two sides by copies and deletions.";
     Exchange, "Exchange", Actions, None, "Move each side's selection to the other side.";
