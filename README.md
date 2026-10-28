@@ -1,6 +1,6 @@
 # Compare All
 
-[![CI](https://github.com/jasonulbright/compare-all/actions/workflows/ci.yml/badge.svg?branch=main&event=push)](https://github.com/jasonulbright/compare-all/actions/workflows/ci.yml)
+[![CI](https://github.com/jasonulbright/compare-all/actions/workflows/ci.yml/badge.svg?event=pull_request)](https://github.com/jasonulbright/compare-all/actions/workflows/ci.yml)
 [![Release workflow](https://img.shields.io/github/actions/workflow/status/jasonulbright/compare-all/release.yml?label=release%20workflow)](https://github.com/jasonulbright/compare-all/actions/workflows/release.yml)
 [![Latest release](https://img.shields.io/github/v/release/jasonulbright/compare-all?label=release)](https://github.com/jasonulbright/compare-all/releases/latest)
 [![Downloads](https://img.shields.io/github/downloads/jasonulbright/compare-all/total?label=downloads)](https://github.com/jasonulbright/compare-all/releases)
