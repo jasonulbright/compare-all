@@ -256,6 +256,61 @@ impl Selection {
         self.cursor = Some((side, rel));
     }
 
+    /// Replace the selection with the range from a pressed row to the row
+    /// currently under a dragged pointer. Crossing panes selects entries on
+    /// both sides; staying in one pane selects only that side.
+    pub fn drag_range(
+        &mut self,
+        start_side: Side,
+        start_rel: &Path,
+        end_side: Side,
+        end_position: usize,
+        rows: &[FlatRow],
+        arena: &Arena,
+    ) -> bool {
+        let Some(start_position) = position_of(rows, arena, start_rel) else {
+            return false;
+        };
+        let Some(end_rel) = rel_at(rows, arena, end_position) else {
+            return false;
+        };
+        let (first, last) = if start_position <= end_position {
+            (start_position, end_position)
+        } else {
+            (end_position, start_position)
+        };
+        let both_sides = start_side != end_side;
+        self.left.clear();
+        self.right.clear();
+        for position in first..=last {
+            let Some(row) = rows.get(position) else {
+                continue;
+            };
+            let Some(node) = arena.node(row.node) else {
+                continue;
+            };
+            if both_sides {
+                if node.left.is_some() {
+                    self.left.insert(node.rel.clone());
+                }
+                if node.right.is_some() {
+                    self.right.insert(node.rel.clone());
+                }
+            } else {
+                let present = match start_side {
+                    Side::Left => node.left.is_some(),
+                    Side::Right => node.right.is_some(),
+                };
+                if present {
+                    self.side_mut(start_side).insert(node.rel.clone());
+                }
+            }
+        }
+        self.anchor = Some((start_side, start_rel.to_path_buf()));
+        self.cursor = Some((end_side, end_rel));
+        true
+    }
+
     /// Select every visible row a rule takes, on the sides a scope covers.
     pub fn select_rule(&mut self, rule: SelectRule, scope: Scope, rows: &[FlatRow], arena: &Arena) {
         self.clear();
@@ -463,6 +518,58 @@ mod tests {
         assert!(selection.contains(Side::Right, Path::new("b.txt")));
         assert!(selection.contains(Side::Right, Path::new("d.txt")));
         assert!(!selection.contains(Side::Right, Path::new("a.txt")));
+    }
+
+    #[test]
+    fn a_drag_within_one_pane_selects_only_that_side() {
+        let (arena, rows) = model();
+        let mut selection = Selection::new();
+        assert!(selection.drag_range(Side::Left, Path::new("a.txt"), Side::Left, 2, &rows, &arena,));
+        assert_eq!(selection.side(Side::Left).len(), 3);
+        assert!(selection.contains(Side::Left, Path::new("c.txt")));
+        assert!(selection.side(Side::Right).is_empty());
+        assert_eq!(selection.cursor().map(|(side, _)| side), Some(Side::Left));
+    }
+
+    #[test]
+    fn a_drag_within_one_pane_skips_rows_absent_from_that_side() {
+        let (arena, rows) = model();
+        let mut selection = Selection::new();
+        assert!(selection.drag_range(
+            Side::Right,
+            Path::new("a.txt"),
+            Side::Right,
+            2,
+            &rows,
+            &arena,
+        ));
+        assert_eq!(selection.side(Side::Right).len(), 2);
+        assert!(selection.contains(Side::Right, Path::new("a.txt")));
+        assert!(selection.contains(Side::Right, Path::new("b.txt")));
+        assert!(!selection.contains(Side::Right, Path::new("c.txt")));
+        assert!(selection.side(Side::Left).is_empty());
+        assert_eq!(selection.cursor().map(|(side, _)| side), Some(Side::Right));
+    }
+
+    #[test]
+    fn a_drag_across_the_panes_selects_existing_items_on_both_sides() {
+        let (arena, rows) = model();
+        let mut selection = Selection::new();
+        assert!(selection.drag_range(
+            Side::Left,
+            Path::new("a.txt"),
+            Side::Right,
+            3,
+            &rows,
+            &arena,
+        ));
+        assert_eq!(selection.side(Side::Left).len(), 3);
+        assert_eq!(selection.side(Side::Right).len(), 3);
+        assert!(selection.contains(Side::Left, Path::new("c.txt")));
+        assert!(!selection.contains(Side::Right, Path::new("c.txt")));
+        assert!(selection.contains(Side::Right, Path::new("d.txt")));
+        assert!(!selection.contains(Side::Left, Path::new("d.txt")));
+        assert_eq!(selection.cursor().map(|(side, _)| side), Some(Side::Right));
     }
 
     #[test]
