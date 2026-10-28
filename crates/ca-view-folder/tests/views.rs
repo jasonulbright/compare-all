@@ -227,6 +227,7 @@ struct DragHarness {
     view: FolderView,
     egui_context: egui::Context,
     rows: Vec<ca_view_folder::tree::FlatRow>,
+    sub_position: usize,
     body: egui::Rect,
     row_height: f32,
 }
@@ -274,6 +275,7 @@ fn drag_harness() -> DragHarness {
         view,
         egui_context,
         rows,
+        sub_position,
         body,
         row_height,
     }
@@ -296,15 +298,7 @@ fn primary_button(position: egui::Pos2, pressed: bool) -> egui::Event {
 )]
 fn dragging_across_the_split_selects_the_visible_range_on_both_sides() {
     let mut harness = drag_harness();
-    let sub_position = harness.rows.iter().position(|row| {
-        harness
-            .view
-            .arena()
-            .node(row.node)
-            .is_some_and(|node| node.rel == Path::new("sub"))
-    });
-    assert!(sub_position.is_some(), "the expanded sub folder is visible");
-    let sub_position = sub_position.unwrap_or_default();
+    let sub_position = harness.sub_position;
     assert!(harness.rows.iter().any(|row| {
         harness
             .view
@@ -388,15 +382,7 @@ fn dragging_across_the_split_selects_the_visible_range_on_both_sides() {
 )]
 fn a_short_drag_to_a_disclosure_marker_does_not_collapse_the_folder() {
     let mut harness = drag_harness();
-    let sub_position = harness.rows.iter().position(|row| {
-        harness
-            .view
-            .arena()
-            .node(row.node)
-            .is_some_and(|node| node.rel == Path::new("sub"))
-    });
-    assert!(sub_position.is_some(), "the expanded sub folder is visible");
-    let sub_position = sub_position.unwrap_or_default();
+    let sub_position = harness.sub_position;
     assert!(sub_position > 0, "the sub folder has a preceding row");
     let boundary = harness.body.top() + harness.row_height * sub_position as f32;
     let disclosure = egui::pos2(harness.body.left() + 8.0, boundary + 1.0);
@@ -495,15 +481,7 @@ fn a_short_drag_to_a_regular_file_row_keeps_the_range() {
 )]
 fn dragging_back_to_the_pressed_row_updates_selection_before_release() {
     let mut harness = drag_harness();
-    let sub_position = harness.rows.iter().position(|row| {
-        harness
-            .view
-            .arena()
-            .node(row.node)
-            .is_some_and(|node| node.rel == Path::new("sub"))
-    });
-    assert!(sub_position.is_some(), "the expanded sub folder is visible");
-    let sub_position = sub_position.unwrap_or_default();
+    let sub_position = harness.sub_position;
     let start = egui::pos2(
         harness.body.left() + harness.body.width() * 0.25,
         harness.body.top() + harness.row_height * 0.5,
