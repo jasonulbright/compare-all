@@ -1,14 +1,9 @@
 name: ci
 
-# Public repositories check every branch push and pull request. Private
-# repositories check version tags, manual runs and same-repository pull
-# requests; private branch pushes and fork pull requests start no hosted job.
+# Pull requests run the full validation gate before merge. Release tags are
+# validated and packaged by release.yml; manual runs remain available for
+# diagnosis without repeating the matrix on main or a tag.
 on:
-  push:
-    branches:
-      - "**"
-    tags:
-      - "v*"
   pull_request:
   workflow_dispatch:
 
@@ -25,7 +20,6 @@ jobs:
     if: >-
       (github.event.repository.name != '' && github.event.repository.private == false) ||
       github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
       (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
     permissions:
       contents: read
@@ -73,7 +67,6 @@ jobs:
     if: >-
       (github.event.repository.name != '' && github.event.repository.private == false) ||
       github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
       (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
     permissions:
       contents: read
@@ -99,7 +92,6 @@ jobs:
     if: >-
       (github.event.repository.name != '' && github.event.repository.private == false) ||
       github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
       (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
     permissions:
       contents: read
@@ -121,7 +113,6 @@ jobs:
     if: >-
       (github.event.repository.name != '' && github.event.repository.private == false) ||
       github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
       (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
     permissions:
       contents: read
