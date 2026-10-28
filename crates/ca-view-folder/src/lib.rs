@@ -3824,6 +3824,7 @@ impl SessionView for FolderView {
         view::declare(HANDLED, |command| self.accepts(command))
     }
 
+    /// A ready, idle filename copy with a selection but no local path has a distinct refusal.
     fn refusal(&self, command: Command) -> Option<&'static str> {
         match command {
             Command::NextDifference | Command::PreviousDifference if !self.accepts(command) => {
