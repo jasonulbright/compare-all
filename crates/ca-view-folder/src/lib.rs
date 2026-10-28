@@ -138,6 +138,7 @@ const HANDLED: &[Command] = &[
     Command::SelectDifferences,
     Command::SelectNewer,
     Command::SelectOrphans,
+    Command::InvertSelection,
     Command::ClearSelection,
     Command::CopyToRight,
     Command::CopyToLeft,
@@ -3695,6 +3696,7 @@ impl SessionView for FolderView {
             Command::FindNext | Command::FindPrevious => self.has_name_match(),
             Command::Cancel => self.status.is_running() || self.stage.is_busy(),
             Command::ClearSelection => !self.selection.is_empty(),
+            Command::InvertSelection => !self.rows.is_empty(),
             Command::CopyToRight | Command::CopyToLeft => idle && !self.selection.is_empty(),
             other => {
                 if select_rule_of(other).is_some() {
@@ -3731,6 +3733,7 @@ impl SessionView for FolderView {
             Command::FindNext => self.step_name(true, false),
             Command::FindPrevious => self.step_name(false, false),
             Command::ClearSelection => self.selection.clear(),
+            Command::InvertSelection => self.selection.invert_visible(&self.rows, &self.arena),
             Command::CopyToRight => self.copy_to(Side::Right),
             Command::CopyToLeft => self.copy_to(Side::Left),
             Command::SwapSides => {
@@ -4299,6 +4302,26 @@ mod stale_results {
         assert_eq!(copy_reason(&view), Some(OPERATION_OPEN));
         let sync = FolderSyncView::from(view);
         assert_eq!(sync.refusal(Command::CopyToRight), Some(OPERATION_OPEN));
+    }
+
+    #[test]
+    fn invert_selection_runs_in_folder_compare_and_folder_sync() {
+        use crate::{Command, FolderSyncView};
+        use ca_ui::view::SessionView;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut compare = ready_view(dir.path());
+        compare.run(Command::SelectAll);
+        assert!(compare.accepts(Command::InvertSelection));
+        compare.run(Command::InvertSelection);
+        assert!(compare.selection().is_empty());
+        compare.run(Command::InvertSelection);
+        assert!(!compare.selection().is_empty());
+
+        let mut sync = FolderSyncView::from(compare);
+        assert!(sync.accepts(Command::InvertSelection));
+        sync.run(Command::InvertSelection);
+        assert!(sync.view_mut().selection().is_empty());
     }
 
     #[test]
