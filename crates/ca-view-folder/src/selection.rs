@@ -277,21 +277,17 @@ impl Selection {
 
     /// Invert the selection among visible rows, considering each side's items independently.
     pub fn invert_visible(&mut self, rows: &[FlatRow], arena: &Arena) {
-        let mut left = BTreeSet::new();
-        let mut right = BTreeSet::new();
         for row in rows {
             let Some(node) = arena.node(row.node) else {
                 continue;
             };
-            if node.left.is_some() && !self.left.contains(&node.rel) {
-                left.insert(node.rel.clone());
+            if node.left.is_some() && !self.left.remove(&node.rel) {
+                self.left.insert(node.rel.clone());
             }
-            if node.right.is_some() && !self.right.contains(&node.rel) {
-                right.insert(node.rel.clone());
+            if node.right.is_some() && !self.right.remove(&node.rel) {
+                self.right.insert(node.rel.clone());
             }
         }
-        self.left = left;
-        self.right = right;
         self.anchor = None;
     }
 
@@ -498,6 +494,28 @@ mod tests {
         assert!(selection.contains(Side::Left, Path::new("a.txt")));
         assert_eq!(selection.side(Side::Right).len(), 1);
         assert!(selection.contains(Side::Right, Path::new("d.txt")));
+    }
+
+    #[test]
+    fn invert_visible_preserves_selections_outside_visible_rows() {
+        let (arena, rows) = model();
+        let hidden = PathBuf::from("a.txt");
+        let hidden_index = arena.index_of(&hidden).unwrap();
+        let visible_rows: Vec<_> = rows
+            .iter()
+            .copied()
+            .filter(|row| row.node != hidden_index)
+            .collect();
+        let mut selection = Selection::new();
+        selection.left.insert(hidden.clone());
+        selection.right.insert(hidden.clone());
+
+        selection.invert_visible(&visible_rows, &arena);
+
+        assert!(selection.contains(Side::Left, &hidden));
+        assert!(selection.contains(Side::Right, &hidden));
+        assert!(selection.contains(Side::Left, Path::new("b.txt")));
+        assert!(selection.contains(Side::Right, Path::new("b.txt")));
     }
 
     #[test]
