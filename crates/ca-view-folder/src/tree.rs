@@ -18,6 +18,7 @@ use std::time::SystemTime;
 pub struct SideInfo {
     /// Size in bytes for a file; zero for a folder.
     pub size: u64,
+    /// Directory links are treated as folders for size display.
     pub is_dir: bool,
     /// Total bytes in a folder after its full listing has been read.
     pub folder_size: Option<u64>,
