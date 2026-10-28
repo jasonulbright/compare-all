@@ -1152,6 +1152,13 @@ pub fn spawn_rescan(
     )
 }
 
+/// The refreshed contents and full-scan totals for one folder.
+struct ScannedSubtree {
+    children: Vec<Node>,
+    left_folder_size: Option<u64>,
+    right_folder_size: Option<u64>,
+}
+
 /// Drop any root that already sits under another root in the set.
 #[must_use]
 pub fn minimal_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
@@ -1179,7 +1186,7 @@ fn scan_subtree(
     name_filter: &str,
     options: &crate::settings::EngineOptions,
     cancel: &Cancel,
-) -> Vec<Node> {
+) -> ScannedSubtree {
     let read = |base: &Path| {
         ca_fs::scan_with(&base.join(rel), &options.scan, cancel.as_fs(), &|_| {})
             .unwrap_or_default()
@@ -1201,7 +1208,11 @@ fn scan_subtree(
     for child in &mut children {
         reprefix(child, rel);
     }
-    children
+    ScannedSubtree {
+        children,
+        left_folder_size: tree.facts.left_folder_size,
+        right_folder_size: tree.facts.right_folder_size,
+    }
 }
 
 /// Put `prefix` in front of every relative path of a freshly scanned subtree.
@@ -1222,24 +1233,78 @@ fn reprefix(node: &mut Node, prefix: &Path) {
 }
 
 /// Replace the children of the node at `rel` with a freshly scanned set.
-fn splice(tree: &mut Node, rel: &Path, children: Vec<Node>) {
+fn splice(tree: &mut Node, rel: &Path, refreshed: ScannedSubtree) {
     if rel.as_os_str().is_empty() {
-        tree.children = children;
+        tree.children = refreshed.children;
+        tree.facts.left_folder_size = refreshed.left_folder_size;
+        tree.facts.right_folder_size = refreshed.right_folder_size;
         return;
     }
-    if let Some(node) = find_mut(tree, rel) {
-        node.children = children;
+    let old_sizes =
+        find_mut(tree, rel).map(|node| (node.facts.left_folder_size, node.facts.right_folder_size));
+    if let Some((old_left, old_right)) = old_sizes {
+        if let Some(node) = find_mut(tree, rel) {
+            node.children = refreshed.children;
+            node.facts.left_folder_size = refreshed.left_folder_size;
+            node.facts.right_folder_size = refreshed.right_folder_size;
+        }
+        update_ancestor_sizes(
+            tree,
+            rel,
+            (old_left, old_right),
+            (refreshed.left_folder_size, refreshed.right_folder_size),
+        );
         return;
     }
     // The folder is new, so it is attached under whichever ancestor the tree
     // does hold; nothing is invented above it.
     if let Some(parent) = rel.parent() {
         if let Some(node) = find_mut(tree, parent) {
-            node.children.extend(children);
+            node.children.extend(refreshed.children);
         } else if parent.as_os_str().is_empty() {
-            tree.children.extend(children);
+            tree.children.extend(refreshed.children);
         }
     }
+    // No previous node means this folder contributed no bytes to its
+    // ancestors. Include its new totals where those ancestors are known.
+    update_ancestor_sizes(
+        tree,
+        rel,
+        (Some(0), Some(0)),
+        (refreshed.left_folder_size, refreshed.right_folder_size),
+    );
+}
+
+/// Adjust every ancestor by the change in the rescanned folder's total.
+fn update_ancestor_sizes(
+    tree: &mut Node,
+    rel: &Path,
+    previous: (Option<u64>, Option<u64>),
+    refreshed: (Option<u64>, Option<u64>),
+) {
+    let mut ancestor = rel.parent();
+    while let Some(path) = ancestor {
+        if let Some(node) = find_mut(tree, path) {
+            node.facts.left_folder_size =
+                updated_total(node.facts.left_folder_size, previous.0, refreshed.0);
+            node.facts.right_folder_size =
+                updated_total(node.facts.right_folder_size, previous.1, refreshed.1);
+        }
+        if path.as_os_str().is_empty() {
+            break;
+        }
+        ancestor = path.parent();
+    }
+}
+
+/// Keep an aggregate known only when all values needed to adjust it are known.
+fn updated_total(total: Option<u64>, previous: Option<u64>, refreshed: Option<u64>) -> Option<u64> {
+    let (Some(total), Some(previous), Some(refreshed)) = (total, previous, refreshed) else {
+        return None;
+    };
+    total
+        .checked_sub(previous)
+        .and_then(|remaining| remaining.checked_add(refreshed))
 }
 
 fn find_mut<'a>(tree: &'a mut Node, rel: &Path) -> Option<&'a mut Node> {
@@ -1278,10 +1343,60 @@ pub fn affected_roots(plan: &OperationPlan) -> Vec<PathBuf> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::{minimal_roots, Answer, Ask, Question};
+    use super::{minimal_roots, splice, Answer, Ask, Question, ScannedSubtree};
+    use ca_fs::{Node, NodeStatus, PairFacts, StatusFlags};
     use ca_ui::worker::Cancel;
     use std::path::PathBuf;
     use std::sync::Arc;
+
+    fn folder(rel: &str, left_size: Option<u64>, children: Vec<Node>) -> Node {
+        Node {
+            name: rel.rsplit('/').next().unwrap_or(rel).to_owned(),
+            rel: PathBuf::from(rel),
+            is_dir: true,
+            left: None,
+            right: None,
+            facts: PairFacts {
+                left_folder_size: left_size,
+                right_folder_size: left_size,
+                ..PairFacts::default()
+            },
+            status: NodeStatus::Same,
+            flags: StatusFlags::default(),
+            quick: None,
+            content: None,
+            error: None,
+            incomplete: false,
+            scan_cancelled: false,
+            children,
+        }
+    }
+
+    #[test]
+    fn targeted_rescan_updates_folder_sizes_through_ancestors() {
+        let target = folder("parent/child", Some(10), Vec::new());
+        let parent = folder("parent", Some(20), vec![target]);
+        let mut root = folder("", Some(30), vec![parent]);
+
+        splice(
+            &mut root,
+            std::path::Path::new("parent/child"),
+            ScannedSubtree {
+                children: Vec::new(),
+                left_folder_size: Some(15),
+                right_folder_size: Some(15),
+            },
+        );
+
+        assert_eq!(root.facts.left_folder_size, Some(35));
+        assert_eq!(root.facts.right_folder_size, Some(35));
+        let refreshed_parent = &root.children[0];
+        assert_eq!(refreshed_parent.facts.left_folder_size, Some(25));
+        assert_eq!(refreshed_parent.facts.right_folder_size, Some(25));
+        let refreshed_child = &refreshed_parent.children[0];
+        assert_eq!(refreshed_child.facts.left_folder_size, Some(15));
+        assert_eq!(refreshed_child.facts.right_folder_size, Some(15));
+    }
 
     /// Run the recovery check on `journals` and take its one result.
     #[cfg(unix)]
