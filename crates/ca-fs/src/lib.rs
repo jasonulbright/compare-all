@@ -44,7 +44,7 @@ pub use criteria::{
 pub use display::{DisplayFilter, FolderDisplayFilter};
 pub use filter::{
     parse_size, wildcard_match, AttributeKind, CaseSensitivity, ContentFilter, FilterContext,
-    FilterTime, Mask, NameFilters, OtherFilter, OtherFilters, UnixFileType,
+    FilterTime, Mask, NameFilters, OtherFilter, OtherFilters, UnixFileType, UnixFileTypes,
 };
 pub use journal::{
     journal_folder, read_records, recover, recover_all, retire, sweep, Journal, JournalRecord,
