@@ -46,6 +46,8 @@ enum Entry {
 
 /// Why a line that names a command with no implementation is disabled.
 const NOT_YET: &str = "Not available yet";
+/// Why a merge output command is unavailable before the merge finishes.
+const MERGE_NOT_READY: &str = "Available once the merge finishes";
 
 /// The text comparison bar, in the observed order.
 ///
@@ -222,6 +224,47 @@ const TEXT_MENUS: &[(&str, &[Entry])] = &[
     ("Help", HELP),
 ];
 
+/// The Text Merge Session menu adds the captured Compare to Output submenu.
+const MERGE_SESSION: &[Entry] = &[
+    Entry::Run(Command::NewSession, ""),
+    Entry::Run(Command::NewTab, ""),
+    Entry::Soon(Command::NewWindow),
+    Entry::Run(Command::OpenSession, ""),
+    Entry::Rule,
+    Entry::Run(Command::LoadWorkspace, NO_STORE),
+    Entry::Run(Command::SaveWorkspaceAs, NO_STORE),
+    Entry::Rule,
+    Entry::Run(Command::SaveSession, NO_SESSION),
+    Entry::Run(Command::SaveSessionAs, NO_SESSION),
+    Entry::Run(Command::SessionSettings, NO_SETTINGS),
+    Entry::Run(Command::ToggleLocked, NO_SAVED),
+    Entry::Run(Command::ClearSession, NO_SESSION),
+    Entry::Run(Command::CloseTab, "No tab is open"),
+    Entry::Rule,
+    Entry::Run(
+        Command::SwapSides,
+        "The active view has no two sides to swap",
+    ),
+    Entry::Run(Command::Reload, "The active view reads nothing to reload"),
+    Entry::Run(
+        Command::Recompare,
+        "The active view has nothing to compare again",
+    ),
+    Entry::Rule,
+    Entry::Run(
+        Command::CompareReport,
+        "The active view has no finished comparison to report",
+    ),
+    Entry::Soon(Command::CompareInfo),
+    Entry::Soon(Command::CompareToOutput),
+    Entry::Rule,
+    Entry::Soon(Command::CompareFilesUsing),
+    Entry::Soon(Command::MergeFiles),
+    Entry::Run(Command::CompareParentFolders, PARENT_FOLDERS),
+    Entry::Rule,
+    Entry::Run(Command::Exit, ""),
+];
+
 /// Version and Media Compare share the common menus but expose their own
 /// Compare Info and report labels.
 const RECORDS_SESSION: &[Entry] = &[
@@ -293,6 +336,17 @@ const RECORDS_FILE: &[Entry] = &[
 /// with an Edit and a View menu of the merge's own. The Actions menu is built
 /// from the merge view's declaration, as on the shared bar.
 const MERGE_MENUS: &[(&str, &[Entry])] = &[
+    ("Session", MERGE_SESSION),
+    TEXT_MENUS[1],
+    ("Edit", MERGE_EDIT),
+    TEXT_MENUS[3],
+    ("View", MERGE_VIEW),
+    ("Tools", TOOLS),
+    ("Help", HELP),
+];
+
+/// Folder Merge retains its existing shared Session menu and Actions item.
+const FOLDER_MERGE_MENUS: &[(&str, &[Entry])] = &[
     TEXT_MENUS[0],
     TEXT_MENUS[1],
     ("Edit", MERGE_EDIT),
@@ -746,7 +800,8 @@ const fn menus_for(view: MenuView) -> &'static [(&'static str, &'static [Entry])
     match view {
         MenuView::Table => TABLE_MENUS,
         MenuView::Folder | MenuView::FolderSync => FOLDER_MENUS,
-        MenuView::Merge | MenuView::FolderMerge => MERGE_MENUS,
+        MenuView::Merge => MERGE_MENUS,
+        MenuView::FolderMerge => FOLDER_MERGE_MENUS,
         MenuView::Registry => REGISTRY_MENUS,
         MenuView::Version | MenuView::Media => RECORDS_MENUS,
         MenuView::Text | MenuView::Hex | MenuView::Other => TEXT_MENUS,
@@ -3549,9 +3604,13 @@ impl App {
     /// a view type carries its own actions into the bar without the shell
     /// naming them.
     fn declared_actions(&self) -> Vec<CommandState> {
+        let view = self.menu_view();
         self.declared
             .iter()
-            .filter(|state| state.command.menu() == Menu::Actions)
+            .filter(|state| {
+                state.command.menu() == Menu::Actions
+                    && !(view == MenuView::Merge && state.command == Command::CompareToOutput)
+            })
             .copied()
             .collect()
     }
@@ -3577,28 +3636,7 @@ impl App {
         ui.menu_button(ACTIONS_MENU, |ui| {
             ui.set_min_width(220.0);
             for state in &actions {
-                if view == MenuView::Merge && state.command == Command::CompareToOutput {
-                    ui.menu_button(state.command.label_in(view), |ui| {
-                        ui.set_min_width(220.0);
-                        for side in [
-                            Command::CompareToOutputLeft,
-                            Command::CompareToOutputCenter,
-                            Command::CompareToOutputRight,
-                        ] {
-                            let enabled = self.line_enabled(side);
-                            let reason = self.line_reason(side, ACTIONABLE);
-                            if widgets::command_item_in(ui, view, side, enabled, reason) {
-                                chosen = Some(side);
-                            }
-                        }
-                    });
-                } else if widgets::command_item_in(
-                    ui,
-                    view,
-                    state.command,
-                    state.enabled,
-                    ACTIONABLE,
-                ) {
+                if widgets::command_item_in(ui, view, state.command, state.enabled, ACTIONABLE) {
                     chosen = Some(state.command);
                 }
             }
@@ -3668,10 +3706,44 @@ impl App {
         chosen
     }
 
+    /// The Text Merge Session submenu for comparing each input with output.
+    fn compare_to_output_item(&self, ui: &mut egui::Ui, view: MenuView) -> Option<Command> {
+        if !self.accepts(Command::CompareToOutput) {
+            widgets::command_item_in(
+                ui,
+                view,
+                Command::CompareToOutput,
+                false,
+                self.refusal(Command::CompareToOutput)
+                    .unwrap_or(MERGE_NOT_READY),
+            );
+            return None;
+        }
+
+        let mut chosen = None;
+        ui.menu_button(Command::CompareToOutput.label_in(view), |ui| {
+            ui.set_min_width(220.0);
+            for command in [
+                Command::CompareToOutputLeft,
+                Command::CompareToOutputCenter,
+                Command::CompareToOutputRight,
+            ] {
+                let enabled = self.accepts(command);
+                let reason = self.refusal(command).unwrap_or(MERGE_NOT_READY);
+                if widgets::command_item_in(ui, view, command, enabled, reason) {
+                    chosen = Some(command);
+                    ui.close_menu();
+                }
+            }
+        });
+        chosen
+    }
+
     fn menu_bar(&mut self, ui: &mut egui::Ui, context: &ViewContext) {
         let view = self.menu_view();
         let mut chosen_entry: Option<usize> = None;
         let mut chosen_file_kind = None;
+        let mut chosen_compare_to_output = None;
         egui::menu::bar(ui, |ui| {
             for (name, entries) in menus_for(view) {
                 ui.menu_button(*name, |ui| {
@@ -3685,6 +3757,10 @@ impl App {
                             }
                             Entry::Soon(Command::CompareFilesUsing) => {
                                 chosen_file_kind = self.compare_files_using_item(ui, view);
+                                continue;
+                            }
+                            Entry::Soon(Command::CompareToOutput) => {
+                                chosen_compare_to_output = self.compare_to_output_item(ui, view);
                                 continue;
                             }
                             Entry::Soon(Command::Explorer) => {
@@ -3735,6 +3811,9 @@ impl App {
         }
         if let Some(kind) = chosen_file_kind {
             self.open_files_using(&kind, context);
+        }
+        if let Some(command) = chosen_compare_to_output {
+            self.run(command, context);
         }
     }
 
@@ -6462,6 +6541,27 @@ mod tests {
     }
 
     #[test]
+    fn compare_to_output_is_in_the_text_merge_session_menu() {
+        let merge = drawn(MenuView::Merge);
+        let session = merge
+            .iter()
+            .find(|(name, _)| *name == "Session")
+            .map(|(_, lines)| lines)
+            .unwrap();
+        assert!(session.iter().any(|line| line == "Compare to Output"));
+
+        let folder_merge = drawn(MenuView::FolderMerge);
+        let folder_session = folder_merge
+            .iter()
+            .find(|(name, _)| *name == "Session")
+            .map(|(_, lines)| lines)
+            .unwrap();
+        assert!(!folder_session
+            .iter()
+            .any(|line| line == "Compare to Output"));
+    }
+
+    #[test]
     fn table_compare_lists_column_fit_only_in_its_view_menu() {
         let table = drawn(MenuView::Table);
         let text = drawn(MenuView::Text);
@@ -6582,9 +6682,9 @@ mod tests {
                 menus_for(view).iter().flat_map(move |(name, entries)| {
                     entries.iter().filter_map(move |entry| match entry {
                         Entry::Run(command, _)
-                        | Entry::Soon(command @ Command::CompareFilesUsing) => {
-                            Some((view, *name, *command))
-                        }
+                        | Entry::Soon(
+                            command @ (Command::CompareFilesUsing | Command::CompareToOutput),
+                        ) => Some((view, *name, *command)),
                         _ => None,
                     })
                 })
@@ -6762,9 +6862,9 @@ mod tests {
     }
 
     /// Text Merge keeps all three input-to-output comparisons reachable from
-    /// its Actions menu, including the non-default center and right inputs.
+    /// its Session menu, including the non-default center and right inputs.
     #[test]
-    fn text_merge_actions_menu_exposes_each_compare_to_output_side() {
+    fn text_merge_session_menu_exposes_each_compare_to_output_side() {
         use ca_ui::testing::probe::Probe;
         use std::cell::RefCell;
 
@@ -6805,7 +6905,12 @@ mod tests {
         let mut run = |ctx: &egui::Context| app.borrow_mut().frame(ctx);
         probe.idle(&mut run);
         probe.idle(&mut run);
-        probe.click(ACTIONS_MENU, &mut run).unwrap();
+        assert!(!app
+            .borrow()
+            .declared_actions()
+            .iter()
+            .any(|state| state.command == Command::CompareToOutput));
+        probe.click("Session", &mut run).unwrap();
         probe.click("Compare to Output", &mut run).unwrap();
         for label in ["Left Side", "Center Side", "Right Side"] {
             let side = probe.find(label).unwrap();
