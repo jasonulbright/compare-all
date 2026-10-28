@@ -304,6 +304,13 @@ fn shows_the_same_steps(shown: &OperationPlan, built: &OperationPlan) -> bool {
         && shown.skipped == built.skipped
 }
 
+/// The row where a mouse range selection began.
+struct DragSelection {
+    side: Side,
+    rel: PathBuf,
+    moved: bool,
+}
+
 /// A folder comparison tab.
 #[allow(clippy::struct_excessive_bools)]
 pub struct FolderView {
@@ -374,6 +381,7 @@ pub struct FolderView {
     content_method: ContentMethod,
     content_done: usize,
     selection: Selection,
+    selection_drag: Option<DragSelection>,
     form: Form,
     stage: Stage,
     ask: Option<Arc<Ask>>,
@@ -553,6 +561,7 @@ impl FolderView {
             content_method: ContentMethod::Binary,
             content_done: 0,
             selection: Selection::new(),
+            selection_drag: None,
             form: Form::default(),
             stage: Stage::Idle,
             ask: None,
@@ -1263,6 +1272,7 @@ impl FolderView {
         self.comparisons.start();
         self.drop_jobs();
         self.drop_operation_in_wait();
+        self.selection_drag = None;
         self.arena = Arena::default();
         self.sides = None;
         self.compared_tree = None;
@@ -2604,8 +2614,10 @@ impl FolderView {
         let mut toggle: Option<u32> = None;
         let mut click: Option<(Side, usize, ClickKind)> = None;
         let cursor = ui.ctx().pointer_latest_pos();
-        let (clicked, double_clicked, modifiers) = ui.input(|input| {
+        let (pressed, down, clicked, double_clicked, modifiers) = ui.input(|input| {
             (
+                input.pointer.primary_pressed(),
+                input.pointer.primary_down(),
                 input.pointer.primary_clicked(),
                 input
                     .pointer
@@ -2613,6 +2625,75 @@ impl FolderView {
                 input.modifiers,
             )
         });
+        let pointer_row = cursor.and_then(|pointer| {
+            if !body.contains(pointer)
+                || (layout.splitter.start..=layout.splitter.end).contains(&pointer.x)
+            {
+                return None;
+            }
+            let position = self.scroll.row_under(pointer.y - body.top(), row_height);
+            (position < total).then(|| {
+                let side = if pointer.x >= layout.right.name.start {
+                    Side::Right
+                } else {
+                    Side::Left
+                };
+                (side, position)
+            })
+        });
+        if pressed {
+            self.selection_drag = pointer_row.and_then(|(side, position)| {
+                let row = self.rows.get(position)?;
+                let node = self.arena.node(row.node)?;
+                Some(DragSelection {
+                    side,
+                    rel: node.rel.clone(),
+                    moved: false,
+                })
+            });
+        }
+        let mut suppress_click = false;
+        if down && !pressed {
+            if let (Some(drag), Some((end_side, end_position))) =
+                (self.selection_drag.as_mut(), pointer_row)
+            {
+                let end_rel = self
+                    .rows
+                    .get(end_position)
+                    .and_then(|row| self.arena.node(row.node))
+                    .map(|node| node.rel.as_path());
+                if end_rel.is_some_and(|rel| rel != drag.rel || end_side != drag.side) {
+                    drag.moved = self.selection.drag_range(
+                        drag.side,
+                        &drag.rel,
+                        end_side,
+                        end_position,
+                        &self.rows,
+                        &self.arena,
+                    );
+                }
+            }
+        }
+        if clicked {
+            if let (Some(drag), Some((end_side, end_position))) =
+                (self.selection_drag.as_ref(), pointer_row)
+            {
+                if drag.moved {
+                    self.selection.drag_range(
+                        drag.side,
+                        &drag.rel,
+                        end_side,
+                        end_position,
+                        &self.rows,
+                        &self.arena,
+                    );
+                    suppress_click = true;
+                }
+            }
+            self.selection_drag = None;
+        } else if !down {
+            self.selection_drag = None;
+        }
         let clip = painter.with_clip_rect(body);
         for position in range {
             let Some(row) = self.rows.get(position) else {
@@ -2690,7 +2771,7 @@ impl FolderView {
                     layout.left
                 };
                 let marker_end = pane.name.start + f32::from(row.depth) * INDENT + 14.0;
-                if clicked && cursor.x <= marker_end {
+                if clicked && !suppress_click && cursor.x <= marker_end {
                     toggle = Some(row.node);
                     continue;
                 }
@@ -2717,7 +2798,7 @@ impl FolderView {
                     None => actions.push(ViewAction::Open(request)),
                 }
             }
-            if clicked {
+            if clicked && !suppress_click {
                 let kind = if modifiers.command {
                     ClickKind::Toggle
                 } else if modifiers.shift {
