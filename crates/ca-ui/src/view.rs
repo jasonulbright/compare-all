@@ -170,6 +170,16 @@ pub trait SessionView {
     /// active tab. Called before [`SessionView::tick`] for every tab.
     fn set_active(&mut self, _active: bool) {}
 
+    /// Whether this view asks the shell to hide its chrome and fill the
+    /// viewport with the view's focused content.
+    fn wants_fullscreen(&self) -> bool {
+        false
+    }
+
+    /// Set the view's fullscreen state. The shell uses this when the user
+    /// exits fullscreen through the window or presses Escape.
+    fn set_fullscreen(&mut self, _fullscreen: bool) {}
+
     /// Paint one frame and collect whatever the view wants the shell to do.
     fn ui(&mut self, ui: &mut egui::Ui, context: &ViewContext) -> Vec<ViewAction>;
 
@@ -466,6 +476,18 @@ impl SessionView for OwnsTemporaries {
         self.view.tick();
     }
 
+    fn set_active(&mut self, active: bool) {
+        self.view.set_active(active);
+    }
+
+    fn wants_fullscreen(&self) -> bool {
+        self.view.wants_fullscreen()
+    }
+
+    fn set_fullscreen(&mut self, fullscreen: bool) {
+        self.view.set_fullscreen(fullscreen);
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, context: &ViewContext) -> Vec<ViewAction> {
         self.view.ui(ui, context)
     }
@@ -572,7 +594,9 @@ pub fn declare(commands: &[Command], enabled: impl Fn(Command) -> bool) -> Vec<C
 mod tests {
     use super::{build, OpenRequest, SessionView, ViewAction, ViewContext, ViewFactory};
     use ca_session::SessionKind;
+    use std::cell::Cell;
     use std::path::PathBuf;
+    use std::rc::Rc;
     use std::time::Duration;
 
     struct Blank;
@@ -591,6 +615,54 @@ mod tests {
         fn create(_left: PathBuf, _right: PathBuf, _context: &ViewContext, _instance: u64) -> Self {
             Self
         }
+    }
+
+    struct FullscreenProbe {
+        active: Rc<Cell<Option<bool>>>,
+        fullscreen: Rc<Cell<bool>>,
+    }
+
+    impl SessionView for FullscreenProbe {
+        fn title(&self) -> String {
+            String::new()
+        }
+
+        fn set_active(&mut self, active: bool) {
+            self.active.set(Some(active));
+        }
+
+        fn wants_fullscreen(&self) -> bool {
+            self.fullscreen.get()
+        }
+
+        fn set_fullscreen(&mut self, fullscreen: bool) {
+            self.fullscreen.set(fullscreen);
+        }
+
+        fn ui(&mut self, _ui: &mut egui::Ui, _context: &ViewContext) -> Vec<ViewAction> {
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn a_temporary_view_forwards_fullscreen_state_and_activity() {
+        let active = Rc::new(Cell::new(None));
+        let fullscreen = Rc::new(Cell::new(true));
+        let mut view = super::OwnsTemporaries {
+            view: Box::new(FullscreenProbe {
+                active: Rc::clone(&active),
+                fullscreen: Rc::clone(&fullscreen),
+            }),
+            temporaries: Vec::new(),
+        };
+
+        assert!(view.wants_fullscreen());
+        view.set_fullscreen(false);
+        view.set_active(false);
+
+        assert!(!view.wants_fullscreen());
+        assert!(!fullscreen.get());
+        assert_eq!(active.get(), Some(false));
     }
 
     #[test]

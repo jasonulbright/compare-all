@@ -70,6 +70,7 @@ const HANDLED: &[Command] = &[
     Command::Copy,
     Command::Cancel,
     Command::NextDisplayMode,
+    Command::ToggleFullscreen,
     Command::ZoomIn,
     Command::ZoomOut,
     Command::ZoomToFit,
@@ -227,6 +228,7 @@ pub struct PictureView {
     /// the fit is stale and is worked out again.
     fitted_for: Option<[f32; 2]>,
     close_requested: bool,
+    fullscreen: bool,
 }
 
 impl PictureView {
@@ -284,6 +286,7 @@ impl PictureView {
             fit_wanted: true,
             fitted_for: None,
             close_requested: false,
+            fullscreen: false,
         };
         view.scheduler.request_now(Stage::Load, Instant::now());
         view
@@ -931,6 +934,27 @@ impl SessionView for PictureView {
         self.drain_copy();
     }
 
+    fn set_active(&mut self, active: bool) {
+        if !active {
+            self.set_fullscreen(false);
+        }
+    }
+
+    fn wants_fullscreen(&self) -> bool {
+        self.fullscreen
+    }
+
+    fn set_fullscreen(&mut self, fullscreen: bool) {
+        self.fullscreen = fullscreen;
+        if fullscreen && !self.panes.shows(self.focused) {
+            self.focused = Pane::ALL
+                .into_iter()
+                .find(|pane| self.panes.shows(*pane))
+                .unwrap_or(self.focused);
+        }
+        self.fitted_for = None;
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, context: &ViewContext) -> Vec<ViewAction> {
         let palette = *ca_ui::theme::picture::palette(theme_variant(ui));
         let mut actions = Vec::new();
@@ -939,26 +963,40 @@ impl SessionView for PictureView {
         self.report.poll(ui.ctx());
         self.reported.clear();
         self.image_rects.clear();
-        // The status bar claims its height before the toolbar does, so a
-        // toolbar that wraps onto more lines never pushes it off the window.
-        let status = egui::TopBottomPanel::bottom(self.id.with("status")).show_inside(ui, |ui| {
-            self.status_bar(ui, &palette);
-        });
-        self.status_rect = status.response.rect;
-        egui::TopBottomPanel::top(self.id.with("head")).show_inside(ui, |ui| {
-            self.path_bar(ui);
-            self.toolbar(ui, &mut actions);
-            self.report_panel(ui);
-        });
-        self.keyboard(ui);
-        if let Some(image) = self.pending_image.take() {
-            ui.ctx().copy_image(image);
-        }
-        egui::CentralPanel::default()
-            .frame(egui::Frame::NONE)
-            .show_inside(ui, |ui| {
-                self.body(ui, &palette);
+        if self.fullscreen {
+            self.status_rect = egui::Rect::NOTHING;
+            self.keyboard(ui);
+            if let Some(image) = self.pending_image.take() {
+                ui.ctx().copy_image(image);
+            }
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show_inside(ui, |ui| {
+                    self.body_fullscreen(ui, &palette);
+                });
+        } else {
+            // The status bar claims its height before the toolbar does, so a
+            // toolbar that wraps onto more lines never pushes it off the window.
+            let status =
+                egui::TopBottomPanel::bottom(self.id.with("status")).show_inside(ui, |ui| {
+                    self.status_bar(ui, &palette);
+                });
+            self.status_rect = status.response.rect;
+            egui::TopBottomPanel::top(self.id.with("head")).show_inside(ui, |ui| {
+                self.path_bar(ui);
+                self.toolbar(ui, &mut actions);
+                self.report_panel(ui);
             });
+            self.keyboard(ui);
+            if let Some(image) = self.pending_image.take() {
+                ui.ctx().copy_image(image);
+            }
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show_inside(ui, |ui| {
+                    self.body(ui, &palette);
+                });
+        }
         if self.scheduler.has_pending() || self.job.is_some() {
             ui.ctx().request_repaint_after(DEBOUNCE);
         }
@@ -1000,6 +1038,7 @@ impl SessionView for PictureView {
             Command::Recompare => self.ask_now(Stage::Compare),
             Command::SwapSides => self.swap_sides(),
             Command::NextDisplayMode => self.set_mode(next_mode(self.settings.mode)),
+            Command::ToggleFullscreen => self.set_fullscreen(!self.fullscreen),
             Command::ZoomIn => self.zoom_in(),
             Command::ZoomOut => self.zoom_out(),
             Command::ZoomToFit => self.zoom_to_fit(),
@@ -1487,11 +1526,31 @@ impl PictureView {
             let Some(rect) = rects.get(&pane).copied() else {
                 continue;
             };
-            self.paint_pane(ui, pane, rect, palette);
+            self.paint_pane(ui, pane, rect, palette, true);
         }
         self.pane_rects = rects;
 
         self.control_column(ui, controls, palette);
+        ui.allocate_rect(room, egui::Sense::hover());
+    }
+
+    /// Fill the view with the pane the user last picked, without the controls
+    /// or the surrounding pane labels.
+    fn body_fullscreen(&mut self, ui: &mut egui::Ui, palette: &Palette) {
+        let room = ui.available_rect_before_wrap();
+        let pane = if self.panes.shows(self.focused) {
+            self.focused
+        } else {
+            Pane::ALL
+                .into_iter()
+                .find(|pane| self.panes.shows(*pane))
+                .unwrap_or(self.focused)
+        };
+        self.pointer = None;
+        let rects = HashMap::from([(pane, room)]);
+        self.refit(&rects);
+        self.paint_pane(ui, pane, room, palette, false);
+        self.pane_rects = rects;
         ui.allocate_rect(room, egui::Sense::hover());
     }
 
@@ -1510,7 +1569,12 @@ impl PictureView {
         if self.fitted_for == Some(size) {
             return;
         }
-        let Some(bounds) = self.content_bounds() else {
+        let bounds = if self.fullscreen {
+            self.content_bounds_for(self.focused)
+        } else {
+            self.content_bounds()
+        };
+        let Some(bounds) = bounds else {
             return;
         };
         self.camera.fit_bounds(size, bounds);
@@ -1522,21 +1586,11 @@ impl PictureView {
     /// A result can start before the left image's corner, so the fit works
     /// against the union rather than against one buffer.
     fn content_bounds(&self) -> Option<[f32; 4]> {
-        let outcome = self.outcome.as_ref()?;
         let mut bounds: Option<[f32; 4]> = None;
         for pane in Pane::ALL {
-            let placement = match pane {
-                Pane::Left => Placement::new([0, 0], [outcome.left.width(), outcome.left.height()]),
-                Pane::Right => Placement::new(
-                    [outcome.offset.x, outcome.offset.y],
-                    [outcome.right.width(), outcome.right.height()],
-                ),
-                Pane::Difference => Placement::new(
-                    [outcome.origin.x, outcome.origin.y],
-                    [outcome.result.width(), outcome.result.height()],
-                ),
+            let Some(next) = self.content_bounds_for(pane) else {
+                continue;
             };
-            let next = placement.bounds();
             bounds = Some(match bounds {
                 None => next,
                 Some(held) => [
@@ -1550,8 +1604,32 @@ impl PictureView {
         bounds
     }
 
+    /// The shared-space rectangle for one pane's content.
+    fn content_bounds_for(&self, pane: Pane) -> Option<[f32; 4]> {
+        let outcome = self.outcome.as_ref()?;
+        let placement = match pane {
+            Pane::Left => Placement::new([0, 0], [outcome.left.width(), outcome.left.height()]),
+            Pane::Right => Placement::new(
+                [outcome.offset.x, outcome.offset.y],
+                [outcome.right.width(), outcome.right.height()],
+            ),
+            Pane::Difference => Placement::new(
+                [outcome.origin.x, outcome.origin.y],
+                [outcome.result.width(), outcome.result.height()],
+            ),
+        };
+        Some(placement.bounds())
+    }
+
     #[allow(clippy::too_many_lines)]
-    fn paint_pane(&mut self, ui: &mut egui::Ui, pane: Pane, rect: egui::Rect, palette: &Palette) {
+    fn paint_pane(
+        &mut self,
+        ui: &mut egui::Ui,
+        pane: Pane,
+        rect: egui::Rect,
+        palette: &Palette,
+        chrome: bool,
+    ) {
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, palette.pane_background);
         let response = ui.interact(
@@ -1580,29 +1658,31 @@ impl PictureView {
 
         self.handle_pane_input(ui, pane, rect, &response);
 
-        let outline = if self.focused == pane {
-            palette.pane_border_focused
-        } else {
-            palette.pane_border
-        };
-        painter.rect_stroke(
-            rect,
-            0.0,
-            egui::Stroke::new(1.0, outline),
-            egui::StrokeKind::Inside,
-        );
-        let title = painter.text(
-            rect.left_top() + egui::vec2(6.0, 4.0),
-            egui::Align2::LEFT_TOP,
-            pane.label(),
-            egui::FontId::proportional(11.0),
-            palette.label_text,
-        );
-        self.reported.push(WidgetRect {
-            name: format!("{} title", pane.label()),
-            rect: title,
-            pane: Some(pane),
-        });
+        if chrome {
+            let outline = if self.focused == pane {
+                palette.pane_border_focused
+            } else {
+                palette.pane_border
+            };
+            painter.rect_stroke(
+                rect,
+                0.0,
+                egui::Stroke::new(1.0, outline),
+                egui::StrokeKind::Inside,
+            );
+            let title = painter.text(
+                rect.left_top() + egui::vec2(6.0, 4.0),
+                egui::Align2::LEFT_TOP,
+                pane.label(),
+                egui::FontId::proportional(11.0),
+                palette.label_text,
+            );
+            self.reported.push(WidgetRect {
+                name: format!("{} title", pane.label()),
+                rect: title,
+                pane: Some(pane),
+            });
+        }
         self.draw_crosshair(ui, pane, rect, palette);
     }
 
@@ -2138,7 +2218,7 @@ fn picture_side(image: Option<&SideImage>) -> ca_ui::report::PictureSide {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
-    use super::{mode_label, side_index, side_label, PictureView, SideImage, Sources, MODES};
+    use super::{mode_label, side_index, side_label, Pane, PictureView, SideImage, Sources, MODES};
     use ca_image::compare::Side;
     use ca_image::decode::{ColorKind, Fidelity, Metadata, Orientation, SourceFormat};
     use ca_ui::testing::context;
@@ -2389,6 +2469,37 @@ mod tests {
             1,
         );
         assert_eq!(view.title(), "left.png - right.png");
+    }
+
+    #[test]
+    fn fullscreen_shows_only_the_picked_visible_pane() {
+        let mut view = PictureView::new(
+            PathBuf::from("left.png"),
+            PathBuf::from("right.png"),
+            &context(),
+            1,
+        );
+        view.panes.set(Pane::Difference, false);
+        view.focused = Pane::Difference;
+        view.set_fullscreen(true);
+
+        assert_eq!(view.focused, Pane::Left);
+        assert!(view.wants_fullscreen());
+        let ctx = egui::Context::default();
+        let _ = ctx.run(ca_ui::testing::raw_input(), |ctx| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show(ctx, |ui| {
+                    view.body_fullscreen(
+                        ui,
+                        ca_ui::theme::picture::palette(ca_ui::theme::Variant::Light),
+                    );
+                });
+        });
+        assert_eq!(view.pane_rects.len(), 1);
+        assert!(view.pane_rects.contains_key(&Pane::Left));
+        assert!(view.pane_rects[&Pane::Left].width() > 1000.0);
+        assert!(view.reported.is_empty());
     }
 
     #[test]
