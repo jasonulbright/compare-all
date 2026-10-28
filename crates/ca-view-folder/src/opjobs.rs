@@ -1294,57 +1294,27 @@ fn splice(tree: &mut Node, rel: &Path, refreshed: ScannedSubtree) {
         tree.facts.right_folder_size = refreshed.right.displayed_size();
         return;
     }
-    let old_sizes = find_mut(tree, rel).map(|node| {
-        (
-            if node.left.is_some() {
-                node.facts.left_folder_size
-            } else {
-                Some(0)
-            },
-            if node.right.is_some() {
-                node.facts.right_folder_size
-            } else {
-                Some(0)
-            },
-        )
-    });
-    if let Some((old_left, old_right)) = old_sizes {
-        let new_contributions = (
-            refreshed.left.contribution(),
-            refreshed.right.contribution(),
-        );
-        if let Some(node) = find_mut(tree, rel) {
-            node.children = refreshed.children;
-            node.facts.left_folder_size = refreshed.left.displayed_size();
-            node.facts.right_folder_size = refreshed.right.displayed_size();
-        }
-        update_ancestor_sizes(tree, rel, (old_left, old_right), new_contributions);
+    let Some(node) = find_mut(tree, rel) else {
         return;
-    }
-    let attached = if let Some(parent) = rel.parent() {
-        if let Some(node) = find_mut(tree, parent) {
-            node.children.extend(refreshed.children);
-            true
-        } else if parent.as_os_str().is_empty() {
-            tree.children.extend(refreshed.children);
-            true
-        } else {
-            false
-        }
-    } else {
-        false
     };
-    if attached {
-        update_ancestor_sizes(
-            tree,
-            rel,
-            (Some(0), Some(0)),
-            (
-                refreshed.left.contribution(),
-                refreshed.right.contribution(),
-            ),
-        );
-    }
+    let old_left = if node.left.is_some() {
+        node.facts.left_folder_size
+    } else {
+        Some(0)
+    };
+    let old_right = if node.right.is_some() {
+        node.facts.right_folder_size
+    } else {
+        Some(0)
+    };
+    let new_contributions = (
+        refreshed.left.contribution(),
+        refreshed.right.contribution(),
+    );
+    node.children = refreshed.children;
+    node.facts.left_folder_size = refreshed.left.displayed_size();
+    node.facts.right_folder_size = refreshed.right.displayed_size();
+    update_ancestor_sizes(tree, rel, (old_left, old_right), new_contributions);
 }
 
 /// A changed side means the scan root itself needs to be included as a child
@@ -1621,6 +1591,32 @@ mod tests {
 
         assert_eq!(root.facts.right_folder_size, Some(16));
         assert_eq!(root.children[0].facts.right_folder_size, Some(16));
+    }
+
+    #[test]
+    fn splice_does_not_attach_children_when_the_target_node_is_missing() {
+        let parent = folder("parent", Some(0), Vec::new());
+        let mut root = folder("", Some(0), vec![parent]);
+        let refreshed = ScannedSubtree {
+            children: vec![folder("parent/missing/child", Some(4), Vec::new())],
+            left: RescannedSide {
+                present: Some(true),
+                folder_size: Some(4),
+            },
+            right: RescannedSide {
+                present: Some(true),
+                folder_size: Some(4),
+            },
+        };
+
+        assert!(needs_wider_rescan(
+            &root,
+            std::path::Path::new("parent/missing"),
+            &refreshed,
+        ));
+        splice(&mut root, std::path::Path::new("parent/missing"), refreshed);
+
+        assert!(root.children[0].children.is_empty());
     }
 
     /// Run the recovery check on `journals` and take its one result.
