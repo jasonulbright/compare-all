@@ -1161,7 +1161,6 @@ pub fn spawn_rescan(
     )
 }
 
-/// The refreshed contents and full-scan totals for one folder.
 struct ScannedSubtree {
     children: Vec<Node>,
     left: RescannedSide,
@@ -1350,7 +1349,6 @@ fn find_node<'a>(tree: &'a Node, rel: &Path) -> Option<&'a Node> {
     None
 }
 
-/// Adjust every ancestor by the change in the rescanned folder's total.
 fn update_ancestor_sizes(
     tree: &mut Node,
     rel: &Path,
