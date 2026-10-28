@@ -2656,33 +2656,46 @@ impl FolderView {
                 input.modifiers,
             )
         });
-        let pointer_row = cursor.and_then(|pointer| {
-            if !body.contains(pointer)
-                || (layout.splitter.start..=layout.splitter.end).contains(&pointer.x)
-            {
-                return None;
-            }
-            let position = self.scroll.row_under(pointer.y - body.top(), row_height);
-            (position < total).then(|| {
-                let side = if pointer.x >= layout.right.name.start {
-                    Side::Right
-                } else {
-                    Side::Left
-                };
-                (side, position)
-            })
-        });
-        if pressed {
-            self.selection_drag = pointer_row.and_then(|(side, position)| {
-                let row = self.rows.get(position)?;
-                let node = self.arena.node(row.node)?;
-                Some(DragSelection {
-                    side,
-                    rel: node.rel.clone(),
-                    moved: false,
-                    last_end: None,
+        let pointer_input_enabled = self.tree_takes_input();
+        let pressed = pressed && pointer_input_enabled;
+        let down = down && pointer_input_enabled;
+        let released = released && pointer_input_enabled;
+        let clicked = clicked && pointer_input_enabled;
+        let double_clicked = double_clicked && pointer_input_enabled;
+        let pointer_row = if pointer_input_enabled {
+            cursor.and_then(|pointer| {
+                if !body.contains(pointer)
+                    || (layout.splitter.start..=layout.splitter.end).contains(&pointer.x)
+                {
+                    return None;
+                }
+                let position = self.scroll.row_under(pointer.y - body.top(), row_height);
+                (position < total).then(|| {
+                    let side = if pointer.x >= layout.right.name.start {
+                        Side::Right
+                    } else {
+                        Side::Left
+                    };
+                    (side, position)
                 })
-            });
+            })
+        } else {
+            self.selection_drag = None;
+            None
+        };
+        if pressed {
+            self.selection_drag = pointer_row
+                .filter(|_| !modifiers.command && !modifiers.shift)
+                .and_then(|(side, position)| {
+                    let row = self.rows.get(position)?;
+                    let node = self.arena.node(row.node)?;
+                    Some(DragSelection {
+                        side,
+                        rel: node.rel.clone(),
+                        moved: false,
+                        last_end: None,
+                    })
+                });
         }
         let mut suppress_click = false;
         if down && !pressed {
@@ -2910,9 +2923,8 @@ impl FolderView {
         }
     }
 
-    /// True while no dialog of the view is on screen, so the tree may hold
-    /// the keyboard.
-    fn tree_takes_keys(&self) -> bool {
+    /// True while no dialog of the view is on screen, so the tree can accept input.
+    fn tree_takes_input(&self) -> bool {
         let recovery_shown = self.show_recovery && !self.notices.is_empty();
         !self.stage.blocks_input() && self.message.is_none() && !recovery_shown
     }
@@ -2926,7 +2938,7 @@ impl FolderView {
     fn claim_keyboard(&self, ui: &egui::Ui, body: egui::Rect) {
         let id = self.tree_widget();
         let response = ui.interact(body, id, egui::Sense::click());
-        if !self.tree_takes_keys() {
+        if !self.tree_takes_input() {
             ui.memory_mut(|memory| memory.surrender_focus(id));
             return;
         }
