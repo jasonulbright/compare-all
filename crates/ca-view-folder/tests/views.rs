@@ -387,6 +387,51 @@ fn dragging_across_the_split_selects_the_visible_range_on_both_sides() -> std::i
         "the click-classified boundary drag must retain a range"
     );
 
+    let file_position = rows.iter().position(|row| {
+        view.arena()
+            .node(row.node)
+            .is_some_and(|node| node.rel == Path::new("sub/differs.txt") && !node.is_dir)
+    });
+    assert!(
+        file_position.is_some(),
+        "the fixture contains a regular file"
+    );
+    let file_position = file_position.unwrap_or_default();
+    assert!(file_position > 0, "the regular file has a preceding row");
+    let file_boundary = body.top() + row_height * file_position as f32;
+    let before_file = egui::pos2(body.left() + 8.0, file_boundary - 1.0);
+    let regular_file = egui::pos2(body.left() + 8.0, file_boundary + 1.0);
+    frame_with(
+        &mut view,
+        &ctx,
+        vec![
+            egui::Event::PointerMoved(before_file),
+            egui::Event::PointerButton {
+                pos: before_file,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ],
+    );
+    frame_with(
+        &mut view,
+        &ctx,
+        vec![egui::Event::PointerMoved(regular_file)],
+    );
+    frame_with(
+        &mut view,
+        &ctx,
+        vec![egui::Event::PointerButton {
+            pos: regular_file,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }],
+    );
+    assert!(ctx.input(|input| input.pointer.primary_clicked()));
+    assert!(view.selection().side(ca_fs::Side::Left).len() > 1);
+
     let start_rel = rows
         .first()
         .and_then(|row| view.arena().node(row.node))
