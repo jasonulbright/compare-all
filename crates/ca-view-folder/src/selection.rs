@@ -509,7 +509,6 @@ mod tests {
         let (arena, rows) = model();
         let orphan = PathBuf::from("d.txt");
         let mut selection = Selection::new();
-        // A stale selection can exist for the blank side of a right-only row.
         selection.left.insert(orphan.clone());
 
         selection.invert_visible(&rows, &arena);
