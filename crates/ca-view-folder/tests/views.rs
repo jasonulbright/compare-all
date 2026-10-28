@@ -814,7 +814,7 @@ fn frame_with(view: &mut FolderView, ctx: &egui::Context, events: Vec<egui::Even
 
 fn frame_with_modifiers(
     view: &mut FolderView,
-    ctx: &egui::Context,
+    egui_context: &egui::Context,
     events: Vec<egui::Event>,
     modifiers: egui::Modifiers,
 ) {
@@ -822,8 +822,8 @@ fn frame_with_modifiers(
     let context = context();
     let mut input = ca_ui::testing::event_input(1_280.0, 800.0, events);
     input.modifiers = modifiers;
-    let _ = ctx.run(input, |ctx| {
-        egui::CentralPanel::default().show(ctx, |ui| {
+    let _ = egui_context.run(input, |frame_context| {
+        egui::CentralPanel::default().show(frame_context, |ui| {
             view.ui(ui, &context);
         });
     });
