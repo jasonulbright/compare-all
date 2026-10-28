@@ -229,12 +229,12 @@ fn a_selection_survives_a_filter_change() {
     clippy::cast_precision_loss,
     clippy::cast_sign_loss
 )]
-fn dragging_across_the_split_selects_the_visible_range_on_both_sides() {
+fn dragging_across_the_split_selects_the_visible_range_on_both_sides() -> std::io::Result<()> {
     let dir = fixture();
     for side in ["left", "right"] {
         let earlier = dir.path().join(side).join("before");
-        std::fs::create_dir_all(&earlier).unwrap();
-        std::fs::write(earlier.join("present.txt"), b"present").unwrap();
+        std::fs::create_dir_all(&earlier)?;
+        std::fs::write(earlier.join("present.txt"), b"present")?;
     }
     let mut view = view_over(dir.path());
     assert!(tick_until(&mut view, SessionView::is_ready));
@@ -340,9 +340,8 @@ fn dragging_across_the_split_selects_the_visible_range_on_both_sides() {
         "releasing on the sub folder disclosure marker must not collapse it"
     );
 
-    // Move across the row boundary by only two points so egui still reports a
-    // click. Releasing over the disclosure marker must not collapse the folder
-    // after the range selection has moved to it.
+    // A two-point row-boundary crossing remains within egui's click threshold;
+    // the disclosure click is suppressed after the range moves.
     assert!(sub_position > 0, "the sub folder has a preceding row");
     let boundary = body.top() + row_height * sub_position as f32;
     let disclosure = egui::pos2(body.left() + 8.0, boundary + 1.0);
@@ -382,6 +381,10 @@ fn dragging_across_the_split_selects_the_visible_range_on_both_sides() {
                 .is_some_and(|node| node.rel == Path::new("sub/differs.txt"))
         }),
         "a click-classified drag ending on the disclosure marker must not collapse it"
+    );
+    assert!(
+        view.selection().side(ca_fs::Side::Left).len() > 1,
+        "the click-classified boundary drag must retain a range"
     );
 
     let start_rel = rows
@@ -426,6 +429,7 @@ fn dragging_across_the_split_selects_the_visible_range_on_both_sides() {
         &std::collections::BTreeSet::from([start_rel])
     );
     assert!(view.selection().side(ca_fs::Side::Right).is_empty());
+    Ok(())
 }
 
 /// One frame of `view` with `events` delivered.
