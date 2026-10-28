@@ -1,3 +1,13 @@
+# v2026.10.28.0013
+
+## 1 action copies selected paths from either side
+
+### Features
+
+- Copy selected local folder paths from either comparison side to the clipboard.
+
+Full changelog: CHANGELOG.md
+
 # v2026.10.28.0012
 
 ## Ten comparison features now available
