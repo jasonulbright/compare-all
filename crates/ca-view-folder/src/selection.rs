@@ -281,11 +281,19 @@ impl Selection {
             let Some(node) = arena.node(row.node) else {
                 continue;
             };
-            if node.left.is_some() && !self.left.remove(&node.rel) {
-                self.left.insert(node.rel.clone());
+            if node.left.is_some() {
+                if !self.left.remove(&node.rel) {
+                    self.left.insert(node.rel.clone());
+                }
+            } else {
+                self.left.remove(&node.rel);
             }
-            if node.right.is_some() && !self.right.remove(&node.rel) {
-                self.right.insert(node.rel.clone());
+            if node.right.is_some() {
+                if !self.right.remove(&node.rel) {
+                    self.right.insert(node.rel.clone());
+                }
+            } else {
+                self.right.remove(&node.rel);
             }
         }
         self.anchor = None;
@@ -494,6 +502,26 @@ mod tests {
         assert!(selection.contains(Side::Left, Path::new("a.txt")));
         assert_eq!(selection.side(Side::Right).len(), 1);
         assert!(selection.contains(Side::Right, Path::new("d.txt")));
+    }
+
+    #[test]
+    fn invert_visible_clears_selection_for_absent_sides() {
+        let (arena, rows) = model();
+        let orphan = PathBuf::from("d.txt");
+        let mut selection = Selection::new();
+        // A stale selection can exist for the blank side of a right-only row.
+        selection.left.insert(orphan.clone());
+
+        selection.invert_visible(&rows, &arena);
+
+        assert!(
+            !selection.contains(Side::Left, &orphan),
+            "inversion must clear selection from the absent left side"
+        );
+        assert!(
+            selection.contains(Side::Right, &orphan),
+            "inversion must select the present right-side item"
+        );
     }
 
     #[test]
