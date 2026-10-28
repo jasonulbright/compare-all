@@ -1131,15 +1131,24 @@ pub fn spawn_rescan(
                 if cancel.is_cancelled() {
                     break;
                 }
-                let refreshed = scan_subtree(
-                    &left_base,
-                    &right_base,
-                    &rel,
-                    &name_filter,
-                    &options,
-                    cancel,
-                );
-                splice(&mut tree, &rel, refreshed);
+                let mut scan_rel = rel;
+                loop {
+                    let refreshed = scan_subtree(
+                        &left_base,
+                        &right_base,
+                        &scan_rel,
+                        &name_filter,
+                        &options,
+                        cancel,
+                    );
+                    if !needs_wider_rescan(&tree, &scan_rel, &refreshed) {
+                        splice(&mut tree, &scan_rel, refreshed);
+                        break;
+                    }
+                    scan_rel = scan_rel
+                        .parent()
+                        .map_or_else(PathBuf::new, Path::to_path_buf);
+                }
             }
             ca_fs::rollup(&mut tree);
             let arena = Arena::from_root(&tree);
@@ -1338,6 +1347,39 @@ fn splice(tree: &mut Node, rel: &Path, refreshed: ScannedSubtree) {
     }
 }
 
+/// A changed side means the scan root itself needs to be included as a child
+/// of its parent so the refreshed tree can update that side's entry as well.
+fn needs_wider_rescan(tree: &Node, rel: &Path, refreshed: &ScannedSubtree) -> bool {
+    if rel.as_os_str().is_empty() {
+        return false;
+    }
+    let node = find_node(tree, rel);
+    let side_changed = |current: bool, rescanned: Option<bool>| {
+        rescanned.is_some_and(|present| current != present)
+    };
+    side_changed(
+        node.is_some_and(|node| node.left.is_some()),
+        refreshed.left.present,
+    ) || side_changed(
+        node.is_some_and(|node| node.right.is_some()),
+        refreshed.right.present,
+    )
+}
+
+fn find_node<'a>(tree: &'a Node, rel: &Path) -> Option<&'a Node> {
+    let mut stack = vec![tree];
+    while let Some(node) = stack.pop() {
+        if node.rel == rel {
+            return Some(node);
+        }
+        if !rel.starts_with(&node.rel) && !node.rel.as_os_str().is_empty() {
+            continue;
+        }
+        stack.extend(node.children.iter());
+    }
+    None
+}
+
 /// Adjust every ancestor by the change in the rescanned folder's total.
 fn update_ancestor_sizes(
     tree: &mut Node,
@@ -1406,7 +1448,10 @@ pub fn affected_roots(plan: &OperationPlan) -> Vec<PathBuf> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::{minimal_roots, splice, Answer, Ask, Question, RescannedSide, ScannedSubtree};
+    use super::{
+        minimal_roots, needs_wider_rescan, splice, Answer, Ask, Question, RescannedSide,
+        ScannedSubtree,
+    };
     use ca_fs::{Node, NodeStatus, PairFacts, StatusFlags};
     use ca_ui::worker::Cancel;
     use std::path::PathBuf;
@@ -1512,6 +1557,70 @@ mod tests {
         assert_eq!(refreshed_parent.facts.left_folder_size, Some(25));
         assert_eq!(refreshed_parent.facts.right_folder_size, Some(40));
         assert_eq!(refreshed_parent.children[0].facts.right_folder_size, None);
+    }
+
+    #[test]
+    fn targeted_rescan_widens_when_a_folder_side_appears() {
+        let mut target = folder("parent/child", Some(10), Vec::new());
+        target.right = None;
+        target.facts.right_folder_size = None;
+        let parent = folder("parent", Some(10), vec![target.clone()]);
+        let mut root = folder("", Some(10), vec![parent]);
+        let rescanned_target = ScannedSubtree {
+            children: Vec::new(),
+            left: RescannedSide {
+                present: Some(true),
+                folder_size: Some(10),
+            },
+            right: RescannedSide {
+                present: Some(true),
+                folder_size: Some(6),
+            },
+        };
+
+        assert!(needs_wider_rescan(
+            &root,
+            std::path::Path::new("parent/child"),
+            &rescanned_target,
+        ));
+
+        let mut refreshed_target = target;
+        refreshed_target.right = refreshed_target.left.clone();
+        refreshed_target.facts.right_folder_size = Some(6);
+        splice(
+            &mut root,
+            std::path::Path::new("parent"),
+            ScannedSubtree {
+                children: vec![refreshed_target],
+                left: RescannedSide {
+                    present: Some(true),
+                    folder_size: Some(10),
+                },
+                right: RescannedSide {
+                    present: Some(true),
+                    folder_size: Some(16),
+                },
+            },
+        );
+
+        let refreshed_child = &root.children[0].children[0];
+        assert!(refreshed_child.right.is_some());
+        assert_eq!(root.facts.right_folder_size, Some(16));
+        assert_eq!(root.children[0].facts.right_folder_size, Some(16));
+        assert!(!needs_wider_rescan(
+            &root,
+            std::path::Path::new("parent/child"),
+            &rescanned_target,
+        ));
+
+        splice(
+            &mut root,
+            std::path::Path::new("parent/child"),
+            rescanned_target,
+        );
+
+        assert_eq!(root.facts.right_folder_size, Some(16));
+        assert_eq!(root.children[0].facts.right_folder_size, Some(16));
     }
 
     /// Run the recovery check on `journals` and take its one result.
