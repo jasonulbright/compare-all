@@ -7,6 +7,8 @@
 use ca_ui::command::Command;
 use ca_ui::testing::{context, sized_input};
 use ca_ui::view::SessionView;
+use ca_view_folder::operations::Operation;
+use ca_view_folder::selection::ClickKind;
 use ca_view_folder::FolderView;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -222,12 +224,606 @@ fn a_selection_survives_a_filter_change() {
     );
 }
 
+struct DragHarness {
+    _directory: tempfile::TempDir,
+    view: FolderView,
+    egui_context: egui::Context,
+    rows: Vec<ca_view_folder::tree::FlatRow>,
+    sub_position: usize,
+    body: egui::Rect,
+    row_height: f32,
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
+fn drag_harness() -> std::io::Result<DragHarness> {
+    let directory = fixture();
+    for side in ["left", "right"] {
+        let earlier = directory.path().join(side).join("before");
+        std::fs::create_dir_all(&earlier)?;
+        std::fs::write(earlier.join("present.txt"), b"present")?;
+    }
+    let mut view = view_over(directory.path());
+    assert!(tick_until(&mut view, SessionView::is_ready));
+    view.run(Command::ExpandAll);
+    let egui_context = egui::Context::default();
+    for _ in 0..3 {
+        frame_with(&mut view, &egui_context, Vec::new());
+    }
+    let rows = view.rows().to_vec();
+    assert!(rows.len() >= 2, "the fixture must contain multiple rows");
+    let body = egui_context
+        .read_response(view.tree_widget())
+        .expect("the folder tree is on screen")
+        .rect;
+    let row_height = view.row_height();
+    let sub_position = rows.iter().position(|row| {
+        view.arena()
+            .node(row.node)
+            .is_some_and(|node| node.rel == Path::new("sub"))
+    });
+    assert!(sub_position.is_some(), "the expanded sub folder is visible");
+    let sub_position = sub_position.unwrap_or_default();
+    let last_visible = ((body.height() / row_height).floor() as usize)
+        .saturating_sub(1)
+        .min(rows.len() - 1);
+    assert!(sub_position <= last_visible, "the sub folder is visible");
+
+    Ok(DragHarness {
+        _directory: directory,
+        view,
+        egui_context,
+        rows,
+        sub_position,
+        body,
+        row_height,
+    })
+}
+
+fn primary_button(position: egui::Pos2, pressed: bool) -> egui::Event {
+    egui::Event::PointerButton {
+        pos: position,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::NONE,
+    }
+}
+
+fn primary_button_with_modifiers(
+    position: egui::Pos2,
+    pressed: bool,
+    modifiers: egui::Modifiers,
+) -> egui::Event {
+    egui::Event::PointerButton {
+        pos: position,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers,
+    }
+}
+
+#[test]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
+fn dragging_across_the_split_selects_the_visible_range_on_both_sides() -> std::io::Result<()> {
+    let mut harness = drag_harness()?;
+    let sub_position = harness.sub_position;
+    assert!(harness.rows.iter().any(|row| {
+        harness
+            .view
+            .arena()
+            .node(row.node)
+            .is_some_and(|node| node.rel == Path::new("sub/differs.txt"))
+    }));
+
+    let start = egui::pos2(
+        harness.body.left() + harness.body.width() * 0.25,
+        harness.body.top() + harness.row_height * 0.5,
+    );
+    let end = egui::pos2(
+        harness.body.left() + harness.body.width() * 0.5 + 10.0,
+        harness.body.top() + harness.row_height * (sub_position as f32 + 0.5),
+    );
+    frame_with(
+        &mut harness.view,
+        &harness.egui_context,
+        vec![
+            egui::Event::PointerMoved(start),
+            primary_button(start, true),
+        ],
+    );
+    frame_with(
+        &mut harness.view,
+        &harness.egui_context,
+        vec![egui::Event::PointerMoved(end)],
+    );
+    frame_with(
+        &mut harness.view,
+        &harness.egui_context,
+        vec![primary_button(end, false)],
+    );
+
+    let expected = |side| {
+        harness
+            .rows
+            .iter()
+            .take(sub_position + 1)
+            .filter_map(|row| {
+                let node = harness.view.arena().node(row.node)?;
+                let present = match side {
+                    ca_fs::Side::Left => node.left.is_some(),
+                    ca_fs::Side::Right => node.right.is_some(),
+                };
+                present.then(|| node.rel.clone())
+            })
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    assert_eq!(
+        harness.view.selection().side(ca_fs::Side::Left),
+        &expected(ca_fs::Side::Left)
+    );
+    assert_eq!(
+        harness.view.selection().side(ca_fs::Side::Right),
+        &expected(ca_fs::Side::Right)
+    );
+    assert_eq!(
+        harness
+            .view
+            .selection()
+            .cursor()
+            .map(|(side, rel)| (side, rel.to_path_buf())),
+        Some((ca_fs::Side::Right, PathBuf::from("sub")))
+    );
+    assert!(harness.view.rows().iter().any(|row| {
+        harness
+            .view
+            .arena()
+            .node(row.node)
+            .is_some_and(|node| node.rel == Path::new("sub/differs.txt"))
+    }));
+    Ok(())
+}
+
+#[test]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
+fn a_short_drag_to_a_disclosure_marker_does_not_collapse_the_folder() -> std::io::Result<()> {
+    let mut harness = drag_harness()?;
+    let sub_position = harness.sub_position;
+    assert!(sub_position > 0, "the sub folder has a preceding row");
+    let boundary = harness.body.top() + harness.row_height * sub_position as f32;
+    let disclosure = egui::pos2(harness.body.left() + 8.0, boundary + 1.0);
+    let before_boundary = egui::pos2(disclosure.x, boundary - 1.0);
+
+    frame_with(
+        &mut harness.view,
+        &harness.egui_context,
+        vec![
+            egui::Event::PointerMoved(before_boundary),
+            primary_button(before_boundary, true),
+        ],
+    );
+    frame_with(
+        &mut harness.view,
+        &harness.egui_context,
+        vec![egui::Event::PointerMoved(disclosure)],
+    );
+    frame_with(
+        &mut harness.view,
+        &harness.egui_context,
+        vec![primary_button(disclosure, false)],
+    );
+
+    assert!(
+        harness
+            .egui_context
+            .input(|input| input.pointer.primary_clicked()),
+        "the short boundary drag remains classified as a click"
+    );
+    assert!(harness.view.rows().iter().any(|row| {
+        harness
+            .view
+            .arena()
+            .node(row.node)
+            .is_some_and(|node| node.rel == Path::new("sub/differs.txt"))
+    }));
+    assert!(harness.view.selection().side(ca_fs::Side::Left).len() > 1);
+    Ok(())
+}
+
+#[test]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
+fn a_short_drag_classified_as_a_double_click_does_not_collapse_the_folder() -> std::io::Result<()> {
+    let mut harness = drag_harness()?;
+    let sub_position = harness.sub_position;
+    assert!(sub_position > 0, "the sub folder has a preceding row");
+    let boundary = harness.body.top() + harness.row_height * sub_position as f32;
+    let disclosure = egui::pos2(harness.body.left() + 8.0, boundary + 1.0);
+    let before_boundary = egui::pos2(disclosure.x, boundary - 1.0);
+
+    frame_with(
+        &mut harness.view,
+        &harness.egui_context,
+        vec![
+            egui::Event::PointerMoved(before_boundary),
+            primary_button(before_boundary, true),
+        ],
+    );
+    frame_with(
+        &mut harness.view,
+        &harness.egui_context,
+        vec![primary_button(before_boundary, false)],
+    );
+
+    frame_with(
+        &mut harness.view,
+        &harness.egui_context,
+        vec![
+            egui::Event::PointerMoved(before_boundary),
+            primary_button(before_boundary, true),
+        ],
+    );
+    frame_with(
+        &mut harness.view,
+        &harness.egui_context,
+        vec![egui::Event::PointerMoved(disclosure)],
+    );
+    frame_with(
+        &mut harness.view,
+        &harness.egui_context,
+        vec![primary_button(disclosure, false)],
+    );
+
+    assert!(harness.egui_context.input(|input| {
+        input
+            .pointer
+            .button_double_clicked(egui::PointerButton::Primary)
+    }));
+    assert!(harness.view.rows().iter().any(|row| {
+        harness
+            .view
+            .arena()
+            .node(row.node)
+            .is_some_and(|node| node.rel == Path::new("sub/differs.txt"))
+    }));
+    Ok(())
+}
+
+#[test]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
+fn a_command_click_drag_keeps_the_existing_selection() -> std::io::Result<()> {
+    let mut harness = drag_harness()?;
+    let file_position = harness.rows.iter().position(|row| {
+        harness
+            .view
+            .arena()
+            .node(row.node)
+            .is_some_and(|node| node.rel == Path::new("sub/differs.txt") && !node.is_dir)
+    });
+    assert!(
+        file_position.is_some(),
+        "the fixture contains a regular file"
+    );
+    let file_position = file_position.unwrap_or_default();
+    assert!(file_position > 0, "the regular file has a preceding row");
+    let rows = harness.rows.clone();
+    let arena = harness.view.arena().clone();
+    let selected_positions = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| {
+            arena
+                .node(row.node)
+                .is_some_and(|node| !node.is_dir && node.rel != Path::new("sub/differs.txt"))
+        })
+        .map(|(position, _)| position)
+        .take(2)
+        .collect::<Vec<_>>();
+    assert_eq!(selected_positions.len(), 2);
+    harness.view.selection_mut().click(
+        ca_fs::Side::Left,
+        selected_positions[0],
+        &rows,
+        &arena,
+        ClickKind::Replace,
+    );
+    harness.view.selection_mut().click(
+        ca_fs::Side::Left,
+        selected_positions[1],
+        &rows,
+        &arena,
+        ClickKind::Toggle,
+    );
+    let original_selection = harness.view.selection().side(ca_fs::Side::Left).clone();
+
+    let boundary = harness.body.top() + harness.row_height * file_position as f32;
+    let before_file = egui::pos2(harness.body.left() + 100.0, boundary - 1.0);
+    let regular_file = egui::pos2(harness.body.left() + 100.0, boundary + 1.0);
+    let modifiers = egui::Modifiers {
+        ctrl: true,
+        command: true,
+        ..egui::Modifiers::NONE
+    };
+    frame_with_modifiers(
+        &mut harness.view,
+        &harness.egui_context,
+        vec![
+            egui::Event::PointerMoved(before_file),
+            primary_button_with_modifiers(before_file, true, modifiers),
+        ],
+        modifiers,
+    );
+    frame_with_modifiers(
+        &mut harness.view,
+        &harness.egui_context,
+        vec![egui::Event::PointerMoved(regular_file)],
+        modifiers,
+    );
+    frame_with_modifiers(
+        &mut harness.view,
+        &harness.egui_context,
+        vec![primary_button_with_modifiers(
+            regular_file,
+            false,
+            modifiers,
+        )],
+        modifiers,
+    );
+
+    assert!(original_selection
+        .iter()
+        .all(|rel| harness.view.selection().contains(ca_fs::Side::Left, rel)));
+    assert!(harness
+        .view
+        .selection()
+        .contains(ca_fs::Side::Left, Path::new("sub/differs.txt")));
+    Ok(())
+}
+
+#[test]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
+fn a_confirmation_dialog_blocks_tree_pointer_selection() -> std::io::Result<()> {
+    let mut harness = drag_harness()?;
+    let rows = harness.rows.clone();
+    let arena = harness.view.arena().clone();
+    let selected_positions = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| {
+            arena
+                .node(row.node)
+                .is_some_and(|node| !node.is_dir && node.rel != Path::new("sub/differs.txt"))
+        })
+        .map(|(position, _)| position)
+        .take(2)
+        .collect::<Vec<_>>();
+    assert_eq!(selected_positions.len(), 2);
+    harness.view.selection_mut().click(
+        ca_fs::Side::Left,
+        selected_positions[0],
+        &rows,
+        &arena,
+        ClickKind::Replace,
+    );
+    harness.view.selection_mut().click(
+        ca_fs::Side::Left,
+        selected_positions[1],
+        &rows,
+        &arena,
+        ClickKind::Toggle,
+    );
+    let original_selection = harness.view.selection().side(ca_fs::Side::Left).clone();
+    harness.view.start_operation(Operation::Delete);
+    assert!(tick_until(&mut harness.view, FolderView::is_confirming));
+
+    let file_position = harness.rows.iter().position(|row| {
+        harness
+            .view
+            .arena()
+            .node(row.node)
+            .is_some_and(|node| node.rel == Path::new("sub/differs.txt") && !node.is_dir)
+    });
+    assert!(
+        file_position.is_some(),
+        "the fixture contains a regular file"
+    );
+    let file_position = file_position.unwrap_or_default();
+    assert!(file_position > 0, "the regular file has a preceding row");
+    let boundary = harness.body.top() + harness.row_height * file_position as f32;
+    let before_file = egui::pos2(harness.body.left() + 100.0, boundary - 1.0);
+    let regular_file = egui::pos2(harness.body.left() + 100.0, boundary + 1.0);
+    frame_with(
+        &mut harness.view,
+        &harness.egui_context,
+        vec![
+            egui::Event::PointerMoved(before_file),
+            primary_button(before_file, true),
+        ],
+    );
+    frame_with(
+        &mut harness.view,
+        &harness.egui_context,
+        vec![egui::Event::PointerMoved(regular_file)],
+    );
+    frame_with(
+        &mut harness.view,
+        &harness.egui_context,
+        vec![primary_button(regular_file, false)],
+    );
+
+    assert_eq!(
+        harness.view.selection().side(ca_fs::Side::Left),
+        &original_selection
+    );
+    Ok(())
+}
+
+#[test]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
+fn a_short_drag_to_a_regular_file_row_keeps_the_range() -> std::io::Result<()> {
+    let mut harness = drag_harness()?;
+    let file_position = harness.rows.iter().position(|row| {
+        harness
+            .view
+            .arena()
+            .node(row.node)
+            .is_some_and(|node| node.rel == Path::new("sub/differs.txt") && !node.is_dir)
+    });
+    assert!(
+        file_position.is_some(),
+        "the fixture contains a regular file"
+    );
+    let file_position = file_position.unwrap_or_default();
+    assert!(file_position > 0, "the regular file has a preceding row");
+    let boundary = harness.body.top() + harness.row_height * file_position as f32;
+    let before_file = egui::pos2(harness.body.left() + 8.0, boundary - 1.0);
+    let regular_file = egui::pos2(harness.body.left() + 8.0, boundary + 1.0);
+
+    frame_with(
+        &mut harness.view,
+        &harness.egui_context,
+        vec![
+            egui::Event::PointerMoved(before_file),
+            primary_button(before_file, true),
+        ],
+    );
+    frame_with(
+        &mut harness.view,
+        &harness.egui_context,
+        vec![egui::Event::PointerMoved(regular_file)],
+    );
+    frame_with(
+        &mut harness.view,
+        &harness.egui_context,
+        vec![primary_button(regular_file, false)],
+    );
+
+    assert!(harness
+        .egui_context
+        .input(|input| input.pointer.primary_clicked()));
+    assert!(harness.view.selection().side(ca_fs::Side::Left).len() > 1);
+    Ok(())
+}
+
+#[test]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
+fn dragging_back_to_the_pressed_row_updates_selection_before_release() -> std::io::Result<()> {
+    let mut harness = drag_harness()?;
+    let sub_position = harness.sub_position;
+    let start = egui::pos2(
+        harness.body.left() + harness.body.width() * 0.25,
+        harness.body.top() + harness.row_height * 0.5,
+    );
+    let end = egui::pos2(
+        harness.body.left() + harness.body.width() * 0.5 + 10.0,
+        harness.body.top() + harness.row_height * (sub_position as f32 + 0.5),
+    );
+    let start_rel = harness
+        .rows
+        .first()
+        .and_then(|row| harness.view.arena().node(row.node))
+        .map(|node| node.rel.clone());
+    assert!(start_rel.is_some(), "the first visible fixture row exists");
+    let start_rel = start_rel.unwrap_or_default();
+
+    frame_with(
+        &mut harness.view,
+        &harness.egui_context,
+        vec![
+            egui::Event::PointerMoved(start),
+            primary_button(start, true),
+        ],
+    );
+    frame_with(
+        &mut harness.view,
+        &harness.egui_context,
+        vec![egui::Event::PointerMoved(end)],
+    );
+    frame_with(
+        &mut harness.view,
+        &harness.egui_context,
+        vec![egui::Event::PointerMoved(start)],
+    );
+    assert_eq!(harness.view.selection().side(ca_fs::Side::Left).len(), 1);
+    assert!(harness
+        .view
+        .selection()
+        .side(ca_fs::Side::Left)
+        .contains(&start_rel));
+    assert!(harness.view.selection().side(ca_fs::Side::Right).is_empty());
+
+    frame_with(
+        &mut harness.view,
+        &harness.egui_context,
+        vec![primary_button(start, false)],
+    );
+    assert_eq!(
+        harness
+            .view
+            .selection()
+            .cursor()
+            .map(|(side, rel)| (side, rel.to_path_buf())),
+        Some((ca_fs::Side::Left, start_rel.clone()))
+    );
+    assert_eq!(
+        harness.view.selection().side(ca_fs::Side::Left),
+        &std::collections::BTreeSet::from([start_rel])
+    );
+    assert!(harness.view.selection().side(ca_fs::Side::Right).is_empty());
+    Ok(())
+}
 /// One frame of `view` with `events` delivered.
 fn frame_with(view: &mut FolderView, ctx: &egui::Context, events: Vec<egui::Event>) {
     view.tick();
     let context = context();
     let _ = ctx.run(ca_ui::testing::event_input(1_280.0, 800.0, events), |ctx| {
         egui::CentralPanel::default().show(ctx, |ui| {
+            view.ui(ui, &context);
+        });
+    });
+}
+
+fn frame_with_modifiers(
+    view: &mut FolderView,
+    egui_context: &egui::Context,
+    events: Vec<egui::Event>,
+    modifiers: egui::Modifiers,
+) {
+    view.tick();
+    let context = context();
+    let mut input = ca_ui::testing::event_input(1_280.0, 800.0, events);
+    input.modifiers = modifiers;
+    let _ = egui_context.run(input, |frame_context| {
+        egui::CentralPanel::default().show(frame_context, |ui| {
             view.ui(ui, &context);
         });
     });

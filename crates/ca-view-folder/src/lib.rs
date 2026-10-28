@@ -305,6 +305,13 @@ fn shows_the_same_steps(shown: &OperationPlan, built: &OperationPlan) -> bool {
         && shown.skipped == built.skipped
 }
 
+struct DragSelection {
+    side: Side,
+    rel: PathBuf,
+    moved: bool,
+    last_end: Option<(Side, usize)>,
+}
+
 /// A folder comparison tab.
 #[allow(clippy::struct_excessive_bools)]
 pub struct FolderView {
@@ -375,6 +382,7 @@ pub struct FolderView {
     content_method: ContentMethod,
     content_done: usize,
     selection: Selection,
+    selection_drag: Option<DragSelection>,
     form: Form,
     stage: Stage,
     ask: Option<Arc<Ask>>,
@@ -554,6 +562,7 @@ impl FolderView {
             content_method: ContentMethod::Binary,
             content_done: 0,
             selection: Selection::new(),
+            selection_drag: None,
             form: Form::default(),
             stage: Stage::Idle,
             ask: None,
@@ -1264,6 +1273,7 @@ impl FolderView {
         self.comparisons.start();
         self.drop_jobs();
         self.drop_operation_in_wait();
+        self.selection_drag = None;
         self.arena = Arena::default();
         self.sides = None;
         self.compared_tree = None;
@@ -1827,6 +1837,9 @@ impl FolderView {
         self.visible = self.arena.visibility(self.filter, self.folder_filter);
         self.rows = self.arena.flatten(&self.expanded, &self.visible);
         self.order = navigate::DisplayOrder::of(&self.arena, &self.visible);
+        if let Some(drag) = &mut self.selection_drag {
+            drag.last_end = None;
+        }
         self.scroll
             .clamp(self.viewport_height, self.row_height(), self.rows.len());
         self.rebuild_pending = false;
@@ -2581,6 +2594,32 @@ impl FolderView {
         }
     }
 
+    fn extend_selection_drag(&mut self, end: Option<(Side, usize)>) {
+        let (Some(drag), Some((end_side, end_position))) = (self.selection_drag.as_mut(), end)
+        else {
+            return;
+        };
+        let endpoint_changed = self
+            .rows
+            .get(end_position)
+            .and_then(|row| self.arena.node(row.node))
+            .is_some_and(|node| node.rel != drag.rel || end_side != drag.side);
+        if (drag.moved || endpoint_changed) && drag.last_end != Some((end_side, end_position)) {
+            let applied = self.selection.drag_range(
+                drag.side,
+                &drag.rel,
+                end_side,
+                end_position,
+                &self.rows,
+                &self.arena,
+            );
+            drag.moved |= applied;
+            if applied {
+                drag.last_end = Some((end_side, end_position));
+            }
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     fn tree_ui(&mut self, ui: &mut egui::Ui, palette: &Palette) -> Vec<ViewAction> {
         let full = ui.available_rect_before_wrap();
@@ -2605,8 +2644,11 @@ impl FolderView {
         let mut toggle: Option<u32> = None;
         let mut click: Option<(Side, usize, ClickKind)> = None;
         let cursor = ui.ctx().pointer_latest_pos();
-        let (clicked, double_clicked, modifiers) = ui.input(|input| {
+        let (pressed, down, released, clicked, double_clicked, modifiers) = ui.input(|input| {
             (
+                input.pointer.primary_pressed(),
+                input.pointer.primary_down(),
+                input.pointer.primary_released(),
                 input.pointer.primary_clicked(),
                 input
                     .pointer
@@ -2614,6 +2656,60 @@ impl FolderView {
                 input.modifiers,
             )
         });
+        let pointer_input_enabled = self.tree_takes_input();
+        let pressed = pressed && pointer_input_enabled;
+        let down = down && pointer_input_enabled;
+        let released = released && pointer_input_enabled;
+        let clicked = clicked && pointer_input_enabled;
+        let double_clicked = double_clicked && pointer_input_enabled;
+        let pointer_row = if pointer_input_enabled {
+            cursor.and_then(|pointer| {
+                if !body.contains(pointer)
+                    || (layout.splitter.start..=layout.splitter.end).contains(&pointer.x)
+                {
+                    return None;
+                }
+                let position = self.scroll.row_under(pointer.y - body.top(), row_height);
+                (position < total).then(|| {
+                    let side = if pointer.x >= layout.right.name.start {
+                        Side::Right
+                    } else {
+                        Side::Left
+                    };
+                    (side, position)
+                })
+            })
+        } else {
+            self.selection_drag = None;
+            None
+        };
+        if pressed {
+            self.selection_drag = pointer_row
+                .filter(|_| !modifiers.command && !modifiers.shift)
+                .and_then(|(side, position)| {
+                    let row = self.rows.get(position)?;
+                    let node = self.arena.node(row.node)?;
+                    Some(DragSelection {
+                        side,
+                        rel: node.rel.clone(),
+                        moved: false,
+                        last_end: None,
+                    })
+                });
+        }
+        let mut suppress_click = false;
+        if down && !pressed {
+            self.extend_selection_drag(pointer_row);
+        }
+        if released {
+            self.extend_selection_drag(pointer_row);
+            suppress_click = clicked
+                && pointer_row.is_some()
+                && self.selection_drag.as_ref().is_some_and(|drag| drag.moved);
+            self.selection_drag = None;
+        } else if !down {
+            self.selection_drag = None;
+        }
         let clip = painter.with_clip_rect(body);
         for position in range {
             let Some(row) = self.rows.get(position) else {
@@ -2691,15 +2787,19 @@ impl FolderView {
                     layout.left
                 };
                 let marker_end = pane.name.start + f32::from(row.depth) * INDENT + 14.0;
-                if clicked && cursor.x <= marker_end {
+                if clicked && !suppress_click && cursor.x <= marker_end {
                     toggle = Some(row.node);
                     continue;
                 }
-                if double_clicked {
+                if double_clicked && !suppress_click {
                     toggle = Some(row.node);
                     continue;
                 }
-            } else if double_clicked && node.left.is_some() && node.right.is_some() {
+            } else if double_clicked
+                && !suppress_click
+                && node.left.is_some()
+                && node.right.is_some()
+            {
                 let request = pair_request(
                     &self.left_path,
                     &self.right_path,
@@ -2718,7 +2818,7 @@ impl FolderView {
                     None => actions.push(ViewAction::Open(request)),
                 }
             }
-            if clicked {
+            if clicked && !suppress_click {
                 let kind = if modifiers.command {
                     ClickKind::Toggle
                 } else if modifiers.shift {
@@ -2823,9 +2923,7 @@ impl FolderView {
         }
     }
 
-    /// True while no dialog of the view is on screen, so the tree may hold
-    /// the keyboard.
-    fn tree_takes_keys(&self) -> bool {
+    fn tree_takes_input(&self) -> bool {
         let recovery_shown = self.show_recovery && !self.notices.is_empty();
         !self.stage.blocks_input() && self.message.is_none() && !recovery_shown
     }
@@ -2839,7 +2937,7 @@ impl FolderView {
     fn claim_keyboard(&self, ui: &egui::Ui, body: egui::Rect) {
         let id = self.tree_widget();
         let response = ui.interact(body, id, egui::Sense::click());
-        if !self.tree_takes_keys() {
+        if !self.tree_takes_input() {
             ui.memory_mut(|memory| memory.surrender_focus(id));
             return;
         }
