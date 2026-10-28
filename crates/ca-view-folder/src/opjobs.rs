@@ -1131,21 +1131,21 @@ pub fn spawn_rescan(
                 if cancel.is_cancelled() {
                     break;
                 }
-                let mut scan_rel = rel;
+                let mut scan_relative_path = rel;
                 loop {
                     let refreshed = scan_subtree(
                         &left_base,
                         &right_base,
-                        &scan_rel,
+                        &scan_relative_path,
                         &name_filter,
                         &options,
                         cancel,
                     );
-                    if !needs_wider_rescan(&tree, &scan_rel, &refreshed) {
-                        splice(&mut tree, &scan_rel, refreshed);
+                    if !needs_wider_rescan(&tree, &scan_relative_path, &refreshed) {
+                        splice(&mut tree, &scan_relative_path, refreshed);
                         break;
                     }
-                    scan_rel = scan_rel
+                    scan_relative_path = scan_relative_path
                         .parent()
                         .map_or_else(PathBuf::new, Path::to_path_buf);
                 }
