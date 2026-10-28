@@ -305,7 +305,6 @@ fn shows_the_same_steps(shown: &OperationPlan, built: &OperationPlan) -> bool {
         && shown.skipped == built.skipped
 }
 
-/// The row where a mouse range selection began.
 struct DragSelection {
     side: Side,
     rel: PathBuf,

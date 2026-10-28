@@ -237,12 +237,12 @@ struct DragHarness {
     clippy::cast_precision_loss,
     clippy::cast_sign_loss
 )]
-fn drag_harness() -> DragHarness {
+fn drag_harness() -> std::io::Result<DragHarness> {
     let directory = fixture();
     for side in ["left", "right"] {
         let earlier = directory.path().join(side).join("before");
-        std::fs::create_dir_all(&earlier).unwrap();
-        std::fs::write(earlier.join("present.txt"), b"present").unwrap();
+        std::fs::create_dir_all(&earlier)?;
+        std::fs::write(earlier.join("present.txt"), b"present")?;
     }
     let mut view = view_over(directory.path());
     assert!(tick_until(&mut view, SessionView::is_ready));
@@ -270,7 +270,7 @@ fn drag_harness() -> DragHarness {
         .min(rows.len() - 1);
     assert!(sub_position <= last_visible, "the sub folder is visible");
 
-    DragHarness {
+    Ok(DragHarness {
         _directory: directory,
         view,
         egui_context,
@@ -278,7 +278,7 @@ fn drag_harness() -> DragHarness {
         sub_position,
         body,
         row_height,
-    }
+    })
 }
 
 fn primary_button(position: egui::Pos2, pressed: bool) -> egui::Event {
@@ -296,8 +296,8 @@ fn primary_button(position: egui::Pos2, pressed: bool) -> egui::Event {
     clippy::cast_precision_loss,
     clippy::cast_sign_loss
 )]
-fn dragging_across_the_split_selects_the_visible_range_on_both_sides() {
-    let mut harness = drag_harness();
+fn dragging_across_the_split_selects_the_visible_range_on_both_sides() -> std::io::Result<()> {
+    let mut harness = drag_harness()?;
     let sub_position = harness.sub_position;
     assert!(harness.rows.iter().any(|row| {
         harness
@@ -372,6 +372,7 @@ fn dragging_across_the_split_selects_the_visible_range_on_both_sides() {
             .node(row.node)
             .is_some_and(|node| node.rel == Path::new("sub/differs.txt"))
     }));
+    Ok(())
 }
 
 #[test]
@@ -380,8 +381,8 @@ fn dragging_across_the_split_selects_the_visible_range_on_both_sides() {
     clippy::cast_precision_loss,
     clippy::cast_sign_loss
 )]
-fn a_short_drag_to_a_disclosure_marker_does_not_collapse_the_folder() {
-    let mut harness = drag_harness();
+fn a_short_drag_to_a_disclosure_marker_does_not_collapse_the_folder() -> std::io::Result<()> {
+    let mut harness = drag_harness()?;
     let sub_position = harness.sub_position;
     assert!(sub_position > 0, "the sub folder has a preceding row");
     let boundary = harness.body.top() + harness.row_height * sub_position as f32;
@@ -421,6 +422,7 @@ fn a_short_drag_to_a_disclosure_marker_does_not_collapse_the_folder() {
             .is_some_and(|node| node.rel == Path::new("sub/differs.txt"))
     }));
     assert!(harness.view.selection().side(ca_fs::Side::Left).len() > 1);
+    Ok(())
 }
 
 #[test]
@@ -429,8 +431,8 @@ fn a_short_drag_to_a_disclosure_marker_does_not_collapse_the_folder() {
     clippy::cast_precision_loss,
     clippy::cast_sign_loss
 )]
-fn a_short_drag_to_a_regular_file_row_keeps_the_range() {
-    let mut harness = drag_harness();
+fn a_short_drag_to_a_regular_file_row_keeps_the_range() -> std::io::Result<()> {
+    let mut harness = drag_harness()?;
     let file_position = harness.rows.iter().position(|row| {
         harness
             .view
@@ -471,6 +473,7 @@ fn a_short_drag_to_a_regular_file_row_keeps_the_range() {
         .egui_context
         .input(|input| input.pointer.primary_clicked()));
     assert!(harness.view.selection().side(ca_fs::Side::Left).len() > 1);
+    Ok(())
 }
 
 #[test]
@@ -479,8 +482,8 @@ fn a_short_drag_to_a_regular_file_row_keeps_the_range() {
     clippy::cast_precision_loss,
     clippy::cast_sign_loss
 )]
-fn dragging_back_to_the_pressed_row_updates_selection_before_release() {
-    let mut harness = drag_harness();
+fn dragging_back_to_the_pressed_row_updates_selection_before_release() -> std::io::Result<()> {
+    let mut harness = drag_harness()?;
     let sub_position = harness.sub_position;
     let start = egui::pos2(
         harness.body.left() + harness.body.width() * 0.25,
@@ -542,6 +545,7 @@ fn dragging_back_to_the_pressed_row_updates_selection_before_release() {
         &std::collections::BTreeSet::from([start_rel])
     );
     assert!(harness.view.selection().side(ca_fs::Side::Right).is_empty());
+    Ok(())
 }
 /// One frame of `view` with `events` delivered.
 fn frame_with(view: &mut FolderView, ctx: &egui::Context, events: Vec<egui::Event>) {
