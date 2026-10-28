@@ -106,6 +106,8 @@ const SCAN_FAILED: &str = "The folder scan failed. Use Refresh to try again";
 const SCAN_STOPPED: &str = "The folder scan was stopped. Use Refresh to try again";
 /// Why an operation needs selected rows.
 const NOTHING_SELECTED_FOR_ACTION: &str = "Select the items to act on first";
+/// Why a selected action cannot export a path.
+const NO_LOCAL_PATH_TO_COPY: &str = "None of the selected items has a local path to copy";
 /// Why an action has no rows when the folder contains none.
 const NO_ITEMS_TO_ACT_ON: &str = "There are no items to act on";
 /// Why the synchronization preview has no operations.
@@ -151,6 +153,7 @@ const HANDLED: &[Command] = &[
     Command::Touch,
     Command::Attributes,
     Command::NewFolder,
+    Command::CopyFilename,
     Command::Exchange,
     Command::Exclude,
 ];
@@ -349,6 +352,7 @@ pub struct FolderView {
     pending_opens: Vec<OpenRequest>,
     /// The report command of this view.
     report: ViewReport,
+    pending_clipboard: Option<String>,
     arena: Arena,
     compared_tree: Option<Box<Node>>,
     expanded: Expanded,
@@ -537,6 +541,7 @@ impl FolderView {
                 egui::Id::new(("folder-compare", instance)),
                 context.notify.clone(),
             ),
+            pending_clipboard: None,
             arena: Arena::default(),
             compared_tree: None,
             expanded: Expanded::new(),
@@ -2252,6 +2257,63 @@ impl FolderView {
         }
     }
 
+    /// Archive sources expose virtual members, so only local sources have an exportable filesystem root.
+    fn copy_base(&self, side: Side) -> Option<PathBuf> {
+        let sides = self.sides.as_ref()?;
+        let (source, base) = match side {
+            Side::Left => (&sides.left, &self.left_path),
+            Side::Right => (&sides.right, &self.right_path),
+        };
+        if !source.is_local_folder() {
+            return None;
+        }
+        std::path::absolute(base).ok()
+    }
+
+    /// Orphan rows can be selected in the blank pane, so membership alone does not prove a path exists there.
+    fn entry_present_on(&self, side: Side, relative_path: &Path) -> bool {
+        self.arena
+            .index_of(relative_path)
+            .and_then(|index| self.arena.node(index))
+            .is_some_and(|node| match side {
+                Side::Left => node.left.is_some(),
+                Side::Right => node.right.is_some(),
+            })
+    }
+
+    /// Availability must use the same local-source and side-presence checks as the clipboard handler.
+    fn has_copyable_selection(&self) -> bool {
+        for side in [Side::Left, Side::Right] {
+            if self.copy_base(side).is_none() {
+                continue;
+            }
+            for relative_path in self.selection.side(side) {
+                if self.entry_present_on(side, relative_path) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Sides are exported independently; otherwise an archive suppresses valid local paths.
+    fn copy_filenames(&mut self) {
+        let mut paths = Vec::with_capacity(self.selection.len());
+        for side in [Side::Left, Side::Right] {
+            let Some(base) = self.copy_base(side) else {
+                continue;
+            };
+            for relative_path in self.selection.side(side) {
+                if self.entry_present_on(side, relative_path) {
+                    paths.push(base.join(relative_path).display().to_string());
+                }
+            }
+        }
+        if !paths.is_empty() {
+            self.pending_clipboard = Some(paths.join("\n"));
+        }
+    }
+
     /// The name the report display filter carries for what the tree shows.
     #[must_use]
     pub const fn report_filter(&self) -> &'static str {
@@ -3699,6 +3761,8 @@ impl SessionView for FolderView {
         self.poll();
     }
 
+    /// Staged text is consumed here because the UI framework emits clipboard
+    /// writes as frame output.
     fn ui(&mut self, ui: &mut egui::Ui, context: &ViewContext) -> Vec<ViewAction> {
         let options = ca_ui::options::current(ui.ctx());
         self.confirmations = options.stored.file_operations.clone();
@@ -3718,6 +3782,9 @@ impl SessionView for FolderView {
             self.selection_bar(ui);
             self.toolbar(ui);
             self.report_panel(ui);
+            if let Some(text) = self.pending_clipboard.take() {
+                ui.ctx().copy_text(text);
+            }
             if self.mode == Mode::Sync {
                 self.sync_bar(ui);
             }
@@ -3757,6 +3824,7 @@ impl SessionView for FolderView {
         view::declare(HANDLED, |command| self.accepts(command))
     }
 
+    /// A ready, idle filename copy with a selection but no local path has a distinct refusal.
     fn refusal(&self, command: Command) -> Option<&'static str> {
         match command {
             Command::NextDifference | Command::PreviousDifference if !self.accepts(command) => {
@@ -3766,6 +3834,14 @@ impl SessionView for FolderView {
             Command::Find if !self.accepts(command) => self.find_refusal(false),
             Command::FindNext | Command::FindPrevious if !self.accepts(command) => {
                 self.find_refusal(true)
+            }
+            Command::CopyFilename
+                if !self.accepts(command)
+                    && self.status == Status::Ready
+                    && matches!(self.stage, Stage::Idle)
+                    && !self.selection.is_empty() =>
+            {
+                Some(NO_LOCAL_PATH_TO_COPY)
             }
             Command::CopyToRight | Command::CopyToLeft | Command::CopyToOtherSide
                 if !self.accepts(command) =>
@@ -3782,6 +3858,7 @@ impl SessionView for FolderView {
         }
     }
 
+    /// Keeps declared command states from advertising actions the active view will refuse.
     fn accepts(&self, command: Command) -> bool {
         let idle = matches!(self.stage, Stage::Idle);
         match command {
@@ -3795,6 +3872,9 @@ impl SessionView for FolderView {
             Command::Cancel => self.status.is_running() || self.stage.is_busy(),
             Command::ClearSelection => !self.selection.is_empty(),
             Command::InvertSelection => !self.rows.is_empty(),
+            Command::CopyFilename => {
+                idle && self.status == Status::Ready && self.has_copyable_selection()
+            }
             Command::CopyToRight | Command::CopyToLeft => idle && !self.selection.is_empty(),
             other => {
                 if select_rule_of(other).is_some() {
@@ -3811,6 +3891,7 @@ impl SessionView for FolderView {
         }
     }
 
+    /// Copy requests stage paths here; the next UI frame publishes their clipboard output.
     fn run(&mut self, command: Command) {
         match command {
             Command::ExpandAll => {
@@ -3832,6 +3913,7 @@ impl SessionView for FolderView {
             Command::FindPrevious => self.step_name(false, false),
             Command::ClearSelection => self.selection.clear(),
             Command::InvertSelection => self.selection.invert_visible(&self.rows, &self.arena),
+            Command::CopyFilename => self.copy_filenames(),
             Command::CopyToRight => self.copy_to(Side::Right),
             Command::CopyToLeft => self.copy_to(Side::Left),
             Command::SwapSides => {
@@ -4246,6 +4328,185 @@ mod stale_results {
         view
     }
 
+    /// Capture platform output because the test process has no native clipboard.
+    fn clipboard_frame(view: &mut FolderView) -> egui::FullOutput {
+        let context = ca_ui::testing::context();
+        let egui_context = egui::Context::default();
+        egui_context.run(
+            ca_ui::testing::event_input(1_000.0, 600.0, Vec::new()),
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    view.ui(ui, &context);
+                });
+            },
+        )
+    }
+
+    fn copied(output: &egui::FullOutput) -> Vec<String> {
+        output
+            .platform_output
+            .commands
+            .iter()
+            .filter_map(|command| match command {
+                egui::OutputCommand::CopyText(text) => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn copy_filename_puts_selected_side_paths_on_the_clipboard() -> std::io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut view = ready_view(dir.path());
+        assert!(!view.accepts(super::Command::CopyFilename));
+
+        view.run(super::Command::SelectAll);
+        assert!(view.accepts(super::Command::CopyFilename));
+        view.run(super::Command::CopyFilename);
+        let output = clipboard_frame(&mut view);
+        let left = dir
+            .path()
+            .join("left")
+            .join("same.txt")
+            .display()
+            .to_string();
+        let right = dir
+            .path()
+            .join("right")
+            .join("same.txt")
+            .display()
+            .to_string();
+        assert_eq!(copied(&output), vec![format!("{left}\n{right}")]);
+
+        view.selection.restrict_to(ca_fs::Side::Right);
+        view.run(super::Command::CopyFilename);
+        let output = clipboard_frame(&mut view);
+        assert_eq!(copied(&output), vec![right]);
+        Ok(())
+    }
+
+    #[test]
+    fn copy_filename_is_available_in_folder_sync() -> std::io::Result<()> {
+        use crate::FolderSyncView;
+        use ca_ui::view::SessionView;
+
+        let dir = tempfile::tempdir()?;
+        let mut sync = FolderSyncView::from(sync_view(dir.path()));
+        sync.run(super::Command::SelectAll);
+        assert!(sync.accepts(super::Command::CopyFilename));
+        sync.run(super::Command::CopyFilename);
+
+        let output = clipboard_frame(sync.view_mut());
+        let left = dir
+            .path()
+            .join("left")
+            .join("same.txt")
+            .display()
+            .to_string();
+        let right = dir
+            .path()
+            .join("right")
+            .join("same.txt")
+            .display()
+            .to_string();
+        assert_eq!(copied(&output), vec![format!("{left}\n{right}")]);
+        Ok(())
+    }
+
+    #[test]
+    /// Relative roots are valid scan inputs, but clipboard consumers need stable absolute paths.
+    fn copy_filename_resolves_relative_roots_to_absolute_paths() -> std::io::Result<()> {
+        let directory = tempfile::tempdir_in(".")?;
+        let relative_directory = if directory.path().is_absolute() {
+            directory
+                .path()
+                .strip_prefix(std::env::current_dir()?)
+                .map_err(std::io::Error::other)?
+                .to_path_buf()
+        } else {
+            directory.path().to_path_buf()
+        };
+        let mut view = ready_view(&relative_directory);
+        assert!(view.left_path.is_relative());
+
+        view.run(super::Command::SelectAll);
+        view.run(super::Command::CopyFilename);
+        let output = clipboard_frame(&mut view);
+        let left = std::path::absolute(relative_directory.join("left").join("same.txt"))?
+            .display()
+            .to_string();
+        let right = std::path::absolute(relative_directory.join("right").join("same.txt"))?
+            .display()
+            .to_string();
+        assert_eq!(copied(&output), vec![format!("{left}\n{right}")]);
+        Ok(())
+    }
+
+    #[test]
+    /// Archive members are virtual; a local side remains copyable in a mixed comparison.
+    fn copy_filename_skips_archive_entries_but_keeps_local_paths() -> std::io::Result<()> {
+        const EMPTY_ZIP: &[u8] = &[
+            0x50, 0x4b, 0x05, 0x06, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        let directory = tempfile::tempdir()?;
+        let mut view = ready_view(directory.path());
+        let archive_path = directory.path().join("right.zip");
+        std::fs::write(&archive_path, EMPTY_ZIP)?;
+        let archive = ca_fs::Source::archive(&archive_path, ca_vfs::ArchiveOptions::default())
+            .map_err(std::io::Error::other)?;
+        view.sides = Some(crate::jobs::Sides {
+            left: ca_fs::Source::local(directory.path().join("left")),
+            right: archive,
+        });
+
+        view.run(super::Command::SelectAll);
+        assert!(view.accepts(super::Command::CopyFilename));
+        view.run(super::Command::CopyFilename);
+        let output = clipboard_frame(&mut view);
+        let left = std::path::absolute(directory.path().join("left").join("same.txt"))?
+            .display()
+            .to_string();
+        assert_eq!(copied(&output), vec![left]);
+        Ok(())
+    }
+
+    #[test]
+    /// Selecting an orphan in its blank pane must not enable an action that copies nothing.
+    fn copy_filename_is_disabled_for_a_selection_on_a_missing_side() -> std::io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut view = ready_view(directory.path());
+        std::fs::remove_file(directory.path().join("left").join("same.txt"))?;
+        view.run(super::Command::Recompare);
+        assert!(poll_until(&mut view, |view| {
+            view.is_ready()
+                && view
+                    .arena
+                    .index_of(Path::new("same.txt"))
+                    .and_then(|index| view.arena.node(index))
+                    .is_some_and(|node| node.left.is_none() && node.right.is_some())
+        }));
+        let index = view.arena.index_of(Path::new("same.txt")).ok_or_else(|| {
+            std::io::Error::other("the right-side entry remains in the comparison")
+        })?;
+        let position = view
+            .rows
+            .iter()
+            .position(|row| row.node == index)
+            .ok_or_else(|| std::io::Error::other("the right-side entry is visible"))?;
+        view.selection.click(
+            ca_fs::Side::Left,
+            position,
+            &view.rows,
+            &view.arena,
+            super::selection::ClickKind::Replace,
+        );
+        assert!(!view.accepts(super::Command::CopyFilename));
+        assert_eq!(
+            view.refusal(super::Command::CopyFilename),
+            Some(super::NO_LOCAL_PATH_TO_COPY)
+        );
+        Ok(())
+    }
     fn sync_view(dir: &Path) -> FolderView {
         let mut view = ready_view(dir);
         view.mode = super::Mode::Sync;
