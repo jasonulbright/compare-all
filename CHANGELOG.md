@@ -1,3 +1,37 @@
+# v2026.10.28.0012
+
+## Ten comparison features now available
+
+### Features
+
+- Add drag range selection across visible folder comparison rows.
+- Show per-side folder totals when scans are complete.
+- Invert selection for visible items on each present side.
+- Enter full screen with F11.
+- Exit full screen with Escape.
+- Open both compared folders' parents together.
+- Compare Left, Center, or Right inputs with the merge output.
+- Recognize seven additional filename aliases for built-in formats.
+- Display the pack list in its own window.
+- Size the pack list window for shorter screens.
+
+### Fixes
+
+- Apply Unix file type filters to the requested include or exclude set.
+- Preserve merge decisions when swapping sides.
+- Match the reference text encoding behavior.
+- Correct the text comparison gutter.
+- Correct Open With targets.
+- Keep application windows and corner notices inside the monitor work area.
+- Keep views available until background work finishes.
+
+### Security
+
+- Fix WebDAV Digest authentication to require HTTPS by default.
+- Includes fixes for five disclosed security issues in dependencies.
+
+Full changelog: CHANGELOG.md
+
 # v2026.10.20.0011
 
 ## 11 theme packs: 2 built in, 9 to download

@@ -1949,7 +1949,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 ## Community Data License Agreement Permissive 2.0 (CDLA-Permissive-2.0)
 
-Used by: `webpki-root-certs 1.0.9`, `webpki-roots 1.0.9`
+Used by: `webpki-root-certs 1.0.11`, `webpki-roots 1.0.11`
 
 ```text
 # Community Data License Agreement - Permissive - Version 2.0
@@ -2835,7 +2835,7 @@ THIS SOFTWARE.
 
 ## ISC License (ISC)
 
-Used by: `rustls-webpki 0.103.15`
+Used by: `rustls-webpki 0.103.16`
 
 ```text
 Except as otherwise noted, this project is licensed under the following
@@ -6855,7 +6855,7 @@ DEALINGS IN THE SOFTWARE.
 
 ## MIT License (MIT)
 
-Used by: `argon2 0.6.0`, `crypto-bigint 0.7.5`, `pkcs5 0.8.1`, `scrypt 0.12.0`, `sec1 0.8.1`, `spki 0.8.0`, `ssh-encoding 0.3.0`, `ssh-key 0.7.0-rc.11`
+Used by: `argon2 0.6.0`, `crypto-bigint 0.7.8`, `pkcs5 0.8.1`, `scrypt 0.12.0`, `sec1 0.8.1`, `spki 0.8.0`, `ssh-encoding 0.3.0`, `ssh-key 0.7.0-rc.11`
 
 ```text
 Copyright (c) 2021-2026 The RustCrypto Project Developers
@@ -7487,7 +7487,7 @@ DEALINGS IN THE SOFTWARE.
 
 ## MIT License (MIT)
 
-Used by: `ctutils 0.4.2`
+Used by: `ctutils 0.4.5`
 
 ```text
 Copyright (c) 2025-2026 The RustCrypto Project Developers
