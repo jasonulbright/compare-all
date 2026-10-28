@@ -241,14 +241,13 @@ fn dragging_across_the_split_selects_the_visible_range_on_both_sides() {
 
     let rows = view.rows().to_vec();
     assert!(rows.len() >= 2, "the fixture must contain multiple rows");
-    let sub_position = rows
-        .iter()
-        .position(|row| {
-            view.arena()
-                .node(row.node)
-                .is_some_and(|node| node.rel == Path::new("sub"))
-        })
-        .expect("the expanded sub folder is visible");
+    let sub_position = rows.iter().position(|row| {
+        view.arena()
+            .node(row.node)
+            .is_some_and(|node| node.rel == Path::new("sub"))
+    });
+    assert!(sub_position.is_some(), "the expanded sub folder is visible");
+    let sub_position = sub_position.unwrap_or_default();
     assert!(rows.iter().any(|row| {
         view.arena()
             .node(row.node)
@@ -325,14 +324,7 @@ fn dragging_across_the_split_selects_the_visible_range_on_both_sides() {
         view.selection()
             .cursor()
             .map(|(side, rel)| (side, rel.to_path_buf())),
-        Some((
-            ca_fs::Side::Right,
-            view.arena()
-                .node(rows[sub_position].node)
-                .expect("the end row is present")
-                .rel
-                .clone(),
-        ))
+        Some((ca_fs::Side::Right, PathBuf::from("sub"),))
     );
     assert!(
         view.rows().iter().any(|row| {
@@ -342,6 +334,49 @@ fn dragging_across_the_split_selects_the_visible_range_on_both_sides() {
         }),
         "releasing on the sub folder disclosure marker must not collapse it"
     );
+
+    let start_rel = rows
+        .first()
+        .and_then(|row| view.arena().node(row.node))
+        .map(|node| node.rel.clone());
+    assert!(start_rel.is_some(), "the first visible fixture row exists");
+    let start_rel = start_rel.unwrap_or_default();
+    frame_with(
+        &mut view,
+        &ctx,
+        vec![
+            egui::Event::PointerMoved(start),
+            egui::Event::PointerButton {
+                pos: start,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ],
+    );
+    frame_with(&mut view, &ctx, vec![egui::Event::PointerMoved(end)]);
+    frame_with(&mut view, &ctx, vec![egui::Event::PointerMoved(start)]);
+    frame_with(
+        &mut view,
+        &ctx,
+        vec![egui::Event::PointerButton {
+            pos: start,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }],
+    );
+    assert_eq!(
+        view.selection()
+            .cursor()
+            .map(|(side, rel)| (side, rel.to_path_buf())),
+        Some((ca_fs::Side::Left, start_rel.clone()))
+    );
+    assert_eq!(
+        view.selection().side(ca_fs::Side::Left),
+        &std::collections::BTreeSet::from([start_rel])
+    );
+    assert!(view.selection().side(ca_fs::Side::Right).is_empty());
 }
 
 /// One frame of `view` with `events` delivered.
