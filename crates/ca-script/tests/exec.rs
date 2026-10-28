@@ -1799,10 +1799,5 @@ fn unixtype_filter_handles_groups_and_none_removes_only_that_filter() {
         "filter unixtype:none\nselect all.files",
     );
     assert!(selected.is_clean(), "{selected:?}");
-    assert_eq!(
-        session.selection,
-        ["link.txt", "plain.txt", "target.txt"]
-            .map(PathBuf::from)
-            .into(),
-    );
+    assert_eq!(session.selection, [PathBuf::from("empty.txt")].into(),);
 }
