@@ -2614,10 +2614,11 @@ impl FolderView {
         let mut toggle: Option<u32> = None;
         let mut click: Option<(Side, usize, ClickKind)> = None;
         let cursor = ui.ctx().pointer_latest_pos();
-        let (pressed, down, clicked, double_clicked, modifiers) = ui.input(|input| {
+        let (pressed, down, released, clicked, double_clicked, modifiers) = ui.input(|input| {
             (
                 input.pointer.primary_pressed(),
                 input.pointer.primary_down(),
+                input.pointer.primary_released(),
                 input.pointer.primary_clicked(),
                 input
                     .pointer
@@ -2674,12 +2675,17 @@ impl FolderView {
                 }
             }
         }
-        if clicked {
+        if released {
             if let (Some(drag), Some((end_side, end_position))) =
                 (self.selection_drag.as_ref(), pointer_row)
             {
-                if drag.moved {
-                    self.selection.drag_range(
+                let end_rel = self
+                    .rows
+                    .get(end_position)
+                    .and_then(|row| self.arena.node(row.node))
+                    .map(|node| node.rel.as_path());
+                if end_rel.is_some_and(|rel| rel != drag.rel || end_side != drag.side) {
+                    let moved = self.selection.drag_range(
                         drag.side,
                         &drag.rel,
                         end_side,
@@ -2687,8 +2693,14 @@ impl FolderView {
                         &self.rows,
                         &self.arena,
                     );
-                    suppress_click = true;
+                    if moved {
+                        if let Some(drag) = self.selection_drag.as_mut() {
+                            drag.moved = true;
+                        }
+                    }
                 }
+                suppress_click =
+                    clicked && self.selection_drag.as_ref().is_some_and(|drag| drag.moved);
             }
             self.selection_drag = None;
         } else if !down {

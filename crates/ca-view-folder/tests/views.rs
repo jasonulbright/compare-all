@@ -224,6 +224,7 @@ fn a_selection_survives_a_filter_change() {
 
 #[test]
 #[allow(
+    clippy::too_many_lines,
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss,
     clippy::cast_sign_loss
@@ -232,6 +233,7 @@ fn dragging_across_the_split_selects_the_visible_range_on_both_sides() {
     let dir = fixture();
     let mut view = view_over(dir.path());
     assert!(tick_until(&mut view, SessionView::is_ready));
+    view.run(Command::ExpandAll);
     let ctx = egui::Context::default();
     for _ in 0..3 {
         frame_with(&mut view, &ctx, Vec::new());
@@ -239,6 +241,19 @@ fn dragging_across_the_split_selects_the_visible_range_on_both_sides() {
 
     let rows = view.rows().to_vec();
     assert!(rows.len() >= 2, "the fixture must contain multiple rows");
+    let sub_position = rows
+        .iter()
+        .position(|row| {
+            view.arena()
+                .node(row.node)
+                .is_some_and(|node| node.rel == Path::new("sub"))
+        })
+        .expect("the expanded sub folder is visible");
+    assert!(rows.iter().any(|row| {
+        view.arena()
+            .node(row.node)
+            .is_some_and(|node| node.rel == Path::new("sub/differs.txt"))
+    }));
     let body = ctx
         .read_response(view.tree_widget())
         .expect("the folder tree is on screen")
@@ -248,13 +263,17 @@ fn dragging_across_the_split_selects_the_visible_range_on_both_sides() {
         .saturating_sub(1)
         .min(rows.len() - 1);
     assert!(last_visible > 0, "the fixture rows fit in the viewport");
+    assert!(
+        sub_position <= last_visible,
+        "the expanded sub folder disclosure marker is visible"
+    );
     let start = egui::pos2(
         body.left() + body.width() * 0.25,
         body.top() + row_height * 0.5,
     );
     let end = egui::pos2(
-        body.left() + body.width() * 0.75,
-        body.top() + row_height * (last_visible as f32 + 0.5),
+        body.left() + body.width() * 0.5 + 10.0,
+        body.top() + row_height * (sub_position as f32 + 0.5),
     );
     frame_with(
         &mut view,
@@ -283,7 +302,7 @@ fn dragging_across_the_split_selects_the_visible_range_on_both_sides() {
 
     let expected = |side| {
         rows.iter()
-            .take(last_visible + 1)
+            .take(sub_position + 1)
             .filter_map(|row| {
                 let node = view.arena().node(row.node)?;
                 let present = match side {
@@ -309,11 +328,19 @@ fn dragging_across_the_split_selects_the_visible_range_on_both_sides() {
         Some((
             ca_fs::Side::Right,
             view.arena()
-                .node(rows[last_visible].node)
+                .node(rows[sub_position].node)
                 .expect("the end row is present")
                 .rel
                 .clone(),
         ))
+    );
+    assert!(
+        view.rows().iter().any(|row| {
+            view.arena()
+                .node(row.node)
+                .is_some_and(|node| node.rel == Path::new("sub/differs.txt"))
+        }),
+        "releasing on the sub folder disclosure marker must not collapse it"
     );
 }
 
