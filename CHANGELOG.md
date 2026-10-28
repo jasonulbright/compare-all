@@ -1,3 +1,13 @@
+# v2026.10.28.0013
+
+## Copy selected folder paths from Folder Compare
+
+### Features
+
+- Copy selected local folder paths from either comparison side to the clipboard.
+
+Full changelog: CHANGELOG.md
+
 # v2026.10.28.0012
 
 ## Ten comparison features now available
