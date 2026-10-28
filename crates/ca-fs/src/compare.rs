@@ -398,7 +398,12 @@ pub fn align_trees(
     }
     let left_folder_sizes = folder_sizes(left);
     let right_folder_sizes = folder_sizes(right);
+    root.facts.left_folder_size = left_folder_sizes.get(Path::new("")).copied().flatten();
+    root.facts.right_folder_size = right_folder_sizes.get(Path::new("")).copied().flatten();
     walk_mut(&mut root, &mut |node| {
+        if node.rel.as_os_str().is_empty() {
+            return;
+        }
         node.facts.left_folder_size = node
             .left
             .as_ref()
@@ -427,6 +432,10 @@ fn folder_sizes(scan: &ScanResult) -> HashMap<PathBuf, Option<u64>> {
             (entry.rel.clone(), complete.then_some(0))
         })
         .collect();
+    sizes.insert(
+        PathBuf::new(),
+        (!scan.cancelled && !scan.root_incomplete).then_some(0),
+    );
     let mut levels: Vec<Vec<&Entry>> = Vec::new();
     for entry in scan.entries.values() {
         let depth = entry.rel.components().count();
@@ -441,9 +450,6 @@ fn folder_sizes(scan: &ScanResult) -> HashMap<PathBuf, Option<u64>> {
     for entries in levels.into_iter().rev() {
         for entry in entries {
             let parent = entry.rel.parent().unwrap_or_else(|| Path::new(""));
-            if parent.as_os_str().is_empty() {
-                continue;
-            }
             let contribution = if entry.is_dir {
                 sizes.get(&entry.rel).copied().flatten()
             } else if scan.facts_of(&entry.rel).size_is_exact {
@@ -1895,6 +1901,8 @@ mod tests {
             &scan(dirs.right.path()),
             &AlignmentOptions::default(),
         );
+        assert_eq!(tree.facts.left_folder_size, Some(8));
+        assert_eq!(tree.facts.right_folder_size, Some(8));
         assert_eq!(find(&tree, "top").facts.left_folder_size, Some(8));
         assert_eq!(find(&tree, "top").facts.right_folder_size, Some(8));
 

@@ -1240,8 +1240,20 @@ fn splice(tree: &mut Node, rel: &Path, refreshed: ScannedSubtree) {
         tree.facts.right_folder_size = refreshed.right_folder_size;
         return;
     }
-    let old_sizes =
-        find_mut(tree, rel).map(|node| (node.facts.left_folder_size, node.facts.right_folder_size));
+    let old_sizes = find_mut(tree, rel).map(|node| {
+        (
+            if node.left.is_some() {
+                node.facts.left_folder_size
+            } else {
+                Some(0)
+            },
+            if node.right.is_some() {
+                node.facts.right_folder_size
+            } else {
+                Some(0)
+            },
+        )
+    });
     if let Some((old_left, old_right)) = old_sizes {
         if let Some(node) = find_mut(tree, rel) {
             node.children = refreshed.children;
@@ -1258,21 +1270,29 @@ fn splice(tree: &mut Node, rel: &Path, refreshed: ScannedSubtree) {
     }
     // The folder is new, so it is attached under whichever ancestor the tree
     // does hold; nothing is invented above it.
-    if let Some(parent) = rel.parent() {
+    let attached = if let Some(parent) = rel.parent() {
         if let Some(node) = find_mut(tree, parent) {
             node.children.extend(refreshed.children);
+            true
         } else if parent.as_os_str().is_empty() {
             tree.children.extend(refreshed.children);
+            true
+        } else {
+            false
         }
+    } else {
+        false
+    };
+    if attached {
+        // No previous node means this folder contributed no bytes to its
+        // ancestors. Include its new totals where those ancestors are known.
+        update_ancestor_sizes(
+            tree,
+            rel,
+            (Some(0), Some(0)),
+            (refreshed.left_folder_size, refreshed.right_folder_size),
+        );
     }
-    // No previous node means this folder contributed no bytes to its
-    // ancestors. Include its new totals where those ancestors are known.
-    update_ancestor_sizes(
-        tree,
-        rel,
-        (Some(0), Some(0)),
-        (refreshed.left_folder_size, refreshed.right_folder_size),
-    );
 }
 
 /// Adjust every ancestor by the change in the rescanned folder's total.
@@ -1350,12 +1370,25 @@ mod tests {
     use std::sync::Arc;
 
     fn folder(rel: &str, left_size: Option<u64>, children: Vec<Node>) -> Node {
+        let entry = ca_fs::Entry {
+            rel: PathBuf::from(rel),
+            name: rel.rsplit('/').next().unwrap_or(rel).to_owned(),
+            is_dir: true,
+            size: 0,
+            modified: None,
+            created: None,
+            attributes: ca_fs::Attributes::default(),
+            link: None,
+            listing_incomplete: false,
+            error: None,
+            refused: false,
+        };
         Node {
             name: rel.rsplit('/').next().unwrap_or(rel).to_owned(),
             rel: PathBuf::from(rel),
             is_dir: true,
-            left: None,
-            right: None,
+            left: Some(entry.clone()),
+            right: Some(entry),
             facts: PairFacts {
                 left_folder_size: left_size,
                 right_folder_size: left_size,
