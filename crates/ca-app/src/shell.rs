@@ -170,6 +170,11 @@ const TEXT_MENUS: &[(&str, &[Entry])] = &[
     (
         "View",
         &[
+            Entry::Run(
+                Command::ToggleFullscreen,
+                "Only available in Picture Compare",
+            ),
+            Entry::Rule,
             Entry::Run(Command::ShowAll, FILTERED),
             Entry::Run(Command::ShowDifferences, FILTERED),
             Entry::Run(Command::ShowSame, FILTERED),
@@ -942,6 +947,14 @@ const ACTIONS_AFTER: &str = "Edit";
 pub struct App {
     tabs: Vec<Box<dyn SessionView>>,
     active: usize,
+    /// Whether this shell, rather than the window manager, entered fullscreen.
+    fullscreen_owned: bool,
+    /// Last viewport fullscreen state reported by the platform, if known.
+    fullscreen_confirmed: Option<bool>,
+    /// Most recent fullscreen state requested by the shell, awaiting a report.
+    fullscreen_pending: Option<bool>,
+    /// Last fullscreen state requested by the active view.
+    fullscreen_wanted: Option<bool>,
     next_instance: u64,
     closing: bool,
     /// What the active view declared this frame, read once and used by every
@@ -1173,6 +1186,10 @@ impl App {
             explorer: ExplorerState::default(),
             tabs: Vec::new(),
             active: 0,
+            fullscreen_owned: false,
+            fullscreen_confirmed: None,
+            fullscreen_pending: None,
+            fullscreen_wanted: None,
             next_instance: 0,
             closing: false,
             declared: Vec::new(),
@@ -3301,6 +3318,10 @@ impl App {
             Command::SessionSettings => has_settings,
             Command::ToggleLocked => ready && self.active_session().is_some(),
             Command::CompareFilesUsing => self.file_pair_paths().is_some(),
+            Command::ToggleFullscreen => self
+                .tabs
+                .get(self.active)
+                .is_some_and(|tab| tab.kind() == Some(SessionKind::PictureCompare)),
             Command::CompareParentFolders => ready && self.parent_folder_paths().is_some(),
             Command::Explorer => self.active_local_explorer_target().is_some(),
             other => self
@@ -3313,6 +3334,10 @@ impl App {
     /// Run a command, at the shell when it owns it and in the active view
     /// otherwise.
     pub fn run(&mut self, command: Command, context: &ViewContext) {
+        if command == Command::ToggleFullscreen {
+            self.toggle_fullscreen();
+            return;
+        }
         self.drop_pending_workspace();
         if command != Command::Exit {
             if let Some(profiles) = self.profiles.as_mut() {
@@ -3332,20 +3357,7 @@ impl App {
                 let instance = self.instance();
                 self.open_settings(instance);
             }
-            Command::ToggleLocked => {
-                if let Some(id) = self.active_session() {
-                    let mut changed = false;
-                    if let Ok(mut handle) = self.store.try_borrow_mut() {
-                        if let Some(store) = handle.store_mut() {
-                            let locked = store.is_locked(&id);
-                            changed = store.set_locked(&id, !locked).is_ok();
-                        }
-                    }
-                    if changed {
-                        self.save_store();
-                    }
-                }
-            }
+            Command::ToggleLocked => self.toggle_locked(),
             Command::ClearSession => self.clear_session(context),
             Command::SaveWorkspaceAs => {
                 let instance = self.instance();
@@ -3415,6 +3427,29 @@ impl App {
         }
     }
 
+    fn toggle_fullscreen(&mut self) {
+        if self.accepts(Command::ToggleFullscreen) {
+            if let Some(tab) = self.tabs.get_mut(self.active) {
+                tab.run(Command::ToggleFullscreen);
+            }
+        }
+    }
+
+    fn toggle_locked(&mut self) {
+        if let Some(id) = self.active_session() {
+            let mut changed = false;
+            if let Ok(mut handle) = self.store.try_borrow_mut() {
+                if let Some(store) = handle.store_mut() {
+                    let locked = store.is_locked(&id);
+                    changed = store.set_locked(&id, !locked).is_ok();
+                }
+            }
+            if changed {
+                self.save_store();
+            }
+        }
+    }
+
     /// An options dialog whose pack browser reads the releases this window
     /// updates from.
     fn new_options_dialog(
@@ -3458,6 +3493,20 @@ impl App {
         let escape_closes = self.resolved.stored.tweaks.escape_closes_file_views;
         let mut ran = Vec::new();
         for (index, stroke) in strokes {
+            let fullscreen = self
+                .tabs
+                .get(self.active)
+                .is_some_and(|tab| tab.wants_fullscreen());
+            if stroke == Keystroke::plain(egui::Key::Escape) && fullscreen {
+                if let Some(tab) = self.tabs.get_mut(self.active) {
+                    tab.set_fullscreen(false);
+                }
+                if self.fullscreen_owned {
+                    self.request_fullscreen(ctx, false);
+                }
+                ran.push(index);
+                continue;
+            }
             if escape_closes
                 && stroke == Keystroke::plain(egui::Key::Escape)
                 && view.folder_bar() != MenuView::Folder
@@ -3469,13 +3518,70 @@ impl App {
             }
             if let Some(command) = command::route_with(view, stroke, &table) {
                 if self.accepts(command) {
-                    self.run(command, context);
+                    if command == Command::ToggleFullscreen {
+                        self.run(command, context);
+                        self.sync_fullscreen(ctx);
+                    } else {
+                        self.run(command, context);
+                    }
                     ran.push(index);
                 }
             }
         }
         if !ran.is_empty() {
             ctx.input_mut(|input| command::drop_text_of(&mut input.events, &ran));
+        }
+    }
+
+    fn request_fullscreen(&mut self, ctx: &egui::Context, fullscreen: bool) {
+        if self.fullscreen_pending != Some(fullscreen) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(fullscreen));
+            self.fullscreen_pending = Some(fullscreen);
+        }
+        if fullscreen {
+            self.fullscreen_owned = true;
+        }
+    }
+
+    fn sync_fullscreen(&mut self, ctx: &egui::Context) {
+        let actual = ctx.input(|input| input.viewport().fullscreen);
+        let previous = self.fullscreen_confirmed;
+        let pending = self.fullscreen_pending;
+
+        if let Some(actual) = actual {
+            self.fullscreen_confirmed = Some(actual);
+            if pending == Some(actual) {
+                self.fullscreen_pending = None;
+                self.fullscreen_owned = actual;
+            }
+        }
+
+        let mut wanted = self
+            .tabs
+            .get(self.active)
+            .is_some_and(|tab| tab.wants_fullscreen());
+        let is_new_request = wanted && self.fullscreen_wanted != Some(true);
+        let external_exit =
+            pending.is_none() && previous == Some(true) && actual == Some(false) && !is_new_request;
+
+        if external_exit {
+            if let Some(tab) = self.tabs.get_mut(self.active) {
+                if tab.wants_fullscreen() {
+                    tab.set_fullscreen(false);
+                }
+            }
+            self.fullscreen_owned = false;
+            wanted = false;
+        }
+
+        self.fullscreen_wanted = Some(wanted);
+        match self.fullscreen_pending {
+            Some(pending) if pending != wanted => self.request_fullscreen(ctx, wanted),
+            None if wanted && actual != Some(true) => self.request_fullscreen(ctx, true),
+            None if !wanted && self.fullscreen_owned && actual != Some(false) => {
+                self.request_fullscreen(ctx, false);
+            }
+            Some(_) | None => {}
         }
     }
 
@@ -3678,6 +3784,9 @@ impl App {
                                 let reason = self.line_reason(*command, reason);
                                 if widgets::command_item_in(ui, view, *command, enabled, reason) {
                                     self.run(*command, context);
+                                    if *command == Command::ToggleFullscreen {
+                                        self.sync_fullscreen(ui.ctx());
+                                    }
                                 }
                                 continue;
                             }
@@ -4005,6 +4114,43 @@ impl App {
         self.options.save();
     }
 
+    fn draw_active_view(
+        &mut self,
+        ctx: &egui::Context,
+        context: &ViewContext,
+        naming: bool,
+        fullscreen: bool,
+    ) -> Vec<ViewAction> {
+        if !fullscreen {
+            egui::TopBottomPanel::top("menu").show(ctx, |ui| {
+                if naming {
+                    ui.disable();
+                }
+                self.menu_bar(ui, context);
+                self.tab_strip(ui);
+            });
+        }
+        let mut actions = Vec::new();
+        let mut show_content = |ui: &mut egui::Ui| {
+            if naming {
+                ui.disable();
+            }
+            if let Some(tab) = self.tabs.get_mut(self.active) {
+                actions = tab.ui(ui, context);
+            } else {
+                ui.label("No session is open");
+            }
+        };
+        if fullscreen {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show(ctx, &mut show_content);
+        } else {
+            egui::CentralPanel::default().show(ctx, &mut show_content);
+        }
+        actions
+    }
+
     /// Paint one frame into `ctx`.
     ///
     /// Split out from the eframe entry point so a frame can be run headless.
@@ -4054,33 +4200,27 @@ impl App {
         } else {
             self.keyboard(ctx, &context);
         }
-        egui::TopBottomPanel::top("menu").show(ctx, |ui| {
-            if naming {
-                ui.disable();
-            }
-            self.menu_bar(ui, &context);
-            self.tab_strip(ui);
-        });
-        let mut actions = Vec::new();
-        egui::CentralPanel::default().show(ctx, |ui| {
-            if naming {
-                ui.disable();
-            }
-            if let Some(tab) = self.tabs.get_mut(self.active) {
-                actions = tab.ui(ui, &context);
-            } else {
-                ui.label("No session is open");
-            }
-        });
+        self.sync_fullscreen(ctx);
+        let fullscreen = self
+            .tabs
+            .get(self.active)
+            .is_some_and(|tab| tab.wants_fullscreen());
+        let actions = self.draw_active_view(ctx, &context, naming, fullscreen);
         if !naming {
             self.apply(actions, &context);
             self.apply_home_actions(&context);
+        }
+        if fullscreen {
+            self.exit_question_panel(ctx);
+        } else if !naming {
             self.draw_dialogs(ctx, &context);
         }
-        self.draw_update_notice(ctx, &context);
-        self.draw_workspace_notice(ctx);
-        self.draw_settings_notice(ctx);
-        self.draw_policy_notice(ctx);
+        if !fullscreen {
+            self.draw_update_notice(ctx, &context);
+            self.draw_workspace_notice(ctx);
+            self.draw_settings_notice(ctx);
+            self.draw_policy_notice(ctx);
+        }
         if ctx.input(|input| input.viewport().close_requested()) && !self.closing {
             self.request_exit();
             if !self.closing {
@@ -6155,6 +6295,8 @@ mod tests {
         (
             "View",
             &[
+                "Full Screen\tF11",
+                "---",
                 "Show All",
                 "Show Differences",
                 "Show Same",
@@ -6720,6 +6862,70 @@ mod tests {
     }
 
     #[test]
+    fn text_merge_session_menu_exposes_each_compare_to_output_side() {
+        use ca_ui::testing::probe::Probe;
+        use std::cell::RefCell;
+
+        let context = context();
+        let files = tempfile::tempdir().unwrap();
+        let left = files.path().join("left.txt");
+        let center = files.path().join("center.txt");
+        let right = files.path().join("right.txt");
+        let output = files.path().join("output.txt");
+        std::fs::write(&left, "left\n").unwrap();
+        std::fs::write(&center, "base\n").unwrap();
+        std::fs::write(&right, "right\n").unwrap();
+
+        let (_settings, mut app) = empty_app();
+        assert!(ca_ui::testing::wait_until(
+            std::time::Duration::from_secs(10),
+            || {
+                app.poll_store();
+                app.store().borrow().is_ready()
+            }
+        ));
+        app.open(
+            &OpenRequest::new(SessionKind::TextMerge, left.clone(), right.clone())
+                .with_center(Some(center))
+                .with_output(Some(output.clone())),
+            &context,
+        );
+        assert!(ca_ui::testing::wait_until(
+            std::time::Duration::from_secs(20),
+            || {
+                app.tabs[0].tick();
+                app.tabs[0].is_ready()
+            }
+        ));
+
+        let app = RefCell::new(app);
+        let mut probe = Probe::new(1600.0, 900.0);
+        let mut run = |egui_context: &egui::Context| app.borrow_mut().frame(egui_context);
+        probe.idle(&mut run);
+        probe.idle(&mut run);
+        assert!(!app
+            .borrow()
+            .declared_actions()
+            .iter()
+            .any(|state| state.command == Command::CompareToOutput));
+        probe.click("Session", &mut run).unwrap();
+        probe.click("Compare to Output", &mut run).unwrap();
+        for label in ["Left Side", "Center Side", "Right Side"] {
+            let side = probe.find(label).unwrap();
+            assert!(side.enabled, "{label} should be available for this merge");
+        }
+
+        probe.click("Right Side", &mut run).unwrap();
+        assert_eq!(app.borrow().tab_count(), 2);
+        let comparison = app.borrow().tab_settings(1).unwrap();
+        let specs = specs_of(&comparison).unwrap();
+        assert_eq!(comparison.kind(), SessionKind::TextCompare);
+        assert_eq!(specs.0, Some(right));
+        assert_eq!(specs.1, Some(output));
+        assert_eq!(specs.2, None);
+    }
+
+    #[test]
     fn compare_parent_folders_opens_the_local_file_directories() {
         let context = context();
         let files = tempfile::tempdir().unwrap();
@@ -6761,6 +6967,337 @@ mod tests {
         assert_eq!(specs.0, Some(left_folder));
         assert_eq!(specs.1, Some(right_folder));
         assert!(!app.accepts(Command::CompareParentFolders));
+    }
+
+    #[test]
+    fn picture_compare_f11_toggles_fullscreen_and_escape_exits_before_close(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let view_context = context();
+        let files = tempfile::tempdir()?;
+        let left_folder = files.path().join("left");
+        let right_folder = files.path().join("right");
+        std::fs::create_dir(&left_folder)?;
+        std::fs::create_dir(&right_folder)?;
+        let left = left_folder.join("left.png");
+        let right = right_folder.join("right.png");
+        let image = include_bytes!("../../../assets/packs/bold-outline/icons/16/bookmark.png");
+        std::fs::write(&left, image)?;
+        std::fs::write(&right, image)?;
+
+        let (_settings, mut app) = empty_app();
+        assert!(ca_ui::testing::wait_until(
+            std::time::Duration::from_secs(10),
+            || {
+                app.poll_store();
+                app.store().borrow().is_ready()
+            }
+        ));
+        app.open_kind(&SessionKind::PictureCompare, left, right, &view_context);
+        assert!(ca_ui::testing::wait_until(
+            std::time::Duration::from_secs(20),
+            || {
+                app.tabs[0].tick();
+                app.tabs[0].is_ready()
+            }
+        ));
+        assert!(app.accepts(Command::ToggleFullscreen));
+        assert_eq!(
+            ca_ui::command::route_with(
+                app.menu_view(),
+                ca_ui::command::Keystroke::plain(egui::Key::F11),
+                &app.resolved.shortcuts,
+            ),
+            Some(Command::ToggleFullscreen)
+        );
+
+        let ctx = egui::Context::default();
+        let input = |key, fullscreen| {
+            let mut input = ca_ui::testing::event_input(
+                1280.0,
+                800.0,
+                vec![egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+            input
+                .viewports
+                .entry(egui::ViewportId::ROOT)
+                .or_default()
+                .fullscreen = Some(fullscreen);
+            input
+        };
+
+        let output = ctx.run(input(egui::Key::F11, false), |ctx| {
+            app.keyboard(ctx, &view_context);
+        });
+        assert!(output.viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .contains(&egui::ViewportCommand::Fullscreen(true)));
+
+        let output = ctx.run(input(egui::Key::F11, true), |ctx| {
+            app.keyboard(ctx, &view_context);
+        });
+        assert!(output.viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .contains(&egui::ViewportCommand::Fullscreen(false)));
+
+        let output = ctx.run(input(egui::Key::F11, false), |ctx| {
+            app.keyboard(ctx, &view_context);
+        });
+        assert!(output.viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .contains(&egui::ViewportCommand::Fullscreen(true)));
+
+        let output = ctx.run(input(egui::Key::Escape, true), |ctx| {
+            app.keyboard(ctx, &view_context);
+        });
+        assert!(output.viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .contains(&egui::ViewportCommand::Fullscreen(false)));
+        assert_eq!(app.tab_count(), 1);
+
+        let _ = ctx.run(input(egui::Key::Escape, false), |ctx| {
+            app.keyboard(ctx, &view_context);
+        });
+        assert_eq!(app.tab_count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn escape_closes_a_file_view_inside_os_owned_fullscreen(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let view_context = context();
+        let files = tempfile::tempdir()?;
+        let left = files.path().join("left.txt");
+        let right = files.path().join("right.txt");
+        std::fs::write(&left, "left\n")?;
+        std::fs::write(&right, "right\n")?;
+
+        let (_settings, mut app) = empty_app();
+        assert!(ca_ui::testing::wait_until(
+            std::time::Duration::from_secs(10),
+            || {
+                app.poll_store();
+                app.store().borrow().is_ready()
+            }
+        ));
+        app.open_kind(&SessionKind::TextCompare, left, right, &view_context);
+        assert!(ca_ui::testing::wait_until(
+            std::time::Duration::from_secs(20),
+            || {
+                app.tabs[0].tick();
+                app.tabs[0].is_ready()
+            }
+        ));
+
+        let mut input = ca_ui::testing::event_input(
+            1280.0,
+            800.0,
+            vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        input
+            .viewports
+            .entry(egui::ViewportId::ROOT)
+            .or_default()
+            .fullscreen = Some(true);
+        let ctx = egui::Context::default();
+        let output = ctx.run(input, |ctx| app.keyboard(ctx, &view_context));
+
+        assert_eq!(app.tab_count(), 0);
+        assert!(!output.viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .contains(&egui::ViewportCommand::Fullscreen(false)));
+        Ok(())
+    }
+
+    #[test]
+    fn fullscreen_sync_only_exits_a_fullscreen_state_the_shell_entered() {
+        let (_settings, mut app) = empty_app();
+        let ctx = egui::Context::default();
+        let input = || {
+            let mut input = ca_ui::testing::event_input(1280.0, 800.0, Vec::new());
+            input
+                .viewports
+                .entry(egui::ViewportId::ROOT)
+                .or_default()
+                .fullscreen = Some(true);
+            input
+        };
+
+        let output = ctx.run(input(), |ctx| app.sync_fullscreen(ctx));
+        assert!(!output.viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .contains(&egui::ViewportCommand::Fullscreen(false)));
+        assert!(!app.fullscreen_owned);
+
+        app.fullscreen_owned = true;
+        let output = ctx.run(input(), |ctx| app.sync_fullscreen(ctx));
+        assert!(output.viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .contains(&egui::ViewportCommand::Fullscreen(false)));
+        assert!(app.fullscreen_owned);
+        assert_eq!(app.fullscreen_pending, Some(false));
+
+        let mut confirmed_exit = ca_ui::testing::event_input(1280.0, 800.0, Vec::new());
+        confirmed_exit
+            .viewports
+            .entry(egui::ViewportId::ROOT)
+            .or_default()
+            .fullscreen = Some(false);
+        let _ = ctx.run(confirmed_exit, |ctx| app.sync_fullscreen(ctx));
+        assert!(!app.fullscreen_owned);
+        assert_eq!(app.fullscreen_pending, None);
+    }
+
+    #[test]
+    fn fullscreen_sync_preserves_new_requests_across_delayed_viewport_reports() {
+        struct FullscreenProbe(Rc<Cell<bool>>);
+
+        impl SessionView for FullscreenProbe {
+            fn title(&self) -> String {
+                "Fullscreen probe".to_owned()
+            }
+
+            fn wants_fullscreen(&self) -> bool {
+                self.0.get()
+            }
+
+            fn set_fullscreen(&mut self, fullscreen: bool) {
+                self.0.set(fullscreen);
+            }
+
+            fn ui(&mut self, _ui: &mut egui::Ui, _context: &ViewContext) -> Vec<ViewAction> {
+                Vec::new()
+            }
+        }
+
+        let (_settings, mut app) = empty_app();
+        let wants_fullscreen = Rc::new(Cell::new(true));
+        app.tabs
+            .push(Box::new(FullscreenProbe(Rc::clone(&wants_fullscreen))));
+        let ctx = egui::Context::default();
+        let run_frame = |app: &mut App, actual: Option<bool>| {
+            let mut input = ca_ui::testing::event_input(1280.0, 800.0, Vec::new());
+            input
+                .viewports
+                .entry(egui::ViewportId::ROOT)
+                .or_default()
+                .fullscreen = actual;
+            ctx.run(input, |ctx| app.sync_fullscreen(ctx))
+        };
+
+        let output = run_frame(&mut app, Some(false));
+        assert!(output.viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .contains(&egui::ViewportCommand::Fullscreen(true)));
+        assert_eq!(app.fullscreen_pending, Some(true));
+
+        let _ = run_frame(&mut app, Some(true));
+        assert_eq!(app.fullscreen_pending, None);
+        assert!(app.fullscreen_owned);
+
+        wants_fullscreen.set(false);
+        let output = run_frame(&mut app, Some(true));
+        assert!(output.viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .contains(&egui::ViewportCommand::Fullscreen(false)));
+        assert_eq!(app.fullscreen_pending, Some(false));
+
+        wants_fullscreen.set(true);
+        let output = run_frame(&mut app, Some(true));
+        assert!(output.viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .contains(&egui::ViewportCommand::Fullscreen(true)));
+        assert_eq!(app.fullscreen_pending, Some(true));
+
+        let output = run_frame(&mut app, Some(false));
+        assert!(!output.viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .contains(&egui::ViewportCommand::Fullscreen(false)));
+        assert!(wants_fullscreen.get());
+        assert_eq!(app.fullscreen_pending, Some(true));
+
+        let _ = run_frame(&mut app, Some(true));
+        assert_eq!(app.fullscreen_pending, None);
+        let output = run_frame(&mut app, Some(false));
+        assert!(!output.viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .contains(&egui::ViewportCommand::Fullscreen(true)));
+        assert!(!wants_fullscreen.get());
+        assert!(!app.fullscreen_owned);
+    }
+
+    #[test]
+    fn picture_compare_view_menu_enters_focused_pane_fullscreen(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use ca_ui::testing::probe::Probe;
+        use std::cell::RefCell;
+
+        let view_context = context();
+        let files = tempfile::tempdir()?;
+        let left = files.path().join("left.png");
+        let right = files.path().join("right.png");
+        let image = include_bytes!("../../../assets/packs/bold-outline/icons/16/bookmark.png");
+        std::fs::write(&left, image)?;
+        std::fs::write(&right, image)?;
+
+        let (_settings, mut app) = empty_app();
+        assert!(ca_ui::testing::wait_until(
+            std::time::Duration::from_secs(10),
+            || {
+                app.poll_store();
+                app.store().borrow().is_ready()
+            }
+        ));
+        app.open_kind(&SessionKind::PictureCompare, left, right, &view_context);
+        assert!(ca_ui::testing::wait_until(
+            std::time::Duration::from_secs(20),
+            || {
+                app.tabs[0].tick();
+                app.tabs[0].is_ready()
+            }
+        ));
+        let app = RefCell::new(app);
+        let mut probe = Probe::new(1280.0, 800.0);
+        let mut run = |ctx: &egui::Context| app.borrow_mut().frame(ctx);
+        probe.idle(&mut run);
+        probe.idle(&mut run);
+
+        probe.click("View", &mut run).unwrap();
+        let label = format!(
+            "{}\t{}",
+            Command::ToggleFullscreen.label_in(MenuView::Other),
+            Command::ToggleFullscreen
+                .shortcut_in(MenuView::Other)
+                .unwrap()
+        );
+        assert!(probe.find(&label).unwrap().enabled);
+        probe.click(&label, &mut run).unwrap();
+        assert!(app.borrow().tabs[0].wants_fullscreen());
+
+        app.borrow_mut().exit_question = true;
+        probe.idle(&mut run);
+        assert!(probe
+            .labels()
+            .iter()
+            .any(|label| label == "Close every tab?"));
+        assert!(!probe.labels().iter().any(|label| label == "Session"));
+        assert!(!probe.labels().iter().any(|label| label == "View"));
+        assert!(!probe
+            .labels()
+            .iter()
+            .any(|label| label == "Picture Compare"));
+        Ok(())
     }
 
     #[test]
