@@ -467,9 +467,6 @@ fn folder_sizes(scan: &ScanResult) -> HashMap<PathBuf, Option<u64>> {
     for error in &scan.errors {
         let mut path = Some(error.rel.as_path());
         while let Some(current) = path {
-            if current.as_os_str().is_empty() {
-                break;
-            }
             if let Some(total) = sizes.get_mut(current) {
                 *total = None;
             }
@@ -1940,6 +1937,35 @@ mod tests {
         let top = find(&tree, "top");
         assert_eq!(top.facts.left_folder_size, None);
         assert_eq!(top.facts.right_folder_size, Some(7));
+    }
+
+    #[test]
+    fn an_error_below_a_folder_invalidates_its_ancestors_and_root_total() {
+        let mut left = synthetic_result(vec![
+            entry("a", "a", true),
+            entry("a/known.txt", "known.txt", false),
+        ]);
+        let mut right = synthetic_result(vec![
+            entry("a", "a", true),
+            entry("a/known.txt", "known.txt", false),
+        ]);
+        left.entries.get_mut(Path::new("a/known.txt")).unwrap().size = 5;
+        right
+            .entries
+            .get_mut(Path::new("a/known.txt"))
+            .unwrap()
+            .size = 5;
+        left.errors.push(crate::scan::EntryError {
+            rel: PathBuf::from("a/unreadable.txt"),
+            message: "cannot read entry".to_owned(),
+        });
+
+        let tree = align(&left, &right, &AlignmentOptions::default());
+
+        assert_eq!(tree.facts.left_folder_size, None);
+        assert_eq!(find(&tree, "a").facts.left_folder_size, None);
+        assert_eq!(tree.facts.right_folder_size, Some(5));
+        assert_eq!(find(&tree, "a").facts.right_folder_size, Some(5));
     }
 
     #[test]
