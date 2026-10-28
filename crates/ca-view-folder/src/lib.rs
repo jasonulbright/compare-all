@@ -310,6 +310,7 @@ struct DragSelection {
     side: Side,
     rel: PathBuf,
     moved: bool,
+    last_end: Option<(Side, usize)>,
 }
 
 /// A folder comparison tab.
@@ -1837,6 +1838,9 @@ impl FolderView {
         self.visible = self.arena.visibility(self.filter, self.folder_filter);
         self.rows = self.arena.flatten(&self.expanded, &self.visible);
         self.order = navigate::DisplayOrder::of(&self.arena, &self.visible);
+        if let Some(drag) = &mut self.selection_drag {
+            drag.last_end = None;
+        }
         self.scroll
             .clamp(self.viewport_height, self.row_height(), self.rows.len());
         self.rebuild_pending = false;
@@ -2601,7 +2605,8 @@ impl FolderView {
             .get(end_position)
             .and_then(|row| self.arena.node(row.node))
             .is_some_and(|node| node.rel != drag.rel || end_side != drag.side);
-        if drag.moved || endpoint_changed {
+        if (drag.moved || endpoint_changed) && drag.last_end != Some((end_side, end_position)) {
+            drag.last_end = Some((end_side, end_position));
             drag.moved |= self.selection.drag_range(
                 drag.side,
                 &drag.rel,
@@ -2673,6 +2678,7 @@ impl FolderView {
                     side,
                     rel: node.rel.clone(),
                     moved: false,
+                    last_end: None,
                 })
             });
         }
