@@ -6861,8 +6861,6 @@ mod tests {
             .all(|state| state.command.menu() == Menu::Actions));
     }
 
-    /// Text Merge keeps all three input-to-output comparisons reachable from
-    /// its Session menu, including the non-default center and right inputs.
     #[test]
     fn text_merge_session_menu_exposes_each_compare_to_output_side() {
         use ca_ui::testing::probe::Probe;
@@ -6902,7 +6900,7 @@ mod tests {
 
         let app = RefCell::new(app);
         let mut probe = Probe::new(1600.0, 900.0);
-        let mut run = |ctx: &egui::Context| app.borrow_mut().frame(ctx);
+        let mut run = |egui_context: &egui::Context| app.borrow_mut().frame(egui_context);
         probe.idle(&mut run);
         probe.idle(&mut run);
         assert!(!app
