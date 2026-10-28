@@ -339,6 +339,18 @@ impl UnixFileType {
         }
     }
 
+    const fn set_bit(self) -> u8 {
+        match self {
+            Self::Regular => 1 << 0,
+            Self::Directory => 1 << 1,
+            Self::Symlink => 1 << 2,
+            Self::Block => 1 << 3,
+            Self::Character => 1 << 4,
+            Self::Fifo => 1 << 5,
+            Self::Socket => 1 << 6,
+        }
+    }
+
     /// True when the entry carries this type.
     ///
     /// A platform that reports no mode word answers false for every type, so a
@@ -349,6 +361,45 @@ impl UnixFileType {
             Some(mode) => mode & 0o170_000 == self.bits(),
             None => false,
         }
+    }
+}
+
+/// A set of POSIX file types used by a filter.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UnixFileTypes(u8);
+
+impl UnixFileTypes {
+    /// An empty set.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self(0)
+    }
+
+    /// Return a set that also contains `kind`.
+    #[must_use]
+    pub const fn with(mut self, kind: UnixFileType) -> Self {
+        self.0 |= kind.set_bit();
+        self
+    }
+
+    /// True when this set contains `kind`.
+    #[must_use]
+    pub const fn contains(self, kind: UnixFileType) -> bool {
+        self.0 & kind.set_bit() != 0
+    }
+
+    fn matches(self, entry: &Entry) -> bool {
+        [
+            UnixFileType::Regular,
+            UnixFileType::Directory,
+            UnixFileType::Symlink,
+            UnixFileType::Block,
+            UnixFileType::Character,
+            UnixFileType::Fifo,
+            UnixFileType::Socket,
+        ]
+        .into_iter()
+        .any(|kind| self.contains(kind) && kind.matches(entry))
     }
 }
 
@@ -371,6 +422,10 @@ pub enum OtherFilter {
     UnixFileTypeIs(UnixFileType),
     /// Exclude entries that are not of this POSIX file type.
     UnixFileTypeIsNot(UnixFileType),
+    /// Exclude entries of any POSIX file type in this set.
+    UnixFileTypeIn(UnixFileTypes),
+    /// Exclude entries with a known POSIX file type outside this set.
+    UnixFileTypeNotIn(UnixFileTypes),
 }
 
 /// The clock and local offset a date filter resolves against.
@@ -526,6 +581,10 @@ fn excludes(item: OtherFilter, entry: &Entry, context: &FilterContext) -> bool {
         OtherFilter::UnixFileTypeIs(kind) => kind.matches(entry),
         OtherFilter::UnixFileTypeIsNot(kind) => {
             entry.attributes.unix_mode.is_some() && !kind.matches(entry)
+        }
+        OtherFilter::UnixFileTypeIn(kinds) => kinds.matches(entry),
+        OtherFilter::UnixFileTypeNotIn(kinds) => {
+            entry.attributes.unix_mode.is_some() && !kinds.matches(entry)
         }
     }
 }
@@ -758,7 +817,8 @@ fn parse_set(pattern: &[char]) -> Option<(CharSet, &[char])> {
 mod tests {
     use super::{
         from_unix_seconds, parse_size, wildcard_match, AttributeKind, CaseSensitivity,
-        FilterContext, FilterTime, Mask, NameFilters, OtherFilter, OtherFilters,
+        FilterContext, FilterTime, Mask, NameFilters, OtherFilter, OtherFilters, UnixFileType,
+        UnixFileTypes,
     };
     use crate::scan::{Attributes, Entry};
     use std::path::{Path, PathBuf};
@@ -1013,5 +1073,63 @@ mod tests {
             ..OtherFilters::default()
         };
         assert!(!unset.allows(&entry("w", 1, 0, Attributes::default()), &context));
+    }
+
+    #[test]
+    fn unix_type_sets_match_any_named_type_and_leave_unknown_modes_unfiltered() {
+        let kinds = UnixFileTypes::new()
+            .with(UnixFileType::Regular)
+            .with(UnixFileType::Symlink);
+        let regular = entry(
+            "regular",
+            1,
+            0,
+            Attributes {
+                unix_mode: Some(0o100_644),
+                ..Attributes::default()
+            },
+        );
+        let link = entry(
+            "link",
+            1,
+            0,
+            Attributes {
+                unix_mode: Some(0o120_777),
+                ..Attributes::default()
+            },
+        );
+        let fifo = entry(
+            "fifo",
+            1,
+            0,
+            Attributes {
+                unix_mode: Some(0o010_600),
+                ..Attributes::default()
+            },
+        );
+        let unknown = entry("unknown", 1, 0, Attributes::default());
+        let context = FilterContext::default();
+
+        let exclude_named = OtherFilters {
+            items: vec![OtherFilter::UnixFileTypeIn(kinds)],
+            exclude_protected_system: false,
+            exclude_hidden: false,
+            ..OtherFilters::default()
+        };
+        assert!(!exclude_named.allows(&regular, &context));
+        assert!(!exclude_named.allows(&link, &context));
+        assert!(exclude_named.allows(&fifo, &context));
+        assert!(exclude_named.allows(&unknown, &context));
+
+        let exclude_other = OtherFilters {
+            items: vec![OtherFilter::UnixFileTypeNotIn(kinds)],
+            exclude_protected_system: false,
+            exclude_hidden: false,
+            ..OtherFilters::default()
+        };
+        assert!(exclude_other.allows(&regular, &context));
+        assert!(exclude_other.allows(&link, &context));
+        assert!(!exclude_other.allows(&fifo, &context));
+        assert!(exclude_other.allows(&unknown, &context));
     }
 }

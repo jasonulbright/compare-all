@@ -429,7 +429,7 @@ pub struct FilterAttribChange {
 /// One signed group of the `filter unixtype:` clause.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnixTypeChange {
-    /// True keeps only the named kinds, false leaves them out.
+    /// True excludes the named kinds, false excludes kinds outside the named set.
     pub include: bool,
     /// The kinds the group names.
     pub kinds: UnixTypeSet,

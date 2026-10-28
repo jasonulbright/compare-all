@@ -1755,3 +1755,54 @@ fn attrib_filter_sign_selects_only_the_requested_attribute_state() {
     assert!(selected.is_clean(), "{selected:?}");
     assert_eq!(session.selection, [PathBuf::from("hidden.dat")].into(),);
 }
+
+#[cfg(unix)]
+#[test]
+fn unixtype_filter_handles_groups_and_none_removes_only_that_filter() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = Fixture::new();
+    fixture.write("left/empty.txt", "");
+    fixture.write("right/empty.txt", "");
+    fixture.write("left/plain.txt", "plain");
+    fixture.write("right/plain.txt", "plain");
+    fixture.write("left/target.txt", "target");
+    fixture.write("right/target.txt", "target");
+    symlink("target.txt", fixture.left().join("link.txt")).expect("left symlink");
+    symlink("target.txt", fixture.right().join("link.txt")).expect("right symlink");
+
+    let mut session = fixture.session();
+    let selected = run(
+        &fixture,
+        &mut session,
+        "filter unixtype:-rl\nselect all.files",
+    );
+    assert!(selected.is_clean(), "{selected:?}");
+    assert_eq!(
+        session.selection,
+        ["empty.txt", "link.txt", "plain.txt", "target.txt"]
+            .map(PathBuf::from)
+            .into(),
+    );
+
+    let selected = run(
+        &fixture,
+        &mut session,
+        "filter size:>0B unixtype:+rl\nselect all.files",
+    );
+    assert!(selected.is_clean(), "{selected:?}");
+    assert!(session.selection.is_empty());
+
+    let selected = run(
+        &fixture,
+        &mut session,
+        "filter unixtype:none\nselect all.files",
+    );
+    assert!(selected.is_clean(), "{selected:?}");
+    assert_eq!(
+        session.selection,
+        ["link.txt", "plain.txt", "target.txt"]
+            .map(PathBuf::from)
+            .into(),
+    );
+}
