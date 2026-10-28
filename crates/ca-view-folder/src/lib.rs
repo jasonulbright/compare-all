@@ -106,6 +106,8 @@ const SCAN_FAILED: &str = "The folder scan failed. Use Refresh to try again";
 const SCAN_STOPPED: &str = "The folder scan was stopped. Use Refresh to try again";
 /// Why an operation needs selected rows.
 const NOTHING_SELECTED_FOR_ACTION: &str = "Select the items to act on first";
+/// Why a selected action cannot export a path.
+const NO_LOCAL_PATH_TO_COPY: &str = "None of the selected items has a local path to copy";
 /// Why an action has no rows when the folder contains none.
 const NO_ITEMS_TO_ACT_ON: &str = "There are no items to act on";
 /// Why the synchronization preview has no operations.
@@ -2294,7 +2296,7 @@ impl FolderView {
         false
     }
 
-    /// Export sides independently so an archive cannot suppress valid paths from the local side.
+    /// Sides are exported independently; otherwise an archive suppresses valid local paths.
     fn copy_filenames(&mut self) {
         let mut paths = Vec::with_capacity(self.selection.len());
         for side in [Side::Left, Side::Right] {
@@ -3759,7 +3761,8 @@ impl SessionView for FolderView {
         self.poll();
     }
 
-    /// Consume staged text here because the UI framework emits clipboard writes as frame output.
+    /// Staged text is consumed here because the UI framework emits clipboard
+    /// writes as frame output.
     fn ui(&mut self, ui: &mut egui::Ui, context: &ViewContext) -> Vec<ViewAction> {
         let options = ca_ui::options::current(ui.ctx());
         self.confirmations = options.stored.file_operations.clone();
@@ -3830,6 +3833,14 @@ impl SessionView for FolderView {
             Command::Find if !self.accepts(command) => self.find_refusal(false),
             Command::FindNext | Command::FindPrevious if !self.accepts(command) => {
                 self.find_refusal(true)
+            }
+            Command::CopyFilename
+                if !self.accepts(command)
+                    && self.status == Status::Ready
+                    && matches!(self.stage, Stage::Idle)
+                    && !self.selection.is_empty() =>
+            {
+                Some(NO_LOCAL_PATH_TO_COPY)
             }
             Command::CopyToRight | Command::CopyToLeft | Command::CopyToOtherSide
                 if !self.accepts(command) =>
@@ -4489,6 +4500,10 @@ mod stale_results {
             super::selection::ClickKind::Replace,
         );
         assert!(!view.accepts(super::Command::CopyFilename));
+        assert_eq!(
+            view.refusal(super::Command::CopyFilename),
+            Some(super::NO_LOCAL_PATH_TO_COPY)
+        );
         Ok(())
     }
     fn sync_view(dir: &Path) -> FolderView {
