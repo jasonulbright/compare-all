@@ -166,6 +166,10 @@ pub struct PairFacts {
     pub left: EntryFacts,
     /// Facts of the right entry.
     pub right: EntryFacts,
+    /// Total file bytes below the left folder, from the full unfiltered scan.
+    pub left_folder_size: Option<u64>,
+    /// Total file bytes below the right folder, from the full unfiltered scan.
+    pub right_folder_size: Option<u64>,
 }
 
 /// Releasing a deep tree must not recurse, because tree depth follows the file
@@ -392,7 +396,87 @@ pub fn align_trees(
             }
         });
     }
+    let left_folder_sizes = folder_sizes(left);
+    let right_folder_sizes = folder_sizes(right);
+    root.facts.left_folder_size = left_folder_sizes.get(Path::new("")).copied().flatten();
+    root.facts.right_folder_size = right_folder_sizes.get(Path::new("")).copied().flatten();
+    walk_mut(&mut root, &mut |node| {
+        if node.rel.as_os_str().is_empty() {
+            return;
+        }
+        node.facts.left_folder_size = node
+            .left
+            .as_ref()
+            .and_then(|entry| left_folder_sizes.get(&entry.rel).copied().flatten());
+        node.facts.right_folder_size = node
+            .right
+            .as_ref()
+            .and_then(|entry| right_folder_sizes.get(&entry.rel).copied().flatten());
+    });
     root
+}
+
+/// Total each folder from the full scan, before filters or alignment can prune
+/// entries. An incomplete folder, a failed listing, cancellation, or an
+/// overflowing total leaves that folder and its ancestors unknown.
+fn folder_sizes(scan: &ScanResult) -> HashMap<PathBuf, Option<u64>> {
+    let mut sizes: HashMap<PathBuf, Option<u64>> = scan
+        .entries
+        .values()
+        .filter(|entry| entry.is_dir)
+        .map(|entry| {
+            let complete = !scan.cancelled
+                && !entry.listing_incomplete
+                && entry.error.is_none()
+                && !entry.refused;
+            (entry.rel.clone(), complete.then_some(0))
+        })
+        .collect();
+    sizes.insert(
+        PathBuf::new(),
+        (!scan.cancelled && !scan.root_incomplete).then_some(0),
+    );
+    let mut levels: Vec<Vec<&Entry>> = Vec::new();
+    for entry in scan.entries.values() {
+        let depth = entry.rel.components().count();
+        while levels.len() <= depth {
+            levels.push(Vec::new());
+        }
+        levels[depth].push(entry);
+    }
+
+    // Entries at greater depths feed their parent folders before those folders
+    // are added to their own parents. This stays linear even for large scans.
+    for entries in levels.into_iter().rev() {
+        for entry in entries {
+            let parent = entry.rel.parent().unwrap_or_else(|| Path::new(""));
+            let contribution = if entry.is_dir {
+                sizes.get(&entry.rel).copied().flatten()
+            } else if entry.error.is_none()
+                && !entry.refused
+                && scan.facts_of(&entry.rel).size_is_exact
+            {
+                Some(entry.size)
+            } else {
+                None
+            };
+            if let Some(total) = sizes.get_mut(parent) {
+                *total = (*total)
+                    .and_then(|current| contribution.and_then(|size| current.checked_add(size)));
+            }
+        }
+    }
+
+    for error in &scan.errors {
+        let mut path = Some(error.rel.as_path());
+        while let Some(current) = path {
+            if let Some(total) = sizes.get_mut(current) {
+                *total = None;
+            }
+            path = current.parent();
+        }
+    }
+    sizes
 }
 
 /// Carry a partial listing down to every pair under it.
@@ -1808,6 +1892,135 @@ mod tests {
             .map(|node| node.name.as_str())
             .collect();
         assert_eq!(names, vec!["keep.txt"]);
+    }
+
+    #[test]
+    fn folder_sizes_include_filtered_files_from_the_full_scan() {
+        let dirs = pair();
+        for side in [dirs.left.path(), dirs.right.path()] {
+            std::fs::create_dir(side.join("top")).unwrap();
+            std::fs::write(side.join("top/keep.txt"), b"ok").unwrap();
+            std::fs::write(side.join("top/hidden.txt"), b"hidden").unwrap();
+        }
+        let mut tree = align(
+            &scan(dirs.left.path()),
+            &scan(dirs.right.path()),
+            &AlignmentOptions::default(),
+        );
+        assert_eq!(tree.facts.left_folder_size, Some(8));
+        assert_eq!(tree.facts.right_folder_size, Some(8));
+        assert_eq!(find(&tree, "top").facts.left_folder_size, Some(8));
+        assert_eq!(find(&tree, "top").facts.right_folder_size, Some(8));
+
+        apply_filters(
+            &mut tree,
+            &NameFilters::parse("-hidden.txt"),
+            &OtherFilters::default(),
+            &FilterContext::default(),
+        );
+        let top = find(&tree, "top");
+        assert_eq!(top.children.len(), 1);
+        assert_eq!(top.facts.left_folder_size, Some(8));
+        assert_eq!(top.facts.right_folder_size, Some(8));
+    }
+
+    #[test]
+    fn an_incomplete_folder_has_no_size_without_blinding_the_other_side() {
+        let mut left =
+            synthetic_result(vec![entry("top", "top", true), entry("top/a", "a", false)]);
+        let mut right =
+            synthetic_result(vec![entry("top", "top", true), entry("top/a", "a", false)]);
+        left.entries
+            .get_mut(Path::new("top"))
+            .unwrap()
+            .listing_incomplete = true;
+        right.entries.get_mut(Path::new("top/a")).unwrap().size = 7;
+
+        let tree = align(&left, &right, &AlignmentOptions::default());
+        let top = find(&tree, "top");
+        assert_eq!(top.facts.left_folder_size, None);
+        assert_eq!(top.facts.right_folder_size, Some(7));
+    }
+
+    #[test]
+    fn an_error_below_a_folder_invalidates_its_ancestors_and_root_total() {
+        let mut left = synthetic_result(vec![
+            entry("a", "a", true),
+            entry("a/known.txt", "known.txt", false),
+        ]);
+        let mut right = synthetic_result(vec![
+            entry("a", "a", true),
+            entry("a/known.txt", "known.txt", false),
+        ]);
+        left.entries.get_mut(Path::new("a/known.txt")).unwrap().size = 5;
+        right
+            .entries
+            .get_mut(Path::new("a/known.txt"))
+            .unwrap()
+            .size = 5;
+        left.errors.push(crate::scan::EntryError {
+            rel: PathBuf::from("a/unreadable.txt"),
+            message: "cannot read entry".to_owned(),
+        });
+
+        let tree = align(&left, &right, &AlignmentOptions::default());
+
+        assert_eq!(tree.facts.left_folder_size, None);
+        assert_eq!(find(&tree, "a").facts.left_folder_size, None);
+        assert_eq!(tree.facts.right_folder_size, Some(5));
+        assert_eq!(find(&tree, "a").facts.right_folder_size, Some(5));
+    }
+
+    #[test]
+    fn an_error_bearing_file_does_not_contribute_to_folder_totals() {
+        let mut left =
+            synthetic_result(vec![entry("a", "a", true), entry("a/file", "file", false)]);
+        let mut right =
+            synthetic_result(vec![entry("a", "a", true), entry("a/file", "file", false)]);
+        left.entries.get_mut(Path::new("a/file")).unwrap().size = 5;
+        left.entries.get_mut(Path::new("a/file")).unwrap().error =
+            Some("cannot read file".to_owned());
+        right.entries.get_mut(Path::new("a/file")).unwrap().size = 5;
+
+        let tree = align(&left, &right, &AlignmentOptions::default());
+
+        assert_eq!(find(&tree, "a").facts.left_folder_size, None);
+        assert_eq!(find(&tree, "a").facts.right_folder_size, Some(5));
+    }
+
+    #[test]
+    fn a_cancelled_scan_keeps_its_folder_size_unknown() {
+        let mut left =
+            synthetic_result(vec![entry("top", "top", true), entry("top/a", "a", false)]);
+        let mut right =
+            synthetic_result(vec![entry("top", "top", true), entry("top/a", "a", false)]);
+        left.cancelled = true;
+        right.entries.get_mut(Path::new("top/a")).unwrap().size = 4;
+
+        let tree = align(&left, &right, &AlignmentOptions::default());
+        let top = find(&tree, "top");
+        assert_eq!(top.facts.left_folder_size, None);
+        assert_eq!(top.facts.right_folder_size, Some(4));
+    }
+
+    #[test]
+    fn an_inexact_file_size_makes_its_folder_total_unknown() {
+        let left = synthetic_result(vec![entry("top", "top", true), entry("top/a", "a", false)]);
+        let mut right =
+            synthetic_result(vec![entry("top", "top", true), entry("top/a", "a", false)]);
+        right.entries.get_mut(Path::new("top/a")).unwrap().size = 4;
+        right.facts.insert(
+            PathBuf::from("top/a"),
+            crate::source::EntryFacts {
+                size_is_exact: false,
+                ..crate::source::EntryFacts::default()
+            },
+        );
+
+        let tree = align(&left, &right, &AlignmentOptions::default());
+        let top = find(&tree, "top");
+        assert_eq!(top.facts.left_folder_size, Some(0));
+        assert_eq!(top.facts.right_folder_size, None);
     }
 
     #[test]
