@@ -170,6 +170,16 @@ pub trait SessionView {
     /// active tab. Called before [`SessionView::tick`] for every tab.
     fn set_active(&mut self, _active: bool) {}
 
+    /// Whether this view asks the shell to hide its chrome and fill the
+    /// viewport with the view's focused content.
+    fn wants_fullscreen(&self) -> bool {
+        false
+    }
+
+    /// Set the view's fullscreen state. The shell uses this when the user
+    /// exits fullscreen through the window or presses Escape.
+    fn set_fullscreen(&mut self, _fullscreen: bool) {}
+
     /// Paint one frame and collect whatever the view wants the shell to do.
     fn ui(&mut self, ui: &mut egui::Ui, context: &ViewContext) -> Vec<ViewAction>;
 

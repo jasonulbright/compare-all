@@ -267,6 +267,7 @@ commands! {
     CompareStructure, "Compare Structure", View, None, "Compare JSON or XML by path and value, or restore the source text.";
     PrettifyForComparison, "Prettify for Comparison", View, None, "Compare recognized JSON, XML, YAML, or TOML after formatting it in memory; source files are never changed.";
     ToggleWordWrap, "Word Wrap", View, None, "Break long lines at the pane edge, or let them run on.";
+    ToggleFullscreen, "Full Screen", View, Some("F11"), "Toggle full screen in Picture Compare.";
     SideBySideLayout, "Side-by-Side Layout", View, None, "Place the two panes beside each other.";
     OverUnderLayout, "Over-Under Layout", View, None, "Place the two panes one above the other.";
     Webpages, "Webpages", View, None, "Render the two sides as web pages.";
@@ -1263,6 +1264,7 @@ fn shared(stroke: Keystroke) -> Option<Command> {
         (true, false, Key::I) => Some(Command::CompareInfo),
         (true, false, Key::F5) => Some(Command::Recompare),
         (false, false, Key::F5) => Some(Command::Reload),
+        (false, false, Key::F11) => Some(Command::ToggleFullscreen),
         (true, false, Key::A) => Some(Command::SelectAll),
         (true, false, Key::F) => Some(Command::Find),
         (false, false, Key::F3) => Some(Command::FindNext),
@@ -1418,6 +1420,7 @@ pub fn bindings(view: MenuView) -> Vec<(Keystroke, Command)> {
         Keystroke::with_command(Key::I),
         Keystroke::with_command(Key::F5),
         Keystroke::plain(Key::F5),
+        Keystroke::plain(Key::F11),
         Keystroke::with_command(Key::A),
         Keystroke::with_command(Key::F),
         Keystroke::plain(Key::F3),
