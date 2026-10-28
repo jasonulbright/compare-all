@@ -894,6 +894,12 @@ pub struct App {
     active: usize,
     /// Whether this shell, rather than the window manager, entered fullscreen.
     fullscreen_owned: bool,
+    /// Last viewport fullscreen state reported by the platform, if known.
+    fullscreen_confirmed: Option<bool>,
+    /// Most recent fullscreen state requested by the shell, awaiting a report.
+    fullscreen_pending: Option<bool>,
+    /// Last fullscreen state requested by the active view.
+    fullscreen_wanted: Option<bool>,
     next_instance: u64,
     closing: bool,
     /// What the active view declared this frame, read once and used by every
@@ -1126,6 +1132,9 @@ impl App {
             tabs: Vec::new(),
             active: 0,
             fullscreen_owned: false,
+            fullscreen_confirmed: None,
+            fullscreen_pending: None,
+            fullscreen_wanted: None,
             next_instance: 0,
             closing: false,
             declared: Vec::new(),
@@ -3437,8 +3446,9 @@ impl App {
                 if let Some(tab) = self.tabs.get_mut(self.active) {
                     tab.set_fullscreen(false);
                 }
-                self.fullscreen_owned = false;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+                if self.fullscreen_owned {
+                    self.request_fullscreen(ctx, false);
+                }
                 ran.push(index);
                 continue;
             }
@@ -3468,20 +3478,55 @@ impl App {
         }
     }
 
+    fn request_fullscreen(&mut self, ctx: &egui::Context, fullscreen: bool) {
+        if self.fullscreen_pending != Some(fullscreen) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(fullscreen));
+            self.fullscreen_pending = Some(fullscreen);
+        }
+        if fullscreen {
+            self.fullscreen_owned = true;
+        }
+    }
+
     fn sync_fullscreen(&mut self, ctx: &egui::Context) {
-        let wanted = self
+        let actual = ctx.input(|input| input.viewport().fullscreen);
+        let previous = self.fullscreen_confirmed;
+        let pending = self.fullscreen_pending;
+
+        if let Some(actual) = actual {
+            self.fullscreen_confirmed = Some(actual);
+            if pending == Some(actual) {
+                self.fullscreen_pending = None;
+                self.fullscreen_owned = actual;
+            }
+        }
+
+        let mut wanted = self
             .tabs
             .get(self.active)
             .is_some_and(|tab| tab.wants_fullscreen());
-        let actual = ctx.input(|input| input.viewport().fullscreen.unwrap_or(false));
-        if wanted && !actual {
-            self.fullscreen_owned = true;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
-        } else if !wanted && actual && self.fullscreen_owned {
+        let is_new_request = wanted && self.fullscreen_wanted != Some(true);
+        let external_exit =
+            pending.is_none() && previous == Some(true) && actual == Some(false) && !is_new_request;
+
+        if external_exit {
+            if let Some(tab) = self.tabs.get_mut(self.active) {
+                if tab.wants_fullscreen() {
+                    tab.set_fullscreen(false);
+                }
+            }
             self.fullscreen_owned = false;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
-        } else if !actual {
-            self.fullscreen_owned = false;
+            wanted = false;
+        }
+
+        self.fullscreen_wanted = Some(wanted);
+        match self.fullscreen_pending {
+            Some(pending) if pending != wanted => self.request_fullscreen(ctx, wanted),
+            None if wanted && actual != Some(true) => self.request_fullscreen(ctx, true),
+            None if !wanted && self.fullscreen_owned && actual != Some(false) => {
+                self.request_fullscreen(ctx, false);
+            }
+            Some(_) | None => {}
         }
     }
 
@@ -6915,6 +6960,95 @@ mod tests {
         assert!(output.viewport_output[&egui::ViewportId::ROOT]
             .commands
             .contains(&egui::ViewportCommand::Fullscreen(false)));
+        assert!(app.fullscreen_owned);
+        assert_eq!(app.fullscreen_pending, Some(false));
+
+        let mut confirmed_exit = ca_ui::testing::event_input(1280.0, 800.0, Vec::new());
+        confirmed_exit
+            .viewports
+            .entry(egui::ViewportId::ROOT)
+            .or_default()
+            .fullscreen = Some(false);
+        let _ = ctx.run(confirmed_exit, |ctx| app.sync_fullscreen(ctx));
+        assert!(!app.fullscreen_owned);
+        assert_eq!(app.fullscreen_pending, None);
+    }
+
+    #[test]
+    fn fullscreen_sync_preserves_new_requests_across_delayed_viewport_reports() {
+        struct FullscreenProbe(Rc<Cell<bool>>);
+
+        impl SessionView for FullscreenProbe {
+            fn title(&self) -> String {
+                "Fullscreen probe".to_owned()
+            }
+
+            fn wants_fullscreen(&self) -> bool {
+                self.0.get()
+            }
+
+            fn set_fullscreen(&mut self, fullscreen: bool) {
+                self.0.set(fullscreen);
+            }
+
+            fn ui(&mut self, _ui: &mut egui::Ui, _context: &ViewContext) -> Vec<ViewAction> {
+                Vec::new()
+            }
+        }
+
+        let (_settings, mut app) = empty_app();
+        let wants_fullscreen = Rc::new(Cell::new(true));
+        app.tabs
+            .push(Box::new(FullscreenProbe(Rc::clone(&wants_fullscreen))));
+        let ctx = egui::Context::default();
+        let run_frame = |app: &mut App, actual: Option<bool>| {
+            let mut input = ca_ui::testing::event_input(1280.0, 800.0, Vec::new());
+            input
+                .viewports
+                .entry(egui::ViewportId::ROOT)
+                .or_default()
+                .fullscreen = actual;
+            ctx.run(input, |ctx| app.sync_fullscreen(ctx))
+        };
+
+        let output = run_frame(&mut app, Some(false));
+        assert!(output.viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .contains(&egui::ViewportCommand::Fullscreen(true)));
+        assert_eq!(app.fullscreen_pending, Some(true));
+
+        let _ = run_frame(&mut app, Some(true));
+        assert_eq!(app.fullscreen_pending, None);
+        assert!(app.fullscreen_owned);
+
+        wants_fullscreen.set(false);
+        let output = run_frame(&mut app, Some(true));
+        assert!(output.viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .contains(&egui::ViewportCommand::Fullscreen(false)));
+        assert_eq!(app.fullscreen_pending, Some(false));
+
+        wants_fullscreen.set(true);
+        let output = run_frame(&mut app, Some(true));
+        assert!(output.viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .contains(&egui::ViewportCommand::Fullscreen(true)));
+        assert_eq!(app.fullscreen_pending, Some(true));
+
+        let output = run_frame(&mut app, Some(false));
+        assert!(!output.viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .contains(&egui::ViewportCommand::Fullscreen(false)));
+        assert!(wants_fullscreen.get());
+        assert_eq!(app.fullscreen_pending, Some(true));
+
+        let _ = run_frame(&mut app, Some(true));
+        assert_eq!(app.fullscreen_pending, None);
+        let output = run_frame(&mut app, Some(false));
+        assert!(!output.viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .contains(&egui::ViewportCommand::Fullscreen(true)));
+        assert!(!wants_fullscreen.get());
         assert!(!app.fullscreen_owned);
     }
 
