@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use ca_fs::{
     AlignmentOptions, AttributeComparison, AttributeKind, Cancel, CompareOptions, ContentMethod,
     FilterContext, FilterTime, NameFilters, Node, NodeStatus, OtherFilter, OtherFilters,
-    ScanOptions,
+    ScanOptions, UnixFileType, UnixFileTypes,
 };
 
 use crate::ast::{
@@ -436,11 +436,24 @@ impl Session {
                         }
                     }
                 }
-                FilterClause::UnixType(_) => {
-                    return Err(ExecError::not_supported(
-                        "filter",
-                        "the file kind clause has no engine behind it yet",
-                    ))
+                FilterClause::UnixType(change) => {
+                    self.other_filters.items.retain(|item| {
+                        !matches!(
+                            item,
+                            OtherFilter::UnixFileTypeIs(_)
+                                | OtherFilter::UnixFileTypeIsNot(_)
+                                | OtherFilter::UnixFileTypeIn(_)
+                                | OtherFilter::UnixFileTypeNotIn(_)
+                        )
+                    });
+                    if let Some(change) = change {
+                        let kinds = unix_file_types(change.kinds);
+                        self.other_filters.items.push(if change.include {
+                            OtherFilter::UnixFileTypeNotIn(kinds)
+                        } else {
+                            OtherFilter::UnixFileTypeIn(kinds)
+                        });
+                    }
                 }
                 FilterClause::ExcludeProtected => {
                     self.other_filters.exclude_protected_system = true;
@@ -519,6 +532,23 @@ impl Session {
         }
         self.selection = chosen;
     }
+}
+
+fn unix_file_types(kinds: crate::ast::UnixTypeSet) -> UnixFileTypes {
+    let mut result = UnixFileTypes::new();
+    for (enabled, kind) in [
+        (kinds.block, UnixFileType::Block),
+        (kinds.character, UnixFileType::Character),
+        (kinds.link, UnixFileType::Symlink),
+        (kinds.fifo, UnixFileType::Fifo),
+        (kinds.regular, UnixFileType::Regular),
+        (kinds.socket, UnixFileType::Socket),
+    ] {
+        if enabled {
+            result = result.with(kind);
+        }
+    }
+    result
 }
 
 fn attribute_comparison(attrs: Option<AttrSet>) -> AttributeComparison {
