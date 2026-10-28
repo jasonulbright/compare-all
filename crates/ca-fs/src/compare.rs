@@ -1263,10 +1263,16 @@ fn keep_node(
     if !names.allows(&node.rel, false) {
         return false;
     }
-    node.left
+    let row_allowed = node
+        .left
         .as_ref()
         .or(node.right.as_ref())
-        .is_none_or(|entry| others.allows(entry, context))
+        .is_none_or(|entry| others.allows(entry, context));
+    row_allowed
+        && [&node.left, &node.right]
+            .into_iter()
+            .flatten()
+            .all(|entry| others.allows_unix_type(entry, context))
 }
 
 #[cfg(test)]
