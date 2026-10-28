@@ -3759,6 +3759,7 @@ impl SessionView for FolderView {
         self.poll();
     }
 
+    /// Consume staged text here because the UI framework emits clipboard writes as frame output.
     fn ui(&mut self, ui: &mut egui::Ui, context: &ViewContext) -> Vec<ViewAction> {
         let options = ca_ui::options::current(ui.ctx());
         self.confirmations = options.stored.file_operations.clone();
@@ -3878,6 +3879,7 @@ impl SessionView for FolderView {
         }
     }
 
+    /// Copy requests stage paths here; the next UI frame publishes their clipboard output.
     fn run(&mut self, command: Command) {
         match command {
             Command::ExpandAll => {
