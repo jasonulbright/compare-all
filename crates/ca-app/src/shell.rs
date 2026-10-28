@@ -685,7 +685,7 @@ const FOLDER_MENUS: &[(&str, &[Entry])] = &[
             Entry::Run(Command::Touch, ACTIONABLE),
             Entry::Run(Command::Exclude, ACTIONABLE),
             Entry::Run(Command::NewFolder, ACTIONABLE),
-            Entry::Soon(Command::CopyFilename),
+            Entry::Run(Command::CopyFilename, ACTIONABLE),
             Entry::Soon(Command::ToggleIgnored),
             Entry::Soon(Command::RefreshSelection),
             Entry::Rule,

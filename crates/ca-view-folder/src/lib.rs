@@ -151,6 +151,7 @@ const HANDLED: &[Command] = &[
     Command::Touch,
     Command::Attributes,
     Command::NewFolder,
+    Command::CopyFilename,
     Command::Exchange,
     Command::Exclude,
 ];
@@ -349,6 +350,7 @@ pub struct FolderView {
     pending_opens: Vec<OpenRequest>,
     /// The report command of this view.
     report: ViewReport,
+    pending_clipboard: Option<String>,
     arena: Arena,
     compared_tree: Option<Box<Node>>,
     expanded: Expanded,
@@ -537,6 +539,7 @@ impl FolderView {
                 egui::Id::new(("folder-compare", instance)),
                 context.notify.clone(),
             ),
+            pending_clipboard: None,
             arena: Arena::default(),
             compared_tree: None,
             expanded: Expanded::new(),
@@ -2252,6 +2255,33 @@ impl FolderView {
         }
     }
 
+    fn copy_filenames(&mut self) {
+        let mut paths = Vec::with_capacity(self.selection.len());
+        for (side, base) in [
+            (Side::Left, &self.left_path),
+            (Side::Right, &self.right_path),
+        ] {
+            for rel in self.selection.side(side) {
+                let Some(index) = self.arena.index_of(rel) else {
+                    continue;
+                };
+                let Some(node) = self.arena.node(index) else {
+                    continue;
+                };
+                let present = match side {
+                    Side::Left => node.left.is_some(),
+                    Side::Right => node.right.is_some(),
+                };
+                if present {
+                    paths.push(base.join(rel).display().to_string());
+                }
+            }
+        }
+        if !paths.is_empty() {
+            self.pending_clipboard = Some(paths.join("\n"));
+        }
+    }
+
     /// The name the report display filter carries for what the tree shows.
     #[must_use]
     pub const fn report_filter(&self) -> &'static str {
@@ -3718,6 +3748,9 @@ impl SessionView for FolderView {
             self.selection_bar(ui);
             self.toolbar(ui);
             self.report_panel(ui);
+            if let Some(text) = self.pending_clipboard.take() {
+                ui.ctx().copy_text(text);
+            }
             if self.mode == Mode::Sync {
                 self.sync_bar(ui);
             }
@@ -3795,6 +3828,9 @@ impl SessionView for FolderView {
             Command::Cancel => self.status.is_running() || self.stage.is_busy(),
             Command::ClearSelection => !self.selection.is_empty(),
             Command::InvertSelection => !self.rows.is_empty(),
+            Command::CopyFilename => {
+                idle && self.status == Status::Ready && !self.selection.is_empty()
+            }
             Command::CopyToRight | Command::CopyToLeft => idle && !self.selection.is_empty(),
             other => {
                 if select_rule_of(other).is_some() {
@@ -3832,6 +3868,7 @@ impl SessionView for FolderView {
             Command::FindPrevious => self.step_name(false, false),
             Command::ClearSelection => self.selection.clear(),
             Command::InvertSelection => self.selection.invert_visible(&self.rows, &self.arena),
+            Command::CopyFilename => self.copy_filenames(),
             Command::CopyToRight => self.copy_to(Side::Right),
             Command::CopyToLeft => self.copy_to(Side::Left),
             Command::SwapSides => {
@@ -4244,6 +4281,88 @@ mod stale_results {
         );
         assert!(poll_until(&mut view, FolderView::is_ready));
         view
+    }
+
+    fn clipboard_frame(view: &mut FolderView) -> egui::FullOutput {
+        let context = ca_ui::testing::context();
+        let egui_context = egui::Context::default();
+        egui_context.run(
+            ca_ui::testing::event_input(1_000.0, 600.0, Vec::new()),
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    view.ui(ui, &context);
+                });
+            },
+        )
+    }
+
+    fn copied(output: &egui::FullOutput) -> Vec<String> {
+        output
+            .platform_output
+            .commands
+            .iter()
+            .filter_map(|command| match command {
+                egui::OutputCommand::CopyText(text) => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn copy_filename_puts_selected_side_paths_on_the_clipboard() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut view = ready_view(dir.path());
+        assert!(!view.accepts(super::Command::CopyFilename));
+
+        view.run(super::Command::SelectAll);
+        assert!(view.accepts(super::Command::CopyFilename));
+        view.run(super::Command::CopyFilename);
+        let output = clipboard_frame(&mut view);
+        let left = dir
+            .path()
+            .join("left")
+            .join("same.txt")
+            .display()
+            .to_string();
+        let right = dir
+            .path()
+            .join("right")
+            .join("same.txt")
+            .display()
+            .to_string();
+        assert_eq!(copied(&output), vec![format!("{left}\n{right}")]);
+
+        view.selection.restrict_to(ca_fs::Side::Right);
+        view.run(super::Command::CopyFilename);
+        let output = clipboard_frame(&mut view);
+        assert_eq!(copied(&output), vec![right]);
+    }
+
+    #[test]
+    fn copy_filename_is_available_in_folder_sync() {
+        use crate::FolderSyncView;
+        use ca_ui::view::SessionView;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut sync = FolderSyncView::from(sync_view(dir.path()));
+        sync.run(super::Command::SelectAll);
+        assert!(sync.accepts(super::Command::CopyFilename));
+        sync.run(super::Command::CopyFilename);
+
+        let output = clipboard_frame(sync.view_mut());
+        let left = dir
+            .path()
+            .join("left")
+            .join("same.txt")
+            .display()
+            .to_string();
+        let right = dir
+            .path()
+            .join("right")
+            .join("same.txt")
+            .display()
+            .to_string();
+        assert_eq!(copied(&output), vec![format!("{left}\n{right}")]);
     }
 
     fn sync_view(dir: &Path) -> FolderView {
