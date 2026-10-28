@@ -297,7 +297,13 @@ impl Selection {
                     self.right.insert(node.rel.clone());
                 }
             } else {
-                self.side_mut(start_side).insert(node.rel.clone());
+                let present = match start_side {
+                    Side::Left => node.left.is_some(),
+                    Side::Right => node.right.is_some(),
+                };
+                if present {
+                    self.side_mut(start_side).insert(node.rel.clone());
+                }
             }
         }
         self.anchor = Some((start_side, start_rel.to_path_buf()));
@@ -523,6 +529,26 @@ mod tests {
         assert!(selection.contains(Side::Left, Path::new("c.txt")));
         assert!(selection.side(Side::Right).is_empty());
         assert_eq!(selection.cursor().map(|(side, _)| side), Some(Side::Left));
+    }
+
+    #[test]
+    fn a_drag_within_one_pane_skips_rows_absent_from_that_side() {
+        let (arena, rows) = model();
+        let mut selection = Selection::new();
+        assert!(selection.drag_range(
+            Side::Right,
+            Path::new("a.txt"),
+            Side::Right,
+            2,
+            &rows,
+            &arena,
+        ));
+        assert_eq!(selection.side(Side::Right).len(), 2);
+        assert!(selection.contains(Side::Right, Path::new("a.txt")));
+        assert!(selection.contains(Side::Right, Path::new("b.txt")));
+        assert!(!selection.contains(Side::Right, Path::new("c.txt")));
+        assert!(selection.side(Side::Left).is_empty());
+        assert_eq!(selection.cursor().map(|(side, _)| side), Some(Side::Right));
     }
 
     #[test]
