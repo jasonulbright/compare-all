@@ -2923,7 +2923,6 @@ impl FolderView {
         }
     }
 
-    /// True while no dialog of the view is on screen, so the tree can accept input.
     fn tree_takes_input(&self) -> bool {
         let recovery_shown = self.show_recovery && !self.notices.is_empty();
         !self.stage.blocks_input() && self.message.is_none() && !recovery_shown
