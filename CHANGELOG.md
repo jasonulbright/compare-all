@@ -1,6 +1,6 @@
 # v2026.10.28.0013
 
-## Copy selected folder paths from Folder Compare
+## 1 action copies selected paths from either side
 
 ### Features
 
