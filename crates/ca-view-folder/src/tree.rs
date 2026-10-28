@@ -16,10 +16,26 @@ use std::time::SystemTime;
 /// What one side of a pair carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SideInfo {
-    /// Size in bytes; zero for a folder.
+    /// Size in bytes for a file; zero for a folder.
     pub size: u64,
+    /// True when this side's entry is a folder.
+    pub is_dir: bool,
+    /// Total bytes in a folder after its full listing has been read.
+    pub folder_size: Option<u64>,
     /// Last modified time, where the file system reported one.
     pub modified: Option<SystemTime>,
+}
+
+impl SideInfo {
+    /// The size to show for this side, if the complete value is known.
+    #[must_use]
+    pub const fn display_size(self) -> Option<u64> {
+        if self.is_dir {
+            self.folder_size
+        } else {
+            Some(self.size)
+        }
+    }
 }
 
 /// One node of the comparison.
@@ -244,8 +260,14 @@ impl Arena {
                 rel: node.rel.clone(),
                 is_dir: node.is_dir,
                 status: node.status,
-                left: node.left.as_ref().map(side_info),
-                right: node.right.as_ref().map(side_info),
+                left: node
+                    .left
+                    .as_ref()
+                    .map(|entry| side_info(entry, node.facts.left_folder_size)),
+                right: node
+                    .right
+                    .as_ref()
+                    .map(|entry| side_info(entry, node.facts.right_folder_size)),
                 content: node.content,
                 children: Vec::new(),
                 depth,
@@ -514,7 +536,7 @@ impl Arena {
 struct SortKey {
     is_dir: bool,
     name: String,
-    size: u64,
+    size: Option<u64>,
     modified: Option<SystemTime>,
 }
 
@@ -522,9 +544,8 @@ impl SortKey {
     fn of(node: &ArenaNode) -> Self {
         let size = node
             .left
-            .map(|side| side.size)
-            .max(node.right.map(|side| side.size))
-            .unwrap_or(0);
+            .and_then(SideInfo::display_size)
+            .max(node.right.and_then(SideInfo::display_size));
         let modified = node
             .left
             .and_then(|side| side.modified)
@@ -587,9 +608,11 @@ pub struct Totals {
     pub kind_mismatches: usize,
 }
 
-fn side_info(entry: &ca_fs::Entry) -> SideInfo {
+fn side_info(entry: &ca_fs::Entry, folder_size: Option<u64>) -> SideInfo {
     SideInfo {
         size: entry.size,
+        is_dir: entry.is_dir,
+        folder_size,
         modified: entry.modified,
     }
 }
@@ -836,6 +859,36 @@ mod tests {
         }
         let arena = Arena::from_root(&tree);
         assert!(arena.node(0).unwrap().incomplete);
+    }
+
+    #[test]
+    fn folder_sizes_from_the_engine_survive_filtered_children() {
+        let mut root = folder(
+            "",
+            vec![folder(
+                "top",
+                vec![
+                    file("top/a", NodeStatus::Different),
+                    folder("top/nested", vec![file("top/nested/b", NodeStatus::Same)]),
+                    file("top/left-only", NodeStatus::LeftOrphan),
+                ],
+            )],
+        );
+        root.children[0].facts.left_folder_size = Some(35);
+        root.children[0].facts.right_folder_size = Some(40);
+        root.children[0].children[1].facts.left_folder_size = Some(20);
+        root.children[0].children[1].facts.right_folder_size = Some(25);
+
+        root.children[0]
+            .children
+            .retain(|node| node.name != "left-only");
+        let arena = Arena::from_root(&root);
+        let top = arena.node(0).unwrap();
+        let nested = arena.node(2).unwrap();
+        assert_eq!(top.left.unwrap().folder_size, Some(35));
+        assert_eq!(top.right.unwrap().folder_size, Some(40));
+        assert_eq!(nested.left.unwrap().folder_size, Some(20));
+        assert_eq!(nested.right.unwrap().folder_size, Some(25));
     }
 
     #[test]
