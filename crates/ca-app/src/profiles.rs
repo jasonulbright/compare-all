@@ -335,6 +335,14 @@ impl ProfileManager {
                             });
                         ui.end_row();
                     });
+                ui.checkbox(
+                    &mut webdav.allow_plaintext_credentials,
+                    "Allow authentication over plain HTTP (legacy compatibility)",
+                );
+                ui.small(concat!(
+                    "HTTP exposes Basic passwords and lets observers ",
+                    "guess Digest passwords offline. Use HTTPS whenever possible."
+                ));
                 secret_note(ui);
             }
             ServiceProfile::S3(s3) => {
@@ -1068,6 +1076,45 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         assert!(manager.job.is_none(), "the profile job did not finish");
+    }
+
+    #[test]
+    fn plaintext_authentication_compatibility_checkbox_toggles_by_accessible_label() {
+        let mut manager =
+            ProfileManager::open_with_loader(std::path::Path::new("."), Arc::new(|| {}), |_| {
+                (Vec::new(), None)
+            });
+        wait_for_job(&mut manager);
+        manager.draft.service =
+            ServiceProfile::WebDav(ca_vfs::remote::profile::WebDavProfile::default());
+        let manager = std::cell::RefCell::new(manager);
+
+        let label = "Allow authentication over plain HTTP (legacy compatibility)";
+        let mut probe = ca_ui::testing::probe::Probe::new(1_400.0, 900.0);
+        let mut draw = |context: &egui::Context| {
+            egui::CentralPanel::default().show(context, |_| {
+                manager.borrow_mut().show(context);
+            });
+        };
+        probe.idle(&mut draw);
+        probe.idle(&mut draw);
+        assert_eq!(probe.find(label).unwrap().toggled, Some(false));
+        assert!(matches!(
+            &manager.borrow().draft.service,
+            ServiceProfile::WebDav(profile) if !profile.allow_plaintext_credentials
+        ));
+
+        probe.click(label, &mut draw).unwrap();
+        assert!(matches!(
+            &manager.borrow().draft.service,
+            ServiceProfile::WebDav(profile) if profile.allow_plaintext_credentials
+        ));
+
+        probe.click(label, &mut draw).unwrap();
+        assert!(matches!(
+            &manager.borrow().draft.service,
+            ServiceProfile::WebDav(profile) if !profile.allow_plaintext_credentials
+        ));
     }
 
     #[test]
