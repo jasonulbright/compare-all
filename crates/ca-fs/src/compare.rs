@@ -452,7 +452,10 @@ fn folder_sizes(scan: &ScanResult) -> HashMap<PathBuf, Option<u64>> {
             let parent = entry.rel.parent().unwrap_or_else(|| Path::new(""));
             let contribution = if entry.is_dir {
                 sizes.get(&entry.rel).copied().flatten()
-            } else if scan.facts_of(&entry.rel).size_is_exact {
+            } else if entry.error.is_none()
+                && !entry.refused
+                && scan.facts_of(&entry.rel).size_is_exact
+            {
                 Some(entry.size)
             } else {
                 None
@@ -1965,6 +1968,23 @@ mod tests {
         assert_eq!(tree.facts.left_folder_size, None);
         assert_eq!(find(&tree, "a").facts.left_folder_size, None);
         assert_eq!(tree.facts.right_folder_size, Some(5));
+        assert_eq!(find(&tree, "a").facts.right_folder_size, Some(5));
+    }
+
+    #[test]
+    fn an_error_bearing_file_does_not_contribute_to_folder_totals() {
+        let mut left =
+            synthetic_result(vec![entry("a", "a", true), entry("a/file", "file", false)]);
+        let mut right =
+            synthetic_result(vec![entry("a", "a", true), entry("a/file", "file", false)]);
+        left.entries.get_mut(Path::new("a/file")).unwrap().size = 5;
+        left.entries.get_mut(Path::new("a/file")).unwrap().error =
+            Some("cannot read file".to_owned());
+        right.entries.get_mut(Path::new("a/file")).unwrap().size = 5;
+
+        let tree = align(&left, &right, &AlignmentOptions::default());
+
+        assert_eq!(find(&tree, "a").facts.left_folder_size, None);
         assert_eq!(find(&tree, "a").facts.right_folder_size, Some(5));
     }
 
