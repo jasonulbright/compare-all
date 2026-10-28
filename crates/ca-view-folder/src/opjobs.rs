@@ -1187,9 +1187,20 @@ fn scan_subtree(
     options: &crate::settings::EngineOptions,
     cancel: &Cancel,
 ) -> ScannedSubtree {
-    let read = |base: &Path| {
-        ca_fs::scan_with(&base.join(rel), &options.scan, cancel.as_fs(), &|_| {})
-            .unwrap_or_default()
+    let read = |base: &Path| match ca_fs::scan_with(
+        &base.join(rel),
+        &options.scan,
+        cancel.as_fs(),
+        &|_| {},
+    ) {
+        Ok(scan) => scan,
+        Err(ca_fs::scan::ScanError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            ca_fs::scan::ScanResult::default()
+        }
+        Err(_) => ca_fs::scan::ScanResult {
+            root_incomplete: true,
+            ..ca_fs::scan::ScanResult::default()
+        },
     };
     let left = read(left_base);
     let right = read(right_base);
@@ -1255,17 +1266,29 @@ fn splice(tree: &mut Node, rel: &Path, refreshed: ScannedSubtree) {
         )
     });
     if let Some((old_left, old_right)) = old_sizes {
+        let new_contributions = find_mut(tree, rel).map_or(
+            (refreshed.left_folder_size, refreshed.right_folder_size),
+            |node| {
+                (
+                    if node.left.is_some() {
+                        refreshed.left_folder_size
+                    } else {
+                        Some(0)
+                    },
+                    if node.right.is_some() {
+                        refreshed.right_folder_size
+                    } else {
+                        Some(0)
+                    },
+                )
+            },
+        );
         if let Some(node) = find_mut(tree, rel) {
             node.children = refreshed.children;
-            node.facts.left_folder_size = refreshed.left_folder_size;
-            node.facts.right_folder_size = refreshed.right_folder_size;
+            node.facts.left_folder_size = node.left.as_ref().and(refreshed.left_folder_size);
+            node.facts.right_folder_size = node.right.as_ref().and(refreshed.right_folder_size);
         }
-        update_ancestor_sizes(
-            tree,
-            rel,
-            (old_left, old_right),
-            (refreshed.left_folder_size, refreshed.right_folder_size),
-        );
+        update_ancestor_sizes(tree, rel, (old_left, old_right), new_contributions);
         return;
     }
     // The folder is new, so it is attached under whichever ancestor the tree
@@ -1284,8 +1307,6 @@ fn splice(tree: &mut Node, rel: &Path, refreshed: ScannedSubtree) {
         false
     };
     if attached {
-        // No previous node means this folder contributed no bytes to its
-        // ancestors. Include its new totals where those ancestors are known.
         update_ancestor_sizes(
             tree,
             rel,
@@ -1429,6 +1450,34 @@ mod tests {
         let refreshed_child = &refreshed_parent.children[0];
         assert_eq!(refreshed_child.facts.left_folder_size, Some(15));
         assert_eq!(refreshed_child.facts.right_folder_size, Some(15));
+    }
+
+    #[test]
+    fn targeted_rescan_keeps_known_totals_for_an_absent_side() {
+        let mut target = folder("parent/child", Some(10), Vec::new());
+        target.right = None;
+        target.facts.right_folder_size = None;
+        let mut parent = folder("parent", Some(20), vec![target]);
+        parent.facts.right_folder_size = Some(40);
+        let mut root = folder("", Some(30), vec![parent]);
+        root.facts.right_folder_size = Some(60);
+
+        splice(
+            &mut root,
+            std::path::Path::new("parent/child"),
+            ScannedSubtree {
+                children: Vec::new(),
+                left_folder_size: Some(15),
+                right_folder_size: Some(0),
+            },
+        );
+
+        assert_eq!(root.facts.left_folder_size, Some(35));
+        assert_eq!(root.facts.right_folder_size, Some(60));
+        let refreshed_parent = &root.children[0];
+        assert_eq!(refreshed_parent.facts.left_folder_size, Some(25));
+        assert_eq!(refreshed_parent.facts.right_folder_size, Some(40));
+        assert_eq!(refreshed_parent.children[0].facts.right_folder_size, None);
     }
 
     /// Run the recovery check on `journals` and take its one result.
