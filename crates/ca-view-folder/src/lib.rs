@@ -2255,7 +2255,7 @@ impl FolderView {
         }
     }
 
-    /// Resolve one local comparison root to an absolute filesystem path.
+    /// Archive sources expose virtual members, so only local sources have an exportable filesystem root.
     fn copy_base(&self, side: Side) -> Option<PathBuf> {
         let sides = self.sides.as_ref()?;
         let (source, base) = match side {
@@ -2268,7 +2268,7 @@ impl FolderView {
         std::path::absolute(base).ok()
     }
 
-    /// Return whether the compared entry exists on the requested side.
+    /// Orphan rows can be selected in the blank pane, so membership alone does not prove a path exists there.
     fn entry_present_on(&self, side: Side, relative_path: &Path) -> bool {
         self.arena
             .index_of(relative_path)
@@ -2279,7 +2279,7 @@ impl FolderView {
             })
     }
 
-    /// Report whether the selection contains an existing path on a local side.
+    /// Availability must use the same local-source and side-presence checks as the clipboard handler.
     fn has_copyable_selection(&self) -> bool {
         for side in [Side::Left, Side::Right] {
             if self.copy_base(side).is_none() {
@@ -2294,7 +2294,7 @@ impl FolderView {
         false
     }
 
-    /// Copy selected paths from local folders to the pending clipboard output.
+    /// Export sides independently so an archive cannot suppress valid paths from the local side.
     fn copy_filenames(&mut self) {
         let mut paths = Vec::with_capacity(self.selection.len());
         for side in [Side::Left, Side::Right] {
@@ -4313,6 +4313,7 @@ mod stale_results {
         view
     }
 
+    /// Capture platform output because the test process has no native clipboard.
     fn clipboard_frame(view: &mut FolderView) -> egui::FullOutput {
         let context = ca_ui::testing::context();
         let egui_context = egui::Context::default();
@@ -4326,6 +4327,7 @@ mod stale_results {
         )
     }
 
+    /// Inspect `CopyText` commands without depending on platform clipboard state.
     fn copied(output: &egui::FullOutput) -> Vec<String> {
         output
             .platform_output
@@ -4339,6 +4341,7 @@ mod stale_results {
     }
 
     #[test]
+    /// Left-first ordering stays stable across both panes, and side restriction narrows the output.
     fn copy_filename_puts_selected_side_paths_on_the_clipboard() -> std::io::Result<()> {
         let dir = tempfile::tempdir()?;
         let mut view = ready_view(dir.path());
@@ -4370,6 +4373,7 @@ mod stale_results {
     }
 
     #[test]
+    /// The sync wrapper must forward both command acceptance and clipboard dispatch.
     fn copy_filename_is_available_in_folder_sync() -> std::io::Result<()> {
         use crate::FolderSyncView;
         use ca_ui::view::SessionView;
@@ -4398,6 +4402,7 @@ mod stale_results {
     }
 
     #[test]
+    /// Relative roots are valid scan inputs, but clipboard consumers need stable absolute paths.
     fn copy_filename_resolves_relative_roots_to_absolute_paths() -> std::io::Result<()> {
         let directory = tempfile::tempdir_in(".")?;
         let relative_directory = if directory.path().is_absolute() {
@@ -4426,6 +4431,7 @@ mod stale_results {
     }
 
     #[test]
+    /// Archive members are virtual; a local side remains copyable in a mixed comparison.
     fn copy_filename_skips_archive_entries_but_keeps_local_paths() -> std::io::Result<()> {
         const EMPTY_ZIP: &[u8] = &[
             0x50, 0x4b, 0x05, 0x06, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
@@ -4453,6 +4459,7 @@ mod stale_results {
     }
 
     #[test]
+    /// Selecting an orphan in its blank pane must not enable an action that copies nothing.
     fn copy_filename_is_disabled_for_a_selection_on_a_missing_side() -> std::io::Result<()> {
         let directory = tempfile::tempdir()?;
         let mut view = ready_view(directory.path());
