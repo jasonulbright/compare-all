@@ -1,3 +1,16 @@
+# v2026.10.29.0014
+
+## 4 changes add file pickers, menu state, Windows rendering defaults, and a separate Options window
+
+### Features
+
+- Prefer the non-OpenGL renderer by default on Windows; preserve fallback and explicit overrides.
+- Show active filters and toggles in the View menu.
+- Add file pickers for required Text Merge inputs and optional center and output paths.
+- Open Options in a separate window on supported platforms.
+
+Full changelog: CHANGELOG.md
+
 # v2026.10.28.0013
 
 ## 1 action copies selected paths from either side
