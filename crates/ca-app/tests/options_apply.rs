@@ -105,6 +105,20 @@ fn restore_factory_defaults_cannot_open_while_options_has_a_draft() {
     );
 }
 
+#[test]
+fn options_cannot_open_while_restore_factory_defaults_is_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app_in(dir.path(), Startup::Home);
+    settle(&mut app);
+    app.run(Command::RestoreFactoryDefaults, &context());
+    assert!(app.restore_dialog().unwrap().is_open());
+
+    assert!(!app.accepts(Command::Options));
+    app.run(Command::Options, &context());
+
+    assert!(app.options_dialog().is_none());
+}
+
 /// A color a person chose reaches a shape the window paints, on the next frame
 /// and without a restart.
 #[test]

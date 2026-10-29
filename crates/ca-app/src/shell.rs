@@ -3309,7 +3309,10 @@ impl App {
             | Command::SaveWorkspaceAs
             | Command::ExportSettings
             | Command::ImportSettings => ready,
-            Command::Options => self.options.is_ready(),
+            Command::Options => {
+                self.options.is_ready()
+                    && !self.restore.as_ref().is_some_and(RestoreDialog::is_open)
+            }
             Command::RestoreFactoryDefaults => {
                 self.options.is_ready()
                     && !self
@@ -3378,7 +3381,11 @@ impl App {
                 let instance = self.instance();
                 self.workspaces = Some(WorkspaceManager::new(instance));
             }
-            Command::Options => self.open_options(),
+            Command::Options => {
+                if !self.restore.as_ref().is_some_and(RestoreDialog::is_open) {
+                    self.open_options();
+                }
+            }
             Command::RestoreFactoryDefaults => {
                 if !self
                     .options_dialog
