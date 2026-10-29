@@ -66,6 +66,8 @@ fn the_options_command_opens_and_closes_the_dialog() {
     settle(&mut app);
     assert!(app.accepts(Command::Options));
     app.run(Command::Options, &context());
+    let egui_context = egui::Context::default();
+    let _ = egui_context.run(raw_input(), |ctx| app.frame(ctx));
     assert!(app.options_dialog().is_some());
     let outcome = app.options_dialog_mut().unwrap().cancel();
     assert!(outcome.closed);

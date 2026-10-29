@@ -991,6 +991,7 @@ pub struct App {
     system_dark: Option<bool>,
     /// The options dialog, while it is open.
     options_dialog: Option<OptionsDialog>,
+    options_viewport_id: egui::ViewportId,
     /// The restore factory defaults wizard, while it is open.
     restore: Option<RestoreDialog>,
     /// The settings dialog, while it is open.
@@ -1154,6 +1155,7 @@ impl App {
             pack_sets_theme: false,
             system_dark: None,
             options_dialog: None,
+            options_viewport_id: egui::ViewportId::ROOT,
             restore: None,
             tab_sessions: Vec::new(),
             tab_recent: Vec::new(),
@@ -3373,6 +3375,8 @@ impl App {
                 if let Some(state) = self.explorer.installed {
                     shown.startup.shell_integration = state.any();
                 }
+                self.options_viewport_id =
+                    egui::ViewportId::from_hash_of(("program-options-viewport", instance));
                 self.options_dialog = Some(self.new_options_dialog(&shown, instance));
             }
             Command::RestoreFactoryDefaults => {
@@ -3953,28 +3957,9 @@ impl App {
         }
     }
 
-    /// Draw whichever dialogs are open and act on what they produced.
+    /// Draw the dialogs that remain in the main viewport and handle their output.
     fn draw_dialogs(&mut self, ctx: &egui::Context, context: &ViewContext) {
         let palette = context.palette;
-        let mut options_outcome = None;
-        if let Some(dialog) = self.options_dialog.as_mut() {
-            options_outcome = dialog.show(ctx, &palette);
-            if let Some(page) = dialog.take_page_request() {
-                self.launches.push(ca_ui::launch::open_url_with_system(
-                    &page,
-                    Arc::clone(&self.spawner),
-                    Arc::clone(&context.notify),
-                ));
-            }
-        }
-        if let Some(produced) = options_outcome {
-            let wanted = produced.options.startup.shell_integration;
-            self.apply_options(*produced.options);
-            self.sync_explorer_menu(wanted, &context.notify);
-            if produced.closed {
-                self.options_dialog = None;
-            }
-        }
         let mut restore_outcome = None;
         if let Some(dialog) = self.restore.as_mut() {
             restore_outcome = dialog.show(ctx);
@@ -4060,6 +4045,63 @@ impl App {
             });
         if let Some(leave) = answer {
             self.answer_exit(leave);
+        }
+    }
+
+    /// Keep the Options viewport alive and handle its results in the root
+    /// window, where settings writes and page launches are coordinated.
+    fn draw_options_viewport(&mut self, ctx: &egui::Context, context: &ViewContext) {
+        let builder = egui::ViewportBuilder::default()
+            .with_title("Options")
+            .with_inner_size([880.0, 700.0])
+            .with_min_inner_size([440.0, 360.0]);
+        let mut outcome = None;
+        let mut page = None;
+        if let Some(dialog) = self.options_dialog.as_mut() {
+            outcome = ctx.show_viewport_immediate(
+                self.options_viewport_id,
+                builder,
+                |viewport_ctx, class| {
+                    ca_ui::theme::chrome::install(viewport_ctx);
+                    let close_requested = class != egui::ViewportClass::Embedded
+                        && viewport_ctx.input(|input| input.viewport().close_requested());
+                    let produced = if close_requested {
+                        Some(dialog.cancel())
+                    } else if class == egui::ViewportClass::Embedded {
+                        dialog.show(viewport_ctx, &context.palette)
+                    } else {
+                        let mut produced = None;
+                        egui::CentralPanel::default().show(viewport_ctx, |ui| {
+                            produced = dialog.body(ui, &context.palette);
+                        });
+                        dialog.show_pack_browser(viewport_ctx);
+                        produced
+                    };
+                    if class != egui::ViewportClass::Embedded
+                        && produced.as_ref().is_some_and(|outcome| outcome.closed)
+                    {
+                        viewport_ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                    produced
+                },
+            );
+            page = dialog.take_page_request();
+        }
+
+        if let Some(page) = page {
+            self.launches.push(ca_ui::launch::open_url_with_system(
+                &page,
+                Arc::clone(&self.spawner),
+                Arc::clone(&context.notify),
+            ));
+        }
+        if let Some(produced) = outcome {
+            let wanted = produced.options.startup.shell_integration;
+            self.apply_options(*produced.options);
+            self.sync_explorer_menu(wanted, &context.notify);
+            if produced.closed {
+                self.options_dialog = None;
+            }
         }
     }
 
@@ -4230,6 +4272,7 @@ impl App {
             self.apply(actions, &context);
             self.apply_home_actions(&context);
         }
+        self.draw_options_viewport(ctx, &context);
         if fullscreen {
             self.exit_question_panel(ctx);
         } else if !naming {
