@@ -1613,6 +1613,21 @@ impl App {
         self.options.replace(options);
     }
 
+    /// Apply Options edits without replacing report preferences saved meanwhile.
+    ///
+    /// The Options dialog has no report controls, so its open-time copy is not
+    /// authoritative for the report preferences written by report views.
+    fn apply_options_dialog(&mut self, mut options: ca_session::ProgramOptions) {
+        if let Some(reports) = self
+            .options
+            .options()
+            .map(|current| current.reports.clone())
+        {
+            options.reports = reports;
+        }
+        self.apply_options(options);
+    }
+
     /// Carry out a restore of the factory defaults.
     pub fn apply_restore(&mut self, selection: &ca_session::RestoreSelection) {
         let mut options = self.options.options_or_default();
@@ -2930,7 +2945,6 @@ impl App {
         self.share_picker = Some(ca_ui::dialog::spawn(pick, Arc::clone(&context.notify)));
     }
 
-    /// Whether an import picker or its package worker can still replace settings.
     fn settings_import_in_progress(&self) -> bool {
         !self.share_writes && self.package_operation_in_progress()
     }
@@ -4103,7 +4117,12 @@ impl App {
 
     /// Keep the Options viewport alive and handle its results in the root
     /// window, where settings writes and page launches are coordinated.
-    fn draw_options_viewport(&mut self, ctx: &egui::Context, context: &ViewContext, naming: bool) {
+    fn draw_options_viewport(
+        &mut self,
+        egui_context: &egui::Context,
+        context: &ViewContext,
+        naming: bool,
+    ) {
         let builder = egui::ViewportBuilder::default()
             .with_title("Options")
             .with_inner_size([880.0, 700.0])
@@ -4112,36 +4131,36 @@ impl App {
         let mut page = None;
         let focus_requested = std::mem::take(&mut self.options_focus_requested);
         if let Some(dialog) = self.options_dialog.as_mut() {
-            outcome = ctx.show_viewport_immediate(
+            outcome = egui_context.show_viewport_immediate(
                 self.options_viewport_id,
                 builder,
-                |viewport_ctx, class| {
-                    ca_ui::theme::chrome::install(viewport_ctx);
+                |viewport_context, class| {
+                    ca_ui::theme::chrome::install(viewport_context);
                     if focus_requested && class != egui::ViewportClass::Embedded {
-                        viewport_ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                        viewport_context.send_viewport_cmd(egui::ViewportCommand::Focus);
                     }
                     let close_requested = class != egui::ViewportClass::Embedded
-                        && viewport_ctx.input(|input| input.viewport().close_requested());
+                        && viewport_context.input(|input| input.viewport().close_requested());
                     let produced = if close_requested {
                         Some(dialog.cancel())
                     } else if class == egui::ViewportClass::Embedded {
                         if naming {
                             None
                         } else {
-                            dialog.show(viewport_ctx, &context.palette)
+                            dialog.show(viewport_context, &context.palette)
                         }
                     } else {
                         let mut produced = None;
-                        egui::CentralPanel::default().show(viewport_ctx, |ui| {
+                        egui::CentralPanel::default().show(viewport_context, |ui| {
                             produced = dialog.body(ui, &context.palette);
                         });
-                        dialog.show_pack_browser(viewport_ctx);
+                        dialog.show_pack_browser(viewport_context);
                         produced
                     };
                     if class != egui::ViewportClass::Embedded
                         && produced.as_ref().is_some_and(|outcome| outcome.closed)
                     {
-                        viewport_ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        viewport_context.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                     produced
                 },
@@ -4158,7 +4177,7 @@ impl App {
         }
         if let Some(produced) = outcome {
             let wanted = produced.options.startup.shell_integration;
-            self.apply_options(*produced.options);
+            self.apply_options_dialog(*produced.options);
             self.sync_explorer_menu(wanted, &context.notify);
             if produced.closed {
                 self.options_dialog = None;
@@ -5037,6 +5056,37 @@ mod tests {
         drop(share_held);
         app.poll_share();
         assert!(app.accepts(Command::Options));
+    }
+
+    #[test]
+    fn options_writeback_preserves_report_preferences_saved_while_open() {
+        let (_settings, mut app) = empty_app();
+        assert!(ca_ui::testing::wait_until(
+            std::time::Duration::from_secs(10),
+            || {
+                app.options.poll();
+                app.options.is_ready()
+            }
+        ));
+
+        app.run(Command::Options, &context());
+        let mut live = app.options.options_or_default();
+        live.reports.set_view(
+            "text-compare",
+            ca_session::options::ReportPreference::default(),
+        );
+        app.apply_options(live);
+
+        let canceled = app.options_dialog.as_mut().unwrap().cancel();
+        app.apply_options_dialog(*canceled.options);
+
+        assert!(app
+            .options
+            .options()
+            .unwrap()
+            .reports
+            .view("text-compare")
+            .is_some());
     }
 
     fn app_with_recent_session() -> (tempfile::TempDir, App, SessionId, PathBuf, PathBuf) {
