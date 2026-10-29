@@ -431,6 +431,7 @@ impl SessionView for HomeView {
                 }
                 if response.clicked() {
                     if kind == SessionKind::TextMerge {
+                        self.cancel_picker();
                         self.merge_setup = true;
                     } else if self.paths_are_set() {
                         self.cancel_picker();
@@ -488,7 +489,12 @@ impl SessionView for HomeView {
             }
             ui.horizontal(|ui| {
                 if ui
-                    .add_enabled(self.paths_are_set(), egui::Button::new("Open Text Merge"))
+                    .add_enabled(
+                        self.paths_are_set()
+                            && self.picker.is_none()
+                            && self.picker_request.is_none(),
+                        egui::Button::new("Open Text Merge"),
+                    )
                     .clicked()
                 {
                     actions.push(ViewAction::Open(self.merge_request()));
@@ -1048,6 +1054,51 @@ mod tests {
                 .with_output(Some("merged.txt".into()))
             )]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn selecting_text_merge_cancels_pickers_and_blocks_open_while_pending(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use std::cell::RefCell;
+
+        let directory = tempfile::tempdir()?;
+        let context = ca_ui::testing::context();
+        let view = RefCell::new(super::HomeView::in_settings_directory(
+            &context,
+            1,
+            directory.path().to_path_buf(),
+        ));
+        let mut probe = ca_ui::testing::probe::Probe::new(1280.0, 800.0);
+        let mut run = |egui_context: &egui::Context| {
+            let mut home = view.borrow_mut();
+            egui::CentralPanel::default().show(egui_context, |ui| {
+                let _ = ca_ui::view::SessionView::ui(&mut *home, ui, &context);
+            });
+        };
+        probe.idle(&mut run);
+        probe.idle(&mut run);
+
+        {
+            let mut home = view.borrow_mut();
+            home.left = "left.txt".to_owned();
+            home.right = "right.txt".to_owned();
+            home.picker_target = super::PathTarget::Left;
+            home.picker = Some(ca_ui::worker::Job::spawn(|emitter, _| {
+                let _ = emitter.send(ca_ui::dialog::DialogMessage::Chosen("late.txt".into()));
+            }));
+        }
+        probe.click("Text Merge", &mut run).unwrap();
+        assert!(view.borrow().merge_setup);
+        assert!(view.borrow().picker.is_none());
+        assert_eq!(view.borrow().left, "left.txt");
+
+        view.borrow_mut().picker_request =
+            Some((super::PathTarget::Left, ca_ui::dialog::Pick::File));
+        probe.idle(&mut run);
+        assert!(!probe.find("Open Text Merge").unwrap().enabled);
+        probe.click("Text Merge", &mut run).unwrap();
+        assert!(view.borrow().picker_request.is_none());
         Ok(())
     }
 
