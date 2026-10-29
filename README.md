@@ -83,6 +83,11 @@ it to the error stream. Send the file when you ask for support. To pick a back
 end, use `--renderer=glow`, `--renderer=software`, or `--renderer=auto`, or
 set the environment variable `COMPARE_ALL_RENDERER`.
 
+Automatic selection tries wgpu first on Windows and OpenGL (glow) first on
+other platforms. If the preferred renderer cannot start, the other renderer
+is tried. This lets Windows virtual machines and remote desktops use wgpu's
+Direct3D 12 software adapter when hardware acceleration is unavailable.
+
 The program also writes the same text to the error stream. To read it, start
 the program from a console window. To test one back end, start it from a
 console window with `--renderer=glow` or `--renderer=software`.

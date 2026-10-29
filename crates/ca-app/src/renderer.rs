@@ -1,8 +1,8 @@
 //! Choice of the graphics back end that draws the window.
 //!
-//! The OpenGL back end starts first. A machine without OpenGL 2.0 makes it
-//! refuse to start, and the Direct3D 12 back end (software rasterizer when
-//! no graphics device exists) starts instead.
+//! Most platforms try OpenGL first. Windows tries wgpu first to avoid the
+//! glow flicker seen on some virtual and remote displays. The other back end
+//! remains a fallback when the preferred one refuses to start.
 
 use std::ffi::OsString;
 use std::fmt;
@@ -37,7 +37,7 @@ impl Renderer {
 /// Which back ends the start may use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Preference {
-    /// OpenGL first, wgpu when OpenGL does not start.
+    /// The platform's preferred renderer, with the other renderer as fallback.
     #[default]
     Auto,
     /// OpenGL only.
@@ -58,6 +58,9 @@ impl Preference {
 
     fn order(self) -> &'static [Renderer] {
         match self {
+            #[cfg(target_os = "windows")]
+            Self::Auto => &[Renderer::Wgpu, Renderer::Glow],
+            #[cfg(not(target_os = "windows"))]
             Self::Auto => &[Renderer::Glow, Renderer::Wgpu],
             Self::Glow => &[Renderer::Glow],
             Self::Software => &[Renderer::Wgpu],
@@ -216,28 +219,43 @@ mod tests {
     }
 
     #[test]
-    fn glow_that_starts_ends_the_sequence() {
+    fn automatic_order_prefers_the_platform_default() {
+        let expected = if cfg!(target_os = "windows") {
+            &[Renderer::Wgpu, Renderer::Glow][..]
+        } else {
+            &[Renderer::Glow, Renderer::Wgpu][..]
+        };
+        assert_eq!(Preference::Auto.order(), expected);
+    }
+
+    #[test]
+    fn the_first_automatic_renderer_ends_the_sequence_when_it_starts() {
         let mut tried = Vec::new();
         let outcome = start_in_order(Preference::Auto, &mut |renderer| {
             tried.push(renderer);
             Ok(())
         });
-        assert_eq!(outcome, Outcome::Finished(Renderer::Glow));
-        assert_eq!(tried, [Renderer::Glow]);
+        assert_eq!(outcome, Outcome::Finished(Preference::Auto.order()[0]));
+        assert_eq!(tried, [Preference::Auto.order()[0]]);
     }
 
     #[test]
-    fn a_glow_error_starts_wgpu() {
+    fn automatic_start_falls_back_to_the_other_renderer() {
+        let order = Preference::Auto.order();
+        let [preferred, fallback] = order else {
+            unreachable!("automatic selection has two renderers");
+        };
         let mut tried = Vec::new();
         let outcome = start_in_order(Preference::Auto, &mut |renderer| {
             tried.push(renderer);
-            match renderer {
-                Renderer::Glow => refuse("opengl 2.0 required"),
-                Renderer::Wgpu => Ok(()),
+            if renderer == *preferred {
+                refuse("preferred renderer refused")
+            } else {
+                Ok(())
             }
         });
-        assert_eq!(outcome, Outcome::Finished(Renderer::Wgpu));
-        assert_eq!(tried, [Renderer::Glow, Renderer::Wgpu]);
+        assert_eq!(outcome, Outcome::Finished(*fallback));
+        assert_eq!(tried, [*preferred, *fallback]);
     }
 
     #[test]
@@ -256,7 +274,8 @@ mod tests {
     }
 
     #[test]
-    fn an_error_after_the_application_ran_does_not_start_wgpu() {
+    fn an_error_after_the_application_ran_does_not_try_a_fallback() {
+        let preferred = Preference::Auto.order()[0];
         let mut tried = Vec::new();
         let outcome = start_in_order(Preference::Auto, &mut |renderer| {
             tried.push(renderer);
@@ -265,8 +284,8 @@ mod tests {
                 application_ran: true,
             })
         });
-        assert_eq!(outcome, Outcome::Failed(Renderer::Glow, "lost".to_owned()));
-        assert_eq!(tried, [Renderer::Glow]);
+        assert_eq!(outcome, Outcome::Failed(preferred, "lost".to_owned()));
+        assert_eq!(tried, [preferred]);
     }
 
     #[test]
