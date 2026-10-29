@@ -213,10 +213,9 @@ pub fn frame_with(
     frame_with_modifiers(view, ctx, width, height, egui::Modifiers::NONE, events);
 }
 
-/// Run one frame with explicit keyboard modifiers and pointer events.
 pub fn frame_with_modifiers(
     view: &mut PictureView,
-    ctx: &egui::Context,
+    egui_context: &egui::Context,
     width: f32,
     height: f32,
     modifiers: egui::Modifiers,
@@ -228,8 +227,8 @@ pub fn frame_with_modifiers(
         modifiers,
         ..sized_input(width, height)
     };
-    let _ = ctx.run(input, |ctx| {
-        egui::CentralPanel::default().show(ctx, |ui| {
+    let _ = egui_context.run(input, |frame_context| {
+        egui::CentralPanel::default().show(frame_context, |ui| {
             view.ui(ui, &context());
         });
     });

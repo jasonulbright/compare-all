@@ -205,7 +205,6 @@ pub struct PictureView {
     pointer: Option<[f32; 2]>,
     /// Whole pixels of an offset drag that have not been applied yet.
     offset_drag: [f32; 2],
-    /// The pane whose primary-button drag is adjusting the image offset.
     offset_drag_pane: Option<Pane>,
     offset_x_text: String,
     offset_y_text: String,
@@ -815,7 +814,7 @@ impl PictureView {
             Pane::Right => (
                 Arc::clone(&outcome.right),
                 outcome.right_preview.as_ref(),
-                [outcome.offset.x, outcome.offset.y],
+                [self.settings.offset.x, self.settings.offset.y],
             ),
             Pane::Difference => (
                 Arc::clone(&outcome.result),
@@ -1618,7 +1617,7 @@ impl PictureView {
         let placement = match pane {
             Pane::Left => Placement::new([0, 0], [outcome.left.width(), outcome.left.height()]),
             Pane::Right => Placement::new(
-                [outcome.offset.x, outcome.offset.y],
+                [self.settings.offset.x, self.settings.offset.y],
                 [outcome.right.width(), outcome.right.height()],
             ),
             Pane::Difference => Placement::new(
@@ -1630,7 +1629,8 @@ impl PictureView {
     }
 
     #[allow(clippy::too_many_lines)]
-    /// Draw one image pane and route its camera or alignment drag gestures.
+    /// A left-pane alignment drag moves the shared camera while its inverse
+    /// offset keeps the right pane stationary.
     fn paint_pane(
         &mut self,
         ui: &mut egui::Ui,
@@ -1870,10 +1870,28 @@ impl PictureView {
         let pan_drag = response.dragged_by(egui::PointerButton::Middle)
             || (response.dragged_by(egui::PointerButton::Primary) && !offset_drag);
         let delta = response.drag_delta();
-        if pan_drag && delta != egui::Vec2::ZERO {
-            self.camera.pan_by_screen([delta.x, delta.y]);
+        // egui crosses the drag threshold after several pointer frames; the
+        // first drag frame must include motion since the original press.
+        let offset_delta = if offset_drag && response.drag_started_by(egui::PointerButton::Primary)
+        {
+            ui.input(
+                |input| match (input.pointer.press_origin(), input.pointer.interact_pos()) {
+                    (Some(press), Some(current)) => current - press,
+                    _ => delta,
+                },
+            )
+        } else {
+            delta
+        };
+        let camera_delta = if offset_drag && pane == Pane::Left {
+            offset_delta
+        } else {
+            delta
+        };
+        if (pan_drag || (offset_drag && pane == Pane::Left)) && camera_delta != egui::Vec2::ZERO {
+            self.camera.pan_by_screen([camera_delta.x, camera_delta.y]);
         }
-        if offset_drag && delta != egui::Vec2::ZERO {
+        if offset_drag && offset_delta != egui::Vec2::ZERO {
             let zoom = model::clamp_zoom(self.camera.zoom);
             // The offset moves the right image relative to the fixed left, so
             // dragging the left image adjusts the offset in the opposite way.
@@ -1881,8 +1899,8 @@ impl PictureView {
                 Pane::Left => -1.0,
                 Pane::Right | Pane::Difference => 1.0,
             };
-            self.offset_drag[0] += direction * delta.x / zoom;
-            self.offset_drag[1] += direction * delta.y / zoom;
+            self.offset_drag[0] += direction * offset_delta.x / zoom;
+            self.offset_drag[1] += direction * offset_delta.y / zoom;
             #[allow(clippy::cast_possible_truncation)]
             let steps = [
                 self.offset_drag[0].trunc() as i32,

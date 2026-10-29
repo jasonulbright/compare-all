@@ -9,45 +9,51 @@ use ca_ui::command::Command;
 use ca_ui::view::SessionView;
 use ca_view_picture::model::Pane;
 
-/// Simulate a primary-button drag within `pane` using the requested modifiers.
+/// Sends separate pointer frames so the drag threshold is part of the test.
 fn drag_primary(
     view: &mut ca_view_picture::PictureView,
-    ctx: &egui::Context,
+    egui_context: &egui::Context,
     pane: Pane,
     modifiers: egui::Modifiers,
     delta: egui::Vec2,
+    steps: u8,
 ) {
-    let from = view.pane_rect(pane).unwrap().center();
-    let to = from + delta;
-    let button = |pos, pressed| egui::Event::PointerButton {
-        pos,
+    let start = view.pane_rect(pane).unwrap().center();
+    let target = start + delta;
+    let steps = steps.max(1);
+    let button = |pointer_position, pressed| egui::Event::PointerButton {
+        pos: pointer_position,
         button: egui::PointerButton::Primary,
         pressed,
         modifiers,
     };
     common::frame_with_modifiers(
         view,
-        ctx,
+        egui_context,
         1_280.0,
         800.0,
         modifiers,
-        vec![egui::Event::PointerMoved(from), button(from, true)],
+        vec![egui::Event::PointerMoved(start), button(start, true)],
     );
+    for step in 1..=steps {
+        let fraction = f32::from(step) / f32::from(steps);
+        let pointer_position = start + delta * fraction;
+        common::frame_with_modifiers(
+            view,
+            egui_context,
+            1_280.0,
+            800.0,
+            modifiers,
+            vec![egui::Event::PointerMoved(pointer_position)],
+        );
+    }
     common::frame_with_modifiers(
         view,
-        ctx,
+        egui_context,
         1_280.0,
         800.0,
         modifiers,
-        vec![egui::Event::PointerMoved(to)],
-    );
-    common::frame_with_modifiers(
-        view,
-        ctx,
-        1_280.0,
-        800.0,
-        modifiers,
-        vec![button(to, false)],
+        vec![button(target, false)],
     );
 }
 
@@ -170,49 +176,80 @@ fn an_arrow_key_nudges_the_offset() {
 }
 
 #[test]
-fn shift_dragging_either_side_image_adjusts_its_alignment() {
-    let dir = tempfile::tempdir().unwrap();
-    let (left, right) = common::pair(dir.path());
-    let (mut view, ctx) = common::open(left, right, 16);
-    assert!(common::run_until_ready(&mut view, &ctx));
+fn shift_dragging_either_side_image_adjusts_its_alignment() -> Result<(), Box<dyn std::error::Error>>
+{
+    let directory = tempfile::tempdir()?;
+    let (left, right) = common::pair(directory.path());
+    let (mut view, context) = common::open(left, right, 16);
+    assert!(common::run_until_ready(&mut view, &context));
     view.actual_size();
-    common::frame(&mut view, &ctx, 1_280.0, 800.0);
+    common::frame(&mut view, &context, 1_280.0, 800.0);
     assert_eq!(view.settings().offset, Offset::zero());
+    let initial_left_rect = view.image_rect(Pane::Left).unwrap();
+    let initial_right_rect = view.image_rect(Pane::Right).unwrap();
+    let initial_camera_origin = view.camera().origin;
 
     drag_primary(
         &mut view,
-        &ctx,
+        &context,
         Pane::Left,
         egui::Modifiers::SHIFT,
         egui::vec2(12.0, 0.0),
+        12,
     );
     assert_eq!(view.settings().offset, Offset::new(-12, 0));
-    assert!(common::run_until(&mut view, &ctx, |view| view
+    common::frame(&mut view, &context, 1_280.0, 800.0);
+    let left_after_left_drag = view.image_rect(Pane::Left).unwrap();
+    let right_after_left_drag = view.image_rect(Pane::Right).unwrap();
+    assert!((left_after_left_drag.min.x - initial_left_rect.min.x - 12.0).abs() < f32::EPSILON);
+    assert!((right_after_left_drag.min.x - initial_right_rect.min.x).abs() < f32::EPSILON);
+    assert!((view.camera().origin[0] - (initial_camera_origin[0] - 12.0)).abs() < f32::EPSILON);
+    assert!(common::run_until(&mut view, &context, |view| view
         .outcome()
         .is_some_and(|outcome| outcome.offset == Offset::new(-12, 0))));
 
+    let camera_origin_before_right_drag = view.camera().origin;
+    let right_rect_before_right_drag = view.image_rect(Pane::Right).unwrap();
     drag_primary(
         &mut view,
-        &ctx,
+        &context,
         Pane::Right,
         egui::Modifiers::SHIFT,
         egui::vec2(12.0, 0.0),
+        12,
     );
     assert_eq!(view.settings().offset, Offset::zero());
-    assert!(common::run_until(&mut view, &ctx, |view| view
+    common::frame(&mut view, &context, 1_280.0, 800.0);
+    let right_after_right_drag = view.image_rect(Pane::Right).unwrap();
+    assert!(
+        (right_after_right_drag.min.x - right_rect_before_right_drag.min.x - 12.0).abs()
+            < f32::EPSILON
+    );
+    let camera_origin_after_right_drag = view.camera().origin;
+    assert!(
+        (camera_origin_after_right_drag[0] - camera_origin_before_right_drag[0]).abs()
+            < f32::EPSILON
+    );
+    assert!(
+        (camera_origin_after_right_drag[1] - camera_origin_before_right_drag[1]).abs()
+            < f32::EPSILON
+    );
+    assert!(common::run_until(&mut view, &context, |view| view
         .outcome()
         .is_some_and(|outcome| outcome.offset == Offset::zero())));
 
     let origin = view.camera().origin;
     drag_primary(
         &mut view,
-        &ctx,
+        &context,
         Pane::Right,
         egui::Modifiers::NONE,
         egui::vec2(12.0, 0.0),
+        1,
     );
     assert_eq!(view.settings().offset, Offset::zero());
     assert!((view.camera().origin[0] - (origin[0] - 12.0)).abs() < f32::EPSILON);
+    Ok(())
 }
 
 #[test]
