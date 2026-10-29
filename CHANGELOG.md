@@ -1,13 +1,14 @@
 # v2026.10.29.0014
 
-## 4 changes add file pickers, menu state, Windows rendering defaults, and a separate Options window
+## 4 user workflows updated
 
 ### Features
 
-- Prefer the non-OpenGL renderer by default on Windows; preserve fallback and explicit overrides.
-- Show active filters and toggles in the View menu.
-- Add file pickers for required Text Merge inputs and optional center and output paths.
-- Open Options in a separate window on supported platforms.
+- Prefer wgpu by default on Windows.
+- Retain automatic fallback and explicit renderer overrides.
+- Show active filters and toggles in menus.
+- Add file pickers for required merge inputs and optional center and output paths.
+- Open settings in a separate window on supported platforms.
 
 Full changelog: CHANGELOG.md
 
