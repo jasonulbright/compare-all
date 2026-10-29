@@ -66,9 +66,69 @@ fn the_options_command_opens_and_closes_the_dialog() {
     settle(&mut app);
     assert!(app.accepts(Command::Options));
     app.run(Command::Options, &context());
+    let egui_context = egui::Context::default();
+    let _ = egui_context.run(raw_input(), |ctx| app.frame(ctx));
     assert!(app.options_dialog().is_some());
+    app.options_dialog_mut().unwrap().set_value(
+        "text_editing.tab_stop",
+        &ca_ui::settings::FieldValue::Count(3),
+    );
+    assert!(
+        !app.accepts(Command::ImportSettings),
+        "settings import must wait until the Options draft closes"
+    );
+    app.run(Command::ImportSettings, &context());
+    assert_eq!(
+        app.options_dialog().unwrap().value("text_editing.tab_stop"),
+        Some(ca_ui::settings::FieldValue::Count(3)),
+        "direct import dispatch disturbed the Options draft"
+    );
+    app.run(Command::Options, &context());
+    assert_eq!(
+        app.options_dialog().unwrap().value("text_editing.tab_stop"),
+        Some(ca_ui::settings::FieldValue::Count(3)),
+        "reopening Options discarded the unsaved draft"
+    );
     let outcome = app.options_dialog_mut().unwrap().cancel();
     assert!(outcome.closed);
+}
+
+#[test]
+fn restore_factory_defaults_cannot_open_while_options_has_a_draft() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app_in(dir.path(), Startup::Home);
+    settle(&mut app);
+    app.run(Command::Options, &context());
+    app.options_dialog_mut().unwrap().set_value(
+        "text_editing.tab_stop",
+        &ca_ui::settings::FieldValue::Count(3),
+    );
+
+    assert!(!app.accepts(Command::RestoreFactoryDefaults));
+    app.run(Command::RestoreFactoryDefaults, &context());
+
+    assert!(app.restore_dialog().is_none());
+    assert_eq!(
+        app.options_dialog().unwrap().value("text_editing.tab_stop"),
+        Some(ca_ui::settings::FieldValue::Count(3)),
+        "the restore command disturbed the Options draft"
+    );
+}
+
+#[test]
+fn options_cannot_open_while_restore_factory_defaults_is_open(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let mut app = app_in(dir.path(), Startup::Home);
+    settle(&mut app);
+    app.run(Command::RestoreFactoryDefaults, &context());
+    assert!(app.restore_dialog().unwrap().is_open());
+
+    assert!(!app.accepts(Command::Options));
+    app.run(Command::Options, &context());
+
+    assert!(app.options_dialog().is_none());
+    Ok(())
 }
 
 /// A color a person chose reaches a shape the window paints, on the next frame
