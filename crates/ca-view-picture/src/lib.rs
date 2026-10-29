@@ -1630,6 +1630,7 @@ impl PictureView {
     }
 
     #[allow(clippy::too_many_lines)]
+    /// Draw one image pane and route its camera or alignment drag gestures.
     fn paint_pane(
         &mut self,
         ui: &mut egui::Ui,

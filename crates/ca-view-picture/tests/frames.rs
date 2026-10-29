@@ -9,6 +9,7 @@ use ca_ui::command::Command;
 use ca_ui::view::SessionView;
 use ca_view_picture::model::Pane;
 
+/// Simulate a primary-button drag within `pane` using the requested modifiers.
 fn drag_primary(
     view: &mut ca_view_picture::PictureView,
     ctx: &egui::Context,
