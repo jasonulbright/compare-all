@@ -2775,7 +2775,7 @@ impl SessionView for FolderMergeView {
         }
         Some(match command {
             Command::ToggleIgnoreSameChanges => self.ignores_same_changes(),
-            Command::ToggleCenterPane => self.shows_center(),
+            Command::ToggleCenterPane => self.has_center() && self.shows_center(),
             _ => return None,
         })
     }
@@ -3061,6 +3061,11 @@ mod tests {
             &ca_ui::testing::context(),
             1,
             dir.path().join("journals"),
+        );
+        assert_eq!(
+            view.checked(ca_ui::command::Command::ToggleCenterPane),
+            Some(false),
+            "a two-way folder merge has no visible center pane"
         );
         view.status = super::Status::Running("Scanning");
         let items = view.toolbar_items();

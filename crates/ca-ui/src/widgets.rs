@@ -11,6 +11,7 @@ pub struct IconButton<'a> {
     selected: Option<bool>,
     above: bool,
     reserve: bool,
+    reserve_check: bool,
 }
 
 impl<'a> IconButton<'a> {
@@ -23,6 +24,7 @@ impl<'a> IconButton<'a> {
             selected: None,
             above: true,
             reserve: false,
+            reserve_check: false,
         }
     }
     /// A selected toggle.
@@ -42,6 +44,7 @@ impl<'a> IconButton<'a> {
     pub const fn menu(mut self) -> Self {
         self.above = false;
         self.reserve = true;
+        self.reserve_check = true;
         self
     }
 }
@@ -65,10 +68,14 @@ impl egui::Widget for IconButton<'_> {
         let size = if self.above { 24.0 } else { 16.0 };
         let gap = ui.spacing().icon_spacing;
         let padding = ui.spacing().button_padding;
+        let check_column = if self.reserve_check { size + gap } else { 0.0 };
         let content = if self.above {
             egui::vec2(galley.size().x.max(size), size + gap + galley.size().y)
         } else {
-            egui::vec2(size + gap + galley.size().x, size.max(galley.size().y))
+            egui::vec2(
+                check_column + size + gap + galley.size().x,
+                size.max(galley.size().y),
+            )
         };
         let desired = (content + padding * 2.0).at_least(ui.spacing().interact_size);
         let (rect, response) = ui.allocate_exact_size(desired, egui::Sense::click());
@@ -109,15 +116,24 @@ impl egui::Widget for IconButton<'_> {
             } else {
                 (
                     egui::Rect::from_min_size(
-                        egui::pos2(inner.min.x, inner.center().y - size / 2.0),
+                        egui::pos2(inner.min.x + check_column, inner.center().y - size / 2.0),
                         egui::vec2(size, size),
                     ),
                     egui::pos2(
-                        inner.min.x + size + gap,
+                        inner.min.x + check_column + size + gap,
                         inner.center().y - galley.size().y / 2.0,
                     ),
                 )
             };
+            if self.reserve_check && self.selected == Some(true) {
+                let center_y = inner.center().y;
+                let left = egui::pos2(inner.min.x + 2.0, center_y);
+                let elbow = egui::pos2(inner.min.x + 6.0, center_y + 4.0);
+                let right = egui::pos2(inner.min.x + 13.0, center_y - 4.0);
+                let stroke = egui::Stroke::new(1.8, visuals.fg_stroke.color);
+                ui.painter().line_segment([left, elbow], stroke);
+                ui.painter().line_segment([elbow, right], stroke);
+            }
             if let Some(icon) = self.icon {
                 icon.paint(ui.painter(), icon_rect, visuals.fg_stroke.color);
             }

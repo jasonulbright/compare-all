@@ -2794,6 +2794,10 @@ impl SessionView for MergeView {
         Some(match command {
             Command::ToggleIgnoreUnimportant => self.rules.ignore_unimportant,
             Command::ToggleIgnoreSameChanges => self.rules.ignore_same_changes,
+            Command::ToggleCenterPane => self.shows_center(),
+            Command::FavorLeft => self.rules.favor_left,
+            Command::FavorRight => self.rules.favor_right,
+            Command::ToggleOverwrite => self.output_pane.is_overwrite(),
             Command::ToggleLineNumbers => self.show_line_numbers,
             Command::Thumbnail => self.show_thumbnail,
             _ => return None,
@@ -3570,6 +3574,7 @@ mod tests {
                 })
         };
         let (mut view, _dir) = open("a\nb\n", None, "a\nc\n");
+        assert_eq!(view.checked(Command::ToggleCenterPane), Some(false));
         assert_eq!(toggle_reason(&view), Some((false, super::NOT_MERGED)));
         assert_eq!(
             view.refusal(Command::ToggleCenterPane),
@@ -3587,6 +3592,17 @@ mod tests {
             Some(super::NO_CENTER)
         );
         assert_eq!(toggle_reason(&view), Some((false, super::NO_CENTER)));
+        assert_eq!(view.checked(Command::ToggleCenterPane), Some(false));
+    }
+
+    #[test]
+    fn a_three_way_merge_reports_center_pane_visibility() {
+        let (mut view, _dir) = open("a\nb\n", Some("a\nb\n"), "a\nc\n");
+        run_until_ready(&mut view);
+
+        assert_eq!(view.checked(Command::ToggleCenterPane), Some(true));
+        view.run(Command::ToggleCenterPane);
+        assert_eq!(view.checked(Command::ToggleCenterPane), Some(false));
     }
 
     fn run_until_ready(view: &mut MergeView) {
@@ -6146,8 +6162,12 @@ mod tests {
         let before = view.output_text();
         let waiting = view.model().totals().conflicts_remaining;
         assert!(waiting > 0);
+        assert_eq!(view.checked(Command::FavorLeft), Some(false));
+        assert_eq!(view.checked(Command::FavorRight), Some(false));
         view.run(Command::FavorLeft);
+        assert_eq!(view.checked(Command::FavorLeft), Some(true));
         view.run(Command::FavorRight);
+        assert_eq!(view.checked(Command::FavorRight), Some(true));
         assert_eq!(view.output_text(), before);
         assert_eq!(view.model().totals().conflicts_remaining, waiting);
     }
@@ -7071,14 +7091,17 @@ mod tests {
         run_until_ready(&mut view);
         assert!(view.accepts(Command::ToggleOverwrite));
         assert!(!view.output_pane.is_overwrite());
+        assert_eq!(view.checked(Command::ToggleOverwrite), Some(false));
         view.run(Command::ToggleOverwrite);
         assert!(view.output_pane.is_overwrite());
+        assert_eq!(view.checked(Command::ToggleOverwrite), Some(true));
         view.output_pane.place(Caret::new(0, 0), false);
         view.output_pane.type_character('X');
         view.absorb_output_edits();
         assert_eq!(view.output_text(), "X\nb\n");
         view.run(Command::ToggleOverwrite);
         assert!(!view.output_pane.is_overwrite());
+        assert_eq!(view.checked(Command::ToggleOverwrite), Some(false));
     }
 
     #[test]

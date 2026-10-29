@@ -3598,7 +3598,6 @@ impl App {
             .any(|state| state.command == command && state.enabled)
     }
 
-    /// The active view's current check state for a menu command, if it has one.
     fn line_checked(&self, command: Command) -> Option<bool> {
         self.tabs
             .get(self.active)
@@ -3643,7 +3642,14 @@ impl App {
         ui.menu_button(ACTIONS_MENU, |ui| {
             ui.set_min_width(220.0);
             for state in &actions {
-                if widgets::command_item_in(ui, view, state.command, state.enabled, ACTIONABLE) {
+                if widgets::command_item_in_with_state(
+                    ui,
+                    view,
+                    state.command,
+                    state.enabled,
+                    self.line_checked(state.command),
+                    ACTIONABLE,
+                ) {
                     chosen = Some(state.command);
                 }
             }
@@ -6922,6 +6928,35 @@ mod tests {
             .declared_actions()
             .iter()
             .any(|state| state.command == Command::CompareToOutput));
+
+        let mut actions_probe = Probe::new(800.0, 600.0);
+        let mut draw_actions = |egui_context: &egui::Context| {
+            egui::CentralPanel::default().show(egui_context, |ui| {
+                app.borrow_mut().actions_menu(ui, &context);
+            });
+        };
+        actions_probe.idle(&mut draw_actions);
+        actions_probe
+            .click(ACTIONS_MENU, &mut draw_actions)
+            .unwrap();
+        assert_eq!(
+            actions_probe.find("Center Pane").unwrap().toggled,
+            Some(true)
+        );
+        actions_probe
+            .click("Center Pane", &mut draw_actions)
+            .unwrap();
+        actions_probe
+            .click(ACTIONS_MENU, &mut draw_actions)
+            .unwrap();
+        assert_eq!(
+            actions_probe.find("Center Pane").unwrap().toggled,
+            Some(false)
+        );
+        actions_probe
+            .click("Center Pane", &mut draw_actions)
+            .unwrap();
+
         probe.click("Session", &mut run).unwrap();
         probe.click("Compare to Output", &mut run).unwrap();
         for label in ["Left Side", "Center Side", "Right Side"] {
@@ -7296,8 +7331,13 @@ mod tests {
                 .unwrap()
         );
         assert!(probe.find(&label).unwrap().enabled);
+        assert_eq!(probe.find(&label).unwrap().toggled, Some(false));
         probe.click(&label, &mut run).unwrap();
         assert!(app.borrow().tabs[0].wants_fullscreen());
+        assert_eq!(
+            app.borrow().tabs[0].checked(Command::ToggleFullscreen),
+            Some(true)
+        );
 
         app.borrow_mut().exit_question = true;
         probe.idle(&mut run);

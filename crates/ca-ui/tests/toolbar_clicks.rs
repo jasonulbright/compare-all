@@ -228,13 +228,31 @@ fn a_checkable_menu_command_announces_and_updates_its_state() {
         });
     };
 
-    probe.idle(&mut draw);
+    let output = probe.frame(Vec::new(), &mut draw);
     let label = line_label(Command::ToggleLineNumbers);
     assert_eq!(probe.find(&label).unwrap().toggled, Some(true));
+    assert_eq!(
+        output
+            .shapes
+            .iter()
+            .filter(|shape| matches!(&shape.shape, egui::Shape::LineSegment { .. }))
+            .count(),
+        2,
+        "a checked menu item paints a checkmark"
+    );
 
     probe.click(&label, &mut draw).unwrap();
-    probe.idle(&mut draw);
+    let output = probe.frame(Vec::new(), &mut draw);
     assert_eq!(probe.find(&label).unwrap().toggled, Some(false));
+    assert_eq!(
+        output
+            .shapes
+            .iter()
+            .filter(|shape| matches!(&shape.shape, egui::Shape::LineSegment { .. }))
+            .count(),
+        0,
+        "an unchecked menu item does not paint a checkmark"
+    );
 }
 
 /// The text shown to accessibility for a menu command, including its shortcut.
