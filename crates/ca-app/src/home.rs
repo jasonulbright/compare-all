@@ -52,6 +52,17 @@ enum PathTarget {
     Output,
 }
 
+impl PathTarget {
+    const fn index(self) -> usize {
+        match self {
+            Self::Left => 0,
+            Self::Center => 1,
+            Self::Right => 2,
+            Self::Output => 3,
+        }
+    }
+}
+
 /// One line of the saved sessions tree, as the shell's tests read it.
 pub type SessionRow = Row;
 
@@ -75,6 +86,7 @@ pub struct HomeView {
     picker: Option<Job<DialogMessage>>,
     picker_request: Option<(PathTarget, Pick)>,
     picker_target: PathTarget,
+    picked_paths: [Option<PathBuf>; 4],
     /// Something the launcher has to say that has nowhere else to appear.
     notice: Option<String>,
     /// A notice the shell may raise after the launcher was built.
@@ -107,6 +119,7 @@ impl HomeView {
             picker: None,
             picker_request: None,
             picker_target: PathTarget::Left,
+            picked_paths: std::array::from_fn(|_| None),
             notice: None,
             shared: None,
             shown_shared: None,
@@ -244,6 +257,7 @@ impl HomeView {
                 match message {
                     DialogMessage::Chosen(path) => {
                         let text = path.display().to_string();
+                        self.picked_paths[self.picker_target.index()] = Some(path);
                         match self.picker_target {
                             PathTarget::Left => self.left = text,
                             PathTarget::Center => self.center = text,
@@ -299,6 +313,21 @@ impl HomeView {
             return;
         }
         self.picker_request = Some((target, pick));
+        (self.notify)();
+    }
+
+    fn cancel_picker(&mut self) {
+        self.picker_request = None;
+        if let Some(job) = self.picker.take() {
+            job.cancel();
+        }
+    }
+
+    fn path_from_field(&self, target: PathTarget, text: &str) -> Option<PathBuf> {
+        self.picked_paths[target.index()].clone().or_else(|| {
+            let text = text.trim();
+            (!text.is_empty()).then(|| PathBuf::from(text))
+        })
     }
 
     fn paths_are_set(&self) -> bool {
@@ -306,20 +335,18 @@ impl HomeView {
     }
 
     fn merge_request(&self) -> OpenRequest {
-        let optional_path = |text: &str| {
-            let text = text.trim();
-            (!text.is_empty()).then(|| PathBuf::from(text))
-        };
         let (left, right) = self.sides();
         OpenRequest::new(SessionKind::TextMerge, left, right)
-            .with_center(optional_path(&self.center))
-            .with_output(optional_path(&self.output))
+            .with_center(self.path_from_field(PathTarget::Center, &self.center))
+            .with_output(self.path_from_field(PathTarget::Output, &self.output))
     }
 
     fn sides(&self) -> (PathBuf, PathBuf) {
         (
-            PathBuf::from(self.left.trim()),
-            PathBuf::from(self.right.trim()),
+            self.path_from_field(PathTarget::Left, &self.left)
+                .unwrap_or_default(),
+            self.path_from_field(PathTarget::Right, &self.right)
+                .unwrap_or_default(),
         )
     }
 
@@ -407,10 +434,12 @@ impl SessionView for HomeView {
                     if kind == SessionKind::TextMerge {
                         self.merge_setup = true;
                     } else if self.paths_are_set() {
+                        self.cancel_picker();
                         self.merge_setup = false;
                         let (left, right) = self.sides();
                         actions.push(ViewAction::Open(OpenRequest::new(kind, left, right)));
                     } else {
+                        self.cancel_picker();
                         self.merge_setup = false;
                         self.push_action(HomeAction::NewSession(kind));
                     }
@@ -443,14 +472,20 @@ impl SessionView for HomeView {
                     PathTarget::Right => &mut self.right,
                     PathTarget::Output => &mut self.output,
                 };
+                let mut path_changed = false;
                 ui.horizontal_wrapped(|ui| {
                     ui.label(label);
                     let width = (ui.available_width() * 0.5).clamp(80.0, 480.0);
-                    ui.add(egui::TextEdit::singleline(field).desired_width(width));
+                    path_changed = ui
+                        .add(egui::TextEdit::singleline(field).desired_width(width))
+                        .changed();
                     if widgets::inline_button(ui, button, ca_ui::icons::Icon::File).clicked() {
                         picker = Some((target, pick));
                     }
                 });
+                if path_changed {
+                    self.picked_paths[target.index()] = None;
+                }
             }
             ui.horizontal(|ui| {
                 if ui
@@ -460,6 +495,7 @@ impl SessionView for HomeView {
                     actions.push(ViewAction::Open(self.merge_request()));
                 }
                 if ui.button("Cancel Text Merge").clicked() {
+                    self.cancel_picker();
                     self.merge_setup = false;
                 }
             });
@@ -471,10 +507,13 @@ impl SessionView for HomeView {
                     PathTarget::Right => &mut self.right,
                     PathTarget::Output => &mut self.output,
                 };
+                let mut path_changed = false;
                 ui.horizontal_wrapped(|ui| {
                     ui.label(label);
                     let width = (ui.available_width() * 0.5).clamp(80.0, 480.0);
-                    ui.add(egui::TextEdit::singleline(field).desired_width(width));
+                    path_changed = ui
+                        .add(egui::TextEdit::singleline(field).desired_width(width))
+                        .changed();
                     if widgets::inline_button(ui, "File", ca_ui::icons::Icon::File).clicked() {
                         picker = Some((target, Pick::File));
                     }
@@ -482,6 +521,9 @@ impl SessionView for HomeView {
                         picker = Some((target, Pick::Folder));
                     }
                 });
+                if path_changed {
+                    self.picked_paths[target.index()] = None;
+                }
             }
         }
         if let Some((target, pick)) = picker {
@@ -507,10 +549,7 @@ impl SessionView for HomeView {
     }
 
     fn on_close(&mut self) {
-        self.picker_request = None;
-        if let Some(job) = self.picker.take() {
-            job.cancel();
-        }
+        self.cancel_picker();
     }
 }
 
@@ -925,19 +964,19 @@ mod tests {
     fn text_merge_from_home_exposes_file_pickers_and_opens_the_named_paths() {
         use std::cell::RefCell;
 
-        let dir = tempfile::tempdir().unwrap();
+        let directory = tempfile::tempdir().unwrap();
         let context = ca_ui::testing::context();
         let view = RefCell::new(super::HomeView::in_settings_directory(
             &context,
             1,
-            dir.path().to_path_buf(),
+            directory.path().to_path_buf(),
         ));
         let actions = RefCell::new(Vec::new());
         let mut probe = ca_ui::testing::probe::Probe::new(1280.0, 800.0);
-        let mut run = |ctx: &egui::Context| {
+        let mut run = |egui_context: &egui::Context| {
             let mut view = view.borrow_mut();
             let mut actions = actions.borrow_mut();
-            egui::CentralPanel::default().show(ctx, |ui| {
+            egui::CentralPanel::default().show(egui_context, |ui| {
                 let requested = ca_ui::view::SessionView::ui(&mut *view, ui, &context);
                 if !requested.is_empty() {
                     *actions = requested;
@@ -977,8 +1016,14 @@ mod tests {
             assert_eq!(view.borrow().picker_request, Some((target, pick)));
             view.borrow_mut().picker_request = None;
         }
+        probe.click("Choose Left File", &mut run).unwrap();
+        assert_eq!(
+            view.borrow().picker_request,
+            Some((super::PathTarget::Left, ca_ui::dialog::Pick::File))
+        );
         probe.click("Cancel Text Merge", &mut run).unwrap();
         assert!(!view.borrow().merge_setup);
+        assert!(view.borrow().picker_request.is_none());
         probe.click("Text Merge", &mut run).unwrap();
 
         {
@@ -1003,13 +1048,54 @@ mod tests {
                 .with_output(Some("merged.txt".into()))
             )]
         );
+    }
 
-        let mut view = view.borrow_mut();
+    #[test]
+    fn merge_requests_preserve_picker_paths_exactly() {
+        let directory = tempfile::tempdir().unwrap();
+        let context = ca_ui::testing::context();
+        let mut view =
+            super::HomeView::in_settings_directory(&context, 1, directory.path().to_path_buf());
+        view.left = "left.txt".to_owned();
+        view.center = "base.txt".to_owned();
+        view.right = "right.txt".to_owned();
+        view.output = "merged.txt".to_owned();
+        view.picked_paths[super::PathTarget::Center.index()] = Some("center with space ".into());
+        view.picked_paths[super::PathTarget::Output.index()] = Some("output with space ".into());
+        view.picked_paths[super::PathTarget::Left.index()] = Some("left with space ".into());
+        view.picked_paths[super::PathTarget::Right.index()] = Some("right with space ".into());
+        let request = view.merge_request();
+        assert_eq!(request.left, super::PathBuf::from("left with space "));
+        assert_eq!(request.right, super::PathBuf::from("right with space "));
+        assert_eq!(request.center, Some("center with space ".into()));
+        assert_eq!(request.output, Some("output with space ".into()));
+
         view.center.clear();
         view.output.clear();
+        view.picked_paths[super::PathTarget::Center.index()] = None;
+        view.picked_paths[super::PathTarget::Output.index()] = None;
         let request = view.merge_request();
         assert_eq!(request.center, None);
         assert_eq!(request.output, None);
+    }
+
+    #[test]
+    fn cancelling_a_picker_discards_a_result_that_has_not_been_polled() {
+        let directory = tempfile::tempdir().unwrap();
+        let context = ca_ui::testing::context();
+        let mut view =
+            super::HomeView::in_settings_directory(&context, 1, directory.path().to_path_buf());
+        view.left = "unchanged.txt".to_owned();
+        view.picker_target = super::PathTarget::Left;
+        view.picker = Some(ca_ui::worker::Job::spawn(|emitter, _| {
+            let _ = emitter.send(ca_ui::dialog::DialogMessage::Chosen("late.txt".into()));
+        }));
+
+        view.cancel_picker();
+        view.poll();
+
+        assert_eq!(view.left, "unchanged.txt");
+        assert!(view.picker.is_none());
     }
 
     #[test]
