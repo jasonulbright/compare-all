@@ -210,9 +210,22 @@ pub fn frame_with(
     height: f32,
     events: Vec<egui::Event>,
 ) {
+    frame_with_modifiers(view, ctx, width, height, egui::Modifiers::NONE, events);
+}
+
+/// Run one frame with explicit keyboard modifiers and pointer events.
+pub fn frame_with_modifiers(
+    view: &mut PictureView,
+    ctx: &egui::Context,
+    width: f32,
+    height: f32,
+    modifiers: egui::Modifiers,
+    events: Vec<egui::Event>,
+) {
     view.tick();
     let input = egui::RawInput {
         events,
+        modifiers,
         ..sized_input(width, height)
     };
     let _ = ctx.run(input, |ctx| {

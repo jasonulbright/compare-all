@@ -9,6 +9,47 @@ use ca_ui::command::Command;
 use ca_ui::view::SessionView;
 use ca_view_picture::model::Pane;
 
+fn drag_primary(
+    view: &mut ca_view_picture::PictureView,
+    ctx: &egui::Context,
+    pane: Pane,
+    modifiers: egui::Modifiers,
+    delta: egui::Vec2,
+) {
+    let from = view.pane_rect(pane).unwrap().center();
+    let to = from + delta;
+    let button = |pos, pressed| egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers,
+    };
+    common::frame_with_modifiers(
+        view,
+        ctx,
+        1_280.0,
+        800.0,
+        modifiers,
+        vec![egui::Event::PointerMoved(from), button(from, true)],
+    );
+    common::frame_with_modifiers(
+        view,
+        ctx,
+        1_280.0,
+        800.0,
+        modifiers,
+        vec![egui::Event::PointerMoved(to)],
+    );
+    common::frame_with_modifiers(
+        view,
+        ctx,
+        1_280.0,
+        800.0,
+        modifiers,
+        vec![button(to, false)],
+    );
+}
+
 #[test]
 fn two_images_open_and_reach_a_comparison() {
     let dir = tempfile::tempdir().unwrap();
@@ -125,6 +166,52 @@ fn an_arrow_key_nudges_the_offset() {
     view.reset_difference_offset();
     assert_eq!(view.settings().offset, Offset::zero());
     assert!(common::run_until_ready(&mut view, &ctx));
+}
+
+#[test]
+fn shift_dragging_either_side_image_adjusts_its_alignment() {
+    let dir = tempfile::tempdir().unwrap();
+    let (left, right) = common::pair(dir.path());
+    let (mut view, ctx) = common::open(left, right, 16);
+    assert!(common::run_until_ready(&mut view, &ctx));
+    view.actual_size();
+    common::frame(&mut view, &ctx, 1_280.0, 800.0);
+    assert_eq!(view.settings().offset, Offset::zero());
+
+    drag_primary(
+        &mut view,
+        &ctx,
+        Pane::Left,
+        egui::Modifiers::SHIFT,
+        egui::vec2(12.0, 0.0),
+    );
+    assert_eq!(view.settings().offset, Offset::new(-12, 0));
+    assert!(common::run_until(&mut view, &ctx, |view| view
+        .outcome()
+        .is_some_and(|outcome| outcome.offset == Offset::new(-12, 0))));
+
+    drag_primary(
+        &mut view,
+        &ctx,
+        Pane::Right,
+        egui::Modifiers::SHIFT,
+        egui::vec2(12.0, 0.0),
+    );
+    assert_eq!(view.settings().offset, Offset::zero());
+    assert!(common::run_until(&mut view, &ctx, |view| view
+        .outcome()
+        .is_some_and(|outcome| outcome.offset == Offset::zero())));
+
+    let origin = view.camera().origin;
+    drag_primary(
+        &mut view,
+        &ctx,
+        Pane::Right,
+        egui::Modifiers::NONE,
+        egui::vec2(12.0, 0.0),
+    );
+    assert_eq!(view.settings().offset, Offset::zero());
+    assert!((view.camera().origin[0] - (origin[0] - 12.0)).abs() < f32::EPSILON);
 }
 
 #[test]
