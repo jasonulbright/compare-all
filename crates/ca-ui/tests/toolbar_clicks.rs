@@ -8,7 +8,7 @@
 
 use ca_session::options::CommandOptions;
 use ca_session::SessionStore;
-use ca_ui::command::Command;
+use ca_ui::command::{Command, MenuView};
 use ca_ui::report::{
     ReportAction, ReportDialog, ReportKind, ReportMessage, ReportSettings, Target,
 };
@@ -207,6 +207,60 @@ fn a_toggle_announces_its_state() {
     probe.idle(&mut draw);
     assert_eq!(probe.find("Favor Left").unwrap().toggled, Some(false));
     assert_eq!(probe.find("Favor Right").unwrap().toggled, Some(true));
+}
+
+#[test]
+fn a_checkable_menu_command_announces_and_updates_its_state() {
+    let selected = Cell::new(true);
+    let mut probe = Probe::new(800.0, 400.0);
+    let mut draw = |ctx: &egui::Context| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            if widgets::command_item_in_with_state(
+                ui,
+                MenuView::Text,
+                Command::ToggleLineNumbers,
+                true,
+                Some(selected.get()),
+                "",
+            ) {
+                selected.set(!selected.get());
+            }
+        });
+    };
+
+    let output = probe.frame(Vec::new(), &mut draw);
+    let label = line_label(Command::ToggleLineNumbers);
+    assert_eq!(probe.find(&label).unwrap().toggled, Some(true));
+    assert_eq!(
+        output
+            .shapes
+            .iter()
+            .filter(|shape| matches!(&shape.shape, egui::Shape::LineSegment { .. }))
+            .count(),
+        2,
+        "a checked menu item paints a checkmark"
+    );
+
+    probe.click(&label, &mut draw).unwrap();
+    let output = probe.frame(Vec::new(), &mut draw);
+    assert_eq!(probe.find(&label).unwrap().toggled, Some(false));
+    assert_eq!(
+        output
+            .shapes
+            .iter()
+            .filter(|shape| matches!(&shape.shape, egui::Shape::LineSegment { .. }))
+            .count(),
+        0,
+        "an unchecked menu item does not paint a checkmark"
+    );
+}
+
+/// The text shown to accessibility for a menu command, including its shortcut.
+fn line_label(command: Command) -> String {
+    match command.shortcut_in(MenuView::Text) {
+        Some(shortcut) => format!("{}\t{shortcut}", command.label_in(MenuView::Text)),
+        None => command.label_in(MenuView::Text).to_owned(),
+    }
 }
 
 /// Every call of the shared button outside the builder: the file that makes

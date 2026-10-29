@@ -3627,6 +3627,10 @@ impl SessionView for FolderSyncView {
         declared
     }
 
+    fn checked(&self, command: Command) -> Option<bool> {
+        self.view.checked(command)
+    }
+
     fn accepts(&self, command: Command) -> bool {
         match command {
             Command::Synchronize => {
@@ -3822,6 +3826,40 @@ impl SessionView for FolderView {
 
     fn commands(&self) -> Vec<ca_ui::view::CommandState> {
         view::declare(HANDLED, |command| self.accepts(command))
+    }
+
+    fn checked(&self, command: Command) -> Option<bool> {
+        Some(match command {
+            Command::ShowAll => self.filter == DisplayFilter::ShowAll,
+            Command::ShowDifferences => self.filter == DisplayFilter::ShowDifferences,
+            Command::ShowSame => self.filter == DisplayFilter::ShowSame,
+            Command::ShowNone => self.filter == DisplayFilter::ShowNone,
+            Command::ShowNoOrphans => self.filter == DisplayFilter::ShowNoOrphans,
+            Command::ShowDifferencesNoOrphans => {
+                self.filter == DisplayFilter::ShowDifferencesNoOrphans
+            }
+            Command::ShowOrphans => self.filter == DisplayFilter::ShowOrphans,
+            Command::ShowLeftNewer => self.filter == DisplayFilter::ShowLeftNewer,
+            Command::ShowRightNewer => self.filter == DisplayFilter::ShowRightNewer,
+            Command::ShowLeftNewerAndLeftOrphans => {
+                self.filter == DisplayFilter::ShowLeftNewerAndLeftOrphans
+            }
+            Command::ShowRightNewerAndRightOrphans => {
+                self.filter == DisplayFilter::ShowRightNewerAndRightOrphans
+            }
+            Command::ShowLeftOrphans => self.filter == DisplayFilter::ShowLeftOrphans,
+            Command::ShowRightOrphans => self.filter == DisplayFilter::ShowRightOrphans,
+            Command::AlwaysShowFolders => {
+                self.folder_filter == FolderDisplayFilter::AlwaysShowFolders
+            }
+            Command::CompareFilesAndFolderStructure => {
+                self.folder_filter == FolderDisplayFilter::CompareFilesAndFolderStructure
+            }
+            Command::OnlyCompareFiles => {
+                self.folder_filter == FolderDisplayFilter::OnlyCompareFiles
+            }
+            _ => return None,
+        })
     }
 
     /// A ready, idle filename copy with a selection but no local path has a distinct refusal.

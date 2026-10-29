@@ -191,6 +191,15 @@ pub trait SessionView {
         Vec::new()
     }
 
+    /// Whether a stateful command is currently selected in this view.
+    ///
+    /// The menu uses this for checkable toggles and the active choice in a
+    /// filter group. A one-shot command or a command with no current state
+    /// returns `None`.
+    fn checked(&self, _command: Command) -> Option<bool> {
+        None
+    }
+
     /// True when the view can run `command` right now.
     ///
     /// The default answer is read from [`SessionView::commands`]. A view whose
@@ -494,6 +503,10 @@ impl SessionView for OwnsTemporaries {
 
     fn commands(&self) -> Vec<CommandState> {
         self.view.commands()
+    }
+
+    fn checked(&self, command: Command) -> Option<bool> {
+        self.view.checked(command)
     }
 
     fn accepts(&self, command: Command) -> bool {

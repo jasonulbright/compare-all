@@ -2899,6 +2899,18 @@ impl SessionView for HexView {
         ca_ui::view::declare(HANDLED, |command| self.accepts(command))
     }
 
+    fn checked(&self, command: Command) -> Option<bool> {
+        Some(match command {
+            Command::ShowAll => self.filter == model::DisplayFilter::All,
+            Command::ShowDifferences => self.filter == model::DisplayFilter::Differences,
+            Command::ShowSame => self.filter == model::DisplayFilter::Same,
+            Command::ShowContext => matches!(self.filter, model::DisplayFilter::Context(_)),
+            Command::ToggleLineNumbers => self.show_addresses,
+            Command::Thumbnail => self.show_thumbnail,
+            _ => return None,
+        })
+    }
+
     fn menu_view(&self) -> ca_ui::command::MenuView {
         ca_ui::command::MenuView::Hex
     }

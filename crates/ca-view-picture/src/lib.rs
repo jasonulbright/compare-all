@@ -1026,6 +1026,10 @@ impl SessionView for PictureView {
         })
     }
 
+    fn checked(&self, command: Command) -> Option<bool> {
+        (command == Command::ToggleFullscreen).then_some(self.fullscreen)
+    }
+
     fn run(&mut self, command: Command) {
         match command {
             Command::CompareReport if self.is_ready() => self.report.request(),
@@ -2221,6 +2225,7 @@ mod tests {
     use super::{mode_label, side_index, side_label, Pane, PictureView, SideImage, Sources, MODES};
     use ca_image::compare::Side;
     use ca_image::decode::{ColorKind, Fidelity, Metadata, Orientation, SourceFormat};
+    use ca_ui::command::Command;
     use ca_ui::testing::context;
     use ca_ui::view::SessionView;
     use std::path::PathBuf;
@@ -2481,10 +2486,12 @@ mod tests {
         );
         view.panes.set(Pane::Difference, false);
         view.focused = Pane::Difference;
+        assert_eq!(view.checked(Command::ToggleFullscreen), Some(false));
         view.set_fullscreen(true);
 
         assert_eq!(view.focused, Pane::Left);
         assert!(view.wants_fullscreen());
+        assert_eq!(view.checked(Command::ToggleFullscreen), Some(true));
         let ctx = egui::Context::default();
         let _ = ctx.run(ca_ui::testing::raw_input(), |ctx| {
             egui::CentralPanel::default()
