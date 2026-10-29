@@ -73,6 +73,16 @@ fn the_options_command_opens_and_closes_the_dialog() {
         "text_editing.tab_stop",
         &ca_ui::settings::FieldValue::Count(3),
     );
+    assert!(
+        !app.accepts(Command::ImportSettings),
+        "settings import must wait until the Options draft closes"
+    );
+    app.run(Command::ImportSettings, &context());
+    assert_eq!(
+        app.options_dialog().unwrap().value("text_editing.tab_stop"),
+        Some(ca_ui::settings::FieldValue::Count(3)),
+        "direct import dispatch disturbed the Options draft"
+    );
     app.run(Command::Options, &context());
     assert_eq!(
         app.options_dialog().unwrap().value("text_editing.tab_stop"),
@@ -106,8 +116,9 @@ fn restore_factory_defaults_cannot_open_while_options_has_a_draft() {
 }
 
 #[test]
-fn options_cannot_open_while_restore_factory_defaults_is_open() {
-    let dir = tempfile::tempdir().unwrap();
+fn options_cannot_open_while_restore_factory_defaults_is_open(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
     let mut app = app_in(dir.path(), Startup::Home);
     settle(&mut app);
     app.run(Command::RestoreFactoryDefaults, &context());
@@ -117,6 +128,7 @@ fn options_cannot_open_while_restore_factory_defaults_is_open() {
     app.run(Command::Options, &context());
 
     assert!(app.options_dialog().is_none());
+    Ok(())
 }
 
 /// A color a person chose reaches a shape the window paints, on the next frame

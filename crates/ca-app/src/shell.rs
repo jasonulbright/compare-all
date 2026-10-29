@@ -2911,7 +2911,14 @@ impl App {
 
     /// Raise a picker that names a package to write or to read.
     fn pick_package(&mut self, writes: bool, context: &ViewContext) {
-        if self.share_picker.is_some() {
+        if self.share_picker.is_some()
+            || self.share.is_some()
+            || (!writes
+                && self
+                    .options_dialog
+                    .as_ref()
+                    .is_some_and(OptionsDialog::is_open))
+        {
             return;
         }
         self.share_writes = writes;
@@ -2921,6 +2928,16 @@ impl App {
             ca_ui::dialog::Pick::File
         };
         self.share_picker = Some(ca_ui::dialog::spawn(pick, Arc::clone(&context.notify)));
+    }
+
+    /// Whether an import picker or its package worker can still replace settings.
+    fn settings_import_in_progress(&self) -> bool {
+        !self.share_writes && self.package_operation_in_progress()
+    }
+
+    /// Whether a package picker or its worker is still active.
+    fn package_operation_in_progress(&self) -> bool {
+        self.share_picker.is_some() || self.share.is_some()
     }
 
     /// Take whatever the picker and the package worker posted.
@@ -3305,13 +3322,20 @@ impl App {
             | Command::SessionHome => true,
             Command::CloseTab | Command::ClearSession => !self.tabs.is_empty(),
             Command::TabNext | Command::TabPrevious => self.tabs.len() > 1,
-            Command::LoadWorkspace
-            | Command::SaveWorkspaceAs
-            | Command::ExportSettings
-            | Command::ImportSettings => ready,
+            Command::LoadWorkspace | Command::SaveWorkspaceAs => ready,
+            Command::ExportSettings => ready && !self.package_operation_in_progress(),
+            Command::ImportSettings => {
+                ready
+                    && !self.package_operation_in_progress()
+                    && !self
+                        .options_dialog
+                        .as_ref()
+                        .is_some_and(OptionsDialog::is_open)
+            }
             Command::Options => {
                 self.options.is_ready()
                     && !self.restore.as_ref().is_some_and(RestoreDialog::is_open)
+                    && !self.settings_import_in_progress()
             }
             Command::RestoreFactoryDefaults => {
                 self.options.is_ready()
@@ -3382,7 +3406,9 @@ impl App {
                 self.workspaces = Some(WorkspaceManager::new(instance));
             }
             Command::Options => {
-                if !self.restore.as_ref().is_some_and(RestoreDialog::is_open) {
+                if !self.restore.as_ref().is_some_and(RestoreDialog::is_open)
+                    && !self.settings_import_in_progress()
+                {
                     self.open_options();
                 }
             }
@@ -4975,6 +5001,42 @@ mod tests {
         let (_settings, app) = empty_app();
         assert_eq!(app.tab_count(), 0);
         assert!(app.active_title().is_none());
+    }
+
+    #[test]
+    fn options_waits_for_settings_import_picker_and_worker() {
+        let (_settings, mut app) = empty_app();
+        assert!(ca_ui::testing::wait_until(
+            std::time::Duration::from_secs(10),
+            || {
+                app.options.poll();
+                app.options.is_ready()
+            }
+        ));
+
+        app.share_writes = false;
+        let (picker, picker_held) =
+            ca_ui::testing::job_held_after(vec![ca_ui::dialog::DialogMessage::Dismissed]);
+        app.share_picker = Some(picker);
+        assert!(!app.accepts(Command::Options));
+        app.run(Command::Options, &context());
+        assert!(app.options_dialog.is_none());
+        drop(picker_held);
+        app.poll_share();
+        assert!(app.accepts(Command::Options));
+
+        let (share, share_held) =
+            ca_ui::testing::job_held_after(vec![ca_ui::share::ShareMessage::Failed {
+                store: None,
+                reason: "test import".to_owned(),
+            }]);
+        app.share = Some(share);
+        assert!(!app.accepts(Command::Options));
+        app.run(Command::Options, &context());
+        assert!(app.options_dialog.is_none());
+        drop(share_held);
+        app.poll_share();
+        assert!(app.accepts(Command::Options));
     }
 
     fn app_with_recent_session() -> (tempfile::TempDir, App, SessionId, PathBuf, PathBuf) {
