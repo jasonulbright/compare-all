@@ -992,6 +992,8 @@ pub struct App {
     /// The options dialog, while it is open.
     options_dialog: Option<OptionsDialog>,
     options_viewport_id: egui::ViewportId,
+    /// Focus the native Options viewport after the Options command runs.
+    options_focus_requested: bool,
     /// The restore factory defaults wizard, while it is open.
     restore: Option<RestoreDialog>,
     /// The settings dialog, while it is open.
@@ -1156,6 +1158,7 @@ impl App {
             system_dark: None,
             options_dialog: None,
             options_viewport_id: egui::ViewportId::ROOT,
+            options_focus_requested: false,
             restore: None,
             tab_sessions: Vec::new(),
             tab_recent: Vec::new(),
@@ -3307,7 +3310,14 @@ impl App {
             | Command::SaveWorkspaceAs
             | Command::ExportSettings
             | Command::ImportSettings => ready,
-            Command::Options | Command::RestoreFactoryDefaults => self.options.is_ready(),
+            Command::Options => self.options.is_ready(),
+            Command::RestoreFactoryDefaults => {
+                self.options.is_ready()
+                    && !self
+                        .options_dialog
+                        .as_ref()
+                        .is_some_and(OptionsDialog::is_open)
+            }
             Command::Profiles => !self.policies.remote_profiles_disabled(),
             Command::CheckForUpdates => {
                 self.update.source.is_some()
@@ -3369,19 +3379,16 @@ impl App {
                 let instance = self.instance();
                 self.workspaces = Some(WorkspaceManager::new(instance));
             }
-            Command::Options => {
-                let instance = self.instance();
-                let mut shown = self.options.options_or_default();
-                if let Some(state) = self.explorer.installed {
-                    shown.startup.shell_integration = state.any();
-                }
-                self.options_viewport_id =
-                    egui::ViewportId::from_hash_of(("program-options-viewport", instance));
-                self.options_dialog = Some(self.new_options_dialog(&shown, instance));
-            }
+            Command::Options => self.open_options(),
             Command::RestoreFactoryDefaults => {
-                let instance = self.instance();
-                self.restore = Some(RestoreDialog::new(instance));
+                if !self
+                    .options_dialog
+                    .as_ref()
+                    .is_some_and(OptionsDialog::is_open)
+                {
+                    let instance = self.instance();
+                    self.restore = Some(RestoreDialog::new(instance));
+                }
             }
             Command::Profiles => {
                 if !self.policies.remote_profiles_disabled() {
@@ -3452,6 +3459,20 @@ impl App {
                 self.save_store();
             }
         }
+    }
+
+    fn open_options(&mut self) {
+        if self.options_dialog.is_none() {
+            let instance = self.instance();
+            let mut shown = self.options.options_or_default();
+            if let Some(state) = self.explorer.installed {
+                shown.startup.shell_integration = state.any();
+            }
+            self.options_viewport_id =
+                egui::ViewportId::from_hash_of(("program-options-viewport", instance));
+            self.options_dialog = Some(self.new_options_dialog(&shown, instance));
+        }
+        self.options_focus_requested = true;
     }
 
     /// An options dialog whose pack browser reads the releases this window
@@ -4050,25 +4071,33 @@ impl App {
 
     /// Keep the Options viewport alive and handle its results in the root
     /// window, where settings writes and page launches are coordinated.
-    fn draw_options_viewport(&mut self, ctx: &egui::Context, context: &ViewContext) {
+    fn draw_options_viewport(&mut self, ctx: &egui::Context, context: &ViewContext, naming: bool) {
         let builder = egui::ViewportBuilder::default()
             .with_title("Options")
             .with_inner_size([880.0, 700.0])
             .with_min_inner_size([440.0, 360.0]);
         let mut outcome = None;
         let mut page = None;
+        let focus_requested = std::mem::take(&mut self.options_focus_requested);
         if let Some(dialog) = self.options_dialog.as_mut() {
             outcome = ctx.show_viewport_immediate(
                 self.options_viewport_id,
                 builder,
                 |viewport_ctx, class| {
                     ca_ui::theme::chrome::install(viewport_ctx);
+                    if focus_requested && class != egui::ViewportClass::Embedded {
+                        viewport_ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    }
                     let close_requested = class != egui::ViewportClass::Embedded
                         && viewport_ctx.input(|input| input.viewport().close_requested());
                     let produced = if close_requested {
                         Some(dialog.cancel())
                     } else if class == egui::ViewportClass::Embedded {
-                        dialog.show(viewport_ctx, &context.palette)
+                        if naming {
+                            None
+                        } else {
+                            dialog.show(viewport_ctx, &context.palette)
+                        }
                     } else {
                         let mut produced = None;
                         egui::CentralPanel::default().show(viewport_ctx, |ui| {
@@ -4272,7 +4301,7 @@ impl App {
             self.apply(actions, &context);
             self.apply_home_actions(&context);
         }
-        self.draw_options_viewport(ctx, &context);
+        self.draw_options_viewport(ctx, &context, naming);
         if fullscreen {
             self.exit_question_panel(ctx);
         } else if !naming {
