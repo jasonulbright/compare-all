@@ -324,10 +324,9 @@ impl HomeView {
     }
 
     fn path_from_field(&self, target: PathTarget, text: &str) -> Option<PathBuf> {
-        self.picked_paths[target.index()].clone().or_else(|| {
-            let text = text.trim();
-            (!text.is_empty()).then(|| PathBuf::from(text))
-        })
+        self.picked_paths[target.index()]
+            .clone()
+            .or_else(|| (!text.trim().is_empty()).then(|| PathBuf::from(text)))
     }
 
     fn paths_are_set(&self) -> bool {
@@ -961,10 +960,11 @@ mod tests {
     }
 
     #[test]
-    fn text_merge_from_home_exposes_file_pickers_and_opens_the_named_paths() {
+    fn text_merge_from_home_exposes_file_pickers_and_opens_the_named_paths(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         use std::cell::RefCell;
 
-        let directory = tempfile::tempdir().unwrap();
+        let directory = tempfile::tempdir()?;
         let context = ca_ui::testing::context();
         let view = RefCell::new(super::HomeView::in_settings_directory(
             &context,
@@ -1048,11 +1048,12 @@ mod tests {
                 .with_output(Some("merged.txt".into()))
             )]
         );
+        Ok(())
     }
 
     #[test]
-    fn merge_requests_preserve_picker_paths_exactly() {
-        let directory = tempfile::tempdir().unwrap();
+    fn merge_requests_preserve_picker_paths_exactly() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
         let context = ca_ui::testing::context();
         let mut view =
             super::HomeView::in_settings_directory(&context, 1, directory.path().to_path_buf());
@@ -1077,11 +1078,24 @@ mod tests {
         let request = view.merge_request();
         assert_eq!(request.center, None);
         assert_eq!(request.output, None);
+
+        view.picked_paths = std::array::from_fn(|_| None);
+        view.left = " left.txt ".to_owned();
+        view.center = " base with spaces ".to_owned();
+        view.right = " right.txt ".to_owned();
+        view.output = " merged with spaces ".to_owned();
+        let request = view.merge_request();
+        assert_eq!(request.left, super::PathBuf::from(" left.txt "));
+        assert_eq!(request.right, super::PathBuf::from(" right.txt "));
+        assert_eq!(request.center, Some(" base with spaces ".into()));
+        assert_eq!(request.output, Some(" merged with spaces ".into()));
+        Ok(())
     }
 
     #[test]
-    fn cancelling_a_picker_discards_a_result_that_has_not_been_polled() {
-        let directory = tempfile::tempdir().unwrap();
+    fn cancelling_a_picker_discards_a_result_that_has_not_been_polled(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
         let context = ca_ui::testing::context();
         let mut view =
             super::HomeView::in_settings_directory(&context, 1, directory.path().to_path_buf());
@@ -1096,6 +1110,7 @@ mod tests {
 
         assert_eq!(view.left, "unchanged.txt");
         assert!(view.picker.is_none());
+        Ok(())
     }
 
     #[test]
