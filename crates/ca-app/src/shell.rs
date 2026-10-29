@@ -992,7 +992,6 @@ pub struct App {
     /// The options dialog, while it is open.
     options_dialog: Option<OptionsDialog>,
     options_viewport_id: egui::ViewportId,
-    /// Focus the native Options viewport after the Options command runs.
     options_focus_requested: bool,
     /// The restore factory defaults wizard, while it is open.
     restore: Option<RestoreDialog>,
