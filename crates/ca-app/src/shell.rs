@@ -991,6 +991,8 @@ pub struct App {
     system_dark: Option<bool>,
     /// The options dialog, while it is open.
     options_dialog: Option<OptionsDialog>,
+    options_viewport_id: egui::ViewportId,
+    options_focus_requested: bool,
     /// The restore factory defaults wizard, while it is open.
     restore: Option<RestoreDialog>,
     /// The settings dialog, while it is open.
@@ -1154,6 +1156,8 @@ impl App {
             pack_sets_theme: false,
             system_dark: None,
             options_dialog: None,
+            options_viewport_id: egui::ViewportId::ROOT,
+            options_focus_requested: false,
             restore: None,
             tab_sessions: Vec::new(),
             tab_recent: Vec::new(),
@@ -1607,6 +1611,21 @@ impl App {
     /// Take what the options dialog produced.
     pub fn apply_options(&mut self, options: ca_session::ProgramOptions) {
         self.options.replace(options);
+    }
+
+    /// Apply Options edits without replacing report preferences saved meanwhile.
+    ///
+    /// The Options dialog has no report controls, so its open-time copy is not
+    /// authoritative for the report preferences written by report views.
+    fn apply_options_dialog(&mut self, mut options: ca_session::ProgramOptions) {
+        if let Some(reports) = self
+            .options
+            .options()
+            .map(|current| current.reports.clone())
+        {
+            options.reports = reports;
+        }
+        self.apply_options(options);
     }
 
     /// Carry out a restore of the factory defaults.
@@ -2907,7 +2926,14 @@ impl App {
 
     /// Raise a picker that names a package to write or to read.
     fn pick_package(&mut self, writes: bool, context: &ViewContext) {
-        if self.share_picker.is_some() {
+        if self.share_picker.is_some()
+            || self.share.is_some()
+            || (!writes
+                && self
+                    .options_dialog
+                    .as_ref()
+                    .is_some_and(OptionsDialog::is_open))
+        {
             return;
         }
         self.share_writes = writes;
@@ -2917,6 +2943,15 @@ impl App {
             ca_ui::dialog::Pick::File
         };
         self.share_picker = Some(ca_ui::dialog::spawn(pick, Arc::clone(&context.notify)));
+    }
+
+    fn settings_import_in_progress(&self) -> bool {
+        !self.share_writes && self.package_operation_in_progress()
+    }
+
+    /// Whether a package picker or its worker is still active.
+    fn package_operation_in_progress(&self) -> bool {
+        self.share_picker.is_some() || self.share.is_some()
     }
 
     /// Take whatever the picker and the package worker posted.
@@ -3301,11 +3336,28 @@ impl App {
             | Command::SessionHome => true,
             Command::CloseTab | Command::ClearSession => !self.tabs.is_empty(),
             Command::TabNext | Command::TabPrevious => self.tabs.len() > 1,
-            Command::LoadWorkspace
-            | Command::SaveWorkspaceAs
-            | Command::ExportSettings
-            | Command::ImportSettings => ready,
-            Command::Options | Command::RestoreFactoryDefaults => self.options.is_ready(),
+            Command::LoadWorkspace | Command::SaveWorkspaceAs => ready,
+            Command::ExportSettings => ready && !self.package_operation_in_progress(),
+            Command::ImportSettings => {
+                ready
+                    && !self.package_operation_in_progress()
+                    && !self
+                        .options_dialog
+                        .as_ref()
+                        .is_some_and(OptionsDialog::is_open)
+            }
+            Command::Options => {
+                self.options.is_ready()
+                    && !self.restore.as_ref().is_some_and(RestoreDialog::is_open)
+                    && !self.settings_import_in_progress()
+            }
+            Command::RestoreFactoryDefaults => {
+                self.options.is_ready()
+                    && !self
+                        .options_dialog
+                        .as_ref()
+                        .is_some_and(OptionsDialog::is_open)
+            }
             Command::Profiles => !self.policies.remote_profiles_disabled(),
             Command::CheckForUpdates => {
                 self.update.source.is_some()
@@ -3368,16 +3420,21 @@ impl App {
                 self.workspaces = Some(WorkspaceManager::new(instance));
             }
             Command::Options => {
-                let instance = self.instance();
-                let mut shown = self.options.options_or_default();
-                if let Some(state) = self.explorer.installed {
-                    shown.startup.shell_integration = state.any();
+                if !self.restore.as_ref().is_some_and(RestoreDialog::is_open)
+                    && !self.settings_import_in_progress()
+                {
+                    self.open_options();
                 }
-                self.options_dialog = Some(self.new_options_dialog(&shown, instance));
             }
             Command::RestoreFactoryDefaults => {
-                let instance = self.instance();
-                self.restore = Some(RestoreDialog::new(instance));
+                if !self
+                    .options_dialog
+                    .as_ref()
+                    .is_some_and(OptionsDialog::is_open)
+                {
+                    let instance = self.instance();
+                    self.restore = Some(RestoreDialog::new(instance));
+                }
             }
             Command::Profiles => {
                 if !self.policies.remote_profiles_disabled() {
@@ -3448,6 +3505,20 @@ impl App {
                 self.save_store();
             }
         }
+    }
+
+    fn open_options(&mut self) {
+        if self.options_dialog.is_none() {
+            let instance = self.instance();
+            let mut shown = self.options.options_or_default();
+            if let Some(state) = self.explorer.installed {
+                shown.startup.shell_integration = state.any();
+            }
+            self.options_viewport_id =
+                egui::ViewportId::from_hash_of(("program-options-viewport", instance));
+            self.options_dialog = Some(self.new_options_dialog(&shown, instance));
+        }
+        self.options_focus_requested = true;
     }
 
     /// An options dialog whose pack browser reads the releases this window
@@ -3953,28 +4024,9 @@ impl App {
         }
     }
 
-    /// Draw whichever dialogs are open and act on what they produced.
+    /// Draw the dialogs that remain in the main viewport and handle their output.
     fn draw_dialogs(&mut self, ctx: &egui::Context, context: &ViewContext) {
         let palette = context.palette;
-        let mut options_outcome = None;
-        if let Some(dialog) = self.options_dialog.as_mut() {
-            options_outcome = dialog.show(ctx, &palette);
-            if let Some(page) = dialog.take_page_request() {
-                self.launches.push(ca_ui::launch::open_url_with_system(
-                    &page,
-                    Arc::clone(&self.spawner),
-                    Arc::clone(&context.notify),
-                ));
-            }
-        }
-        if let Some(produced) = options_outcome {
-            let wanted = produced.options.startup.shell_integration;
-            self.apply_options(*produced.options);
-            self.sync_explorer_menu(wanted, &context.notify);
-            if produced.closed {
-                self.options_dialog = None;
-            }
-        }
         let mut restore_outcome = None;
         if let Some(dialog) = self.restore.as_mut() {
             restore_outcome = dialog.show(ctx);
@@ -4060,6 +4112,76 @@ impl App {
             });
         if let Some(leave) = answer {
             self.answer_exit(leave);
+        }
+    }
+
+    /// Keep the Options viewport alive and handle its results in the root
+    /// window, where settings writes and page launches are coordinated.
+    fn draw_options_viewport(
+        &mut self,
+        egui_context: &egui::Context,
+        context: &ViewContext,
+        naming: bool,
+    ) {
+        let builder = egui::ViewportBuilder::default()
+            .with_title("Options")
+            .with_inner_size([880.0, 700.0])
+            .with_min_inner_size([440.0, 360.0]);
+        let mut outcome = None;
+        let mut page = None;
+        let focus_requested = std::mem::take(&mut self.options_focus_requested);
+        if let Some(dialog) = self.options_dialog.as_mut() {
+            outcome = egui_context.show_viewport_immediate(
+                self.options_viewport_id,
+                builder,
+                |viewport_context, class| {
+                    ca_ui::theme::chrome::install(viewport_context);
+                    if focus_requested && class != egui::ViewportClass::Embedded {
+                        viewport_context.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    }
+                    let close_requested = class != egui::ViewportClass::Embedded
+                        && viewport_context.input(|input| input.viewport().close_requested());
+                    let produced = if close_requested {
+                        Some(dialog.cancel())
+                    } else if class == egui::ViewportClass::Embedded {
+                        if naming {
+                            None
+                        } else {
+                            dialog.show(viewport_context, &context.palette)
+                        }
+                    } else {
+                        let mut produced = None;
+                        egui::CentralPanel::default().show(viewport_context, |ui| {
+                            produced = dialog.body(ui, &context.palette);
+                        });
+                        dialog.show_pack_browser(viewport_context);
+                        produced
+                    };
+                    if class != egui::ViewportClass::Embedded
+                        && produced.as_ref().is_some_and(|outcome| outcome.closed)
+                    {
+                        viewport_context.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                    produced
+                },
+            );
+            page = dialog.take_page_request();
+        }
+
+        if let Some(page) = page {
+            self.launches.push(ca_ui::launch::open_url_with_system(
+                &page,
+                Arc::clone(&self.spawner),
+                Arc::clone(&context.notify),
+            ));
+        }
+        if let Some(produced) = outcome {
+            let wanted = produced.options.startup.shell_integration;
+            self.apply_options_dialog(*produced.options);
+            self.sync_explorer_menu(wanted, &context.notify);
+            if produced.closed {
+                self.options_dialog = None;
+            }
         }
     }
 
@@ -4230,6 +4352,7 @@ impl App {
             self.apply(actions, &context);
             self.apply_home_actions(&context);
         }
+        self.draw_options_viewport(ctx, &context, naming);
         if fullscreen {
             self.exit_question_panel(ctx);
         } else if !naming {
@@ -4897,6 +5020,73 @@ mod tests {
         let (_settings, app) = empty_app();
         assert_eq!(app.tab_count(), 0);
         assert!(app.active_title().is_none());
+    }
+
+    #[test]
+    fn options_waits_for_settings_import_picker_and_worker() {
+        let (_settings, mut app) = empty_app();
+        assert!(ca_ui::testing::wait_until(
+            std::time::Duration::from_secs(10),
+            || {
+                app.options.poll();
+                app.options.is_ready()
+            }
+        ));
+
+        app.share_writes = false;
+        let (picker, picker_held) =
+            ca_ui::testing::job_held_after(vec![ca_ui::dialog::DialogMessage::Dismissed]);
+        app.share_picker = Some(picker);
+        assert!(!app.accepts(Command::Options));
+        app.run(Command::Options, &context());
+        assert!(app.options_dialog.is_none());
+        drop(picker_held);
+        app.poll_share();
+        assert!(app.accepts(Command::Options));
+
+        let (share, share_held) =
+            ca_ui::testing::job_held_after(vec![ca_ui::share::ShareMessage::Failed {
+                store: None,
+                reason: "test import".to_owned(),
+            }]);
+        app.share = Some(share);
+        assert!(!app.accepts(Command::Options));
+        app.run(Command::Options, &context());
+        assert!(app.options_dialog.is_none());
+        drop(share_held);
+        app.poll_share();
+        assert!(app.accepts(Command::Options));
+    }
+
+    #[test]
+    fn options_writeback_preserves_report_preferences_saved_while_open() {
+        let (_settings, mut app) = empty_app();
+        assert!(ca_ui::testing::wait_until(
+            std::time::Duration::from_secs(10),
+            || {
+                app.options.poll();
+                app.options.is_ready()
+            }
+        ));
+
+        app.run(Command::Options, &context());
+        let mut live = app.options.options_or_default();
+        live.reports.set_view(
+            "text-compare",
+            ca_session::options::ReportPreference::default(),
+        );
+        app.apply_options(live);
+
+        let canceled = app.options_dialog.as_mut().unwrap().cancel();
+        app.apply_options_dialog(*canceled.options);
+
+        assert!(app
+            .options
+            .options()
+            .unwrap()
+            .reports
+            .view("text-compare")
+            .is_some());
     }
 
     fn app_with_recent_session() -> (tempfile::TempDir, App, SessionId, PathBuf, PathBuf) {
