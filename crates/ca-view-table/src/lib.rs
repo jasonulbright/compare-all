@@ -2351,6 +2351,21 @@ impl SessionView for TableView {
         ca_ui::view::declare(HANDLED, |command| self.accepts(command))
     }
 
+    fn checked(&self, command: Command) -> Option<bool> {
+        Some(match command {
+            Command::ShowAll => self.grid.filter() == model::DisplayFilter::All,
+            Command::ShowDifferences => self.grid.filter() == model::DisplayFilter::Differences,
+            Command::ShowSame => self.grid.filter() == model::DisplayFilter::Same,
+            Command::ShowNone => self.grid.filter() == model::DisplayFilter::None,
+            Command::ToggleIgnoreUnimportant => self.grid.ignores_unimportant(),
+            Command::HideSameColumns => self.grid.hides_same_columns(),
+            Command::ToggleLineNumbers => self.show_row_numbers,
+            Command::Thumbnail => self.show_strip,
+            Command::ToggleLineDetails => self.show_details,
+            _ => return None,
+        })
+    }
+
     fn refusal(&self, command: Command) -> Option<&'static str> {
         let (source, target) = match command {
             Command::CopyToRight | Command::CopyToLeft => {
@@ -2961,16 +2976,30 @@ mod tests {
         let mut view = view_over(Arc::new(source));
         assert_eq!(view.menu_view(), MenuView::Table);
 
+        assert_eq!(view.checked(Command::ToggleIgnoreUnimportant), Some(false));
         view.run(Command::ToggleIgnoreUnimportant);
         assert!(view.grid().ignores_unimportant());
+        assert_eq!(view.checked(Command::ToggleIgnoreUnimportant), Some(true));
+
+        assert_eq!(view.checked(Command::HideSameColumns), Some(false));
         view.run(Command::HideSameColumns);
         assert!(view.grid().hides_same_columns());
+        assert_eq!(view.checked(Command::HideSameColumns), Some(true));
+
+        assert_eq!(view.checked(Command::ToggleLineNumbers), Some(true));
         view.run(Command::ToggleLineNumbers);
         assert!(!view.show_row_numbers);
+        assert_eq!(view.checked(Command::ToggleLineNumbers), Some(false));
+
+        assert_eq!(view.checked(Command::Thumbnail), Some(true));
         view.run(Command::Thumbnail);
         assert!(!view.show_strip);
+        assert_eq!(view.checked(Command::Thumbnail), Some(false));
+
+        assert_eq!(view.checked(Command::ToggleLineDetails), Some(true));
         view.run(Command::ToggleLineDetails);
         assert!(!view.show_details);
+        assert_eq!(view.checked(Command::ToggleLineDetails), Some(false));
     }
 
     #[test]

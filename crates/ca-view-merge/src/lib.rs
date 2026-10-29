@@ -2787,6 +2787,19 @@ impl SessionView for MergeView {
         ca_ui::view::declare(HANDLED, |command| SessionView::accepts(self, command))
     }
 
+    fn checked(&self, command: Command) -> Option<bool> {
+        if let Some(filter) = MergeFilter::from_command(command, self.context_lines) {
+            return Some(self.filter.same_choice(filter));
+        }
+        Some(match command {
+            Command::ToggleIgnoreUnimportant => self.rules.ignore_unimportant,
+            Command::ToggleIgnoreSameChanges => self.rules.ignore_same_changes,
+            Command::ToggleLineNumbers => self.show_line_numbers,
+            Command::Thumbnail => self.show_thumbnail,
+            _ => return None,
+        })
+    }
+
     fn refusal(&self, command: Command) -> Option<&'static str> {
         let needs_merge = matches!(
             command,
@@ -5424,19 +5437,34 @@ mod tests {
         let (mut view, _dir) = open(LEFT, Some(CENTER), RIGHT);
         run_until_ready(&mut view);
         let all = view.visible_rows().len();
+
+        assert_eq!(view.checked(Command::ShowConflicts), Some(false));
         view.run(Command::ShowConflicts);
         assert_eq!(view.filter(), super::MergeFilter::Conflicts);
+        assert_eq!(view.checked(Command::ShowConflicts), Some(true));
         assert_eq!(view.visible_rows().len(), conflict_rows(&view).len());
+
+        assert_eq!(view.checked(Command::ShowMergeable), Some(false));
         view.run(Command::ShowMergeable);
+        assert_eq!(view.checked(Command::ShowMergeable), Some(true));
         assert_eq!(view.visible_rows().len(), 1);
+
+        assert_eq!(view.checked(Command::ShowSame), Some(false));
         view.run(Command::ShowSame);
+        assert_eq!(view.checked(Command::ShowSame), Some(true));
         assert_eq!(view.visible_rows().len(), 4);
+
         view.run(Command::ShowNone);
+        assert_eq!(view.checked(Command::ShowNone), Some(true));
         assert!(view.visible_rows().is_empty());
         frame(&mut view);
+
         view.run(Command::ShowContext);
+        assert_eq!(view.checked(Command::ShowContext), Some(true));
         assert!(matches!(view.filter(), super::MergeFilter::Context(_)));
+
         view.run(Command::ShowAll);
+        assert_eq!(view.checked(Command::ShowAll), Some(true));
         assert_eq!(view.visible_rows().len(), all);
         frame(&mut view);
     }

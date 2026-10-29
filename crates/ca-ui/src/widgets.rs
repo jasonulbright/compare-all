@@ -289,14 +289,27 @@ pub fn command_item_in(
     enabled: bool,
     reason: &str,
 ) -> bool {
+    command_item_in_with_state(ui, view, command, enabled, None, reason)
+}
+
+/// A menu entry that reports its current toggle or filter choice when known.
+pub fn command_item_in_with_state(
+    ui: &mut egui::Ui,
+    view: MenuView,
+    command: Command,
+    enabled: bool,
+    checked: Option<bool>,
+    reason: &str,
+) -> bool {
     let label = match command.shortcut_in(view) {
         Some(shortcut) => format!("{}\t{shortcut}", command.label_in(view)),
         None => command.label_in(view).to_string(),
     };
-    let response = ui.add_enabled(
-        enabled,
-        IconButton::new(&label, crate::icons::command_icon(command)).menu(),
-    );
+    let mut button = IconButton::new(&label, crate::icons::command_icon(command)).menu();
+    if let Some(checked) = checked {
+        button = button.selected(checked);
+    }
+    let response = ui.add_enabled(enabled, button);
     if !enabled {
         let _ = disabled_reason(response, reason);
         return false;

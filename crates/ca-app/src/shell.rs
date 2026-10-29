@@ -3598,6 +3598,13 @@ impl App {
             .any(|state| state.command == command && state.enabled)
     }
 
+    /// The active view's current check state for a menu command, if it has one.
+    fn line_checked(&self, command: Command) -> Option<bool> {
+        self.tabs
+            .get(self.active)
+            .and_then(|tab| tab.checked(command))
+    }
+
     /// The action commands the active view declared, in declaration order.
     ///
     /// The menu is built from the declaration rather than from a fixed list, so
@@ -3782,7 +3789,14 @@ impl App {
                             Entry::Run(command, reason) => {
                                 let enabled = self.line_enabled(*command);
                                 let reason = self.line_reason(*command, reason);
-                                if widgets::command_item_in(ui, view, *command, enabled, reason) {
+                                if widgets::command_item_in_with_state(
+                                    ui,
+                                    view,
+                                    *command,
+                                    enabled,
+                                    self.line_checked(*command),
+                                    reason,
+                                ) {
                                     self.run(*command, context);
                                     if *command == Command::ToggleFullscreen {
                                         self.sync_fullscreen(ui.ctx());

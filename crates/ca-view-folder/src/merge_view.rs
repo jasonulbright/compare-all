@@ -2769,6 +2769,17 @@ impl SessionView for FolderMergeView {
         view::declare(HANDLED, |command| self.accepts(command))
     }
 
+    fn checked(&self, command: Command) -> Option<bool> {
+        if let Some(filter) = MergeFilter::of(command) {
+            return Some(self.filter == filter);
+        }
+        Some(match command {
+            Command::ToggleIgnoreSameChanges => self.ignores_same_changes(),
+            Command::ToggleCenterPane => self.shows_center(),
+            _ => return None,
+        })
+    }
+
     fn refusal(&self, command: Command) -> Option<&'static str> {
         let covered = matches!(
             command,

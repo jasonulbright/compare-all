@@ -4932,6 +4932,21 @@ impl SessionView for TextView {
         ca_ui::view::declare(HANDLED, |command| self.accepts(command))
     }
 
+    fn checked(&self, command: Command) -> Option<bool> {
+        Some(match command {
+            Command::ShowAll => self.filter == model::DisplayFilter::All,
+            Command::ShowDifferences => self.filter == model::DisplayFilter::Differences,
+            Command::ShowSame => self.filter == model::DisplayFilter::Same,
+            Command::ShowNone => self.filter == model::DisplayFilter::None,
+            Command::ShowContext => matches!(self.filter, model::DisplayFilter::Context(_)),
+            Command::ToggleIgnoreUnimportant => self.ignore_unimportant,
+            Command::ToggleLineDetails => self.show_details,
+            Command::ToggleLineNumbers => self.show_line_numbers,
+            Command::ToggleSyntaxHighlighting => self.syntax_highlighting,
+            _ => return None,
+        })
+    }
+
     fn accepts(&self, command: Command) -> bool {
         if self.editing_off() && command_is_save_or_overwrite(command) {
             return false;
@@ -5549,9 +5564,11 @@ mod tests {
         assert!(view.syntax_converged());
         assert!(view.accepts(Command::ToggleSyntaxHighlighting));
 
+        assert_eq!(view.checked(Command::ToggleSyntaxHighlighting), Some(true));
         view.refresh_line_cache(&(0..view.visible.len()));
         assert!(view.line_cache[&(0, 0)].spans.is_some());
         view.run(Command::ToggleSyntaxHighlighting);
+        assert_eq!(view.checked(Command::ToggleSyntaxHighlighting), Some(false));
         view.refresh_line_cache(&(0..view.visible.len()));
         assert!(view.line_cache[&(0, 0)].spans.is_none());
     }
