@@ -249,6 +249,60 @@ fn shift_dragging_either_side_image_adjusts_its_alignment() -> Result<(), Box<dy
     );
     assert_eq!(view.settings().offset, Offset::zero());
     assert!((view.camera().origin[0] - (origin[0] - 12.0)).abs() < f32::EPSILON);
+
+    Ok(())
+}
+
+#[test]
+fn left_alignment_drag_waits_for_a_committed_pixel_at_max_zoom(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let (left, right) = common::pair(directory.path());
+    let (mut view, context) = common::open(left, right, 17);
+    assert!(common::run_until_ready(&mut view, &context));
+    view.actual_size();
+    for _ in 0..10 {
+        view.zoom_in();
+    }
+    assert!(view.camera().zoom > 31.9);
+    common::frame(&mut view, &context, 1_280.0, 800.0);
+    let initial_left_rect = view.image_rect(Pane::Left).unwrap();
+    let initial_right_rect = view.image_rect(Pane::Right).unwrap();
+    let initial_camera_origin = view.camera().origin;
+
+    drag_primary(
+        &mut view,
+        &context,
+        Pane::Left,
+        egui::Modifiers::SHIFT,
+        egui::vec2(16.0, 0.0),
+        16,
+    );
+    assert_eq!(view.settings().offset, Offset::zero());
+    common::frame(&mut view, &context, 1_280.0, 800.0);
+    assert!((view.camera().origin[0] - initial_camera_origin[0]).abs() < f32::EPSILON);
+    assert!(
+        (view.image_rect(Pane::Left).unwrap().min.x - initial_left_rect.min.x).abs() < f32::EPSILON
+    );
+    assert!(
+        (view.image_rect(Pane::Right).unwrap().min.x - initial_right_rect.min.x).abs()
+            < f32::EPSILON
+    );
+
+    drag_primary(
+        &mut view,
+        &context,
+        Pane::Left,
+        egui::Modifiers::SHIFT,
+        egui::vec2(32.0, 0.0),
+        32,
+    );
+    assert_eq!(view.settings().offset, Offset::new(-1, 0));
+    common::frame(&mut view, &context, 1_280.0, 800.0);
+    let left_after_whole_pixel_drag = view.image_rect(Pane::Left).unwrap();
+    let right_after_whole_pixel_drag = view.image_rect(Pane::Right).unwrap();
+    assert!((left_after_whole_pixel_drag.min.x - initial_left_rect.min.x - 32.0).abs() < 0.01);
+    assert!((right_after_whole_pixel_drag.min.x - initial_right_rect.min.x).abs() < 0.01);
     Ok(())
 }
 

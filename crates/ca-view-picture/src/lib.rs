@@ -1883,13 +1883,8 @@ impl PictureView {
         } else {
             delta
         };
-        let camera_delta = if offset_drag && pane == Pane::Left {
-            offset_delta
-        } else {
-            delta
-        };
-        if (pan_drag || (offset_drag && pane == Pane::Left)) && camera_delta != egui::Vec2::ZERO {
-            self.camera.pan_by_screen([camera_delta.x, camera_delta.y]);
+        if pan_drag && delta != egui::Vec2::ZERO {
+            self.camera.pan_by_screen([delta.x, delta.y]);
         }
         if offset_drag && offset_delta != egui::Vec2::ZERO {
             let zoom = model::clamp_zoom(self.camera.zoom);
@@ -1910,6 +1905,12 @@ impl PictureView {
                 self.offset_drag[0] -= f32_of_signed(steps[0]);
                 self.offset_drag[1] -= f32_of_signed(steps[1]);
                 self.nudge_offset(steps[0], steps[1]);
+                if pane == Pane::Left {
+                    self.camera.pan_by_screen([
+                        -f32_of_signed(steps[0]) * zoom,
+                        -f32_of_signed(steps[1]) * zoom,
+                    ]);
+                }
             }
         }
         if response.drag_stopped() {
