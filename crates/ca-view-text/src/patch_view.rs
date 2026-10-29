@@ -618,6 +618,10 @@ impl SessionView for TextPatchView {
         ca_ui::view::declare(&all, |command| self.accepts(command))
     }
 
+    fn checked(&self, command: Command) -> Option<bool> {
+        self.inner.as_ref().and_then(|inner| inner.checked(command))
+    }
+
     fn accepts(&self, command: Command) -> bool {
         let shown = self.data.is_some() && self.job.is_none();
         let writes = !self.session_settings.specs.disable_editing;

@@ -1930,6 +1930,20 @@ impl SessionView for RecordsView {
         ca_ui::view::declare(&handled, |command| self.accepts(command))
     }
 
+    fn checked(&self, command: Command) -> Option<bool> {
+        Some(match command {
+            Command::ShowAll => self.listing.filter() == DisplayFilter::All,
+            Command::ShowDifferences => self.listing.filter() == DisplayFilter::Differences,
+            Command::ShowSame => self.listing.filter() == DisplayFilter::Same,
+            Command::ShowNone => self.listing.filter() == DisplayFilter::None,
+            Command::ToggleIgnoreUnimportant => self.listing.ignores_unimportant(),
+            Command::ToggleLineDetails => self.show_details,
+            Command::HexDetails => self.show_hex,
+            Command::Thumbnail => self.show_strip,
+            _ => return None,
+        })
+    }
+
     fn refusal(&self, command: Command) -> Option<&'static str> {
         self.copy_refusal(command)
     }

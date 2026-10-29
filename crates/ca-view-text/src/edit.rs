@@ -1167,6 +1167,10 @@ impl SessionView for TextEditView {
         ca_ui::view::declare(HANDLED, |command| self.accepts(command))
     }
 
+    fn checked(&self, command: Command) -> Option<bool> {
+        (command == Command::ToggleLineNumbers).then_some(self.show_line_numbers)
+    }
+
     fn accepts(&self, command: Command) -> bool {
         let ready = self.status == Status::Ready;
         let editable = ready && !self.pane.is_read_only();
