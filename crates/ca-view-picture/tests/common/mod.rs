@@ -210,13 +210,25 @@ pub fn frame_with(
     height: f32,
     events: Vec<egui::Event>,
 ) {
+    frame_with_modifiers(view, ctx, width, height, egui::Modifiers::NONE, events);
+}
+
+pub fn frame_with_modifiers(
+    view: &mut PictureView,
+    egui_context: &egui::Context,
+    width: f32,
+    height: f32,
+    modifiers: egui::Modifiers,
+    events: Vec<egui::Event>,
+) {
     view.tick();
     let input = egui::RawInput {
         events,
+        modifiers,
         ..sized_input(width, height)
     };
-    let _ = ctx.run(input, |ctx| {
-        egui::CentralPanel::default().show(ctx, |ui| {
+    let _ = egui_context.run(input, |frame_context| {
+        egui::CentralPanel::default().show(frame_context, |ui| {
             view.ui(ui, &context());
         });
     });
