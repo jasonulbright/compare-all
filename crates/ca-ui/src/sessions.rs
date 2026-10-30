@@ -338,6 +338,14 @@ impl StoreHandle {
         }));
     }
 
+    /// A save that never ends, holding the store: a real save leaves the
+    /// handle without its store while the worker runs, so `store()` is
+    /// `None` until the save ends.
+    pub(crate) fn stall_save_with_store(&mut self) {
+        self.stall_save();
+        self.store = None;
+    }
+
     /// End the wait of a later close for a save in flight at `deadline`.
     ///
     /// The exit spends one bound on every wait for a save in flight, and the

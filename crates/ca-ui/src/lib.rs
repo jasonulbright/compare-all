@@ -37,6 +37,7 @@ pub mod theme;
 pub mod thumbnail;
 pub mod toolbar;
 pub mod view;
+pub mod viewport;
 pub mod widgets;
 pub mod worker;
 pub mod workspace;
