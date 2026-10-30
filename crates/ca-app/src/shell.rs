@@ -2438,6 +2438,7 @@ impl App {
         }
         self.workspace_notice = None;
         self.session_save = None;
+        self.settings = None;
         while !self.tabs.is_empty() {
             let mut view = self.tabs.remove(0);
             self.publish_exit(view.as_ref());
@@ -3273,6 +3274,7 @@ impl App {
             self.tab_sessions.remove(index);
             self.tab_recent.remove(index);
         }
+        self.settings_tab_removed(index);
         view.on_close();
         if self.tabs.is_empty() {
             // Closing the last tab is an ordinary close, never the restart a
@@ -3282,6 +3284,21 @@ impl App {
             self.active = 0;
         } else if self.active >= self.tabs.len() {
             self.active = self.tabs.len() - 1;
+        }
+    }
+
+    /// Keep the settings dialog on the tab it was opened for once the tab at
+    /// `index` is gone: the dialog of that tab closes, since its settings
+    /// must not reach the tab that takes its place, and a dialog on a later
+    /// tab follows that tab to its new index.
+    fn settings_tab_removed(&mut self, index: usize) {
+        if self.settings.is_none() {
+            return;
+        }
+        match self.settings_tab.cmp(&index) {
+            std::cmp::Ordering::Equal => self.settings = None,
+            std::cmp::Ordering::Greater => self.settings_tab -= 1,
+            std::cmp::Ordering::Less => {}
         }
     }
 
@@ -4099,6 +4116,7 @@ impl App {
         self.tab_sessions.remove(launcher);
         self.tab_recent.remove(launcher);
         self.session_save = None;
+        self.settings_tab_removed(launcher);
         view.on_close();
         self.active = self.tabs.len().saturating_sub(1);
     }
@@ -5717,13 +5735,53 @@ mod tests {
             "the edits are kept"
         );
 
-        // Once the dialog has closed, the command opens a new one.
         let _ = app.settings.as_mut().unwrap().accept();
         let _ = ctx.run(raw_input(), |ctx| app.frame(ctx));
         assert!(app.settings.is_none());
         app.run(Command::SessionSettings, &context);
         let output = ctx.run(raw_input(), |ctx| app.frame(ctx));
         assert_ne!(the_focused_child_window(&output), window);
+    }
+
+    #[test]
+    fn the_settings_dialog_follows_its_tab_when_an_earlier_tab_closes_and_closes_with_it() {
+        let (_settings, mut app) = empty_app();
+        let context = context();
+        for pair in [("a.txt", "b.txt"), ("c.txt", "d.txt"), ("e.txt", "f.txt")] {
+            app.open_kind(
+                &SessionKind::TextCompare,
+                PathBuf::from(pair.0),
+                PathBuf::from(pair.1),
+                &context,
+            );
+        }
+        assert_eq!(app.active, 2);
+        app.run(Command::SessionSettings, &context);
+        assert_eq!(app.settings_tab, 2);
+
+        // A tab after the dialog's tab leaves it alone; one before it moves
+        // the dialog's index with its tab.
+        app.active = 1;
+        app.run(Command::SessionSettings, &context);
+        assert_eq!(
+            app.settings_tab, 1,
+            "the dialog is opened for the active tab"
+        );
+        app.close_tab(2);
+        assert!(app.settings.is_some());
+        assert_eq!(app.settings_tab, 1);
+        app.close_tab(0);
+        assert!(app.settings.is_some());
+        assert_eq!(app.settings_tab, 0);
+
+        // Running the command for the same tab reuses the dialog; closing
+        // that tab closes the dialog rather than handing it to another tab.
+        app.active = 0;
+        let before = app.settings.as_ref().map(std::ptr::from_ref);
+        app.run(Command::SessionSettings, &context);
+        assert_eq!(app.settings.as_ref().map(std::ptr::from_ref), before);
+        app.close_tab(0);
+        assert!(app.settings.is_none());
     }
 
     #[test]
