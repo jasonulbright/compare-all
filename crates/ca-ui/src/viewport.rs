@@ -5,7 +5,7 @@
 //! moved beside the main window, put on another monitor, or left open while
 //! the comparison is worked on. A backend without native viewports, and a
 //! headless test frame, embed the same dialog in the root window instead,
-//! where it draws the egui window it always drew.
+//! where it draws an egui window of its own.
 //!
 //! The dialog itself knows nothing about where it is drawn. It offers a body
 //! for a panel and a window for the root, and the host picks one.

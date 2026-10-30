@@ -1126,7 +1126,9 @@ impl Default for App {
     }
 }
 
-/// The native window of the options dialog.
+// The `instance` of each window is unique per opened dialog in this process
+// and forms the identity of its viewport, so a dialog opened again after it
+// closed gets a window of its own rather than the stale one.
 fn options_window(instance: u64) -> NativeWindow {
     NativeWindow::new(
         "program-options-viewport",
@@ -1137,7 +1139,6 @@ fn options_window(instance: u64) -> NativeWindow {
     )
 }
 
-/// The native window of the settings dialog of a `kind` session.
 fn settings_window(instance: u64, kind: &str) -> NativeWindow {
     let title = if kind.is_empty() {
         "Session Settings".to_owned()
@@ -1153,7 +1154,6 @@ fn settings_window(instance: u64, kind: &str) -> NativeWindow {
     )
 }
 
-/// The native window of the workspace manager.
 fn workspaces_window(instance: u64) -> NativeWindow {
     NativeWindow::new(
         "workspaces-viewport",
@@ -1164,7 +1164,6 @@ fn workspaces_window(instance: u64) -> NativeWindow {
     )
 }
 
-/// The native window of the remote profile manager.
 fn profiles_window(instance: u64) -> NativeWindow {
     NativeWindow::new(
         "remote-profiles-viewport",
@@ -1857,6 +1856,10 @@ impl App {
             .as_mut()
             .is_some_and(|profiles| !profiles.request_exit())
         {
+            // The question about the draft, or the wait for the running
+            // operation, is in the profile window, which may sit behind
+            // this one.
+            self.profiles_window.request_focus();
             return;
         }
         if self.select_refusing_tab() {
@@ -3590,7 +3593,6 @@ impl App {
         self.profiles_window.request_focus();
     }
 
-    /// Give the workspace manager a native window of its own.
     fn open_workspaces_window(&mut self, instance: u64) {
         self.workspaces_window = workspaces_window(instance);
         self.workspaces_window.request_focus();
@@ -4127,9 +4129,9 @@ impl App {
     ///
     /// Where the platform has no native viewports the root window embeds
     /// them, and an embedded dialog stays hidden while `embedded_hidden`
-    /// holds: while the window is full screen or a session is being named,
-    /// as it always was. A native window is drawn through both, so it never
-    /// vanishes and reappears.
+    /// holds: while the window is full screen or a session is being named.
+    /// A native window is drawn through both, so it never vanishes and
+    /// reappears.
     fn draw_native_windows(
         &mut self,
         ctx: &egui::Context,
@@ -5742,6 +5744,41 @@ mod tests {
         let profiles = app.profiles.as_ref().unwrap();
         assert!(profiles.is_dirty_for_test(), "the draft is kept");
         assert!(profiles.is_open());
+    }
+
+    #[test]
+    fn an_exit_held_by_an_unsaved_profile_draft_brings_the_profiles_window_to_the_front() {
+        let (_settings, mut app) = empty_app();
+        let context = context();
+        let ctx = egui::Context::default();
+        let _close = native_backend(&ctx);
+
+        app.run(Command::Profiles, &context);
+        let output = ctx.run(raw_input(), |ctx| app.frame(ctx));
+        let window = the_focused_child_window(&output);
+        profiles_loaded(&mut app, &ctx);
+        app.profiles
+            .as_mut()
+            .unwrap()
+            .set_description_for_test("unsaved description");
+        let output = ctx.run(raw_input(), |ctx| app.frame(ctx));
+        assert!(!ca_ui::testing::viewport_was_sent(
+            &output,
+            window,
+            &egui::ViewportCommand::Focus
+        ));
+
+        app.try_leave();
+        assert!(
+            !app.closing,
+            "the exit waits for the answer about the draft"
+        );
+        let output = ctx.run(raw_input(), |ctx| app.frame(ctx));
+        assert!(
+            ca_ui::testing::viewport_was_sent(&output, window, &egui::ViewportCommand::Focus),
+            "the window that asks the question comes to the front"
+        );
+        assert!(app.profiles.is_some());
     }
 
     #[test]

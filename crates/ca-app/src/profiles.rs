@@ -140,7 +140,7 @@ impl ProfileManager {
         self.confirmations(ui.ctx());
     }
 
-    /// True while the manager is on screen.
+    /// False once the manager has closed and its owner may drop it.
     #[must_use]
     pub fn is_open(&self) -> bool {
         self.open
