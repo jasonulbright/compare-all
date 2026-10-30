@@ -129,6 +129,23 @@ impl ProfileManager {
         !self.open
     }
 
+    /// Draw the manager into the panel of a native window, with the questions
+    /// it asks as windows over that panel.
+    ///
+    /// The close box of the native window goes through [`Self::request_close`];
+    /// the manager reports it has closed through [`Self::is_open`].
+    pub fn body(&mut self, ui: &mut egui::Ui) {
+        self.poll_job();
+        self.contents(ui);
+        self.confirmations(ui.ctx());
+    }
+
+    /// True while the manager is on screen.
+    #[must_use]
+    pub fn is_open(&self) -> bool {
+        self.open
+    }
+
     /// Bring an already open manager window above other application windows.
     pub fn bring_to_front(&mut self) {
         self.focus_requested = true;
@@ -539,8 +556,12 @@ impl ProfileManager {
         }
     }
 
-    fn request_close(&mut self) {
+    /// Close the manager, as its Close button and the close box of its window
+    /// ask. A running operation keeps it open and says so; an unwritten draft
+    /// raises the discard question.
+    pub fn request_close(&mut self) {
         if self.job.is_some() {
+            self.notice = Some("Please wait for the profile operation to finish.".to_owned());
             return;
         }
         if self.is_dirty() {

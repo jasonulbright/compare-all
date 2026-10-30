@@ -17,6 +17,7 @@ use ca_ui::settings::{Scope, SettingsDialog, SettingsOutcome};
 use ca_ui::share::{ImportReportDialog, ShareMessage};
 use ca_ui::theme::Variant;
 use ca_ui::view::{CommandState, OpenRequest, SessionView, ViewAction, ViewContext};
+use ca_ui::viewport::{Host, NativeWindow};
 use ca_ui::widgets;
 use ca_ui::worker::Job;
 use ca_ui::workspace::{WorkspaceAction, WorkspaceManager};
@@ -991,12 +992,14 @@ pub struct App {
     system_dark: Option<bool>,
     /// The options dialog, while it is open.
     options_dialog: Option<OptionsDialog>,
-    options_viewport_id: egui::ViewportId,
-    options_focus_requested: bool,
+    /// The native window the options dialog is drawn in.
+    options_window: NativeWindow,
     /// The restore factory defaults wizard, while it is open.
     restore: Option<RestoreDialog>,
     /// The settings dialog, while it is open.
     settings: Option<SettingsDialog>,
+    /// The native window the settings dialog is drawn in.
+    settings_window: NativeWindow,
     /// The tab the settings dialog is editing.
     settings_tab: usize,
     /// The sides the Specs page showed when the settings dialog opened.
@@ -1007,6 +1010,8 @@ pub struct App {
     policy_notice: Option<String>,
     /// The workspace manager, while it is open.
     workspaces: Option<WorkspaceManager>,
+    /// The native window the workspace manager is drawn in.
+    workspaces_window: NativeWindow,
     /// The report of the last import, while it is on screen.
     import_report: Option<ImportReportDialog>,
     /// The package worker, while one is running.
@@ -1049,6 +1054,8 @@ pub struct App {
     work_area: crate::window_fit::WorkAreaSource,
     /// The remote connection profile manager.
     profiles: Option<crate::profiles::ProfileManager>,
+    /// The native window the profile manager is drawn in.
+    profiles_window: NativeWindow,
     /// The file manager menu and the worker that reads or changes it.
     explorer: ExplorerState,
 }
@@ -1119,6 +1126,55 @@ impl Default for App {
     }
 }
 
+/// The native window of the options dialog.
+fn options_window(instance: u64) -> NativeWindow {
+    NativeWindow::new(
+        "program-options-viewport",
+        instance,
+        "Options",
+        [880.0, 700.0],
+        [440.0, 360.0],
+    )
+}
+
+/// The native window of the settings dialog of a `kind` session.
+fn settings_window(instance: u64, kind: &str) -> NativeWindow {
+    let title = if kind.is_empty() {
+        "Session Settings".to_owned()
+    } else {
+        format!("{kind} Session Settings")
+    };
+    NativeWindow::new(
+        "session-settings-viewport",
+        instance,
+        title,
+        [820.0, 640.0],
+        [480.0, 360.0],
+    )
+}
+
+/// The native window of the workspace manager.
+fn workspaces_window(instance: u64) -> NativeWindow {
+    NativeWindow::new(
+        "workspaces-viewport",
+        instance,
+        "Manage Workspaces",
+        [600.0, 440.0],
+        [380.0, 260.0],
+    )
+}
+
+/// The native window of the remote profile manager.
+fn profiles_window(instance: u64) -> NativeWindow {
+    NativeWindow::new(
+        "remote-profiles-viewport",
+        instance,
+        "Remote Profiles",
+        [840.0, 620.0],
+        [700.0, 480.0],
+    )
+}
+
 impl App {
     /// A window holding nothing.
     ///
@@ -1156,18 +1212,19 @@ impl App {
             pack_sets_theme: false,
             system_dark: None,
             options_dialog: None,
-            options_viewport_id: egui::ViewportId::ROOT,
-            options_focus_requested: false,
+            options_window: options_window(0),
             restore: None,
             tab_sessions: Vec::new(),
             tab_recent: Vec::new(),
             session_save: None,
             settings: None,
+            settings_window: settings_window(0, ""),
             settings_tab: 0,
             settings_shown: None,
             settings_notice: None,
             policy_notice: None,
             workspaces: None,
+            workspaces_window: workspaces_window(0),
             import_report: None,
             share: None,
             share_picker: None,
@@ -1187,6 +1244,7 @@ impl App {
             window_fit: crate::window_fit::WindowFit::new(egui::Vec2::from(MINIMUM_WINDOW_SIZE)),
             work_area: crate::window_fit::work_area_of,
             profiles: None,
+            profiles_window: profiles_window(0),
             explorer: ExplorerState::default(),
             tabs: Vec::new(),
             active: 0,
@@ -2728,6 +2786,8 @@ impl App {
             &layers,
             instance,
         ));
+        self.settings_window = settings_window(instance, settings.kind().title());
+        self.settings_window.request_focus();
         self.settings_tab = self.active;
     }
 
@@ -3414,10 +3474,12 @@ impl App {
             Command::SaveWorkspaceAs => {
                 let instance = self.instance();
                 self.workspaces = Some(WorkspaceManager::with_name(instance, "Workspace"));
+                self.open_workspaces_window(instance);
             }
             Command::LoadWorkspace => {
                 let instance = self.instance();
                 self.workspaces = Some(WorkspaceManager::new(instance));
+                self.open_workspaces_window(instance);
             }
             Command::Options => {
                 if !self.restore.as_ref().is_some_and(RestoreDialog::is_open)
@@ -3436,18 +3498,7 @@ impl App {
                     self.restore = Some(RestoreDialog::new(instance));
                 }
             }
-            Command::Profiles => {
-                if !self.policies.remote_profiles_disabled() {
-                    if let Some(profiles) = self.profiles.as_mut() {
-                        profiles.bring_to_front();
-                    } else {
-                        self.profiles = Some(crate::profiles::ProfileManager::open(
-                            &self.settings_directory,
-                            Arc::clone(&context.notify),
-                        ));
-                    }
-                }
-            }
+            Command::Profiles => self.open_profiles(context),
             Command::EditTextFile => {
                 self.open_kind(
                     &SessionKind::TextEdit,
@@ -3514,11 +3565,35 @@ impl App {
             if let Some(state) = self.explorer.installed {
                 shown.startup.shell_integration = state.any();
             }
-            self.options_viewport_id =
-                egui::ViewportId::from_hash_of(("program-options-viewport", instance));
+            self.options_window = options_window(instance);
             self.options_dialog = Some(self.new_options_dialog(&shown, instance));
         }
-        self.options_focus_requested = true;
+        self.options_window.request_focus();
+    }
+
+    /// Open the remote profile manager in a native window of its own, or
+    /// bring the open one to the front.
+    fn open_profiles(&mut self, context: &ViewContext) {
+        if self.policies.remote_profiles_disabled() {
+            return;
+        }
+        if let Some(profiles) = self.profiles.as_mut() {
+            profiles.bring_to_front();
+        } else {
+            self.profiles = Some(crate::profiles::ProfileManager::open(
+                &self.settings_directory,
+                Arc::clone(&context.notify),
+            ));
+            let instance = self.instance();
+            self.profiles_window = profiles_window(instance);
+        }
+        self.profiles_window.request_focus();
+    }
+
+    /// Give the workspace manager a native window of its own.
+    fn open_workspaces_window(&mut self, instance: u64) {
+        self.workspaces_window = workspaces_window(instance);
+        self.workspaces_window.request_focus();
     }
 
     /// An options dialog whose pack browser reads the releases this window
@@ -4024,9 +4099,9 @@ impl App {
         }
     }
 
-    /// Draw the dialogs that remain in the main viewport and handle their output.
-    fn draw_dialogs(&mut self, ctx: &egui::Context, context: &ViewContext) {
-        let palette = context.palette;
+    /// Draw the dialogs that remain in the main viewport and handle their
+    /// output: the questions that block the window until they are answered.
+    fn draw_dialogs(&mut self, ctx: &egui::Context) {
         let mut restore_outcome = None;
         if let Some(dialog) = self.restore.as_mut() {
             restore_outcome = dialog.show(ctx);
@@ -4038,9 +4113,50 @@ impl App {
             self.apply_restore(&produced.selection);
             self.restore = None;
         }
+        if let Some(report) = self.import_report.as_mut() {
+            report.show(ctx);
+            if !report.is_open() {
+                self.import_report = None;
+            }
+        }
+        self.exit_question_panel(ctx);
+    }
+
+    /// Draw the dialogs that are used alongside a comparison, each in a
+    /// native window of its own, and handle what they produce.
+    ///
+    /// Where the platform has no native viewports the root window embeds
+    /// them, and an embedded dialog stays hidden while `embedded_hidden`
+    /// holds: while the window is full screen or a session is being named,
+    /// as it always was. A native window is drawn through both, so it never
+    /// vanishes and reappears.
+    fn draw_native_windows(
+        &mut self,
+        ctx: &egui::Context,
+        context: &ViewContext,
+        embedded_hidden: bool,
+    ) {
+        let palette = context.palette;
+
         let mut outcome = None;
         if let Some(dialog) = self.settings.as_mut() {
-            outcome = dialog.show(ctx, &palette);
+            let frame = self.settings_window.show(ctx, |host| match host {
+                Host::Embedded(ctx) => {
+                    if embedded_hidden {
+                        None
+                    } else {
+                        dialog.show(ctx, &palette)
+                    }
+                }
+                Host::Native(ui) => dialog.body(ui, &palette),
+            });
+            if frame.close_requested {
+                dialog.cancel();
+            }
+            outcome = frame.produced;
+            if outcome.is_some() || !dialog.is_open() {
+                self.settings_window.close(ctx, frame.native);
+            }
             if !dialog.is_open() && outcome.is_none() {
                 self.settings = None;
             }
@@ -4049,11 +4165,28 @@ impl App {
             self.apply_settings(&outcome, context);
             self.settings = None;
         }
+
         let mut asked = None;
         if let Some(manager) = self.workspaces.as_mut() {
             if let Ok(handle) = self.store.try_borrow() {
                 if let Some(store) = handle.store() {
-                    asked = manager.show(ctx, store);
+                    let frame = self.workspaces_window.show(ctx, |host| match host {
+                        Host::Embedded(ctx) => {
+                            if embedded_hidden {
+                                None
+                            } else {
+                                manager.show(ctx, store)
+                            }
+                        }
+                        Host::Native(ui) => manager.body(ui, store),
+                    });
+                    if frame.close_requested {
+                        manager.close();
+                    }
+                    asked = frame.produced;
+                    if !manager.is_open() {
+                        self.workspaces_window.close(ctx, frame.native);
+                    }
                 }
             }
             if !manager.is_open() {
@@ -4063,16 +4196,24 @@ impl App {
         if let Some(action) = asked {
             self.apply_workspace(&action, context);
         }
-        if let Some(report) = self.import_report.as_mut() {
-            report.show(ctx);
-            if !report.is_open() {
-                self.import_report = None;
-            }
-        }
+
         let mut profiles_closed = false;
         let mut profiles_approved_exit = false;
         if let Some(manager) = self.profiles.as_mut() {
-            profiles_closed = manager.show(ctx);
+            let frame = self.profiles_window.show(ctx, |host| match host {
+                Host::Embedded(ctx) => !embedded_hidden && manager.show(ctx),
+                Host::Native(ui) => {
+                    manager.body(ui);
+                    false
+                }
+            });
+            if frame.close_requested {
+                manager.request_close();
+            }
+            profiles_closed = frame.produced || !manager.is_open();
+            if profiles_closed {
+                self.profiles_window.close(ctx, frame.native);
+            }
             profiles_approved_exit = manager.take_exit_allowed();
         }
         if profiles_closed {
@@ -4081,7 +4222,6 @@ impl App {
         if profiles_approved_exit {
             self.try_leave();
         }
-        self.exit_question_panel(ctx);
     }
 
     /// The question raised before a window holding several tabs closes.
@@ -4115,7 +4255,7 @@ impl App {
         }
     }
 
-    /// Keep the Options viewport alive and handle its results in the root
+    /// Keep the Options window alive and handle its results in the root
     /// window, where settings writes and page launches are coordinated.
     fn draw_options_viewport(
         &mut self,
@@ -4123,48 +4263,34 @@ impl App {
         context: &ViewContext,
         naming: bool,
     ) {
-        let builder = egui::ViewportBuilder::default()
-            .with_title("Options")
-            .with_inner_size([880.0, 700.0])
-            .with_min_inner_size([440.0, 360.0]);
         let mut outcome = None;
         let mut page = None;
-        let focus_requested = std::mem::take(&mut self.options_focus_requested);
         if let Some(dialog) = self.options_dialog.as_mut() {
-            outcome = egui_context.show_viewport_immediate(
-                self.options_viewport_id,
-                builder,
-                |viewport_context, class| {
-                    ca_ui::theme::chrome::install(viewport_context);
-                    if focus_requested && class != egui::ViewportClass::Embedded {
-                        viewport_context.send_viewport_cmd(egui::ViewportCommand::Focus);
-                    }
-                    let close_requested = class != egui::ViewportClass::Embedded
-                        && viewport_context.input(|input| input.viewport().close_requested());
-                    let produced = if close_requested {
-                        Some(dialog.cancel())
-                    } else if class == egui::ViewportClass::Embedded {
-                        if naming {
-                            None
-                        } else {
-                            dialog.show(viewport_context, &context.palette)
-                        }
+            let frame = self.options_window.show(egui_context, |host| match host {
+                Host::Embedded(ctx) => {
+                    if naming {
+                        None
                     } else {
-                        let mut produced = None;
-                        egui::CentralPanel::default().show(viewport_context, |ui| {
-                            produced = dialog.body(ui, &context.palette);
-                        });
-                        dialog.show_pack_browser(viewport_context);
-                        produced
-                    };
-                    if class != egui::ViewportClass::Embedded
-                        && produced.as_ref().is_some_and(|outcome| outcome.closed)
-                    {
-                        viewport_context.send_viewport_cmd(egui::ViewportCommand::Close);
+                        dialog.show(ctx, &context.palette)
                     }
+                }
+                Host::Native(ui) => {
+                    let produced = dialog.body(ui, &context.palette);
+                    // The browser is a window over the body; drawn through
+                    // the context of the native window it stays a window of
+                    // its own in the accessibility tree.
+                    dialog.show_pack_browser(ui.ctx());
                     produced
-                },
-            );
+                }
+            });
+            outcome = if frame.close_requested {
+                Some(dialog.cancel())
+            } else {
+                frame.produced
+            };
+            if outcome.as_ref().is_some_and(|produced| produced.closed) {
+                self.options_window.close(egui_context, frame.native);
+            }
             page = dialog.take_page_request();
         }
 
@@ -4353,10 +4479,11 @@ impl App {
             self.apply_home_actions(&context);
         }
         self.draw_options_viewport(ctx, &context, naming);
+        self.draw_native_windows(ctx, &context, naming || fullscreen);
         if fullscreen {
             self.exit_question_panel(ctx);
         } else if !naming {
-            self.draw_dialogs(ctx, &context);
+            self.draw_dialogs(ctx);
         }
         if !fullscreen {
             self.draw_update_notice(ctx, &context);
@@ -5427,6 +5554,194 @@ mod tests {
 
         assert!(!app.closing, "the shell closed over an unsaved profile");
         assert!(app.profiles.as_ref().unwrap().is_dirty_for_test());
+    }
+
+    /// A backend with native windows for `ctx`. The close box of every
+    /// child window is pressed on each frame while the returned flag holds.
+    fn native_backend(ctx: &egui::Context) -> Rc<Cell<bool>> {
+        let close = Rc::new(Cell::new(false));
+        let pressed = Rc::clone(&close);
+        ca_ui::testing::native_viewports(ctx, move |_| pressed.get());
+        close
+    }
+
+    /// The windows a frame drew besides the root window.
+    fn child_windows(output: &egui::FullOutput) -> Vec<egui::ViewportId> {
+        output
+            .viewport_output
+            .keys()
+            .copied()
+            .filter(|id| *id != egui::ViewportId::ROOT)
+            .collect()
+    }
+
+    /// The one window a frame drew besides the root window, which was
+    /// brought to the front on this frame.
+    fn the_focused_child_window(output: &egui::FullOutput) -> egui::ViewportId {
+        let children = child_windows(output);
+        assert_eq!(children.len(), 1, "the dialog has one window of its own");
+        assert!(
+            ca_ui::testing::viewport_was_sent(output, children[0], &egui::ViewportCommand::Focus),
+            "the window is brought to the front when the dialog opens"
+        );
+        children[0]
+    }
+
+    #[test]
+    fn options_opens_in_a_native_window_whose_close_box_cancels_it() {
+        let (_settings, mut app) = empty_app();
+        let context = context();
+        let ctx = egui::Context::default();
+        let close = native_backend(&ctx);
+        frames_until(&mut app, |app| app.options.is_ready());
+
+        app.run(Command::Options, &context);
+        let output = ctx.run(raw_input(), |ctx| app.frame(ctx));
+        let window = the_focused_child_window(&output);
+        assert!(app.options_dialog.is_some());
+
+        let output = ctx.run(raw_input(), |ctx| app.frame(ctx));
+        assert_eq!(child_windows(&output), vec![window]);
+        assert!(
+            !ca_ui::testing::viewport_was_sent(&output, window, &egui::ViewportCommand::Focus),
+            "focus is asked for once"
+        );
+
+        close.set(true);
+        let output = ctx.run(raw_input(), |ctx| app.frame(ctx));
+        assert!(
+            app.options_dialog.is_none(),
+            "the close box cancels the dialog"
+        );
+        assert!(ca_ui::testing::viewport_was_sent(
+            &output,
+            window,
+            &egui::ViewportCommand::Close
+        ));
+    }
+
+    #[test]
+    fn session_settings_opens_in_a_native_window_whose_close_box_cancels_it() {
+        let (_settings, mut app) = empty_app();
+        let context = context();
+        let ctx = egui::Context::default();
+        let close = native_backend(&ctx);
+        app.open_kind(
+            &SessionKind::TextCompare,
+            PathBuf::from("left.txt"),
+            PathBuf::from("right.txt"),
+            &context,
+        );
+        assert!(app.accepts(Command::SessionSettings));
+
+        app.run(Command::SessionSettings, &context);
+        let output = ctx.run(raw_input(), |ctx| app.frame(ctx));
+        let window = the_focused_child_window(&output);
+        assert!(app.settings.is_some());
+
+        close.set(true);
+        let output = ctx.run(raw_input(), |ctx| app.frame(ctx));
+        assert!(app.settings.is_none(), "the close box cancels the dialog");
+        assert!(ca_ui::testing::viewport_was_sent(
+            &output,
+            window,
+            &egui::ViewportCommand::Close
+        ));
+        assert!(
+            app.settings_notice.is_none(),
+            "a cancelled dialog applies nothing"
+        );
+    }
+
+    #[test]
+    fn the_workspace_manager_opens_in_a_native_window_whose_close_box_closes_it() {
+        let (_settings, mut app) = empty_app();
+        let context = context();
+        let ctx = egui::Context::default();
+        let close = native_backend(&ctx);
+        frames_until(&mut app, |app| {
+            app.store()
+                .try_borrow()
+                .is_ok_and(|handle| handle.is_ready())
+        });
+
+        app.run(Command::LoadWorkspace, &context);
+        let output = ctx.run(raw_input(), |ctx| app.frame(ctx));
+        let window = the_focused_child_window(&output);
+        assert!(app.workspaces.is_some());
+
+        close.set(true);
+        let output = ctx.run(raw_input(), |ctx| app.frame(ctx));
+        assert!(app.workspaces.is_none(), "the close box closes the manager");
+        assert!(ca_ui::testing::viewport_was_sent(
+            &output,
+            window,
+            &egui::ViewportCommand::Close
+        ));
+    }
+
+    /// Run frames of `ctx` until the profile manager has read its folder.
+    fn profiles_loaded(app: &mut App, ctx: &egui::Context) {
+        assert!(ca_ui::testing::wait_until(
+            std::time::Duration::from_secs(5),
+            || {
+                let _ = ctx.run(raw_input(), |ctx| app.frame(ctx));
+                app.profiles
+                    .as_ref()
+                    .is_some_and(|profiles| !profiles.is_busy_for_test())
+            }
+        ));
+    }
+
+    #[test]
+    fn remote_profiles_opens_in_a_native_window_whose_close_box_closes_it() {
+        let (_settings, mut app) = empty_app();
+        let context = context();
+        let ctx = egui::Context::default();
+        let close = native_backend(&ctx);
+
+        app.run(Command::Profiles, &context);
+        let output = ctx.run(raw_input(), |ctx| app.frame(ctx));
+        let window = the_focused_child_window(&output);
+        profiles_loaded(&mut app, &ctx);
+
+        // Opening the manager again brings its window to the front.
+        app.run(Command::Profiles, &context);
+        let output = ctx.run(raw_input(), |ctx| app.frame(ctx));
+        assert_eq!(the_focused_child_window(&output), window);
+
+        close.set(true);
+        let output = ctx.run(raw_input(), |ctx| app.frame(ctx));
+        assert!(app.profiles.is_none(), "the close box closes the manager");
+        assert!(ca_ui::testing::viewport_was_sent(
+            &output,
+            window,
+            &egui::ViewportCommand::Close
+        ));
+    }
+
+    #[test]
+    fn the_close_box_of_the_profiles_window_asks_about_an_unsaved_draft() {
+        let (_settings, mut app) = empty_app();
+        let context = context();
+        let ctx = egui::Context::default();
+        let close = native_backend(&ctx);
+
+        app.run(Command::Profiles, &context);
+        profiles_loaded(&mut app, &ctx);
+        app.profiles
+            .as_mut()
+            .unwrap()
+            .set_description_for_test("unsaved description");
+
+        close.set(true);
+        for _ in 0..3 {
+            let _ = ctx.run(raw_input(), |ctx| app.frame(ctx));
+        }
+        assert!(app.profiles.is_some(), "the manager stays open");
+        let profiles = app.profiles.as_ref().unwrap();
+        assert!(profiles.is_dirty_for_test(), "the draft is kept");
+        assert!(profiles.is_open());
     }
 
     #[test]

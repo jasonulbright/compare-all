@@ -101,6 +101,49 @@ pub fn event_input(width: f32, height: f32, events: Vec<egui::Event>) -> egui::R
     }
 }
 
+/// Run every immediate viewport as a nested frame of its own, as a native
+/// backend does, so a test reaches the native window of a dialog rather than
+/// its embedded fallback.
+///
+/// `close_box` says whether the close box of the child window named is
+/// pressed on a frame. The commands a child window sends, such as a focus
+/// or a close, come out of the root frame's output under the child's id, as
+/// egui hands them to the outermost pass. The renderer stays installed for
+/// the rest of the current thread, which is one test under the test
+/// harness; `ctx` stops embedding viewports, as a backend with native
+/// windows does.
+pub fn native_viewports(
+    ctx: &egui::Context,
+    close_box: impl Fn(egui::ViewportId) -> bool + 'static,
+) {
+    ctx.set_embed_viewports(false);
+    egui::Context::set_immediate_viewport_renderer(move |ctx, mut viewport| {
+        let id = viewport.ids.this;
+        let mut input = sized_input(800.0, 600.0);
+        input.viewport_id = id;
+        let info = input.viewports.entry(id).or_default();
+        info.parent = Some(viewport.ids.parent);
+        if close_box(id) {
+            info.events.push(egui::ViewportEvent::Close);
+        }
+        let _ = ctx.run(input, |ctx| (viewport.viewport_ui_cb)(ctx));
+    });
+}
+
+/// True when the root frame's `output` tells the viewport `id` to run
+/// `command`.
+#[must_use]
+pub fn viewport_was_sent(
+    output: &egui::FullOutput,
+    id: egui::ViewportId,
+    command: &egui::ViewportCommand,
+) -> bool {
+    output
+        .viewport_output
+        .get(&id)
+        .is_some_and(|out| out.commands.contains(command))
+}
+
 /// Poll `condition` until it holds or `budget` runs out, and report which.
 pub fn wait_until(budget: Duration, mut condition: impl FnMut() -> bool) -> bool {
     let deadline = Instant::now() + budget;
