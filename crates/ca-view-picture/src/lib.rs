@@ -205,6 +205,7 @@ pub struct PictureView {
     pointer: Option<[f32; 2]>,
     /// Whole pixels of an offset drag that have not been applied yet.
     offset_drag: [f32; 2],
+    offset_drag_pane: Option<Pane>,
     offset_x_text: String,
     offset_y_text: String,
     /// The side the rotate and flip controls act on.
@@ -271,6 +272,7 @@ impl PictureView {
             checker: None,
             pointer: None,
             offset_drag: [0.0, 0.0],
+            offset_drag_pane: None,
             offset_x_text: "0".to_owned(),
             offset_y_text: "0".to_owned(),
             active_side: Side::Left,
@@ -794,6 +796,7 @@ impl PictureView {
     fn reset_offset(&mut self) {
         self.settings.offset = Offset::zero();
         self.offset_drag = [0.0, 0.0];
+        self.offset_drag_pane = None;
         self.sync_offset_fields();
         self.ask(Stage::Compare);
     }
@@ -811,7 +814,7 @@ impl PictureView {
             Pane::Right => (
                 Arc::clone(&outcome.right),
                 outcome.right_preview.as_ref(),
-                [outcome.offset.x, outcome.offset.y],
+                [self.settings.offset.x, self.settings.offset.y],
             ),
             Pane::Difference => (
                 Arc::clone(&outcome.result),
@@ -1614,7 +1617,7 @@ impl PictureView {
         let placement = match pane {
             Pane::Left => Placement::new([0, 0], [outcome.left.width(), outcome.left.height()]),
             Pane::Right => Placement::new(
-                [outcome.offset.x, outcome.offset.y],
+                [self.settings.offset.x, self.settings.offset.y],
                 [outcome.right.width(), outcome.right.height()],
             ),
             Pane::Difference => Placement::new(
@@ -1626,6 +1629,8 @@ impl PictureView {
     }
 
     #[allow(clippy::too_many_lines)]
+    /// A left-pane alignment drag moves the shared camera while its inverse
+    /// offset keeps the right pane stationary.
     fn paint_pane(
         &mut self,
         ui: &mut egui::Ui,
@@ -1852,18 +1857,45 @@ impl PictureView {
             }
         }
 
-        let offset_drag =
-            pane == Pane::Difference && response.dragged_by(egui::PointerButton::Primary);
+        if response.drag_started_by(egui::PointerButton::Primary) {
+            let shift = ui.input(|input| input.modifiers.shift);
+            self.offset_drag_pane = match pane {
+                Pane::Difference => Some(pane),
+                Pane::Left | Pane::Right if shift => Some(pane),
+                Pane::Left | Pane::Right => None,
+            };
+        }
+        let offset_drag = response.dragged_by(egui::PointerButton::Primary)
+            && self.offset_drag_pane == Some(pane);
         let pan_drag = response.dragged_by(egui::PointerButton::Middle)
             || (response.dragged_by(egui::PointerButton::Primary) && !offset_drag);
         let delta = response.drag_delta();
+        // egui crosses the drag threshold after several pointer frames; the
+        // first drag frame must include motion since the original press.
+        let offset_delta = if offset_drag && response.drag_started_by(egui::PointerButton::Primary)
+        {
+            ui.input(
+                |input| match (input.pointer.press_origin(), input.pointer.interact_pos()) {
+                    (Some(press), Some(current)) => current - press,
+                    _ => delta,
+                },
+            )
+        } else {
+            delta
+        };
         if pan_drag && delta != egui::Vec2::ZERO {
             self.camera.pan_by_screen([delta.x, delta.y]);
         }
-        if offset_drag && delta != egui::Vec2::ZERO {
+        if offset_drag && offset_delta != egui::Vec2::ZERO {
             let zoom = model::clamp_zoom(self.camera.zoom);
-            self.offset_drag[0] += delta.x / zoom;
-            self.offset_drag[1] += delta.y / zoom;
+            // The offset moves the right image relative to the fixed left, so
+            // dragging the left image adjusts the offset in the opposite way.
+            let direction = match pane {
+                Pane::Left => -1.0,
+                Pane::Right | Pane::Difference => 1.0,
+            };
+            self.offset_drag[0] += direction * offset_delta.x / zoom;
+            self.offset_drag[1] += direction * offset_delta.y / zoom;
             #[allow(clippy::cast_possible_truncation)]
             let steps = [
                 self.offset_drag[0].trunc() as i32,
@@ -1873,10 +1905,17 @@ impl PictureView {
                 self.offset_drag[0] -= f32_of_signed(steps[0]);
                 self.offset_drag[1] -= f32_of_signed(steps[1]);
                 self.nudge_offset(steps[0], steps[1]);
+                if pane == Pane::Left {
+                    self.camera.pan_by_screen([
+                        -f32_of_signed(steps[0]) * zoom,
+                        -f32_of_signed(steps[1]) * zoom,
+                    ]);
+                }
             }
         }
         if response.drag_stopped() {
             self.offset_drag = [0.0, 0.0];
+            self.offset_drag_pane = None;
         }
     }
 
@@ -1931,7 +1970,8 @@ impl PictureView {
     /// because the label, two fields and a button on one line need more width
     /// than the column has.
     fn control_lines(&mut self, ui: &mut egui::Ui, palette: &Palette) {
-        ui.colored_label(palette.label_text, "Offset");
+        ui.colored_label(palette.label_text, "Offset")
+            .on_hover_text("Drag the Difference pane or Shift-drag either image to align it.");
         let mut reported = Vec::new();
         ui.horizontal(|ui| {
             let mut apply = false;
