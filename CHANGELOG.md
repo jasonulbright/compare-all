@@ -1,3 +1,21 @@
+# v2026.10.30.0015
+
+## Picture alignment and dialog windows improved
+
+### Features
+
+- Align pictures by Shift-dragging either side or the Difference pane.
+- Open Session Settings, Manage Workspaces and Remote Profiles in separate windows.
+- Bring an existing dialog window forward when its command runs again.
+
+### Fixes
+
+- Keep Session Settings attached to its tab through tab closes and clearing.
+- Respect unsaved changes and active operations when closing Remote Profiles.
+- Keep import reports and exit confirmations in the main window.
+
+Full changelog: CHANGELOG.md
+
 # v2026.10.29.0014
 
 ## 4 user workflows updated
