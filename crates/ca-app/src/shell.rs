@@ -3236,6 +3236,11 @@ impl App {
                 self.tab_recent[index] = None;
                 self.session_save = None;
                 self.settings_notice = None;
+                // The dialog edited the view that was cleared away; its
+                // edits must not reach the cleared view.
+                if self.settings_tab == index {
+                    self.settings = None;
+                }
             }
             Err(reason) => self.settings_notice = Some(reason.to_owned()),
         }
@@ -4210,28 +4215,34 @@ impl App {
 
         let mut asked = None;
         if let Some(manager) = self.workspaces.as_mut() {
-            if let Ok(handle) = self.store.try_borrow() {
-                if let Some(store) = handle.store() {
-                    let frame = self.workspaces_window.show(ctx, |host| match host {
-                        Host::Embedded(ctx) => {
-                            if embedded_hidden {
-                                None
-                            } else {
-                                manager.show(ctx, store)
-                            }
+            // The store is away on its worker while it saves; the native
+            // window stays up and says so rather than closing and opening
+            // again when the store comes back.
+            let handle = self.store.try_borrow().ok();
+            let store = handle.as_ref().and_then(|handle| handle.store());
+            let frame = self
+                .workspaces_window
+                .show(ctx, |host| match (host, store) {
+                    (Host::Embedded(ctx), Some(store)) => {
+                        if embedded_hidden {
+                            None
+                        } else {
+                            manager.show(ctx, store)
                         }
-                        Host::Native(ui) => manager.body(ui, store),
-                    });
-                    if frame.close_requested {
-                        manager.close();
                     }
-                    asked = frame.produced;
-                    if !manager.is_open() {
-                        self.workspaces_window.close(ctx, frame.native);
+                    (Host::Embedded(_), None) => None,
+                    (Host::Native(ui), Some(store)) => manager.body(ui, store),
+                    (Host::Native(ui), None) => {
+                        ui.label("Saving the workspaces…");
+                        None
                     }
-                }
+                });
+            if frame.close_requested {
+                manager.close();
             }
+            asked = frame.produced;
             if !manager.is_open() {
+                self.workspaces_window.close(ctx, frame.native);
                 self.workspaces = None;
             }
         }
@@ -5759,8 +5770,6 @@ mod tests {
         app.run(Command::SessionSettings, &context);
         assert_eq!(app.settings_tab, 2);
 
-        // A tab after the dialog's tab leaves it alone; one before it moves
-        // the dialog's index with its tab.
         app.active = 1;
         app.run(Command::SessionSettings, &context);
         assert_eq!(
@@ -5774,14 +5783,84 @@ mod tests {
         assert!(app.settings.is_some());
         assert_eq!(app.settings_tab, 0);
 
-        // Running the command for the same tab reuses the dialog; closing
-        // that tab closes the dialog rather than handing it to another tab.
         app.active = 0;
         let before = app.settings.as_ref().map(std::ptr::from_ref);
         app.run(Command::SessionSettings, &context);
         assert_eq!(app.settings.as_ref().map(std::ptr::from_ref), before);
         app.close_tab(0);
         assert!(app.settings.is_none());
+    }
+
+    #[test]
+    fn clear_session_closes_the_settings_dialog_of_the_cleared_tab() {
+        let context = context();
+        let dir = tempfile::tempdir().unwrap();
+        let left = dir.path().join("left.txt");
+        let right = dir.path().join("right.txt");
+        std::fs::write(&left, "left\n").unwrap();
+        std::fs::write(&right, "right\n").unwrap();
+        let (_settings, mut app) = empty_app();
+        assert!(ca_ui::testing::wait_until(
+            std::time::Duration::from_secs(10),
+            || {
+                app.poll_store();
+                app.store().borrow().is_ready()
+            }
+        ));
+        app.open_kind(&SessionKind::TextCompare, left, right, &context);
+        assert!(ca_ui::testing::wait_until(
+            std::time::Duration::from_secs(20),
+            || {
+                app.tabs[0].tick();
+                app.tabs[0].is_ready()
+            }
+        ));
+        app.run(Command::SessionSettings, &context);
+        assert!(app.settings.is_some());
+
+        app.run(Command::ClearSession, &context);
+
+        assert_eq!(app.settings_notice(), None);
+        assert!(
+            app.settings.is_none(),
+            "the dialog of the view that was cleared away is gone"
+        );
+    }
+
+    #[test]
+    fn the_workspace_manager_window_stays_while_the_store_saves() {
+        let (_settings, mut app) = empty_app();
+        let context = context();
+        let ctx = egui::Context::default();
+        let _close = native_backend(&ctx);
+        frames_until(&mut app, |app| {
+            app.store()
+                .try_borrow()
+                .is_ok_and(|handle| handle.is_ready())
+        });
+        app.run(Command::LoadWorkspace, &context);
+        let output = ctx.run(raw_input(), |ctx| app.frame(ctx));
+        let window = the_focused_child_window(&output);
+
+        {
+            let store = Rc::clone(app.store());
+            let mut handle = store.borrow_mut();
+            ca_ui::testing::hold_store_in_a_save(&mut handle);
+        }
+        assert!(
+            app.store()
+                .try_borrow()
+                .is_ok_and(|handle| handle.store().is_none()),
+            "the store is away on its save"
+        );
+
+        let output = ctx.run(raw_input(), |ctx| app.frame(ctx));
+        assert_eq!(
+            child_windows(&output),
+            vec![window],
+            "the window stays up while the store is away"
+        );
+        assert!(app.workspaces.is_some());
     }
 
     #[test]

@@ -338,6 +338,13 @@ impl StoreHandle {
         }));
     }
 
+    /// As [`Self::stall_save`], with the store away on the save as a real
+    /// save has it, for a test of what is shown while the store is away.
+    pub(crate) fn stall_save_with_store(&mut self) {
+        self.stall_save();
+        self.store = None;
+    }
+
     /// End the wait of a later close for a save in flight at `deadline`.
     ///
     /// The exit spends one bound on every wait for a save in flight, and the

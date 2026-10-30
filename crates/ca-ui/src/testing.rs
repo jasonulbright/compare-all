@@ -197,3 +197,10 @@ pub fn stall_saves(
     store.stall_save();
     options.stall_save();
 }
+
+/// Put a save of the sessions document that never ends in flight, with the
+/// store away on it as a real save has it, for a test of what is shown while
+/// the store is away.
+pub fn hold_store_in_a_save(store: &mut crate::sessions::StoreHandle) {
+    store.stall_save_with_store();
+}
