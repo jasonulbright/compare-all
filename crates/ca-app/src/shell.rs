@@ -1056,6 +1056,10 @@ pub struct App {
     profiles: Option<crate::profiles::ProfileManager>,
     /// The native window the profile manager is drawn in.
     profiles_window: NativeWindow,
+    /// The main window is brought to the front on the next frame, because a
+    /// question in it waits for an answer while another window may be in
+    /// front.
+    main_focus_requested: bool,
     /// The file manager menu and the worker that reads or changes it.
     explorer: ExplorerState,
 }
@@ -1244,6 +1248,7 @@ impl App {
             work_area: crate::window_fit::work_area_of,
             profiles: None,
             profiles_window: profiles_window(0),
+            main_focus_requested: false,
             explorer: ExplorerState::default(),
             tabs: Vec::new(),
             active: 0,
@@ -1863,6 +1868,9 @@ impl App {
             return;
         }
         if self.select_refusing_tab() {
+            // The tab's question is in the main window, which the profile
+            // window may have been brought in front of.
+            self.main_focus_requested = true;
             return;
         }
         self.leave();
@@ -4427,6 +4435,9 @@ impl App {
     pub fn frame(&mut self, ctx: &egui::Context) {
         ca_ui::theme::chrome::install(ctx);
         self.fit_window(ctx);
+        if std::mem::take(&mut self.main_focus_requested) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
         let repaint = ctx.clone();
         self.options.poll();
         let resolved = Arc::new(self.resolve_options(ctx));
@@ -5779,6 +5790,50 @@ mod tests {
             "the window that asks the question comes to the front"
         );
         assert!(app.profiles.is_some());
+    }
+
+    #[test]
+    fn an_exit_held_by_a_tab_brings_the_main_window_to_the_front() {
+        let (_settings, mut app) = empty_app();
+        let context = context();
+        let ctx = egui::Context::default();
+        let _close = native_backend(&ctx);
+        app.push(Box::new(UnsavedView {
+            close_checks: Rc::new(Cell::new(0)),
+        }));
+
+        app.run(Command::Profiles, &context);
+        profiles_loaded(&mut app, &ctx);
+        let output = ctx.run(raw_input(), |ctx| app.frame(ctx));
+        assert!(!ca_ui::testing::viewport_was_sent(
+            &output,
+            egui::ViewportId::ROOT,
+            &egui::ViewportCommand::Focus
+        ));
+
+        // The profile manager permits the exit; the unsaved tab refuses it
+        // with a question in the main window.
+        app.try_leave();
+        assert!(!app.closing);
+        assert_eq!(app.active_title().as_deref(), Some("Unsaved edit"));
+        let output = ctx.run(raw_input(), |ctx| app.frame(ctx));
+        assert!(
+            ca_ui::testing::viewport_was_sent(
+                &output,
+                egui::ViewportId::ROOT,
+                &egui::ViewportCommand::Focus
+            ),
+            "the main window comes to the front for its question"
+        );
+        let output = ctx.run(raw_input(), |ctx| app.frame(ctx));
+        assert!(
+            !ca_ui::testing::viewport_was_sent(
+                &output,
+                egui::ViewportId::ROOT,
+                &egui::ViewportCommand::Focus
+            ),
+            "focus is asked for once"
+        );
     }
 
     #[test]
