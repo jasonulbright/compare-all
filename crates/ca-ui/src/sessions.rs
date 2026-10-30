@@ -338,8 +338,9 @@ impl StoreHandle {
         }));
     }
 
-    /// As [`Self::stall_save`], with the store away on the save as a real
-    /// save has it, for a test of what is shown while the store is away.
+    /// A save that never ends, holding the store: a real save leaves the
+    /// handle without its store while the worker runs, so `store()` is
+    /// `None` until the save ends.
     pub(crate) fn stall_save_with_store(&mut self) {
         self.stall_save();
         self.store = None;

@@ -3236,8 +3236,8 @@ impl App {
                 self.tab_recent[index] = None;
                 self.session_save = None;
                 self.settings_notice = None;
-                // The dialog edited the view that was cleared away; its
-                // edits must not reach the cleared view.
+                // A dialog bound to the replaced view must not apply its
+                // edits to the replacement.
                 if self.settings_tab == index {
                     self.settings = None;
                 }
