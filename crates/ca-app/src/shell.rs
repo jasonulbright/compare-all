@@ -2769,6 +2769,12 @@ impl App {
     /// The Specs page of a tab that shows a saved session names the sides the
     /// stored session names; every other page shows what the view runs under.
     fn open_settings(&mut self, instance: u64) {
+        if self.settings.as_ref().is_some_and(SettingsDialog::is_open)
+            && self.settings_tab == self.active
+        {
+            self.settings_window.request_focus();
+            return;
+        }
         let Some(mut settings) = self.tabs.get(self.active).and_then(|tab| tab.settings()) else {
             return;
         };
@@ -3482,16 +3488,8 @@ impl App {
             }
             Command::ToggleLocked => self.toggle_locked(),
             Command::ClearSession => self.clear_session(context),
-            Command::SaveWorkspaceAs => {
-                let instance = self.instance();
-                self.workspaces = Some(WorkspaceManager::with_name(instance, "Workspace"));
-                self.open_workspaces_window(instance);
-            }
-            Command::LoadWorkspace => {
-                let instance = self.instance();
-                self.workspaces = Some(WorkspaceManager::new(instance));
-                self.open_workspaces_window(instance);
-            }
+            Command::SaveWorkspaceAs => self.open_workspaces(true),
+            Command::LoadWorkspace => self.open_workspaces(false),
             Command::Options => {
                 if !self.restore.as_ref().is_some_and(RestoreDialog::is_open)
                     && !self.settings_import_in_progress()
@@ -3601,7 +3599,23 @@ impl App {
         self.profiles_window.request_focus();
     }
 
-    fn open_workspaces_window(&mut self, instance: u64) {
+    /// Open the workspace manager in a native window of its own, with the
+    /// name field filled in when `named`, or bring the open one to the front.
+    fn open_workspaces(&mut self, named: bool) {
+        if self
+            .workspaces
+            .as_ref()
+            .is_some_and(WorkspaceManager::is_open)
+        {
+            self.workspaces_window.request_focus();
+            return;
+        }
+        let instance = self.instance();
+        self.workspaces = Some(if named {
+            WorkspaceManager::with_name(instance, "Workspace")
+        } else {
+            WorkspaceManager::new(instance)
+        });
         self.workspaces_window = workspaces_window(instance);
         self.workspaces_window.request_focus();
     }
@@ -5667,6 +5681,79 @@ mod tests {
     }
 
     #[test]
+    fn session_settings_run_again_focuses_its_open_window_and_keeps_its_edits() {
+        let (_settings, mut app) = empty_app();
+        let context = context();
+        let ctx = egui::Context::default();
+        let _close = native_backend(&ctx);
+        app.open_kind(
+            &SessionKind::TextCompare,
+            PathBuf::from("left.txt"),
+            PathBuf::from("right.txt"),
+            &context,
+        );
+        app.run(Command::SessionSettings, &context);
+        let output = ctx.run(raw_input(), |ctx| app.frame(ctx));
+        let window = the_focused_child_window(&output);
+        let edited = ca_ui::settings::FieldValue::Count(17);
+        app.settings
+            .as_mut()
+            .unwrap()
+            .set_value("alignment.skew_tolerance", &edited);
+
+        app.run(Command::SessionSettings, &context);
+        let output = ctx.run(raw_input(), |ctx| app.frame(ctx));
+        assert_eq!(
+            the_focused_child_window(&output),
+            window,
+            "the open window comes to the front"
+        );
+        assert_eq!(
+            app.settings
+                .as_ref()
+                .unwrap()
+                .value("alignment.skew_tolerance"),
+            Some(edited),
+            "the edits are kept"
+        );
+
+        // Once the dialog has closed, the command opens a new one.
+        let _ = app.settings.as_mut().unwrap().accept();
+        let _ = ctx.run(raw_input(), |ctx| app.frame(ctx));
+        assert!(app.settings.is_none());
+        app.run(Command::SessionSettings, &context);
+        let output = ctx.run(raw_input(), |ctx| app.frame(ctx));
+        assert_ne!(the_focused_child_window(&output), window);
+    }
+
+    #[test]
+    fn the_workspace_manager_run_again_focuses_its_open_window() {
+        let (_settings, mut app) = empty_app();
+        let context = context();
+        let ctx = egui::Context::default();
+        let _close = native_backend(&ctx);
+        frames_until(&mut app, |app| {
+            app.store()
+                .try_borrow()
+                .is_ok_and(|handle| handle.is_ready())
+        });
+
+        app.run(Command::SaveWorkspaceAs, &context);
+        let output = ctx.run(raw_input(), |ctx| app.frame(ctx));
+        let window = the_focused_child_window(&output);
+        app.workspaces.as_mut().unwrap().select("held");
+
+        app.run(Command::LoadWorkspace, &context);
+        let output = ctx.run(raw_input(), |ctx| app.frame(ctx));
+        assert_eq!(the_focused_child_window(&output), window);
+        assert_eq!(
+            app.workspaces.as_ref().unwrap().name(),
+            "held",
+            "the manager keeps its state"
+        );
+    }
+
+    #[test]
     fn the_workspace_manager_opens_in_a_native_window_whose_close_box_closes_it() {
         let (_settings, mut app) = empty_app();
         let context = context();
@@ -5811,8 +5898,7 @@ mod tests {
             &egui::ViewportCommand::Focus
         ));
 
-        // The profile manager permits the exit; the unsaved tab refuses it
-        // with a question in the main window.
+        // The profile manager permits the exit; the unsaved tab refuses it.
         app.try_leave();
         assert!(!app.closing);
         assert_eq!(app.active_title().as_deref(), Some("Unsaved edit"));
