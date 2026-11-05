@@ -710,13 +710,23 @@ fn target_permissions(
                     "target appeared",
                 ));
             }
+            let multiple_links = {
+                #[cfg(windows)]
+                {
+                    target_has_multiple_links(path, &metadata)?
+                }
+                #[cfg(not(windows))]
+                {
+                    target_has_multiple_links(path, &metadata)
+                }
+            };
             let refused = if metadata.file_type().is_symlink() {
                 Some("it is a link")
             } else if metadata.is_dir() {
                 Some("it is a folder")
             } else if !metadata.is_file() {
                 Some("it is not a regular file")
-            } else if has_multiple_links(path, &metadata)? {
+            } else if multiple_links {
                 Some("it has multiple hard links")
             } else if metadata.permissions().readonly() {
                 Some("it is read-only")
@@ -736,44 +746,41 @@ fn target_permissions(
     }
 }
 
-fn has_multiple_links(path: &Path, metadata: &fs::Metadata) -> io::Result<bool> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let _ = path;
-        Ok(metadata.nlink() > 1)
-    }
-    #[cfg(windows)]
-    {
-        use winsafe::prelude::*;
-        let name = windows_path(path)?;
-        let (file, _) = winsafe::HFILE::CreateFile(
-            &name,
-            winsafe::co::GENERIC::default(),
-            Some(
-                winsafe::co::FILE_SHARE::READ
-                    | winsafe::co::FILE_SHARE::WRITE
-                    | winsafe::co::FILE_SHARE::DELETE,
-            ),
-            None,
-            winsafe::co::DISPOSITION::OPEN_EXISTING,
-            winsafe::co::FILE_ATTRIBUTE::NORMAL,
-            None,
-            None,
-            None,
-        )
+#[cfg(unix)]
+fn target_has_multiple_links(_path: &Path, metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    metadata.nlink() > 1
+}
+
+#[cfg(windows)]
+fn target_has_multiple_links(path: &Path, _metadata: &fs::Metadata) -> io::Result<bool> {
+    use winsafe::prelude::*;
+    let name = windows_path(path)?;
+    let (file, _) = winsafe::HFILE::CreateFile(
+        &name,
+        winsafe::co::GENERIC::default(),
+        Some(
+            winsafe::co::FILE_SHARE::READ
+                | winsafe::co::FILE_SHARE::WRITE
+                | winsafe::co::FILE_SHARE::DELETE,
+        ),
+        None,
+        winsafe::co::DISPOSITION::OPEN_EXISTING,
+        winsafe::co::FILE_ATTRIBUTE::NORMAL,
+        None,
+        None,
+        None,
+    )
+    .map_err(|code| io::Error::from_raw_os_error(code.raw().cast_signed()))?;
+    let info = file
+        .GetFileInformationByHandle()
         .map_err(|code| io::Error::from_raw_os_error(code.raw().cast_signed()))?;
-        let info = file
-            .GetFileInformationByHandle()
-            .map_err(|code| io::Error::from_raw_os_error(code.raw().cast_signed()))?;
-        let _ = metadata;
-        Ok(info.nNumberOfLinks > 1)
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = (path, metadata);
-        Ok(false)
-    }
+    Ok(info.nNumberOfLinks > 1)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn target_has_multiple_links(_path: &Path, _metadata: &fs::Metadata) -> bool {
+    false
 }
 
 fn retryable(error: &io::Error) -> bool {
