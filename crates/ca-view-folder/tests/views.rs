@@ -1261,6 +1261,12 @@ fn explorer_selects_the_file_side_of_a_row_that_is_a_folder_on_the_other_side() 
     } else {
         text(&folder)
     };
+    #[cfg(target_os = "macos")]
+    assert_eq!(
+        explorer_command_of(&view).arguments,
+        ["-R".to_owned(), text(&folder)]
+    );
+    #[cfg(not(target_os = "macos"))]
     assert_eq!(
         explorer_command_of(&view).arguments,
         std::slice::from_ref(&opened)
