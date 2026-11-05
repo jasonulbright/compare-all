@@ -41,7 +41,7 @@ use jobs::{ContentMessage, ScanFailure, ScanMessage, SortMessage};
 use operations::{Form, Operation, Request};
 use opjobs::{
     Answer, Ask, CleanupMessage, ExecMessage, PlanMessage, PlanOutcome, PreviewMessage,
-    ProgressState, RecoverMessage, RecoveryNotice, RescanMessage,
+    ProgressState, RecoverMessage, RecoveryNotice, RescanMessage, SelectionRefreshMessage,
 };
 use selection::{ClickKind, Scope, SelectRule, Selection};
 use std::path::{Path, PathBuf};
@@ -106,6 +106,8 @@ const SCAN_FAILED: &str = "The folder scan failed. Use Refresh to try again";
 const SCAN_STOPPED: &str = "The folder scan was stopped. Use Refresh to try again";
 /// Why an operation needs selected rows.
 const NOTHING_SELECTED_FOR_ACTION: &str = "Select the items to act on first";
+/// Why the refresh selection command has no rows to read.
+const NOTHING_SELECTED_TO_REFRESH: &str = "Select the items to refresh first";
 /// Why a selected action cannot export a path.
 const NO_LOCAL_PATH_TO_COPY: &str = "None of the selected items has a local path to copy";
 /// Why an action has no rows when the folder contains none.
@@ -125,6 +127,7 @@ const HANDLED: &[Command] = &[
     Command::CompareReport,
     Command::ExpandAll,
     Command::CollapseAll,
+    Command::RefreshSelection,
     Command::CompareContents,
     Command::SwapSides,
     Command::Reload,
@@ -335,6 +338,7 @@ pub struct FolderView {
     plan_job: Option<Job<PlanMessage>>,
     exec_job: Option<Job<ExecMessage>>,
     rescan_job: Option<Job<RescanMessage>>,
+    selection_refresh_job: Option<Job<SelectionRefreshMessage>>,
     recover_job: Option<Job<RecoverMessage>>,
     cleanup_job: Option<Job<CleanupMessage>>,
     preview_job: Option<Job<PreviewMessage>>,
@@ -346,6 +350,7 @@ pub struct FolderView {
     /// produced must never replace the current one.
     plan_comparison: u64,
     rescan_comparison: u64,
+    selection_refresh_comparison: u64,
     preview_comparison: u64,
     extract_job: Option<Job<jobs::ExtractMessage>>,
     /// Tabs to open on the next frame, from work that finished off the frame.
@@ -527,12 +532,14 @@ impl FolderView {
             plan_job: None,
             exec_job: None,
             rescan_job: None,
+            selection_refresh_job: None,
             recover_job: None,
             cleanup_job: None,
             preview_job: None,
             comparisons: ca_ui::schedule::Generations::new(),
             plan_comparison: 0,
             rescan_comparison: 0,
+            selection_refresh_comparison: 0,
             preview_comparison: 0,
             extract_job: None,
             pending_opens: Vec::new(),
@@ -1168,6 +1175,42 @@ impl FolderView {
         ));
     }
 
+    /// Start a row-scoped refresh on the background worker.
+    fn refresh_selection(&mut self) {
+        if !self.accepts(Command::RefreshSelection) {
+            return;
+        }
+        let Some(tree) = self.compared_tree.take() else {
+            return;
+        };
+        let Some(sides) = self.sides.clone() else {
+            self.compared_tree = Some(tree);
+            return;
+        };
+        let selected = self
+            .selection
+            .side(Side::Left)
+            .iter()
+            .chain(self.selection.side(Side::Right))
+            .cloned()
+            .collect();
+        self.selection_refresh_comparison = self.comparisons.current();
+        self.status = Status::Running("Refreshing selection");
+        self.selection_refresh_job = Some(opjobs::spawn_refresh_selection(
+            opjobs::SelectionRefreshRequest {
+                tree,
+                sides,
+                selected,
+                left_root: self.left_path.clone(),
+                right_root: self.right_path.clone(),
+                name_filter: self.name_filter.clone(),
+                previous_errors: self.scan_errors.clone(),
+                options: Box::new(self.engine_options()),
+            },
+            self.notify.clone(),
+        ));
+    }
+
     /// Rebuild the synchronisation preview from the comparison.
     fn refresh_preview(&mut self) {
         if self.mode != Mode::Sync || self.stage.blocks_input() {
@@ -1315,6 +1358,9 @@ impl FolderView {
             self.sort_job.take().map(|job| job.cancel_handle()),
             self.plan_job.take().map(|job| job.cancel_handle()),
             self.rescan_job.take().map(|job| job.cancel_handle()),
+            self.selection_refresh_job
+                .take()
+                .map(|job| job.cancel_handle()),
             self.preview_job.take().map(|job| job.cancel_handle()),
         ]
         .into_iter()
@@ -1350,6 +1396,7 @@ impl FolderView {
             self.content_job.as_ref().map(Job::cancel_handle),
             self.sort_job.as_ref().map(Job::cancel_handle),
             self.rescan_job.as_ref().map(Job::cancel_handle),
+            self.selection_refresh_job.as_ref().map(Job::cancel_handle),
             self.plan_job.as_ref().map(Job::cancel_handle),
             self.exec_cancel.clone(),
         ]
@@ -1369,6 +1416,7 @@ impl FolderView {
         self.poll_plan();
         self.poll_exec();
         self.poll_rescan();
+        self.poll_selection_refresh();
         self.poll_recovery();
         self.poll_cleanup();
         self.poll_preview();
@@ -1711,6 +1759,56 @@ impl FolderView {
         }
         if finished {
             self.rescan_job = None;
+        }
+    }
+
+    fn poll_selection_refresh(&mut self) {
+        let Some(job) = self.selection_refresh_job.as_mut() else {
+            return;
+        };
+        let messages = job.drain();
+        let finished = job.is_finished();
+        let current = self
+            .comparisons
+            .is_current(self.selection_refresh_comparison);
+        for message in messages {
+            if !current {
+                continue;
+            }
+            match message {
+                SelectionRefreshMessage::Done {
+                    arena,
+                    tree,
+                    errors,
+                } => {
+                    self.arena = *arena;
+                    self.compared_tree = Some(tree);
+                    self.scan_errors = errors;
+                    self.selection.retain_known(&self.arena);
+                    self.status = Status::Ready;
+                    self.last_refresh = Instant::now();
+                    self.sync.stale = true;
+                    if self.sort != Sort::default() {
+                        self.start_sort();
+                    }
+                    self.rebuild();
+                    if self.mode == Mode::Sync {
+                        self.refresh_preview();
+                    }
+                }
+                SelectionRefreshMessage::Failed { reason, tree } => {
+                    if let Some(tree) = tree {
+                        self.compared_tree = Some(tree);
+                        self.status = Status::Ready;
+                        self.message = Some(("Refresh Selection".to_owned(), reason));
+                    } else {
+                        self.status = Status::Failed(reason);
+                    }
+                }
+            }
+        }
+        if finished {
+            self.selection_refresh_job = None;
         }
     }
 
@@ -3869,6 +3967,15 @@ impl SessionView for FolderView {
                 Some(navigate::NO_DIFFERENCE)
             }
             Command::Reload | Command::Recompare if !self.accepts(command) => Some(READ_BUSY),
+            Command::RefreshSelection if !self.accepts(command) => {
+                if self.selection.is_empty() {
+                    Some(NOTHING_SELECTED_TO_REFRESH)
+                } else if self.status == Status::Ready && matches!(self.stage, Stage::Idle) {
+                    Some(SCAN_NOT_READY)
+                } else {
+                    Some(READ_BUSY)
+                }
+            }
             Command::Find if !self.accepts(command) => self.find_refusal(false),
             Command::FindNext | Command::FindPrevious if !self.accepts(command) => {
                 self.find_refusal(true)
@@ -3904,6 +4011,19 @@ impl SessionView for FolderView {
             Command::CompareContents | Command::CompareReport => self.compared_tree.is_some(),
             Command::SwapSides => self.status == Status::Ready && idle,
             Command::Reload | Command::Recompare => !self.status.is_running() && idle,
+            Command::RefreshSelection => {
+                self.status == Status::Ready
+                    && idle
+                    && !self.selection.is_empty()
+                    && self.compared_tree.is_some()
+                    && self.sides.is_some()
+                    && self.scan_job.is_none()
+                    && self.content_job.is_none()
+                    && self.sort_job.is_none()
+                    && self.rescan_job.is_none()
+                    && self.selection_refresh_job.is_none()
+                    && self.preview_job.is_none()
+            }
             Command::NextDifference => self.has_difference(true),
             Command::PreviousDifference => self.has_difference(false),
             Command::FindNext | Command::FindPrevious => self.has_name_match(),
@@ -3943,6 +4063,7 @@ impl SessionView for FolderView {
             Command::CompareContents => self.start_content_comparison(),
             Command::CompareReport => self.report.request(),
             Command::Cancel => self.request_stop(),
+            Command::RefreshSelection => self.refresh_selection(),
             Command::Reload | Command::Recompare => self.restart(),
             Command::NextDifference => self.step_difference(true),
             Command::PreviousDifference => self.step_difference(false),

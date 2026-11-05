@@ -5,6 +5,7 @@
 //! all run here. The frame thread only ever drains messages and reads a shared
 //! progress record, so none of these ever hold a frame.
 
+use crate::jobs::ScanFailure;
 use crate::operations::{Operation, Request};
 use crate::selection::Scope;
 use crate::tree::Arena;
@@ -1109,6 +1110,67 @@ impl Terminal for RescanMessage {
     }
 }
 
+/// What a selected row refresh produced.
+#[derive(Debug)]
+pub enum SelectionRefreshMessage {
+    /// The selected subtrees were reconciled with the current comparison.
+    Done {
+        /// Flattened comparison.
+        arena: Box<Arena>,
+        /// Updated comparison tree.
+        tree: Box<Node>,
+        /// Per-entry errors within the refreshed subtrees.
+        errors: Vec<ScanFailure>,
+    },
+    /// The refresh could not finish; the unchanged tree is returned when possible.
+    Failed {
+        /// Why the refresh stopped.
+        reason: String,
+        /// The tree as it stood before the refresh.
+        tree: Option<Box<Node>>,
+    },
+}
+
+/// Inputs for a row-scoped refresh.
+pub struct SelectionRefreshRequest {
+    /// The current comparison tree.
+    pub tree: Box<Node>,
+    /// Sources that back the two sides.
+    pub sides: crate::jobs::Sides,
+    /// Selected comparison keys.
+    pub selected: Vec<PathBuf>,
+    /// Display roots used by the other filters.
+    pub left_root: PathBuf,
+    /// Display roots used by the other filters.
+    pub right_root: PathBuf,
+    /// Active name filter.
+    pub name_filter: String,
+    /// Errors from the comparison before this refresh.
+    pub previous_errors: Vec<ScanFailure>,
+    /// Comparison and scan settings.
+    pub options: Box<crate::settings::EngineOptions>,
+}
+
+impl Terminal for SelectionRefreshMessage {
+    fn is_terminal(&self) -> bool {
+        true
+    }
+
+    fn cancelled() -> Self {
+        Self::Failed {
+            reason: "the selection refresh stopped before it finished".to_owned(),
+            tree: None,
+        }
+    }
+
+    fn panicked(detail: String) -> Self {
+        Self::Failed {
+            reason: detail,
+            tree: None,
+        }
+    }
+}
+
 /// Re-read only the folders a batch touched and splice them into the tree.
 ///
 /// Rescanning the whole comparison after every operation costs a pass over
@@ -1159,6 +1221,305 @@ pub fn spawn_rescan(
         },
         notify,
     )
+}
+
+/// Re-read the selected rows and replace their subtrees in the current tree.
+///
+/// Each side is scanned at the path recorded for that side, which preserves
+/// rows whose names differ under an alignment rule. A missing entry is
+/// reconciled as an absence. Other scan failures leave the original tree
+/// untouched.
+#[must_use]
+pub fn spawn_refresh_selection(
+    request: SelectionRefreshRequest,
+    notify: Arc<dyn Fn() + Send + Sync>,
+) -> Job<SelectionRefreshMessage> {
+    Job::spawn_notifying(
+        move |emitter, cancel| {
+            let SelectionRefreshRequest {
+                tree,
+                sides,
+                selected,
+                left_root,
+                right_root,
+                name_filter,
+                previous_errors,
+                options,
+            } = request;
+            let mut tree = tree;
+            let context = SelectionRefreshContext {
+                sides,
+                left_root,
+                right_root,
+                name_filter,
+                options,
+            };
+            let mut updates = Vec::new();
+            let mut errors = previous_errors;
+            for key in minimal_roots(&selected) {
+                if cancel.is_cancelled() {
+                    send_selection_refresh_failed(
+                        emitter,
+                        tree,
+                        "the selection refresh was stopped",
+                    );
+                    return;
+                }
+                match refresh_selected_root(&tree, key, &context, &mut errors, cancel) {
+                    Ok(Some(update)) => updates.push(update),
+                    Ok(None) => {}
+                    Err(reason) => {
+                        send_selection_refresh_failed(emitter, tree, &reason);
+                        return;
+                    }
+                }
+            }
+
+            if cancel.is_cancelled() {
+                send_selection_refresh_failed(emitter, tree, "the selection refresh was stopped");
+                return;
+            }
+            for update in updates {
+                replace_selected_node(
+                    &mut tree,
+                    &update.key,
+                    update.replacement,
+                    update.previous,
+                    update.refreshed,
+                );
+            }
+            ca_fs::rollup(&mut tree);
+            let arena = Arena::from_root(&tree);
+            emitter.send(SelectionRefreshMessage::Done {
+                arena: Box::new(arena),
+                tree,
+                errors,
+            });
+        },
+        notify,
+    )
+}
+
+struct SelectionRefreshContext {
+    sides: crate::jobs::Sides,
+    left_root: PathBuf,
+    right_root: PathBuf,
+    name_filter: String,
+    options: Box<crate::settings::EngineOptions>,
+}
+
+fn refresh_selected_root(
+    tree: &Node,
+    key: PathBuf,
+    context: &SelectionRefreshContext,
+    errors: &mut Vec<ScanFailure>,
+    cancel: &Cancel,
+) -> Result<Option<SelectionUpdate>, String> {
+    let Some(current) = find_node(tree, &key) else {
+        return Ok(None);
+    };
+    let left_rel = current
+        .left
+        .as_ref()
+        .map_or_else(|| key.clone(), |entry| entry.rel.clone());
+    let right_rel = current
+        .right
+        .as_ref()
+        .map_or_else(|| key.clone(), |entry| entry.rel.clone());
+    let previous = node_contributions(current);
+    let left = scan_selection_side(
+        &context.sides.left,
+        &left_rel,
+        "Left",
+        &context.options.scan,
+        cancel,
+    )?;
+    let right = scan_selection_side(
+        &context.sides.right,
+        &right_rel,
+        "Right",
+        &context.options.scan,
+        cancel,
+    )?;
+    if cancel.is_cancelled() || left.cancelled || right.cancelled {
+        return Err("the selection refresh was stopped".to_owned());
+    }
+    errors.retain(|error| {
+        !((!error.right && error.path.starts_with(&left_rel))
+            || (error.right && error.path.starts_with(&right_rel)))
+    });
+    errors.extend(scan_failures(&left, false));
+    errors.extend(scan_failures(&right, true));
+
+    let mut refreshed =
+        ca_fs::align_trees(&left, &right, &context.options.alignment, cancel.as_fs());
+    let raw = find_selected_node(&refreshed, &key, &left_rel, &right_rel);
+    let new_contributions = raw.map_or((Some(0), Some(0)), node_contributions);
+    let names = crate::jobs::name_filters_of(&context.options, &context.name_filter);
+    let mut other_filters = context.options.other_filters.clone();
+    other_filters.left_root.clone_from(&context.left_root);
+    other_filters.right_root.clone_from(&context.right_root);
+    ca_fs::apply_filters(
+        &mut refreshed,
+        &names,
+        &other_filters,
+        &ca_fs::FilterContext::default(),
+    );
+    ca_fs::compare_quick(&mut refreshed, &context.options.compare);
+    let mut replacement = take_selected_node(&mut refreshed, &key, &left_rel, &right_rel);
+    if let Some(node) = replacement.as_mut() {
+        let old_rel = node.rel.clone();
+        rebase_node_paths(node, &old_rel, &key);
+    }
+    Ok(Some(SelectionUpdate {
+        key,
+        replacement,
+        previous,
+        refreshed: new_contributions,
+    }))
+}
+
+fn scan_selection_side(
+    source: &ca_fs::Source,
+    rel: &Path,
+    side: &str,
+    options: &ca_fs::ScanOptions,
+    cancel: &Cancel,
+) -> Result<ca_fs::ScanResult, String> {
+    match ca_fs::scan_source_subtree(source, rel, options, cancel.as_fs()) {
+        Ok(Some(scan)) => Ok(scan),
+        Ok(None) => Ok(ca_fs::ScanResult::default()),
+        Err(error) => Err(format!("{side} side: {error}")),
+    }
+}
+
+fn send_selection_refresh_failed(
+    emitter: &ca_ui::worker::Emitter<SelectionRefreshMessage>,
+    tree: Box<Node>,
+    reason: &str,
+) {
+    emitter.send(SelectionRefreshMessage::Failed {
+        reason: reason.to_owned(),
+        tree: Some(tree),
+    });
+}
+
+struct SelectionUpdate {
+    key: PathBuf,
+    replacement: Option<Node>,
+    previous: (Option<u64>, Option<u64>),
+    refreshed: (Option<u64>, Option<u64>),
+}
+
+fn node_contributions(node: &Node) -> (Option<u64>, Option<u64>) {
+    let side = |entry: Option<&ca_fs::Entry>, folder_size: Option<u64>| match entry {
+        Some(entry) if entry.is_dir => folder_size,
+        Some(entry) => Some(entry.size),
+        None => Some(0),
+    };
+    (
+        side(node.left.as_ref(), node.facts.left_folder_size),
+        side(node.right.as_ref(), node.facts.right_folder_size),
+    )
+}
+
+fn scan_failures(scan: &ca_fs::ScanResult, right: bool) -> Vec<ScanFailure> {
+    scan.errors
+        .iter()
+        .map(|error| ScanFailure {
+            path: error.rel.clone(),
+            message: error.message.clone(),
+            right,
+        })
+        .collect()
+}
+
+fn find_selected_node<'a>(
+    tree: &'a Node,
+    key: &Path,
+    left_rel: &Path,
+    right_rel: &Path,
+) -> Option<&'a Node> {
+    let mut found = None;
+    tree.walk(&mut |node| {
+        if found.is_none()
+            && (node.rel == key
+                || node
+                    .left
+                    .as_ref()
+                    .is_some_and(|entry| entry.rel == left_rel)
+                || node
+                    .right
+                    .as_ref()
+                    .is_some_and(|entry| entry.rel == right_rel))
+        {
+            found = Some(node);
+        }
+    });
+    found
+}
+
+fn take_selected_node(
+    tree: &mut Node,
+    key: &Path,
+    left_rel: &Path,
+    right_rel: &Path,
+) -> Option<Node> {
+    fn take(parent: &mut Node, key: &Path, left_rel: &Path, right_rel: &Path) -> Option<Node> {
+        if let Some(index) = parent.children.iter().position(|node| {
+            node.rel == key
+                || node
+                    .left
+                    .as_ref()
+                    .is_some_and(|entry| entry.rel == left_rel)
+                || node
+                    .right
+                    .as_ref()
+                    .is_some_and(|entry| entry.rel == right_rel)
+        }) {
+            return Some(parent.children.remove(index));
+        }
+        for child in &mut parent.children {
+            if let Some(node) = take(child, key, left_rel, right_rel) {
+                return Some(node);
+            }
+        }
+        None
+    }
+    take(tree, key, left_rel, right_rel)
+}
+
+fn rebase_node_paths(node: &mut Node, from: &Path, to: &Path) {
+    let mut stack = vec![node];
+    while let Some(node) = stack.pop() {
+        if let Ok(suffix) = node.rel.strip_prefix(from) {
+            node.rel = to.join(suffix);
+        }
+        stack.extend(node.children.iter_mut());
+    }
+}
+
+fn replace_selected_node(
+    tree: &mut Node,
+    key: &Path,
+    replacement: Option<Node>,
+    previous: (Option<u64>, Option<u64>),
+    refreshed: (Option<u64>, Option<u64>),
+) {
+    let Some(parent_rel) = key.parent() else {
+        return;
+    };
+    let Some(parent) = find_mut(tree, parent_rel) else {
+        return;
+    };
+    let Some(index) = parent.children.iter().position(|node| node.rel == key) else {
+        return;
+    };
+    parent.children.remove(index);
+    if let Some(node) = replacement {
+        parent.children.insert(index, node);
+    }
+    update_ancestor_sizes(tree, key, previous, refreshed);
 }
 
 struct ScannedSubtree {
@@ -1417,12 +1778,12 @@ pub fn affected_roots(plan: &OperationPlan) -> Vec<PathBuf> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::{
-        minimal_roots, needs_wider_rescan, splice, Answer, Ask, Question, RescannedSide,
-        ScannedSubtree,
+        minimal_roots, needs_wider_rescan, spawn_refresh_selection, splice, Answer, Ask, Question,
+        RescannedSide, ScannedSubtree, SelectionRefreshMessage, SelectionRefreshRequest,
     };
     use ca_fs::{Node, NodeStatus, PairFacts, StatusFlags};
     use ca_ui::worker::Cancel;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
     fn folder(rel: &str, left_size: Option<u64>, children: Vec<Node>) -> Node {
@@ -1459,6 +1820,134 @@ mod tests {
             scan_cancelled: false,
             children,
         }
+    }
+
+    fn full_tree(
+        left: &std::path::Path,
+        right: &std::path::Path,
+    ) -> (Box<Node>, crate::jobs::Sides) {
+        let sides = crate::jobs::Sides {
+            left: ca_fs::Source::local(left),
+            right: ca_fs::Source::local(right),
+        };
+        let options =
+            crate::settings::options_of(&ca_session::settings::FolderCompareSettings::default());
+        let cancel = ca_fs::Cancel::new();
+        let left_scan = ca_fs::scan_source(&sides.left, &options.scan, &cancel, &|_| {}).unwrap();
+        let right_scan = ca_fs::scan_source(&sides.right, &options.scan, &cancel, &|_| {}).unwrap();
+        let mut tree = ca_fs::align_trees(&left_scan, &right_scan, &options.alignment, &cancel);
+        ca_fs::compare_quick(&mut tree, &options.compare);
+        (Box::new(tree), sides)
+    }
+
+    fn refresh(
+        tree: Box<Node>,
+        sides: crate::jobs::Sides,
+        left: &std::path::Path,
+        right: &std::path::Path,
+        selected: &[&str],
+    ) -> SelectionRefreshMessage {
+        let options =
+            crate::settings::options_of(&ca_session::settings::FolderCompareSettings::default());
+        let mut job = spawn_refresh_selection(
+            SelectionRefreshRequest {
+                tree,
+                sides,
+                selected: selected.iter().map(PathBuf::from).collect(),
+                left_root: left.to_path_buf(),
+                right_root: right.to_path_buf(),
+                name_filter: String::new(),
+                previous_errors: Vec::new(),
+                options: Box::new(options),
+            },
+            Arc::new(|| {}),
+        );
+        job.wait(std::time::Duration::from_secs(10))
+            .into_iter()
+            .next()
+            .unwrap()
+    }
+
+    #[test]
+    fn selection_refresh_updates_one_file_and_leaves_an_unselected_change_stale() {
+        let base = tempfile::tempdir().unwrap();
+        let left = base.path().join("left");
+        let right = base.path().join("right");
+        std::fs::create_dir_all(&left).unwrap();
+        std::fs::create_dir_all(&right).unwrap();
+        for side in [&left, &right] {
+            std::fs::write(side.join("target.txt"), b"old target").unwrap();
+            std::fs::write(side.join("neighbor.txt"), b"old neighbor").unwrap();
+        }
+        let (tree, sides) = full_tree(&left, &right);
+        std::fs::write(left.join("target.txt"), b"the refreshed target is longer").unwrap();
+        std::fs::write(
+            left.join("neighbor.txt"),
+            b"a changed but unselected neighbor",
+        )
+        .unwrap();
+
+        let message = refresh(tree, sides, &left, &right, &["target.txt"]);
+        assert!(
+            matches!(&message, SelectionRefreshMessage::Done { .. }),
+            "the selected rows did not refresh: {message:?}"
+        );
+        let SelectionRefreshMessage::Done { tree, .. } = message else {
+            return;
+        };
+        let mut nodes = Vec::new();
+        tree.walk(&mut |node| nodes.push(node));
+        let target = nodes
+            .iter()
+            .find(|node| node.rel == Path::new("target.txt"))
+            .unwrap();
+        assert_eq!(target.left.as_ref().map(|entry| entry.size), Some(30));
+        let neighbor = nodes
+            .iter()
+            .find(|node| node.rel == Path::new("neighbor.txt"))
+            .unwrap();
+        assert_eq!(neighbor.left.as_ref().map(|entry| entry.size), Some(12));
+        assert_eq!(tree.facts.left_folder_size, Some(42));
+        assert_eq!(tree.facts.right_folder_size, Some(22));
+    }
+
+    #[test]
+    fn selection_refresh_reconciles_a_folder_subtree_and_removes_a_deleted_row() {
+        let base = tempfile::tempdir().unwrap();
+        let left = base.path().join("left");
+        let right = base.path().join("right");
+        for side in [&left, &right] {
+            std::fs::create_dir_all(side.join("selected")).unwrap();
+            std::fs::create_dir_all(side.join("sibling")).unwrap();
+            std::fs::write(side.join("selected/old.txt"), b"old").unwrap();
+            std::fs::write(side.join("sibling/keep.txt"), b"keep").unwrap();
+        }
+        let (tree, sides) = full_tree(&left, &right);
+        std::fs::remove_file(left.join("selected/old.txt")).unwrap();
+        std::fs::write(left.join("selected/new.txt"), b"new selected row").unwrap();
+
+        let message = refresh(tree, sides, &left, &right, &["selected"]);
+        assert!(
+            matches!(&message, SelectionRefreshMessage::Done { .. }),
+            "the selected folder did not refresh: {message:?}"
+        );
+        let SelectionRefreshMessage::Done { tree, .. } = message else {
+            return;
+        };
+        let mut nodes = Vec::new();
+        tree.walk(&mut |node| nodes.push(node));
+        assert!(nodes
+            .iter()
+            .any(|node| node.rel == Path::new("selected/new.txt")));
+        let deleted = nodes
+            .iter()
+            .find(|node| node.rel == Path::new("selected/old.txt"))
+            .unwrap();
+        assert!(deleted.left.is_none());
+        assert!(deleted.right.is_some());
+        assert!(nodes
+            .iter()
+            .any(|node| node.rel == Path::new("sibling/keep.txt")));
     }
 
     #[test]

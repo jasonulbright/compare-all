@@ -6,9 +6,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use ca_fs::{
-    compare_source_contents, quick_compare_with, scan_source, scan_with, Cancel, ContentError,
-    ContentOutcome, ContentSide, ContentTests, Entry, EntryFacts, FileOps, Mount, QuickTests,
-    Source, SourceKind, SourceOps, TimeFidelity,
+    compare_source_contents, quick_compare_with, scan_source, scan_source_subtree, scan_with,
+    Cancel, ContentError, ContentOutcome, ContentSide, ContentTests, Entry, EntryFacts, FileOps,
+    Mount, QuickTests, ScanOptions, Source, SourceKind, SourceOps, TimeFidelity,
 };
 use ca_vfs::{
     ArchiveOptions, Cancel as VfsCancel, Limits, LocalFs, Snapshot, SnapshotOptions, VfsPath,
@@ -92,6 +92,35 @@ fn a_local_folder_scanned_as_a_source_matches_the_path_scanner() {
         assert_eq!(entry.name, other.name);
     }
     assert!(through.facts.is_empty(), "a folder states nothing coarser");
+}
+
+#[test]
+fn a_selected_archive_folder_scan_keeps_its_tree_and_source_facts() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = zip_with(
+        &dir.path().join("source.zip"),
+        &[("selected/file.txt", b"selected"), ("other.txt", b"other")],
+    );
+    let options = ScanOptions::default();
+    let cancel = Cancel::new();
+    let full = scan_source(&source, &options, &cancel, &|_| {}).unwrap();
+    let selected = scan_source_subtree(&source, Path::new("selected"), &options, &cancel)
+        .unwrap()
+        .unwrap();
+
+    assert!(selected.entries.contains_key(Path::new("selected")));
+    assert!(selected
+        .entries
+        .contains_key(Path::new("selected/file.txt")));
+    assert!(!selected.entries.contains_key(Path::new("other.txt")));
+    for rel in selected.entries.keys() {
+        assert_eq!(
+            selected.facts_of(rel),
+            full.facts_of(rel),
+            "{}",
+            rel.display()
+        );
+    }
 }
 
 /// The local scan keeps its own path, so the two entry points cost the same.
