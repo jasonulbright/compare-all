@@ -1147,6 +1147,28 @@ fn symlinks_are_refused_including_dangling_links() {
     assert_eq!(names(dir.path()), ["link"]);
 }
 
+#[cfg(windows)]
+#[test]
+fn replacement_refuses_a_dangling_symbolic_link_before_following_it() -> io::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let link = dir.path().join("dangling-link");
+    let target = dir.path().join("missing-target");
+    if let Err(error) = std::os::windows::fs::symlink_file(&target, &link) {
+        eprintln!("skipping symbolic-link test: {error}");
+        return Ok(());
+    }
+
+    let error = write_atomic(&link, b"replacement")
+        .err()
+        .ok_or_else(|| io::Error::other("replacement followed a dangling symbolic link"))?;
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+    assert!(error.to_string().contains("link"), "{error}");
+    assert!(fs::symlink_metadata(&link)?.file_type().is_symlink());
+    assert!(!target.exists());
+    assert_eq!(names(dir.path()), ["dangling-link"]);
+    Ok(())
+}
+
 #[test]
 fn a_log_opened_without_append_starts_empty_and_with_append_keeps_lines() {
     let dir = tempfile::tempdir().unwrap();

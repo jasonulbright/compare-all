@@ -711,30 +711,32 @@ fn target_permissions(
                     "target appeared",
                 ));
             }
-            let multiple_links = if reject_multiple_links {
-                #[cfg(windows)]
-                {
-                    target_has_multiple_links(path, &metadata)?
-                }
-                #[cfg(not(windows))]
-                {
-                    target_has_multiple_links(path, &metadata)
-                }
-            } else {
-                false
-            };
             let refused = if metadata.file_type().is_symlink() {
                 Some("it is a link")
             } else if metadata.is_dir() {
                 Some("it is a folder")
             } else if !metadata.is_file() {
                 Some("it is not a regular file")
-            } else if multiple_links {
-                Some("it has multiple hard links")
-            } else if metadata.permissions().readonly() {
-                Some("it is read-only")
             } else {
-                None
+                let multiple_links = if reject_multiple_links {
+                    #[cfg(windows)]
+                    {
+                        target_has_multiple_links(path, &metadata)?
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        target_has_multiple_links(path, &metadata)
+                    }
+                } else {
+                    false
+                };
+                if multiple_links {
+                    Some("it has multiple hard links")
+                } else if metadata.permissions().readonly() {
+                    Some("it is read-only")
+                } else {
+                    None
+                }
             };
             if let Some(reason) = refused {
                 return Err(io::Error::new(
