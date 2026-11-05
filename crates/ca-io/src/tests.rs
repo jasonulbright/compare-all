@@ -1154,6 +1154,9 @@ fn replacement_refuses_a_dangling_symbolic_link_before_following_it() -> io::Res
     let link = dir.path().join("dangling-link");
     let target = dir.path().join("missing-target");
     if let Err(error) = std::os::windows::fs::symlink_file(&target, &link) {
+        if std::env::var_os("GITHUB_ACTIONS").is_some() {
+            return Err(error);
+        }
         eprintln!("skipping symbolic-link test: {error}");
         return Ok(());
     }
