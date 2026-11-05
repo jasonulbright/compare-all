@@ -137,6 +137,7 @@ fn cursor(view: &FolderView) -> Option<PathBuf> {
     view.selection().cursor().map(|(_, rel)| rel.to_path_buf())
 }
 
+/// Select one visible path on one side of a folder view.
 fn select_path(view: &mut FolderView, side: Side, rel: &str) {
     let rows = view.rows().to_vec();
     let arena = view.arena().clone();
@@ -260,6 +261,7 @@ fn next_and_previous_difference_walk_the_differences_and_open_folders() {
 }
 
 #[test]
+/// Refresh the chosen row while leaving an unselected disk change untouched.
 fn refresh_selection_updates_only_selected_rows_in_folder_compare() {
     let fixture = Fixture::new();
     let mut view = fixture.view();
@@ -288,6 +290,7 @@ fn refresh_selection_updates_only_selected_rows_in_folder_compare() {
 }
 
 #[test]
+/// Refresh the selected row in Folder Sync after its preview becomes ready.
 fn refresh_selection_is_available_in_folder_sync_after_its_preview_finishes() {
     let fixture = Fixture::new();
     let mut sync = fixture.sync_view();

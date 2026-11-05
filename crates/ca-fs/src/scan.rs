@@ -302,6 +302,7 @@ pub fn scan_source_subtree(
     Ok(Some(result))
 }
 
+/// Read one selected local entry and include its children when it is a folder.
 fn scan_local_subtree(
     source: &Source,
     rel: &Path,
@@ -354,6 +355,7 @@ fn scan_local_subtree(
     Ok(Some(result))
 }
 
+/// Read a shallow listing of the selected entry's parent directory.
 fn scan_local_parent(
     parent_path: &Path,
     options: &ScanOptions,
@@ -376,6 +378,7 @@ fn scan_local_parent(
     }
 }
 
+/// Whether a path lookup failed because the path vanished or crossed a file.
 fn is_missing_path(error: &std::io::Error) -> bool {
     matches!(
         error.kind(),
@@ -383,6 +386,7 @@ fn is_missing_path(error: &std::io::Error) -> bool {
     )
 }
 
+/// Return the final component of a selected relative path.
 fn local_final_name(rel: &Path) -> Result<PathBuf, ScanError> {
     rel.file_name().map(PathBuf::from).ok_or_else(|| {
         ScanError::Source(format!(
@@ -392,6 +396,7 @@ fn local_final_name(rel: &Path) -> Result<PathBuf, ScanError> {
     })
 }
 
+/// Remove the selected entry from its parent's shallow scan.
 fn take_local_selection(
     parent_scan: &mut ScanResult,
     parent_name: &Path,
@@ -416,6 +421,7 @@ fn take_local_selection(
     Ok(None)
 }
 
+/// Read the selected folder's descendants under the configured depth limit.
 fn scan_local_descendants(
     source: &Source,
     rel: &Path,
@@ -444,6 +450,7 @@ fn scan_local_descendants(
     Ok(true)
 }
 
+/// Add an entry's error unless the scan result already contains it.
 fn add_entry_error(result: &mut ScanResult, rel: &Path, entry: &Entry) {
     if let Some(message) = entry.error.as_ref().filter(|message| {
         !result
@@ -458,6 +465,7 @@ fn add_entry_error(result: &mut ScanResult, rel: &Path, entry: &Entry) {
     }
 }
 
+/// Convert one virtual source entry into a scan result row and facts.
 fn insert_source_entry(
     result: &mut ScanResult,
     rel: &Path,
@@ -478,6 +486,7 @@ fn insert_source_entry(
     result.entries.insert(rel.to_path_buf(), entry);
 }
 
+/// Add a selected folder's path prefix to all rows in its descendant scan.
 fn prefix_result(target: &mut ScanResult, mut source: ScanResult, prefix: &Path) {
     for (rel, mut entry) in source.entries {
         let rel = prefix.join(rel);
@@ -1300,6 +1309,7 @@ mod tests {
     }
 
     #[test]
+    /// Scanning a selected file excludes siblings and reports a missing path.
     fn a_selected_file_scan_reads_only_that_entry() {
         let dir = tree();
         let source = Source::local(dir.path());
@@ -1325,6 +1335,7 @@ mod tests {
     }
 
     #[test]
+    /// A selected folder includes its row and honors the configured depth.
     fn a_selected_folder_scan_includes_its_row_and_respects_the_depth_limit() {
         let dir = tree();
         std::fs::create_dir_all(dir.path().join("sub/deeper")).unwrap();
@@ -1349,6 +1360,7 @@ mod tests {
     }
 
     #[test]
+    /// A selected directory link remains a leaf when following links is off.
     fn a_selected_directory_link_is_not_followed_when_the_scan_disallows_it() {
         let dir = tree();
         let target = dir.path().join("sub");

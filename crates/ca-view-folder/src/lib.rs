@@ -1762,6 +1762,7 @@ impl FolderView {
         }
     }
 
+    /// Apply a finished selected refresh or restore its original tree on error.
     fn poll_selection_refresh(&mut self) {
         let Some(job) = self.selection_refresh_job.as_mut() else {
             return;
@@ -3970,7 +3971,10 @@ impl SessionView for FolderView {
             Command::RefreshSelection if !self.accepts(command) => {
                 if self.selection.is_empty() {
                     Some(NOTHING_SELECTED_TO_REFRESH)
-                } else if self.status == Status::Ready && matches!(self.stage, Stage::Idle) {
+                } else if self.status == Status::Ready
+                    && matches!(self.stage, Stage::Idle)
+                    && (self.compared_tree.is_none() || self.sides.is_none())
+                {
                     Some(SCAN_NOT_READY)
                 } else {
                     Some(READ_BUSY)

@@ -7702,6 +7702,7 @@ mod tests {
     }
 
     #[test]
+    /// The Actions menu exposes refresh by its accessible label and starts it.
     fn refresh_selection_runs_from_its_accessible_actions_menu_label() {
         use ca_ui::testing::probe::Probe;
         use std::cell::RefCell;

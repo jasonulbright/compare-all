@@ -1300,6 +1300,7 @@ pub fn spawn_refresh_selection(
     )
 }
 
+/// Inputs shared by every selected root in one refresh job.
 struct SelectionRefreshContext {
     sides: crate::jobs::Sides,
     left_root: PathBuf,
@@ -1308,6 +1309,7 @@ struct SelectionRefreshContext {
     options: Box<crate::settings::EngineOptions>,
 }
 
+/// Rescan one selected row and prepare its replacement without changing `tree`.
 fn refresh_selected_root(
     tree: &Node,
     key: PathBuf,
@@ -1318,23 +1320,23 @@ fn refresh_selected_root(
     let Some(current) = find_node(tree, &key) else {
         return Ok(None);
     };
-    let left_rel = current
-        .left
-        .as_ref()
-        .map_or_else(|| key.clone(), |entry| entry.rel.clone());
-    let right_rel = current
-        .right
-        .as_ref()
-        .map_or_else(|| key.clone(), |entry| entry.rel.clone());
+    let left_rel = current.left.as_ref().map_or_else(
+        || side_path_for_key(tree, &key, false),
+        |entry| entry.rel.clone(),
+    );
+    let right_rel = current.right.as_ref().map_or_else(
+        || side_path_for_key(tree, &key, true),
+        |entry| entry.rel.clone(),
+    );
     let previous = node_contributions(current);
-    let left = scan_selection_side(
+    let mut left = scan_selection_side(
         &context.sides.left,
         &left_rel,
         "Left",
         &context.options.scan,
         cancel,
     )?;
-    let right = scan_selection_side(
+    let mut right = scan_selection_side(
         &context.sides.right,
         &right_rel,
         "Right",
@@ -1344,6 +1346,8 @@ fn refresh_selected_root(
     if cancel.is_cancelled() || left.cancelled || right.cancelled {
         return Err("the selection refresh was stopped".to_owned());
     }
+    add_side_ancestors(&mut left, tree, &left_rel, false);
+    add_side_ancestors(&mut right, tree, &right_rel, true);
     errors.retain(|error| {
         !((!error.right && error.path.starts_with(&left_rel))
             || (error.right && error.path.starts_with(&right_rel)))
@@ -1379,6 +1383,81 @@ fn refresh_selected_root(
     }))
 }
 
+/// Derive a missing side's path from its nearest mapped ancestor in the tree.
+fn side_path_for_key(tree: &Node, key: &Path, right: bool) -> PathBuf {
+    let mut nearest: Option<(PathBuf, PathBuf)> = None;
+    tree.walk(&mut |node| {
+        if node.rel.as_os_str().is_empty() || !key.starts_with(&node.rel) {
+            return;
+        }
+        let entry = if right {
+            node.right.as_ref()
+        } else {
+            node.left.as_ref()
+        };
+        let Some(entry) = entry else {
+            return;
+        };
+        if nearest
+            .as_ref()
+            .is_none_or(|(display, _)| node.rel.components().count() > display.components().count())
+        {
+            nearest = Some((node.rel.clone(), entry.rel.clone()));
+        }
+    });
+    nearest.map_or_else(
+        || key.to_path_buf(),
+        |(display, source)| {
+            key.strip_prefix(display)
+                .map_or(source.clone(), |suffix| source.join(suffix))
+        },
+    )
+}
+
+/// Add cached side entries for ancestors so alignment can reach a nested scan.
+fn add_side_ancestors(scan: &mut ca_fs::ScanResult, tree: &Node, rel: &Path, right: bool) {
+    let mut ancestors = Vec::new();
+    let mut parent = rel.parent();
+    while let Some(path) = parent {
+        if path.as_os_str().is_empty() {
+            break;
+        }
+        ancestors.push(path.to_path_buf());
+        parent = path.parent();
+    }
+    for ancestor in ancestors.into_iter().rev() {
+        if scan.entries.contains_key(&ancestor) {
+            continue;
+        }
+        let mut cached = None;
+        tree.walk(&mut |node| {
+            if cached.is_some() {
+                return;
+            }
+            let entry = if right {
+                node.right.as_ref()
+            } else {
+                node.left.as_ref()
+            };
+            if let Some(entry) = entry.filter(|entry| entry.rel == ancestor) {
+                let facts = if right {
+                    node.facts.right
+                } else {
+                    node.facts.left
+                };
+                cached = Some((entry.clone(), facts));
+            }
+        });
+        if let Some((entry, facts)) = cached {
+            if facts != ca_fs::EntryFacts::default() {
+                scan.facts.insert(ancestor.clone(), facts);
+            }
+            scan.entries.insert(ancestor, entry);
+        }
+    }
+}
+
+/// Read a selected path from one source, treating a vanished path as absent.
 fn scan_selection_side(
     source: &ca_fs::Source,
     rel: &Path,
@@ -1393,6 +1472,7 @@ fn scan_selection_side(
     }
 }
 
+/// Return a failed refresh with its original tree for the view to restore.
 fn send_selection_refresh_failed(
     emitter: &ca_ui::worker::Emitter<SelectionRefreshMessage>,
     tree: Box<Node>,
@@ -1404,6 +1484,7 @@ fn send_selection_refresh_failed(
     });
 }
 
+/// A completed subtree and the totals needed to replace its old contribution.
 struct SelectionUpdate {
     key: PathBuf,
     replacement: Option<Node>,
@@ -1411,6 +1492,7 @@ struct SelectionUpdate {
     refreshed: (Option<u64>, Option<u64>),
 }
 
+/// Return the selected row's contribution to its parent folder's size.
 fn node_contributions(node: &Node) -> (Option<u64>, Option<u64>) {
     let side = |entry: Option<&ca_fs::Entry>, folder_size: Option<u64>| match entry {
         Some(entry) if entry.is_dir => folder_size,
@@ -1423,6 +1505,7 @@ fn node_contributions(node: &Node) -> (Option<u64>, Option<u64>) {
     )
 }
 
+/// Convert scan errors into side-tagged view errors.
 fn scan_failures(scan: &ca_fs::ScanResult, right: bool) -> Vec<ScanFailure> {
     scan.errors
         .iter()
@@ -1434,6 +1517,7 @@ fn scan_failures(scan: &ca_fs::ScanResult, right: bool) -> Vec<ScanFailure> {
         .collect()
 }
 
+/// Find the refreshed row by display key or either side's stored source path.
 fn find_selected_node<'a>(
     tree: &'a Node,
     key: &Path,
@@ -1459,12 +1543,14 @@ fn find_selected_node<'a>(
     found
 }
 
+/// Remove one refreshed row from an aligned partial tree.
 fn take_selected_node(
     tree: &mut Node,
     key: &Path,
     left_rel: &Path,
     right_rel: &Path,
 ) -> Option<Node> {
+    /// Remove a matching direct child or search each child folder.
     fn take(parent: &mut Node, key: &Path, left_rel: &Path, right_rel: &Path) -> Option<Node> {
         if let Some(index) = parent.children.iter().position(|node| {
             node.rel == key
@@ -1489,6 +1575,7 @@ fn take_selected_node(
     take(tree, key, left_rel, right_rel)
 }
 
+/// Rebase only comparison keys, keeping side-specific source paths intact.
 fn rebase_node_paths(node: &mut Node, from: &Path, to: &Path) {
     let mut stack = vec![node];
     while let Some(node) = stack.pop() {
@@ -1499,6 +1586,7 @@ fn rebase_node_paths(node: &mut Node, from: &Path, to: &Path) {
     }
 }
 
+/// Replace a selected row and adjust each ancestor's known folder total.
 fn replace_selected_node(
     tree: &mut Node,
     key: &Path,
@@ -1786,6 +1874,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
+    /// Make a compared local tree for the selection refresh tests.
     fn folder(rel: &str, left_size: Option<u64>, children: Vec<Node>) -> Node {
         let entry = ca_fs::Entry {
             rel: PathBuf::from(rel),
@@ -1822,6 +1911,7 @@ mod tests {
         }
     }
 
+    /// Scan and compare both fixture roots before a selected refresh.
     fn full_tree(
         left: &std::path::Path,
         right: &std::path::Path,
@@ -1840,6 +1930,7 @@ mod tests {
         (Box::new(tree), sides)
     }
 
+    /// Run the worker for the selected relative paths and return its answer.
     fn refresh(
         tree: Box<Node>,
         sides: crate::jobs::Sides,
@@ -1869,6 +1960,7 @@ mod tests {
     }
 
     #[test]
+    /// A selected top-level file updates while an unselected change stays stale.
     fn selection_refresh_updates_one_file_and_leaves_an_unselected_change_stale() {
         let base = tempfile::tempdir().unwrap();
         let left = base.path().join("left");
@@ -1912,21 +2004,69 @@ mod tests {
     }
 
     #[test]
+    /// A nested selected file remains in the tree and updates ancestor totals.
+    fn selection_refresh_keeps_a_nested_file_and_updates_its_ancestor_totals() {
+        let base = tempfile::tempdir().unwrap();
+        let left = base.path().join("left");
+        let right = base.path().join("right");
+        for side in [&left, &right] {
+            std::fs::create_dir_all(side.join("parent/selected")).unwrap();
+            std::fs::write(side.join("parent/selected/target.txt"), b"old target").unwrap();
+            std::fs::write(side.join("parent/selected/neighbor.txt"), b"old neighbor").unwrap();
+        }
+        let (tree, sides) = full_tree(&left, &right);
+        std::fs::write(
+            left.join("parent/selected/target.txt"),
+            b"the refreshed target is longer",
+        )
+        .unwrap();
+        std::fs::write(
+            left.join("parent/selected/neighbor.txt"),
+            b"a changed but unselected neighbor",
+        )
+        .unwrap();
+
+        let message = refresh(tree, sides, &left, &right, &["parent/selected/target.txt"]);
+        assert!(
+            matches!(&message, SelectionRefreshMessage::Done { .. }),
+            "the nested file did not refresh: {message:?}"
+        );
+        let SelectionRefreshMessage::Done { tree, .. } = message else {
+            return;
+        };
+        let mut nodes = Vec::new();
+        tree.walk(&mut |node| nodes.push(node));
+        let target = nodes
+            .iter()
+            .find(|node| node.rel == Path::new("parent/selected/target.txt"))
+            .unwrap();
+        assert_eq!(target.left.as_ref().map(|entry| entry.size), Some(30));
+        let neighbor = nodes
+            .iter()
+            .find(|node| node.rel == Path::new("parent/selected/neighbor.txt"))
+            .unwrap();
+        assert_eq!(neighbor.left.as_ref().map(|entry| entry.size), Some(12));
+        assert_eq!(tree.facts.left_folder_size, Some(42));
+        assert_eq!(tree.facts.right_folder_size, Some(22));
+    }
+
+    #[test]
+    /// A nested folder refresh adds and removes descendants without losing siblings.
     fn selection_refresh_reconciles_a_folder_subtree_and_removes_a_deleted_row() {
         let base = tempfile::tempdir().unwrap();
         let left = base.path().join("left");
         let right = base.path().join("right");
         for side in [&left, &right] {
-            std::fs::create_dir_all(side.join("selected")).unwrap();
-            std::fs::create_dir_all(side.join("sibling")).unwrap();
-            std::fs::write(side.join("selected/old.txt"), b"old").unwrap();
-            std::fs::write(side.join("sibling/keep.txt"), b"keep").unwrap();
+            std::fs::create_dir_all(side.join("parent/selected")).unwrap();
+            std::fs::create_dir_all(side.join("parent/sibling")).unwrap();
+            std::fs::write(side.join("parent/selected/old.txt"), b"old").unwrap();
+            std::fs::write(side.join("parent/sibling/keep.txt"), b"keep").unwrap();
         }
         let (tree, sides) = full_tree(&left, &right);
-        std::fs::remove_file(left.join("selected/old.txt")).unwrap();
-        std::fs::write(left.join("selected/new.txt"), b"new selected row").unwrap();
+        std::fs::remove_file(left.join("parent/selected/old.txt")).unwrap();
+        std::fs::write(left.join("parent/selected/new.txt"), b"new selected row").unwrap();
 
-        let message = refresh(tree, sides, &left, &right, &["selected"]);
+        let message = refresh(tree, sides, &left, &right, &["parent/selected"]);
         assert!(
             matches!(&message, SelectionRefreshMessage::Done { .. }),
             "the selected folder did not refresh: {message:?}"
@@ -1938,16 +2078,16 @@ mod tests {
         tree.walk(&mut |node| nodes.push(node));
         assert!(nodes
             .iter()
-            .any(|node| node.rel == Path::new("selected/new.txt")));
+            .any(|node| node.rel == Path::new("parent/selected/new.txt")));
         let deleted = nodes
             .iter()
-            .find(|node| node.rel == Path::new("selected/old.txt"))
+            .find(|node| node.rel == Path::new("parent/selected/old.txt"))
             .unwrap();
         assert!(deleted.left.is_none());
         assert!(deleted.right.is_some());
         assert!(nodes
             .iter()
-            .any(|node| node.rel == Path::new("sibling/keep.txt")));
+            .any(|node| node.rel == Path::new("parent/sibling/keep.txt")));
     }
 
     #[test]

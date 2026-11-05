@@ -95,6 +95,7 @@ fn a_local_folder_scanned_as_a_source_matches_the_path_scanner() {
 }
 
 #[test]
+/// Scanning an archive selection returns only its subtree with matching facts.
 fn a_selected_archive_folder_scan_keeps_its_tree_and_source_facts() {
     let dir = tempfile::tempdir().unwrap();
     let source = zip_with(
