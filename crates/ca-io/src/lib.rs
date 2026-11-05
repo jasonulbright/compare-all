@@ -6,7 +6,7 @@
 //! (best effort if the OS refuses cleanup); unrelated siblings are never removed.
 //!
 //! This is not a power-loss guarantee. Callers own overwrite consent, parent
-//! creation and concurrent-change policy. Existing read-only and
+//! creation and concurrent-change policy. Existing read-only, hard-linked and
 //! non-regular targets (including symlinks) are refused at preparation time.
 //! Unix permission bits are preserved. Existing Windows files use `ReplaceFileW`;
 //! tests cover protected DACLs, the Hidden flag, named streams and creation time.
@@ -716,6 +716,8 @@ fn target_permissions(
                 Some("it is a folder")
             } else if !metadata.is_file() {
                 Some("it is not a regular file")
+            } else if has_multiple_links(path, &metadata)? {
+                Some("it has multiple hard links")
             } else if metadata.permissions().readonly() {
                 Some("it is read-only")
             } else {
@@ -731,6 +733,46 @@ fn target_permissions(
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
+    }
+}
+
+fn has_multiple_links(path: &Path, metadata: &fs::Metadata) -> io::Result<bool> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let _ = path;
+        Ok(metadata.nlink() > 1)
+    }
+    #[cfg(windows)]
+    {
+        use winsafe::prelude::*;
+        let name = windows_path(path)?;
+        let (file, _) = winsafe::HFILE::CreateFile(
+            &name,
+            winsafe::co::GENERIC::default(),
+            Some(
+                winsafe::co::FILE_SHARE::READ
+                    | winsafe::co::FILE_SHARE::WRITE
+                    | winsafe::co::FILE_SHARE::DELETE,
+            ),
+            None,
+            winsafe::co::DISPOSITION::OPEN_EXISTING,
+            winsafe::co::FILE_ATTRIBUTE::NORMAL,
+            None,
+            None,
+            None,
+        )
+        .map_err(|code| io::Error::from_raw_os_error(code.raw().cast_signed()))?;
+        let info = file
+            .GetFileInformationByHandle()
+            .map_err(|code| io::Error::from_raw_os_error(code.raw().cast_signed()))?;
+        let _ = metadata;
+        Ok(info.nNumberOfLinks > 1)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (path, metadata);
+        Ok(false)
     }
 }
 

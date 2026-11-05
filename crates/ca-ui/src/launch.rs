@@ -297,12 +297,11 @@ pub fn system_open_command(path: &std::path::Path) -> LaunchCommand {
 
 /// The command that shows `path` in the platform's file manager.
 ///
-/// A folder is opened directly, and only a path that is a folder when this
-/// call runs is opened: a request to open a file starts the program that
-/// handles the file. Every other item is selected in its folder, or its
-/// folder is opened where the platform has no selection. On macOS a folder
-/// that the system takes for a package is shown from the inside without a
-/// request to open it, because that request starts a program. On macOS and
+/// A path that is a folder when this call runs is opened as a folder where
+/// that is safe. On macOS every selected folder is revealed in Finder with
+/// `-R`, which avoids asking Launch Services to open a package as an
+/// application. Files are selected in their folder where the platform
+/// supports selection, or their containing folder is opened. On macOS and
 /// Linux the path is one process argument. On Windows it is a part between
 /// quotation marks of the command line that the file manager reads. No
 /// platform passes it through a shell.
@@ -341,7 +340,7 @@ fn explorer_command_on(
     path: &std::path::Path,
     selection: Selection,
     is_folder: impl Fn(&std::path::Path) -> bool,
-    mac_folder: impl FnOnce(&std::path::Path) -> MacFolder,
+    _mac_folder: impl FnOnce(&std::path::Path) -> MacFolder,
 ) -> LaunchCommand {
     // The kind a view names can be the kind of the other side of its row, or
     // of an item that is replaced after the scan. Only a folder is opened.
@@ -355,16 +354,7 @@ fn explorer_command_on(
     let open = |arguments: Vec<String>| (std::path::PathBuf::from("/usr/bin/open"), arguments);
     let select = |item: &std::path::Path| open(vec!["-R".to_owned(), path_argument(item)]);
     let (program, arguments) = match (os, selection) {
-        ("macos", Selection::Folders) => match mac_folder(path) {
-            MacFolder::Plain => open(vec![path_argument(path)]),
-            // Selecting an item of the package opens a window on the inside
-            // of the package and starts nothing.
-            MacFolder::Package {
-                inside: Some(inside),
-            } => select(&inside),
-            MacFolder::Package { inside: None } => select(path),
-        },
-        ("macos", Selection::Files) => select(path),
+        ("macos", Selection::Files | Selection::Folders) => select(path),
         // The parent of a path that is gone can be a file.
         (_, Selection::Files) => (
             std::path::PathBuf::from("xdg-open"),
@@ -704,9 +694,11 @@ mod tests {
             arguments("windows", base.path()),
             [format!("\"{}\"", windows_text(base.path()))]
         );
-        for os in ["macos", "linux"] {
-            assert_eq!(arguments(os, base.path()), [text(base.path())], "{os}");
-        }
+        assert_eq!(
+            arguments("macos", base.path()),
+            ["-R".to_owned(), text(base.path())]
+        );
+        assert_eq!(arguments("linux", base.path()), [text(base.path())]);
     }
 
     #[test]
@@ -759,7 +751,7 @@ mod tests {
     }
 
     #[test]
-    fn the_mac_file_manager_opens_a_plain_folder_and_never_asks_to_open_a_package() {
+    fn the_mac_file_manager_reveals_folders_without_opening_packages() {
         let arguments = |folder: &str, kind: MacFolder| {
             let command = explorer_command_on(
                 "macos",
@@ -771,26 +763,28 @@ mod tests {
             assert_eq!(command.program, PathBuf::from("/usr/bin/open"));
             command.arguments
         };
-        // The name does not decide: a folder with an extension that is no
-        // package opens, and a package with a plain name does not.
+        // A folder is selected in Finder even when Launch Services would
+        // treat it as an application package.
         for plain in [
             "/tmp/left/plain folder",
             "/tmp/left/release.v2",
             "/tmp/left",
         ] {
-            assert_eq!(arguments(plain, MacFolder::Plain), [plain]);
+            assert_eq!(
+                arguments(plain, MacFolder::Plain),
+                ["-R".to_owned(), plain.to_owned()]
+            );
         }
         for package in ["/tmp/left/Probe.app", "/tmp/left/link to a bundle"] {
-            let inside = PathBuf::from(package).join("Contents");
             let shown = arguments(
                 package,
                 MacFolder::Package {
-                    inside: Some(inside.clone()),
+                    inside: Some(PathBuf::from(package).join("Contents")),
                 },
             );
-            assert_eq!(shown, ["-R".to_owned(), inside.display().to_string()]);
+            assert_eq!(shown, ["-R".to_owned(), package.to_owned()]);
             let empty = arguments(package, MacFolder::Package { inside: None });
-            assert_eq!(empty, ["-R", package]);
+            assert_eq!(empty, ["-R".to_owned(), package.to_owned()]);
         }
     }
 
@@ -834,14 +828,12 @@ mod tests {
             MacFolder::Package { inside: None }
         );
 
-        // The whole command for the link asks for no open of the bundle.
+        // The whole command reveals the link without asking Launch Services
+        // to open its application bundle.
         let command = system_explorer_command(&link_to_bundle, Selection::Folders);
         assert_eq!(
             command.arguments,
-            [
-                "-R".to_owned(),
-                link_to_bundle.join("Contents").display().to_string()
-            ]
+            ["-R".to_owned(), link_to_bundle.display().to_string()]
         );
     }
 
@@ -1082,19 +1074,25 @@ mod tests {
                 assert!(select.arguments_as_written, "{path}");
             }
         }
-        // The command of every other platform and of every other builder
-        // leaves the quotation marks to the system.
-        for os in ["macos", "linux"] {
-            let command = explorer_command_on(
-                os,
-                "/work/a,b".as_ref(),
-                Selection::Folders,
-                |_| true,
-                |_| MacFolder::Plain,
-            );
-            assert_eq!(command.arguments, ["/work/a,b"]);
-            assert!(!command.arguments_as_written, "{os}");
-        }
+        // Other platform builders keep paths as process arguments.
+        let mac = explorer_command_on(
+            "macos",
+            "/work/a,b".as_ref(),
+            Selection::Folders,
+            |_| true,
+            |_| MacFolder::Plain,
+        );
+        assert_eq!(mac.arguments, ["-R", "/work/a,b"]);
+        assert!(!mac.arguments_as_written);
+        let linux = explorer_command_on(
+            "linux",
+            "/work/a,b".as_ref(),
+            Selection::Folders,
+            |_| true,
+            |_| MacFolder::Plain,
+        );
+        assert_eq!(linux.arguments, ["/work/a,b"]);
+        assert!(!linux.arguments_as_written);
         assert!(!super::system_open_command("/work/a,b".as_ref()).arguments_as_written);
         assert!(!entry().command(&context()).arguments_as_written);
     }

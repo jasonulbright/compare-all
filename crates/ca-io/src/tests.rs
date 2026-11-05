@@ -25,6 +25,21 @@ fn creates_and_replaces_complete_files() {
     assert_eq!(names(dir.path()), ["output"]);
 }
 
+#[test]
+fn replacement_refuses_a_file_with_multiple_hard_links() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("output");
+    let alias = dir.path().join("alias");
+    fs::write(&target, b"original").unwrap();
+    fs::hard_link(&target, &alias).unwrap();
+
+    let error = write_atomic(&target, b"replacement").unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    assert!(error.to_string().contains("multiple hard links"));
+    assert_eq!(fs::read(&target).unwrap(), b"original");
+    assert_eq!(fs::read(&alias).unwrap(), b"original");
+}
+
 #[cfg(unix)]
 #[test]
 fn replacement_and_failed_output_keep_the_ordinary_owner_group_and_mode() {
