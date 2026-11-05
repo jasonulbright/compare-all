@@ -652,7 +652,12 @@ mod tests {
         let command = system_explorer_command(&folder, Selection::Folders);
         #[cfg(target_os = "windows")]
         assert_eq!(command.arguments, [format!("\"{}\"", folder.display())]);
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            command.arguments,
+            ["-R".to_owned(), folder.display().to_string()]
+        );
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         assert_eq!(command.arguments, [folder.display().to_string()]);
     }
 

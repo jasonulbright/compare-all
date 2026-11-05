@@ -175,8 +175,26 @@ impl State {
             if let Ok(rest) = path.strip_prefix(&mount.prefix) {
                 let mut inside = VfsPath::root();
                 for part in rest.components() {
-                    let text = part.as_os_str().to_string_lossy();
-                    inside = inside.join(&text).map_err(|error| {
+                    // VfsPath stores UTF-8 and treats backslashes as separators.
+                    let text = part.as_os_str().to_str().ok_or_else(|| {
+                        refuse(
+                            io::ErrorKind::InvalidInput,
+                            format!(
+                                "cannot route a path under {}: a component is not valid Unicode",
+                                mount.prefix.display()
+                            ),
+                        )
+                    })?;
+                    if text.contains('\\') {
+                        return Err(refuse(
+                            io::ErrorKind::InvalidInput,
+                            format!(
+                                "cannot route a path under {}: a component contains a path separator",
+                                mount.prefix.display()
+                            ),
+                        ));
+                    }
+                    inside = inside.join(text).map_err(|error| {
                         refuse(
                             io::ErrorKind::InvalidInput,
                             format!(
@@ -642,18 +660,57 @@ mod tests {
     }
 
     #[test]
-    fn an_invalid_path_under_a_mount_never_falls_through_to_the_local_disk() {
-        let mounted = tempfile::tempdir().unwrap();
+    fn an_invalid_path_under_a_mount_never_falls_through_to_the_local_disk() -> std::io::Result<()>
+    {
+        let mounted = tempfile::tempdir()?;
         let prefix = mounted.path().join("mounted");
-        std::fs::create_dir(&prefix).unwrap();
+        std::fs::create_dir(&prefix)?;
         let local_target = prefix.join("victim.");
-        std::fs::write(&local_target, b"local file").unwrap();
+        std::fs::write(&local_target, b"local file")?;
 
-        let source = tempfile::tempdir().unwrap();
+        let source = tempfile::tempdir()?;
         let ops = SourceOps::new(vec![Mount::new(prefix, Source::local(source.path()))]);
-        let error = ops.remove_file(&local_target).unwrap_err();
+        let error = ops
+            .remove_file(&local_target)
+            .err()
+            .ok_or_else(|| std::io::Error::other("invalid mounted path was removed"))?;
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         assert!(local_target.exists());
         assert!(ops.identity_is_path(&local_target));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn routing_refuses_components_that_vfs_paths_would_change() -> std::io::Result<()> {
+        use std::os::unix::ffi::OsStringExt;
+
+        let mounted = tempfile::tempdir()?;
+        let prefix = mounted.path().join("mounted");
+        std::fs::create_dir(&prefix)?;
+        let source = tempfile::tempdir()?;
+        let nested = source.path().join("a");
+        std::fs::create_dir(&nested)?;
+        std::fs::write(nested.join("b"), b"separator target")?;
+        std::fs::write(source.path().join("name\u{fffd}"), b"lossy target")?;
+        let ops = SourceOps::new(vec![Mount::new(
+            prefix.clone(),
+            Source::local(source.path()),
+        )]);
+
+        let separator = prefix.join("a\\b");
+        let error = ops
+            .probe(&separator)
+            .err()
+            .ok_or_else(|| std::io::Error::other("mounted path component was split"))?;
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+
+        let invalid_utf8 = prefix.join(std::ffi::OsString::from_vec(b"name\xff".to_vec()));
+        let error = ops
+            .probe(&invalid_utf8)
+            .err()
+            .ok_or_else(|| std::io::Error::other("non-Unicode mounted path was rewritten"))?;
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        Ok(())
     }
 }

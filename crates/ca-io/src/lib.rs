@@ -69,7 +69,7 @@ pub fn write_atomic_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
 /// parent must already exist.
 pub fn open_log(path: &Path, append: bool) -> io::Result<File> {
     if append {
-        target_permissions(path, false, "append to")?;
+        target_permissions(path, false, "append to", false)?;
     } else {
         write_atomic(path, b"")?;
     }
@@ -83,7 +83,7 @@ pub fn open_log(path: &Path, append: bool) -> io::Result<File> {
 /// Returns [`io::ErrorKind::NotFound`] when the file is absent, or another
 /// error if the target is unsuitable or the removal fails.
 pub fn remove_file(path: &Path) -> io::Result<()> {
-    target_permissions(path, false, "remove")?;
+    target_permissions(path, false, "remove", false)?;
     fs::remove_file(path)
 }
 
@@ -347,7 +347,7 @@ fn replace_impl<T, E: From<io::Error>>(
     let extended_path = windows_extended_path(path)?;
     #[cfg(windows)]
     let path = extended_path.as_deref().unwrap_or(path);
-    let permissions = target_permissions(path, require_absent, "replace")?;
+    let permissions = target_permissions(path, require_absent, "replace", true)?;
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -700,6 +700,7 @@ fn target_permissions(
     path: &Path,
     require_absent: bool,
     operation: &str,
+    reject_multiple_links: bool,
 ) -> io::Result<Option<fs::Permissions>> {
     refuse_other_spelling(path)?;
     match fs::symlink_metadata(path) {
@@ -710,7 +711,7 @@ fn target_permissions(
                     "target appeared",
                 ));
             }
-            let multiple_links = {
+            let multiple_links = if reject_multiple_links {
                 #[cfg(windows)]
                 {
                     target_has_multiple_links(path, &metadata)?
@@ -719,6 +720,8 @@ fn target_permissions(
                 {
                     target_has_multiple_links(path, &metadata)
                 }
+            } else {
+                false
             };
             let refused = if metadata.file_type().is_symlink() {
                 Some("it is a link")
