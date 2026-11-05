@@ -74,8 +74,8 @@ pub use ops::plan::{
 };
 pub use rules::RulesEngine;
 pub use scan::{
-    scan, scan_source, scan_with, Attributes, Entry, EntryError, LinkKind, ScanError, ScanOptions,
-    ScanProgress, ScanResult,
+    scan, scan_source, scan_source_subtree, scan_with, Attributes, Entry, EntryError, LinkKind,
+    ScanError, ScanOptions, ScanProgress, ScanResult,
 };
 pub use source::{
     ArchiveFormat, ArchiveHandling, ArchiveTypes, EntryFacts, Limits, Source, SourceError,

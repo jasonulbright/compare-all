@@ -688,7 +688,7 @@ const FOLDER_MENUS: &[(&str, &[Entry])] = &[
             Entry::Run(Command::NewFolder, ACTIONABLE),
             Entry::Run(Command::CopyFilename, ACTIONABLE),
             Entry::Soon(Command::ToggleIgnored),
-            Entry::Soon(Command::RefreshSelection),
+            Entry::Run(Command::RefreshSelection, ACTIONABLE),
             Entry::Rule,
             Entry::Run(Command::Synchronize, "Nothing is waiting to be reconciled"),
             Entry::Rule,
@@ -7699,6 +7699,65 @@ mod tests {
         assert!(actions
             .iter()
             .all(|state| state.command.menu() == Menu::Actions));
+    }
+
+    #[test]
+    /// The Actions menu exposes refresh by its accessible label and starts it.
+    fn refresh_selection_runs_from_its_accessible_actions_menu_label() {
+        use ca_ui::testing::probe::Probe;
+        use std::cell::RefCell;
+
+        let context = context();
+        let files = tempfile::tempdir().unwrap();
+        let left = files.path().join("left");
+        let right = files.path().join("right");
+        std::fs::create_dir(&left).unwrap();
+        std::fs::create_dir(&right).unwrap();
+        std::fs::write(left.join("selected.txt"), "left").unwrap();
+        std::fs::write(right.join("selected.txt"), "right").unwrap();
+
+        let (_settings, mut app) = empty_app();
+        assert!(ca_ui::testing::wait_until(
+            std::time::Duration::from_secs(10),
+            || {
+                app.poll_store();
+                app.store().borrow().is_ready()
+            }
+        ));
+        app.open(
+            &OpenRequest::new(SessionKind::FolderCompare, left, right),
+            &context,
+        );
+        assert!(ca_ui::testing::wait_until(
+            std::time::Duration::from_secs(20),
+            || {
+                app.tabs[0].tick();
+                app.tabs[0].is_ready()
+            }
+        ));
+        app.tabs[0].run(Command::SelectAll);
+        app.declared = app.tabs[0].commands();
+        assert!(app
+            .declared_actions()
+            .iter()
+            .any(|state| state.command == Command::RefreshSelection && state.enabled));
+
+        let app = RefCell::new(app);
+        let mut probe = Probe::new(800.0, 600.0);
+        let mut draw_actions = |egui_context: &egui::Context| {
+            egui::CentralPanel::default().show(egui_context, |ui| {
+                app.borrow_mut().actions_menu(ui, &context);
+            });
+        };
+        probe.idle(&mut draw_actions);
+        probe.click(ACTIONS_MENU, &mut draw_actions).unwrap();
+        let refresh_label = "Refresh Selection\tShift+F5";
+        assert!(probe.find(refresh_label).unwrap().enabled);
+        probe.click(refresh_label, &mut draw_actions).unwrap();
+        assert!(
+            !app.borrow().tabs[0].is_ready(),
+            "clicking Refresh Selection did not start the scan"
+        );
     }
 
     #[test]

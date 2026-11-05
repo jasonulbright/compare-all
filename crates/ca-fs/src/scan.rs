@@ -233,6 +233,278 @@ pub fn scan_source(
     Ok(result)
 }
 
+/// Scan one selected entry and, when it is a folder, its descendants.
+///
+/// Paths in the returned result remain relative to `source`'s root, and the
+/// selected entry itself is included. A missing entry returns `Ok(None)`;
+/// other read failures are errors so a caller can keep its current tree.
+///
+/// # Errors
+/// Returns [`ScanError::Source`] when the source cannot resolve or list the
+/// selected entry, and [`ScanError::Io`] when a local parent cannot be read.
+pub fn scan_source_subtree(
+    source: &Source,
+    rel: &Path,
+    options: &ScanOptions,
+    cancel: &Cancel,
+) -> Result<Option<ScanResult>, ScanError> {
+    if rel.as_os_str().is_empty() {
+        return Err(ScanError::Source(
+            "the source root is not a selectable item".to_owned(),
+        ));
+    }
+    if cancel.is_cancelled() {
+        return Ok(Some(ScanResult {
+            cancelled: true,
+            root_incomplete: true,
+            ..ScanResult::default()
+        }));
+    }
+    let path = source
+        .entry_path(rel)
+        .map_err(|error| ScanError::Source(error.to_string()))?;
+
+    if source.is_local_folder() {
+        return scan_local_subtree(source, rel, options, cancel);
+    }
+
+    let listed = match source.file_system().metadata(&path) {
+        Ok(listed) => listed,
+        Err(ca_vfs::VfsError::NotFound { .. }) => return Ok(None),
+        Err(error) => return Err(ScanError::Source(error.to_string())),
+    };
+    let root_rel = native_path(&listed.path);
+    let mut result = ScanResult::default();
+    insert_source_entry(&mut result, &root_rel, &listed, options);
+
+    if listed.is_dir() {
+        match ca_vfs::walk(
+            source.file_system().as_ref(),
+            &path,
+            &ca_vfs::Cancel::from_flag(cancel.as_flag()),
+        ) {
+            Ok(entries) => {
+                for listed in entries {
+                    let entry_rel = native_path(&listed.path);
+                    insert_source_entry(&mut result, &entry_rel, &listed, options);
+                }
+            }
+            Err(ca_vfs::VfsError::Cancelled) => {
+                result.cancelled = true;
+                result.root_incomplete = true;
+            }
+            Err(ca_vfs::VfsError::NotFound { .. } | ca_vfs::VfsError::NotADirectory { .. }) => {
+                return Ok(None);
+            }
+            Err(error) => return Err(ScanError::Source(error.to_string())),
+        }
+    }
+    Ok(Some(result))
+}
+
+/// Read one selected local entry and include its children when it is a folder.
+fn scan_local_subtree(
+    source: &Source,
+    rel: &Path,
+    options: &ScanOptions,
+    cancel: &Cancel,
+) -> Result<Option<ScanResult>, ScanError> {
+    let parent_rel = rel.parent().unwrap_or_else(|| Path::new(""));
+    let parent_path = source.origin().join(parent_rel);
+    let Some(mut parent_scan) = scan_local_parent(&parent_path, options, cancel)? else {
+        return Ok(None);
+    };
+    if parent_scan.cancelled {
+        return Ok(Some(ScanResult {
+            cancelled: true,
+            root_incomplete: true,
+            ..ScanResult::default()
+        }));
+    }
+    let parent_name = local_final_name(rel)?;
+    let Some(mut root_entry) = take_local_selection(&mut parent_scan, &parent_name)? else {
+        return Ok(None);
+    };
+
+    let mut result = ScanResult::default();
+    if let Some(facts) = parent_scan.facts.remove(&parent_name) {
+        if facts != EntryFacts::default() {
+            result.facts.insert(rel.to_path_buf(), facts);
+        }
+    }
+    for error in parent_scan.errors {
+        if error.rel == parent_name {
+            result.errors.push(EntryError {
+                rel: rel.to_path_buf(),
+                message: error.message,
+            });
+        }
+    }
+    root_entry.rel = rel.to_path_buf();
+    root_entry.listing_incomplete = false;
+    if root_entry.is_dir {
+        let still_present =
+            scan_local_descendants(source, rel, options, cancel, &mut root_entry, &mut result)?;
+        if !still_present {
+            return Ok(None);
+        }
+    }
+
+    add_entry_error(&mut result, rel, &root_entry);
+    result.entries.insert(rel.to_path_buf(), root_entry);
+    Ok(Some(result))
+}
+
+/// Read a shallow listing of the selected entry's parent directory.
+fn scan_local_parent(
+    parent_path: &Path,
+    options: &ScanOptions,
+    cancel: &Cancel,
+) -> Result<Option<ScanResult>, ScanError> {
+    match std::fs::metadata(parent_path) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => return Ok(None),
+        Err(error) if is_missing_path(&error) => return Ok(None),
+        Err(error) => return Err(ScanError::Io(error)),
+    }
+    let shallow = ScanOptions {
+        max_depth: Some(1),
+        ..options.clone()
+    };
+    match scan_with(parent_path, &shallow, cancel, &|_| {}) {
+        Ok(scan) => Ok(Some(scan)),
+        Err(ScanError::Io(error)) if is_missing_path(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Whether a path lookup failed because the path vanished or crossed a file.
+fn is_missing_path(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+    )
+}
+
+/// Return the final component of a selected relative path.
+fn local_final_name(rel: &Path) -> Result<PathBuf, ScanError> {
+    rel.file_name().map(PathBuf::from).ok_or_else(|| {
+        ScanError::Source(format!(
+            "the selected path has no final component: {}",
+            rel.display()
+        ))
+    })
+}
+
+/// Remove the selected entry from its parent's shallow scan.
+fn take_local_selection(
+    parent_scan: &mut ScanResult,
+    parent_name: &Path,
+) -> Result<Option<Entry>, ScanError> {
+    if let Some(entry) = parent_scan.entries.remove(parent_name) {
+        return Ok(Some(entry));
+    }
+    if let Some(error) = parent_scan
+        .errors
+        .iter()
+        .find(|error| error.rel == parent_name)
+    {
+        return Err(ScanError::Source(error.message.clone()));
+    }
+    if parent_scan.root_incomplete {
+        let reason = parent_scan.errors.first().map_or_else(
+            || "the parent listing is incomplete".to_owned(),
+            |error| error.message.clone(),
+        );
+        return Err(ScanError::Source(reason));
+    }
+    Ok(None)
+}
+
+/// Read the selected folder's descendants under the configured depth limit.
+fn scan_local_descendants(
+    source: &Source,
+    rel: &Path,
+    options: &ScanOptions,
+    cancel: &Cancel,
+    root_entry: &mut Entry,
+    result: &mut ScanResult,
+) -> Result<bool, ScanError> {
+    let depth = rel.components().count();
+    let at_depth_limit = options.max_depth.is_some_and(|limit| depth >= limit);
+    if root_entry.refused || (root_entry.is_link() && !options.follow_links) || at_depth_limit {
+        root_entry.listing_incomplete = true;
+        return Ok(true);
+    }
+    let mut subtree_options = options.clone();
+    subtree_options.max_depth = options.max_depth.map(|limit| limit - depth);
+    let root_path = source.origin().join(rel);
+    let subtree = match scan_with(&root_path, &subtree_options, cancel, &|_| {}) {
+        Ok(scan) => scan,
+        Err(ScanError::Io(error)) if is_missing_path(&error) => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    root_entry.listing_incomplete = subtree.root_incomplete;
+    result.root_incomplete = subtree.root_incomplete;
+    prefix_result(result, subtree, rel);
+    Ok(true)
+}
+
+/// Add an entry's error unless the scan result already contains it.
+fn add_entry_error(result: &mut ScanResult, rel: &Path, entry: &Entry) {
+    if let Some(message) = entry.error.as_ref().filter(|message| {
+        !result
+            .errors
+            .iter()
+            .any(|error| error.rel == rel && error.message == **message)
+    }) {
+        result.errors.push(EntryError {
+            rel: rel.to_path_buf(),
+            message: message.clone(),
+        });
+    }
+}
+
+/// Convert one virtual source entry into a scan result row and facts.
+fn insert_source_entry(
+    result: &mut ScanResult,
+    rel: &Path,
+    listed: &ca_vfs::VfsEntry,
+    options: &ScanOptions,
+) {
+    let entry = convert(rel, listed, options);
+    if let Some(message) = entry.error.clone() {
+        result.errors.push(EntryError {
+            rel: rel.to_path_buf(),
+            message,
+        });
+    }
+    let facts = EntryFacts::of(listed);
+    if facts != EntryFacts::default() {
+        result.facts.insert(rel.to_path_buf(), facts);
+    }
+    result.entries.insert(rel.to_path_buf(), entry);
+}
+
+/// Add a selected folder's path prefix to all rows in its descendant scan.
+fn prefix_result(target: &mut ScanResult, mut source: ScanResult, prefix: &Path) {
+    for (rel, mut entry) in source.entries {
+        let rel = prefix.join(rel);
+        entry.rel.clone_from(&rel);
+        target.entries.insert(rel, entry);
+    }
+    for (rel, facts) in source.facts {
+        target.facts.insert(prefix.join(rel), facts);
+    }
+    target
+        .errors
+        .extend(source.errors.drain(..).map(|error| EntryError {
+            rel: prefix.join(error.rel),
+            message: error.message,
+        }));
+    target.cancelled = source.cancelled;
+}
+
 /// The native relative path one virtual path names.
 fn native_path(path: &ca_vfs::VfsPath) -> PathBuf {
     let mut out = PathBuf::new();
@@ -778,7 +1050,10 @@ fn attributes(meta: &Metadata, name: &str) -> Attributes {
     reason = "test setup runs a platform tool directly"
 )]
 mod tests {
-    use super::{scan, scan_with, Cancel, LinkKind, ScanOptions, ScanProgress};
+    use super::{
+        scan, scan_source_subtree, scan_with, Cancel, LinkKind, ScanOptions, ScanProgress,
+    };
+    use crate::source::Source;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1031,5 +1306,79 @@ mod tests {
             assert_eq!(scanned.modified, Some(listed), "{fidelity:?}");
             assert_eq!(scanned.created, Some(listed), "{fidelity:?}");
         }
+    }
+
+    #[test]
+    /// Scanning a selected file excludes siblings and reports a missing path.
+    fn a_selected_file_scan_reads_only_that_entry() {
+        let dir = tree();
+        let source = Source::local(dir.path());
+        let result = scan_source_subtree(
+            &source,
+            Path::new("a.txt"),
+            &ScanOptions::default(),
+            &Cancel::new(),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(result.entries[Path::new("a.txt")].size, 5);
+        assert!(scan_source_subtree(
+            &source,
+            Path::new("missing.txt"),
+            &ScanOptions::default(),
+            &Cancel::new(),
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    #[test]
+    /// A selected folder includes its row and honors the configured depth.
+    fn a_selected_folder_scan_includes_its_row_and_respects_the_depth_limit() {
+        let dir = tree();
+        std::fs::create_dir_all(dir.path().join("sub/deeper")).unwrap();
+        std::fs::write(dir.path().join("sub/deeper/c.txt"), b"deep").unwrap();
+        let source = Source::local(dir.path());
+        let result = scan_source_subtree(
+            &source,
+            Path::new("sub"),
+            &ScanOptions {
+                max_depth: Some(2),
+                ..ScanOptions::default()
+            },
+            &Cancel::new(),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(result.entries.contains_key(Path::new("sub")));
+        assert!(result.entries.contains_key(Path::new("sub/b.txt")));
+        assert!(result.entries[Path::new("sub/deeper")].listing_incomplete);
+        assert!(!result.entries.contains_key(Path::new("sub/deeper/c.txt")));
+    }
+
+    #[test]
+    /// A selected directory link remains a leaf when following links is off.
+    fn a_selected_directory_link_is_not_followed_when_the_scan_disallows_it() {
+        let dir = tree();
+        let target = dir.path().join("sub");
+        let link = dir.path().join("alias");
+        if !directory_link(&link, &target) {
+            return;
+        }
+        let source = Source::local(dir.path());
+        let result = scan_source_subtree(
+            &source,
+            Path::new("alias"),
+            &ScanOptions::default(),
+            &Cancel::new(),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(result.entries.contains_key(Path::new("alias")));
+        assert!(!result.entries.contains_key(Path::new("alias/b.txt")));
     }
 }

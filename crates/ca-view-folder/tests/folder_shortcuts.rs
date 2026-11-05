@@ -3,11 +3,13 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, missing_docs)]
 
+use ca_fs::Side;
 use ca_session::SessionKind;
 use ca_ui::command::{route, route_with, Command, Keystroke, MenuView, ShortcutTable};
 use ca_ui::testing::context;
 use ca_ui::testing::probe::{self, Probe};
 use ca_ui::view::{OpenRequest, SessionView};
+use ca_view_folder::selection::ClickKind;
 use ca_view_folder::{FolderMergeView, FolderSyncView, FolderView};
 use egui::Key;
 use std::path::{Path, PathBuf};
@@ -135,6 +137,22 @@ fn cursor(view: &FolderView) -> Option<PathBuf> {
     view.selection().cursor().map(|(_, rel)| rel.to_path_buf())
 }
 
+/// Select one visible path on one side of a folder view.
+fn select_path(view: &mut FolderView, side: Side, rel: &str) {
+    let rows = view.rows().to_vec();
+    let arena = view.arena().clone();
+    let position = rows
+        .iter()
+        .position(|row| {
+            arena
+                .node(row.node)
+                .is_some_and(|node| node.rel == Path::new(rel))
+        })
+        .unwrap();
+    view.selection_mut()
+        .click(side, position, &rows, &arena, ClickKind::Replace);
+}
+
 fn expect(view: &mut impl SessionView, command: Command) {
     assert!(view.accepts(command), "{command:?} was refused");
     view.run(command);
@@ -160,6 +178,7 @@ fn the_folder_keys_reach_the_commands() {
     key(Keystroke::plain(Key::F3), Command::FindNext);
     key(Keystroke::with_shift(Key::F3), Command::FindPrevious);
     key(Keystroke::with_command(Key::F5), Command::Recompare);
+    key(Keystroke::with_shift(Key::F5), Command::RefreshSelection);
     key(
         Keystroke::with_command_shift(Key::A),
         Command::SelectAllFiles,
@@ -203,6 +222,10 @@ fn a_folder_sync_has_no_copy_keys() {
     let fixture = Fixture::new();
     let sync = FolderSyncView::from(fixture.view());
     assert_eq!(sync.menu_view(), MenuView::FolderSync);
+    assert_eq!(
+        route(MenuView::FolderSync, Keystroke::with_shift(Key::F5)),
+        Some(Command::RefreshSelection),
+    );
     for stroke in [
         Keystroke::with_command(Key::R),
         Keystroke::with_command(Key::L),
@@ -235,6 +258,62 @@ fn next_and_previous_difference_walk_the_differences_and_open_folders() {
     let before = cursor(&view).unwrap();
     assert_ne!(last, before);
     assert!(seen.contains(&before));
+}
+
+#[test]
+/// Refresh the chosen row while leaving an unselected disk change untouched.
+fn refresh_selection_updates_only_selected_rows_in_folder_compare() {
+    let fixture = Fixture::new();
+    let mut view = fixture.view();
+    refused(&view, Command::RefreshSelection);
+
+    fixture.write("left", "same.txt", b"new selected contents");
+    fixture.write("left", "newer.txt", b"a much longer unselected file");
+    select_path(&mut view, Side::Left, "same.txt");
+    expect(&mut view, Command::RefreshSelection);
+    assert!(wait(|| {
+        view.tick();
+        SessionView::is_ready(&view)
+    }));
+
+    let node = |rel: &str| {
+        let index = view.arena().index_of(Path::new(rel)).unwrap();
+        view.arena().node(index).unwrap().clone()
+    };
+    let selected = node("same.txt");
+    assert_eq!(selected.left.map(|side| side.size), Some(21));
+    assert_eq!(selected.right.map(|side| side.size), Some(6));
+    assert!(view.selection().contains(Side::Left, Path::new("same.txt")));
+
+    let untouched = node("newer.txt");
+    assert_eq!(untouched.left.map(|side| side.size), Some(10));
+}
+
+#[test]
+/// Refresh the selected row in Folder Sync after its preview becomes ready.
+fn refresh_selection_is_available_in_folder_sync_after_its_preview_finishes() {
+    let fixture = Fixture::new();
+    let mut sync = fixture.sync_view();
+    assert!(wait(|| {
+        sync.tick();
+        sync.view_mut().sync_pending() > 0
+    }));
+    fixture.write("left", "same.txt", b"changed in sync mode");
+    select_path(sync.view_mut(), Side::Left, "same.txt");
+    assert!(sync.accepts(Command::RefreshSelection));
+    expect(&mut sync, Command::RefreshSelection);
+    assert!(wait(|| {
+        sync.tick();
+        sync.accepts(Command::RefreshSelection)
+    }));
+
+    let index = sync
+        .view_mut()
+        .arena()
+        .index_of(Path::new("same.txt"))
+        .unwrap();
+    let node = sync.view_mut().arena().node(index).unwrap();
+    assert_eq!(node.left.map(|side| side.size), Some(20));
 }
 
 #[test]
