@@ -424,20 +424,9 @@ fn replacing_a_dangling_directory_symlink_succeeds() {
 #[test]
 fn a_failed_staged_rename_restores_the_file_moved_to_backup() {
     let directory = fixture();
-    let settings_dir = tempfile::tempdir().unwrap();
     let server =
         SshTestServer::start_failing_rename_number(directory.path(), "operator", &password(), 2);
-    let store = KnownHosts::new(settings_dir.path().join("known_hosts"));
-    store
-        .record(
-            "127.0.0.1",
-            server.port(),
-            &server.host_key_type,
-            &server.host_key,
-        )
-        .unwrap();
-    let settings = profile(&server, &settings_dir.path().join("known_hosts"));
-    let fs = SftpFs::connect(&settings, &context(), &Cancel::new()).unwrap();
+    let (_settings_dir, _settings, _server, fs) = connected_server(server);
 
     let error = fs
         .write_file(
