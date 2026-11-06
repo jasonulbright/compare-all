@@ -17,7 +17,7 @@ use crate::limits::carry;
 /// deadline are examined again.
 const POLL_SLICE: Duration = Duration::from_millis(200);
 
-/// A point in time a call must finish by.
+/// A point in time by which a stalled call must make progress.
 #[derive(Debug, Clone, Copy)]
 pub struct Deadline {
     at: Option<Instant>,

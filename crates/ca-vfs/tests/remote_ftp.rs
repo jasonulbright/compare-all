@@ -459,7 +459,7 @@ fn a_secured_profile_with_no_transport_configuration_is_refused() {
 }
 
 #[test]
-fn a_transfer_that_keeps_moving_outlasts_the_call_timeout() {
+fn a_transfer_that_keeps_moving_outlasts_the_stall_timeout() {
     let directory = fixture();
     let options = Options {
         account: Some(("operator".to_owned(), "hunter2".to_owned())),
@@ -472,7 +472,7 @@ fn a_transfer_that_keeps_moving_outlasts_the_call_timeout() {
     context.call_timeout = Duration::from_millis(1_000);
     let fs = FtpFs::connect(&profile(&server, options), &context, &Cancel::new()).unwrap();
 
-    // Eighteen bytes at one byte per interval take longer than the call
+    // Eighteen bytes at one byte per interval take longer than the stall
     // timeout, while no single wait comes near it.
     let started = std::time::Instant::now();
     let mut handle = fs

@@ -13,10 +13,13 @@
 //!
 //! # Bounds
 //!
-//! Every call has a deadline and polls the caller's
-//! [`Cancel`](crate::Cancel). Listings and reads are charged against
-//! [`Limits`](crate::Limits), so a server that answers a listing request with
-//! an endless stream costs the ceiling rather than the caller's memory.
+//! Remote operations are bounded by `call_timeout`, with details depending on
+//! the transport. Progress-aware streams renew their inactivity deadline as
+//! bytes arrive, so a steady transfer may outlast `call_timeout`. SFTP applies
+//! it to each operation. Cancellation is checked at transport-defined points
+//! and may not interrupt work already in flight. Listings and reads are
+//! charged against [`Limits`](crate::Limits), so an endless listing costs the
+//! ceiling rather than the caller's memory.
 //!
 //! # Secrets
 //!
@@ -86,7 +89,8 @@ pub struct RemoteContext {
     pub secrets: Arc<dyn SecretStore>,
     /// Ceilings on what one listing or one read may cost.
     pub limits: Limits,
-    /// How long one call may take before it fails.
+    /// Timeout used by remote operations; progress-aware streams renew it as
+    /// bytes arrive.
     pub call_timeout: Duration,
     /// Where accepted secure shell host keys are recorded. A profile that
     /// names its own store overrides this.
@@ -124,7 +128,7 @@ impl RemoteContext {
         }
     }
 
-    /// A deadline one call from now.
+    /// An inactivity deadline for transports that use progress-aware I/O.
     #[must_use]
     pub fn deadline(&self) -> Deadline {
         Deadline::after(self.call_timeout)

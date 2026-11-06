@@ -43,6 +43,23 @@ fn replacement_refuses_a_file_with_multiple_hard_links() -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
+#[test]
+fn windows_link_count_probe_needs_no_shared_file_access() -> io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let dir = tempfile::tempdir()?;
+    let target = dir.path().join("output");
+    fs::write(&target, b"original")?;
+    let _held = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(&target)?;
+    let metadata = fs::symlink_metadata(&target)?;
+    assert!(!target_has_multiple_links(&target, &metadata)?);
+    Ok(())
+}
+
 #[test]
 fn appending_and_removing_do_not_refuse_multiple_hard_links() -> io::Result<()> {
     let dir = tempfile::tempdir()?;
