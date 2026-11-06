@@ -525,6 +525,7 @@ impl russh_sftp::server::Handler for SftpHandler {
         let target = self
             .resolve(&filename)
             .ok_or(StatusCode::PermissionDenied)?;
+        #[cfg(windows)]
         let metadata = std::fs::symlink_metadata(&target).map_err(|_| StatusCode::NoSuchFile)?;
         #[cfg(windows)]
         let remove = {
