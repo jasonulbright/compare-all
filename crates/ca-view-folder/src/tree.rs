@@ -804,6 +804,7 @@ mod tests {
         assert_eq!(rows[1].depth, 1);
     }
 
+    /// Ignoring a folder rolls its differences into matching statuses and totals.
     #[test]
     fn ignoring_a_folder_makes_its_differences_match() {
         let arena = Arena::from_root(&sample());
@@ -839,6 +840,7 @@ mod tests {
         assert!(same_filter[different]);
     }
 
+    /// A child override restores its difference under an ignored folder.
     #[test]
     fn a_child_override_restores_its_difference_under_an_ignored_folder() {
         let arena = Arena::from_root(&sample());
@@ -859,6 +861,7 @@ mod tests {
         assert!(!ignored[different]);
     }
 
+    /// Ignoring a row preserves its error status and error count.
     #[test]
     fn ignoring_a_row_does_not_hide_an_error() {
         let arena = Arena::from_root(&folder("", vec![file("unreadable.txt", NodeStatus::Error)]));

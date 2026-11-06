@@ -4907,6 +4907,7 @@ mod stale_results {
         control
     }
 
+    /// Folder Sync explains why Ignored stays disabled even with a selection.
     #[test]
     fn ignored_is_disabled_with_a_specific_reason_on_the_sync_tab() {
         use crate::selection::{Scope, SelectRule};
@@ -4925,6 +4926,7 @@ mod stale_results {
         );
     }
 
+    /// Folder Compare names empty selection, scan, and operation refusal states.
     #[test]
     fn ignored_refusal_names_the_compare_scan_and_operation_blockers() {
         use crate::{

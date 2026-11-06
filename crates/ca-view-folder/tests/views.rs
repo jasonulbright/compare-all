@@ -76,6 +76,7 @@ fn a_content_comparison_that_runs_to_the_end_leaves_the_view_ready() {
     assert!(view.arena().totals().files > 0);
 }
 
+/// Ignored rows act as matches in navigation, selection, and reports.
 #[test]
 fn ignored_folder_rows_count_as_matching_and_leave_difference_selection() {
     let dir = fixture();

@@ -7701,8 +7701,8 @@ mod tests {
             .all(|state| state.command.menu() == Menu::Actions));
     }
 
-    #[test]
     /// The Actions menu toggles Ignored and starts Refresh Selection by label.
+    #[test]
     fn ignored_and_refresh_selection_run_from_accessible_actions_labels() {
         use ca_ui::testing::probe::Probe;
         use std::cell::RefCell;

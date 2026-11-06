@@ -166,12 +166,12 @@ fn half_a_million_nodes_paint_inside_the_budget_while_results_arrive() {
     assert!(worst <= BUDGET, "worst frame was {worst:?}");
 }
 
+/// Measure ignored-state rebuilds and navigation over half a million rows.
 #[test]
 #[cfg_attr(
     debug_assertions,
     ignore = "wall-clock budget holds for release builds"
 )]
-/// Measure ignored-state rebuilds and per-frame navigation over half a million rows.
 fn ignoring_a_half_million_node_tree_rebuilds_and_navigates_within_budget() {
     const ENTRIES: usize = 500_500;
     const REBUILD_BUDGET: Duration = Duration::from_secs(20);
