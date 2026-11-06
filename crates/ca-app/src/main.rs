@@ -166,6 +166,7 @@ fn run_window(
                 let Some((startup, stored)) = taken else {
                     return Err("the start data was already used".into());
                 };
+                ca_ui::font::apply_chrome_scale(&creation.egui_ctx);
                 renderer::record_active(chosen);
                 ca_app::startup::mark_window_started();
                 std::thread::spawn(|| {

@@ -7,6 +7,40 @@
 
 use ca_session::options::provisional::{MAXIMUM_POINT_SIZE, MINIMUM_POINT_SIZE};
 
+/// Point size of small chrome labels.
+pub const CHROME_SMALL_POINT_SIZE: f32 = 9.0;
+/// Point size of body and button chrome.
+pub const CHROME_BODY_POINT_SIZE: f32 = 12.5;
+/// Point size of chrome headings.
+pub const CHROME_HEADING_POINT_SIZE: f32 = 18.0;
+/// Point size of the default monospace text role.
+pub const CHROME_MONOSPACE_POINT_SIZE: f32 = 12.0;
+/// Shared line-height ratio for file content panes.
+pub const CONTENT_ROW_HEIGHT_RATIO: f32 = 1.45;
+
+/// Apply the shared proportional and monospace size scale to an egui context.
+pub fn apply_chrome_scale(context: &egui::Context) {
+    context.style_mut(|style| {
+        style.text_styles.insert(
+            egui::TextStyle::Small,
+            egui::FontId::proportional(CHROME_SMALL_POINT_SIZE),
+        );
+        let body = egui::FontId::proportional(CHROME_BODY_POINT_SIZE);
+        style
+            .text_styles
+            .insert(egui::TextStyle::Body, body.clone());
+        style.text_styles.insert(egui::TextStyle::Button, body);
+        style.text_styles.insert(
+            egui::TextStyle::Heading,
+            egui::FontId::proportional(CHROME_HEADING_POINT_SIZE),
+        );
+        style.text_styles.insert(
+            egui::TextStyle::Monospace,
+            egui::FontId::monospace(CHROME_MONOSPACE_POINT_SIZE),
+        );
+    });
+}
+
 /// Smallest point size a view draws at.
 ///
 /// The bound is the one the options page accepts, so a size reached by zooming
@@ -26,6 +60,7 @@ pub const STEP: f32 = 1.0;
 pub struct FontSize {
     configured: f32,
     current: f32,
+    pixels_per_point: f32,
     zoomed: bool,
 }
 
@@ -37,7 +72,15 @@ impl FontSize {
         Self {
             configured,
             current: configured,
+            pixels_per_point: 1.0,
             zoomed: false,
+        }
+    }
+
+    /// Set the display scale used to snap row heights to physical pixels.
+    pub fn set_pixels_per_point(&mut self, pixels_per_point: f32) {
+        if pixels_per_point.is_finite() && pixels_per_point > 0.0 {
+            self.pixels_per_point = pixels_per_point;
         }
     }
 
@@ -103,11 +146,14 @@ impl FontSize {
         true
     }
 
-    /// The height of one row at this size, with the padding the options state.
+    /// The height of one row at this size, snapped to the physical pixel grid.
     #[must_use]
     pub fn row_height(&self, ratio: f32, extra_spacing: u32) -> f32 {
         let extra = f32::from(u16::try_from(extra_spacing).unwrap_or(u16::MAX));
-        (self.current * ratio).round().max(1.0) + extra
+        (self.current.mul_add(ratio, extra) * self.pixels_per_point)
+            .round()
+            .max(1.0)
+            / self.pixels_per_point
     }
 }
 
@@ -183,5 +229,57 @@ mod tests {
         assert!((size.row_height(1.45, 3) - 18.0).abs() < f32::EPSILON);
         size.zoom(4.0);
         assert!((size.row_height(1.45, 0) - 20.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn the_row_height_snaps_to_the_physical_pixel_grid() {
+        let mut size = FontSize::new(10.5);
+        for (scale, expected_pixels) in [(1.0, 15.0), (1.25, 19.0), (1.5, 23.0), (2.0, 30.0)] {
+            size.set_pixels_per_point(scale);
+            let height = size.row_height(1.45, 0);
+            let pixels = height * scale;
+            assert!(
+                (pixels - expected_pixels).abs() < 0.0001,
+                "physical row height {pixels} at {scale} pixels per point did not match {expected_pixels}"
+            );
+        }
+        assert!((size.row_height(1.45, 0) - 15.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn an_invalid_display_scale_does_not_break_row_height() {
+        let mut size = FontSize::new(10.5);
+        size.set_pixels_per_point(f32::NAN);
+        size.set_pixels_per_point(0.0);
+        assert!((size.row_height(1.45, 0) - 15.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn chrome_roles_use_the_shared_type_scale() {
+        let context = egui::Context::default();
+        super::apply_chrome_scale(&context);
+        let style = context.style();
+        assert_eq!(
+            style.text_styles.get(&egui::TextStyle::Small),
+            Some(&egui::FontId::proportional(super::CHROME_SMALL_POINT_SIZE))
+        );
+        assert_eq!(
+            style.text_styles.get(&egui::TextStyle::Body),
+            Some(&egui::FontId::proportional(super::CHROME_BODY_POINT_SIZE))
+        );
+        assert_eq!(
+            style.text_styles.get(&egui::TextStyle::Button),
+            Some(&egui::FontId::proportional(super::CHROME_BODY_POINT_SIZE))
+        );
+        assert_eq!(
+            style.text_styles.get(&egui::TextStyle::Heading),
+            Some(&egui::FontId::proportional(
+                super::CHROME_HEADING_POINT_SIZE
+            ))
+        );
+        assert_eq!(
+            style.text_styles.get(&egui::TextStyle::Monospace),
+            Some(&egui::FontId::monospace(super::CHROME_MONOSPACE_POINT_SIZE))
+        );
     }
 }

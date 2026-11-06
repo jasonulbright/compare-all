@@ -359,6 +359,7 @@ impl TextEditView {
 
     fn follow_options(&mut self, ctx: &egui::Context) {
         let options = ca_ui::options::current(ctx);
+        self.font.set_pixels_per_point(ctx.pixels_per_point());
         self.font.follow(options.editor_point_size());
         self.line_spacing = options.extra_line_spacing();
         self.find_from_word = options.stored.text_editing.find_uses_current_word;

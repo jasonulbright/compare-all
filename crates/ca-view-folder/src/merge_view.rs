@@ -2220,7 +2220,7 @@ impl FolderMergeView {
         let columns = self.columns();
         let width = ui.available_width();
         let column_width = ((width - ACTION_WIDTH) / columns.len().max(1) as f32).max(40.0);
-        let font = egui::FontId::proportional(13.0);
+        let font = egui::TextStyle::Body.resolve(ui.style());
         let target = self.settings.merge.target.clone();
         let mut clicked: Option<(usize, Option<Pane>, bool, bool)> = None;
         ui.horizontal(|ui| {

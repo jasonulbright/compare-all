@@ -46,12 +46,12 @@ use thumbnail::Strip;
 /// The tests measure against this; a frame asks the view, because the size
 /// follows the options document.
 #[cfg(test)]
-const ROW_HEIGHT: f32 = 19.0;
+const ROW_HEIGHT: f32 = 15.0;
 /// Row height as a multiple of the display font size.
 ///
 /// The default editor point size times this ratio is [`ROW_HEIGHT`], so a build
 /// that states no font size keeps the measured row height.
-const ROW_HEIGHT_RATIO: f32 = 1.81;
+const ROW_HEIGHT_RATIO: f32 = ca_ui::font::CONTENT_ROW_HEIGHT_RATIO;
 /// Height of the column header row.
 const HEADER_HEIGHT: f32 = 22.0;
 /// Width of the row number and status gutter.
@@ -402,6 +402,7 @@ impl TableView {
     /// Take the sizes the options document now states.
     fn follow_options(&mut self, ctx: &egui::Context) {
         let options = ca_ui::options::current(ctx);
+        self.font.set_pixels_per_point(ctx.pixels_per_point());
         self.font.follow(options.editor_point_size());
         self.line_spacing = options.extra_line_spacing();
         self.save_rules = ca_ui::save::SaveRules::from_options(&options.stored);
@@ -1761,7 +1762,7 @@ impl TableView {
         columns: &std::ops::Range<usize>,
     ) {
         painter.rect_filled(areas.header, 0.0, palette.header_background);
-        let font = egui::FontId::proportional(self.font.points());
+        let font = egui::TextStyle::Body.resolve(ui.style());
         let mut hide_column = None;
         for (pane_index, pane) in [areas.left, areas.right].into_iter().enumerate() {
             let origin = pane.left() + areas.gutter - self.horizontal;
@@ -1843,7 +1844,7 @@ impl TableView {
         if pane.width() <= 0.0 {
             return;
         }
-        let font = egui::FontId::proportional(self.font.points());
+        let font = egui::FontId::monospace(self.font.points());
         let cells = egui::Rect::from_min_max(
             egui::pos2(pane.left() + gutter, pane.top()),
             egui::pos2(pane.right(), pane.bottom()),
@@ -3851,7 +3852,11 @@ mod tests {
         let source = FakeSource::repeating(1_000_000, 50, &[RowStatus::Different]);
         let grid = crate::model::Grid::new(Arc::new(source));
         let rows = ca_ui::scroll::RowScroll::top().visible(800.0, ROW_HEIGHT, grid.visual_rows());
-        assert!(rows.len() <= 45, "laid out {} rows", rows.len());
+        assert!(
+            rows.len() <= 55,
+            "laid out {} rows at {ROW_HEIGHT}-point rows",
+            rows.len()
+        );
         let columns = grid.visible_columns(0.0, 600.0);
         assert!(columns.len() <= 8, "laid out {} columns", columns.len());
     }

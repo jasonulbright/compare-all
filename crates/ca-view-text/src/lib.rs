@@ -64,9 +64,9 @@ const SCROLLBAR: f32 = 12.0;
 /// The size is chosen for the row height it produces: at this size and at a
 /// display scale of one, [`TextView::row_height`] is fifteen points, which is
 /// the measured row height.
-const DEFAULT_FONT_SIZE: f32 = 10.5;
+const DEFAULT_FONT_SIZE: f32 = ca_session::options::provisional::EDITOR_POINT_SIZE;
 /// Row height as a multiple of the display font size.
-const ROW_HEIGHT_RATIO: f32 = 1.45;
+const ROW_HEIGHT_RATIO: f32 = ca_ui::font::CONTENT_ROW_HEIGHT_RATIO;
 /// Greatest context line count the toolbar offers, the same as the Text
 /// Editing page offers.
 const CONTEXT_LINES_LIMIT: u32 = 99;
@@ -1421,6 +1421,7 @@ impl TextView {
     fn follow_options(&mut self, ctx: &egui::Context) {
         let options = ca_ui::options::current(ctx);
         let before = (self.font.points(), self.line_spacing);
+        self.font.set_pixels_per_point(ctx.pixels_per_point());
         self.font.follow(options.editor_point_size());
         self.line_spacing = options.extra_line_spacing();
         self.navigation = options.stored.next_difference.clone();
