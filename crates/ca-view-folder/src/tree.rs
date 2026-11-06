@@ -464,7 +464,7 @@ impl Arena {
             }
             below[index] = flags;
             statuses[index] = if node.is_dir {
-                if node.status.is_structural() && !ignored[index] {
+                if !ignored[index] && (node.status.is_structural() || node.children.is_empty()) {
                     node.status
                 } else {
                     ca_fs::folder_status(flags, node.own_error)
@@ -874,6 +874,30 @@ mod tests {
         assert_eq!(statuses[index], NodeStatus::Error);
         assert!(ignored[index]);
         assert_eq!(arena.totals_with_statuses(&statuses).errors, 1);
+    }
+
+    /// An override on another row leaves an unrolled empty folder unchanged.
+    #[test]
+    fn ignoring_another_row_preserves_an_empty_folder_status() {
+        let arena = Arena::from_root(&folder(
+            "",
+            vec![
+                folder("empty", Vec::new()),
+                file("different.txt", NodeStatus::Different),
+            ],
+        ));
+        let overrides = HashMap::from([(PathBuf::from("different.txt"), true)]);
+        let (statuses, ignored) = arena.statuses_with_ignored(&overrides);
+        let empty = arena.index_of(std::path::Path::new("empty")).unwrap() as usize;
+
+        assert_eq!(statuses[empty], NodeStatus::NotCompared);
+        assert!(!ignored[empty]);
+        let same_filter = arena.visibility_with_statuses(
+            DisplayFilter::ShowSame,
+            FolderDisplayFilter::default(),
+            &statuses,
+        );
+        assert!(!same_filter[empty]);
     }
 
     #[test]
