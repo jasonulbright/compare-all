@@ -44,9 +44,9 @@ use std::sync::Arc;
 /// Width of the overview strip.
 const THUMBNAIL_WIDTH: f32 = 26.0;
 /// Display font size a new view starts at.
-const DEFAULT_FONT_SIZE: f32 = 10.5;
+const DEFAULT_FONT_SIZE: f32 = ca_session::options::provisional::EDITOR_POINT_SIZE;
 /// Row height as a multiple of the display font size.
-const ROW_HEIGHT_RATIO: f32 = 1.45;
+const ROW_HEIGHT_RATIO: f32 = ca_ui::font::CONTENT_ROW_HEIGHT_RATIO;
 /// Columns kept for line numbers, in characters.
 const LINE_NUMBER_COLUMNS: f32 = 5.0;
 /// Width of the take button column at the left edge of the output gutter.
@@ -822,6 +822,7 @@ impl MergeView {
     fn follow_options(&mut self, ctx: &egui::Context) {
         let options = ca_ui::options::current(ctx);
         let before = (self.font.points(), self.line_spacing);
+        self.font.set_pixels_per_point(ctx.pixels_per_point());
         self.font.follow(options.editor_point_size());
         self.line_spacing = options.extra_line_spacing();
         self.save_rules = ca_ui::save::SaveRules::from_options(&options.stored);
@@ -2314,7 +2315,7 @@ impl MergeView {
             header_rect.left_center() + egui::vec2(4.0, 0.0),
             egui::Align2::LEFT_CENTER,
             widgets::elide_to_width(ui, &self.pane_title(pane), rect.width() - 8.0),
-            egui::FontId::proportional(self.font_size()),
+            egui::TextStyle::Body.resolve(ui.style()),
             palette.unchanged_text,
         );
         let body =

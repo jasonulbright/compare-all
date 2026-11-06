@@ -10,7 +10,7 @@
 /// height does not change when the options document names no font.
 pub const EDITOR_POINT_SIZE: f32 = 10.5;
 /// Point size of the byte pane font.
-pub const HEX_POINT_SIZE: f32 = 13.0;
+pub const HEX_POINT_SIZE: f32 = EDITOR_POINT_SIZE;
 /// Point size of every remaining listing.
 pub const LISTING_POINT_SIZE: f32 = 12.0;
 /// Point size of a folder listing when the system font is not used.

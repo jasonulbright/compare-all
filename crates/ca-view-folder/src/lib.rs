@@ -2677,7 +2677,7 @@ impl FolderView {
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, palette.folder_header_background);
         let mut clicked: Option<SortColumn> = None;
-        let font = egui::FontId::proportional(12.0);
+        let font = egui::TextStyle::Body.resolve(ui.style());
         for (index, pane) in [layout.left, layout.right].into_iter().enumerate() {
             for (column, span) in [
                 (SortColumn::Name, pane.name),

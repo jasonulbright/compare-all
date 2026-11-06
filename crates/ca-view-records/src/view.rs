@@ -29,7 +29,7 @@ use std::sync::Arc;
 pub mod editing;
 
 /// Row height as a multiple of the display font size.
-const ROW_HEIGHT_RATIO: f32 = 1.81;
+const ROW_HEIGHT_RATIO: f32 = ca_ui::font::CONTENT_ROW_HEIGHT_RATIO;
 /// Height of the column header row.
 const HEADER_HEIGHT: f32 = 22.0;
 /// Width of the gap between the two panes.
@@ -362,6 +362,7 @@ impl RecordsView {
 
     fn follow_options(&mut self, ctx: &egui::Context) {
         let options = ca_ui::options::current(ctx);
+        self.font.set_pixels_per_point(ctx.pixels_per_point());
         self.font.follow(options.editor_point_size());
         self.line_spacing = options.extra_line_spacing();
     }
@@ -1223,7 +1224,7 @@ impl RecordsView {
         self.scroll.clamp(areas.rows.height(), height, total);
         let range = self.scroll.visible(areas.rows.height(), height, total);
 
-        self.header(&painter, palette, &areas);
+        self.header(ui, &painter, palette, &areas);
         for (side, pane) in [(Side::Left, areas.left), (Side::Right, areas.right)] {
             self.paint_pane(&painter, palette, side, pane, &range);
         }
@@ -1265,9 +1266,9 @@ impl RecordsView {
         }
     }
 
-    fn header(&self, painter: &egui::Painter, palette: &Palette, areas: &Areas) {
+    fn header(&self, ui: &egui::Ui, painter: &egui::Painter, palette: &Palette, areas: &Areas) {
         painter.rect_filled(areas.header, 0.0, palette.header_background);
-        let font = egui::FontId::proportional(self.font.points());
+        let font = egui::TextStyle::Body.resolve(ui.style());
         for pane in [areas.left, areas.right] {
             let clipped = painter.with_clip_rect(egui::Rect::from_min_max(
                 egui::pos2(pane.left(), areas.header.top()),
@@ -1302,7 +1303,7 @@ impl RecordsView {
         if pane.width() <= 0.0 {
             return;
         }
-        let font = egui::FontId::proportional(self.font.points());
+        let font = egui::FontId::monospace(self.font.points());
         let height = self.row_height();
         let clipped = painter.with_clip_rect(pane);
         let columns = Columns::of(pane);

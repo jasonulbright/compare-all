@@ -41,9 +41,9 @@ const CENTER_WIDTH: f32 = 14.0;
 /// Thickness of a scrollbar.
 const SCROLLBAR: f32 = 12.0;
 /// Row height as a multiple of the display font size.
-const ROW_HEIGHT_RATIO: f32 = 1.45;
+const ROW_HEIGHT_RATIO: f32 = ca_ui::font::CONTENT_ROW_HEIGHT_RATIO;
 /// Display font size a new view starts at.
-const DEFAULT_FONT_SIZE: f32 = 13.0;
+const DEFAULT_FONT_SIZE: f32 = ca_session::options::provisional::HEX_POINT_SIZE;
 /// How long the last change is waited out before the comparison runs again.
 const REDIFF_DEBOUNCE: Duration = Duration::from_millis(300);
 /// Width the drop downs on the toolbar are laid out in.
@@ -765,6 +765,7 @@ impl HexView {
     fn follow_options(&mut self, ctx: &egui::Context) {
         let options = ca_ui::options::current(ctx);
         let before = (self.font.points(), self.line_spacing);
+        self.font.set_pixels_per_point(ctx.pixels_per_point());
         self.font.follow(options.hex_point_size());
         self.line_spacing = options.extra_line_spacing();
         self.save_rules = ca_ui::save::SaveRules::from_options(&options.stored);

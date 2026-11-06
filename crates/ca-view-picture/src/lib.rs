@@ -1658,7 +1658,7 @@ impl PictureView {
                 rect.left_top() + egui::vec2(8.0, 8.0),
                 egui::Align2::LEFT_TOP,
                 message.0,
-                egui::FontId::proportional(13.0),
+                egui::TextStyle::Body.resolve(ui.style()),
                 message.1(palette),
             );
         } else if let Some(content) = self.content(pane) {
@@ -1683,7 +1683,7 @@ impl PictureView {
                 rect.left_top() + egui::vec2(6.0, 4.0),
                 egui::Align2::LEFT_TOP,
                 pane.label(),
-                egui::FontId::proportional(11.0),
+                egui::TextStyle::Small.resolve(ui.style()),
                 palette.label_text,
             );
             self.reported.push(WidgetRect {

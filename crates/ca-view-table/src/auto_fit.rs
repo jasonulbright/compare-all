@@ -17,6 +17,7 @@ struct Layout<'a> {
     column: usize,
     text: Cow<'a, str>,
     inset: f32,
+    heading: bool,
 }
 
 /// What the sizing worker posted.
@@ -52,8 +53,16 @@ pub fn spawn(
 ) -> Job<Message> {
     Job::spawn_notifying(
         move |emitter, cancel| {
-            let font = egui::FontId::proportional(point_size);
-            let widths = measure(source.as_ref(), pixels_per_point, &font, cancel, |_, _| {});
+            let content_font = egui::FontId::monospace(point_size);
+            let heading_font = egui::FontId::proportional(ca_ui::font::CHROME_BODY_POINT_SIZE);
+            let widths = measure(
+                source.as_ref(),
+                pixels_per_point,
+                &content_font,
+                &heading_font,
+                cancel,
+                |_, _| {},
+            );
             let message = widths.map_or(Message::Cancelled, Message::Ready);
             let _ = emitter.send(message);
         },
@@ -64,7 +73,8 @@ pub fn spawn(
 fn measure(
     source: &dyn Source,
     pixels_per_point: f32,
-    font: &egui::FontId,
+    content_font: &egui::FontId,
+    heading_font: &egui::FontId,
     cancel: &Cancel,
     mut on_font_pass: impl FnMut(usize, &Arc<egui::Context>),
 ) -> Option<Vec<f32>> {
@@ -80,11 +90,13 @@ fn measure(
             column: index,
             text: Cow::Borrowed(&column.name),
             inset: column_inset(column),
+            heading: true,
         });
         if batch.len() == LAYOUTS_PER_PASS {
             if !measure_batch(
                 pixels_per_point,
-                font,
+                content_font,
+                heading_font,
                 cancel,
                 &batch,
                 &mut widths,
@@ -122,11 +134,13 @@ fn measure(
                     column,
                     text,
                     inset: column_inset(info),
+                    heading: false,
                 });
                 if batch.len() == LAYOUTS_PER_PASS {
                     if !measure_batch(
                         pixels_per_point,
-                        font,
+                        content_font,
+                        heading_font,
                         cancel,
                         &batch,
                         &mut widths,
@@ -143,7 +157,8 @@ fn measure(
     if !batch.is_empty()
         && !measure_batch(
             pixels_per_point,
-            font,
+            content_font,
+            heading_font,
             cancel,
             &batch,
             &mut widths,
@@ -158,7 +173,8 @@ fn measure(
 /// Shape one bounded batch in a fresh context so its galley cache dies with it.
 fn measure_batch(
     pixels_per_point: f32,
-    font: &egui::FontId,
+    content_font: &egui::FontId,
+    heading_font: &egui::FontId,
     cancel: &Cancel,
     batch: &[Layout<'_>],
     widths: &mut [f32],
@@ -178,6 +194,11 @@ fn measure_batch(
                     cancelled = true;
                     break;
                 }
+                let font = if layout.heading {
+                    heading_font
+                } else {
+                    content_font
+                };
                 let galley = font_cache.layout_delayed_color(
                     layout.text.as_ref().to_owned(),
                     font.clone(),
@@ -266,14 +287,16 @@ mod tests {
     fn each_batch_uses_a_separate_bounded_font_cache() {
         let rows = LAYOUTS_PER_PASS / 2 + 1;
         let source = FakeSource::repeating(rows, 1, &[RowStatus::Same]);
-        let font = egui::FontId::proportional(14.0);
+        let content_font = egui::FontId::monospace(14.0);
+        let heading_font = egui::FontId::proportional(ca_ui::font::CHROME_BODY_POINT_SIZE);
         let mut pass_sizes = Vec::new();
         let mut contexts: Vec<std::sync::Weak<egui::Context>> = Vec::new();
 
         let widths = measure(
             &source,
             1.0,
-            &font,
+            &content_font,
+            &heading_font,
             &ca_ui::worker::Cancel::new(),
             |layouts, fonts| {
                 if let Some(previous) = contexts.last() {
