@@ -44,12 +44,12 @@ use opjobs::{
     ProgressState, RecoverMessage, RecoveryNotice, RescanMessage, SelectionRefreshMessage,
 };
 use selection::{ClickKind, Scope, SelectRule, Selection};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use sync_mode::SyncMode;
-use tree::{ignored_at, Arena, ArenaNode, Expanded, FlatRow, Sort, SortColumn, Totals};
+use tree::{Arena, ArenaNode, Expanded, FlatRow, Sort, SortColumn, Totals};
 
 /// Row height as a multiple of the folder listing font size.
 ///
@@ -107,6 +107,10 @@ const SCAN_FAILED: &str = "The folder scan failed. Use Refresh to try again";
 const SCAN_STOPPED: &str = "The folder scan was stopped. Use Refresh to try again";
 /// Why an operation needs selected rows.
 const NOTHING_SELECTED_FOR_ACTION: &str = "Select the items to act on first";
+/// Why ignored state cannot be changed in a synchronization view.
+const IGNORE_ONLY_IN_COMPARE: &str = "Ignored is available only in Folder Compare";
+/// Why ignored state cannot be changed without a selected comparison row.
+const NOTHING_SELECTED_TO_IGNORE: &str = "Select comparison rows to ignore first";
 /// Why the refresh selection command has no rows to read.
 const NOTHING_SELECTED_TO_REFRESH: &str = "Select the items to refresh first";
 /// Why a selected action cannot export a path.
@@ -1986,44 +1990,91 @@ impl FolderView {
     }
 
     /// The status the current view exposes for an arena row.
-    pub(crate) fn effective_status(&self, node: &ArenaNode) -> NodeStatus {
-        self.arena
-            .index_of(&node.rel)
-            .and_then(|index| self.effective_statuses.get(index as usize))
+    pub(crate) fn effective_status_at(&self, index: u32, node: &ArenaNode) -> NodeStatus {
+        if self.effective_statuses.is_empty() {
+            return node.status;
+        }
+        self.effective_statuses
+            .get(index as usize)
             .copied()
             .unwrap_or(node.status)
     }
 
-    fn selected_row_paths(&self) -> Vec<PathBuf> {
-        let mut paths = BTreeSet::new();
-        paths.extend(self.selection.side(Side::Left).iter().cloned());
-        paths.extend(self.selection.side(Side::Right).iter().cloned());
-        paths
-            .into_iter()
-            .filter(|rel| self.arena.index_of(rel).is_some())
-            .collect()
+    /// Whether either side has a selected path that still names an arena row.
+    fn has_selected_rows(&self) -> bool {
+        self.selection
+            .side(Side::Left)
+            .iter()
+            .chain(self.selection.side(Side::Right))
+            .any(|rel| self.arena.index_of(rel).is_some())
     }
 
+    /// Whether every selected path still in the arena has an ignored override.
     fn selected_rows_are_ignored(&self) -> bool {
-        let paths = self.selected_row_paths();
-        !paths.is_empty()
-            && paths
-                .iter()
-                .all(|rel| ignored_at(rel, &self.ignored_overrides))
+        let mut found = false;
+        for rel in self
+            .selection
+            .side(Side::Left)
+            .iter()
+            .chain(self.selection.side(Side::Right))
+        {
+            let Some(index) = self.arena.index_of(rel) else {
+                continue;
+            };
+            found = true;
+            if !self
+                .ignored_rows
+                .get(index as usize)
+                .copied()
+                .unwrap_or(false)
+            {
+                return false;
+            }
+        }
+        found
     }
 
+    /// Toggle ignored state on selected rows that still belong to the arena.
     fn toggle_selected_ignored(&mut self) {
-        let paths = self.selected_row_paths();
-        if paths.is_empty() {
+        if !self.has_selected_rows() {
             return;
         }
-        let ignored = !paths
+        let ignored = !self.selected_rows_are_ignored();
+        let selection = &self.selection;
+        let arena = &self.arena;
+        let overrides = &mut self.ignored_overrides;
+        for rel in selection
+            .side(Side::Left)
             .iter()
-            .all(|rel| ignored_at(rel, &self.ignored_overrides));
-        for rel in paths {
-            self.ignored_overrides.insert(rel, ignored);
+            .chain(selection.side(Side::Right))
+        {
+            if arena.index_of(rel).is_some() {
+                overrides.insert(rel.clone(), ignored);
+            }
         }
         self.rebuild();
+    }
+
+    /// Explain why the ignored action is unavailable in the current view.
+    fn ignored_refusal(&self) -> &'static str {
+        if self.mode != Mode::Compare {
+            return IGNORE_ONLY_IN_COMPARE;
+        }
+        if self.stage.blocks_input() {
+            return OPERATION_OPEN;
+        }
+        if !matches!(self.stage, Stage::Idle) {
+            return READ_BUSY;
+        }
+        match self.status {
+            Status::Running(_) => SCAN_NOT_READY,
+            Status::Failed(_) => SCAN_FAILED,
+            Status::Cancelled => SCAN_STOPPED,
+            Status::Ready if self.selection.is_empty() || !self.has_selected_rows() => {
+                NOTHING_SELECTED_TO_IGNORE
+            }
+            Status::Ready => READ_BUSY,
+        }
     }
 
     fn apply_fields(&mut self) {
@@ -4092,6 +4143,7 @@ impl SessionView for FolderView {
     /// A ready, idle filename copy with a selection but no local path has a distinct refusal.
     fn refusal(&self, command: Command) -> Option<&'static str> {
         match command {
+            Command::ToggleRowIgnored if !self.accepts(command) => Some(self.ignored_refusal()),
             Command::NextDifference | Command::PreviousDifference if !self.accepts(command) => {
                 Some(navigate::NO_DIFFERENCE)
             }
@@ -4161,7 +4213,7 @@ impl SessionView for FolderView {
                     && self.status == Status::Ready
                     && idle
                     && !self.selection.is_empty()
-                    && !self.selected_row_paths().is_empty()
+                    && self.has_selected_rows()
             }
             Command::NextDifference => self.has_difference(true),
             Command::PreviousDifference => self.has_difference(false),
@@ -4853,6 +4905,57 @@ mod stale_results {
             .expect("the requested accessible control is present");
         probe.press_at(control.rect.center(), &mut draw);
         control
+    }
+
+    #[test]
+    fn ignored_is_disabled_with_a_specific_reason_on_the_sync_tab() {
+        use crate::selection::{Scope, SelectRule};
+        use crate::{Command, FolderSyncView, IGNORE_ONLY_IN_COMPARE};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut view = sync_view(dir.path());
+        view.select(SelectRule::All, Scope::Both);
+        assert!(!view.selection().is_empty());
+
+        let sync = FolderSyncView::from(view);
+        assert!(!sync.accepts(Command::ToggleRowIgnored));
+        assert_eq!(
+            sync.refusal(Command::ToggleRowIgnored),
+            Some(IGNORE_ONLY_IN_COMPARE)
+        );
+    }
+
+    #[test]
+    fn ignored_refusal_names_the_compare_scan_and_operation_blockers() {
+        use crate::{
+            Command, OperationPlan, Stage, Status, NOTHING_SELECTED_TO_IGNORE, OPERATION_OPEN,
+            SCAN_NOT_READY,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut view = ready_view(dir.path());
+        assert_eq!(
+            view.refusal(Command::ToggleRowIgnored),
+            Some(NOTHING_SELECTED_TO_IGNORE)
+        );
+
+        view.run(Command::SelectAll);
+        view.status = Status::Running("Scanning");
+        assert_eq!(
+            view.refusal(Command::ToggleRowIgnored),
+            Some(SCAN_NOT_READY)
+        );
+
+        view.status = Status::Ready;
+        view.stage = Stage::Running(Box::new(OperationPlan::new(
+            ca_fs::OperationKind::Copy,
+            Vec::new(),
+            ca_fs::OperationOptions::default(),
+        )));
+        assert_eq!(
+            view.refusal(Command::ToggleRowIgnored),
+            Some(OPERATION_OPEN)
+        );
     }
 
     /// A compared tree that holds `stale.txt`, which no scan of the view's

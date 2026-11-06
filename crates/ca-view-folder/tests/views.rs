@@ -103,6 +103,11 @@ fn ignored_folder_rows_count_as_matching_and_leave_difference_selection() {
     assert_eq!(row_status("sub/differs.txt"), Some("Same".to_string()));
     assert_eq!(row_status("orphan.txt"), Some("Same".to_string()));
 
+    let selected = view.selection().clone();
+    view.select(SelectRule::Differences, Scope::Both);
+    assert!(view.selection().is_empty());
+    *view.selection_mut() = selected;
+
     view.run(Command::ToggleRowIgnored);
     assert_eq!(view.checked(Command::ToggleRowIgnored), Some(false));
     let (_, payload) = view.report_payload();

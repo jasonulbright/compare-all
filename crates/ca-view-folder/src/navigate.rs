@@ -82,11 +82,12 @@ impl DisplayOrder {
 
 impl FolderView {
     /// True when some row the filters show passes `test`.
-    fn any_shown(&self, test: &impl Fn(&ArenaNode) -> bool) -> bool {
-        self.order
-            .order
-            .iter()
-            .any(|index| self.arena.node(*index).is_some_and(test))
+    fn any_shown(&self, test: &impl Fn(u32, &ArenaNode) -> bool) -> bool {
+        self.order.order.iter().any(|index| {
+            self.arena
+                .node(*index)
+                .is_some_and(|node| test(*index, node))
+        })
     }
 
     /// The nearest node after or before the cursor, in row order, that passes
@@ -96,7 +97,7 @@ impl FolderView {
         forward: bool,
         wrap: bool,
         inclusive: bool,
-        test: &impl Fn(&ArenaNode) -> bool,
+        test: &impl Fn(u32, &ArenaNode) -> bool,
     ) -> Option<usize> {
         let order = &self.order.order;
         let count = order.len();
@@ -127,7 +128,11 @@ impl FolderView {
         };
         positions
             .filter_map(|position| order.get(position).copied())
-            .find(|index| self.arena.node(*index).is_some_and(test))
+            .find(|index| {
+                self.arena
+                    .node(*index)
+                    .is_some_and(|node| test(*index, node))
+            })
             .map(|index| index as usize)
     }
 
@@ -174,16 +179,16 @@ impl FolderView {
     /// True when a move to the next or previous difference has a target. The
     /// move does not wrap, so each direction runs out on its own.
     pub(crate) fn has_difference(&self, forward: bool) -> bool {
-        self.next_node(forward, false, false, &|node| {
-            is_difference(node, self.effective_status(node))
+        self.next_node(forward, false, false, &|index, node| {
+            is_difference(node, self.effective_status_at(index, node))
         })
         .is_some()
     }
 
     /// Move the cursor to the next or previous difference.
     pub(crate) fn step_difference(&mut self, forward: bool) {
-        if let Some(index) = self.next_node(forward, false, false, &|node| {
-            is_difference(node, self.effective_status(node))
+        if let Some(index) = self.next_node(forward, false, false, &|index, node| {
+            is_difference(node, self.effective_status_at(index, node))
         }) {
             self.reveal_node(index);
         }
@@ -191,7 +196,7 @@ impl FolderView {
 
     /// True when the search text matches a name the filters show.
     pub(crate) fn has_name_match(&self) -> bool {
-        self.find.has_text() && self.any_shown(&|node| self.find.matches(&node.name))
+        self.find.has_text() && self.any_shown(&|_, node| self.find.matches(&node.name))
     }
 
     /// Move the cursor to the next or previous name that holds the search
@@ -199,7 +204,9 @@ impl FolderView {
     pub(crate) fn step_name(&mut self, forward: bool, inclusive: bool) {
         let found = {
             let find = &self.find;
-            self.next_node(forward, true, inclusive, &|node| find.matches(&node.name))
+            self.next_node(forward, true, inclusive, &|_, node| {
+                find.matches(&node.name)
+            })
         };
         if let Some(index) = found {
             self.reveal_node(index);

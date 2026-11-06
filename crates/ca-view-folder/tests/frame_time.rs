@@ -12,9 +12,13 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use ca_fs::{Attributes, ContentOutcome, ContentUpdate, Entry, Node, NodeStatus, StatusFlags};
+use ca_fs::{
+    Attributes, ContentOutcome, ContentUpdate, Entry, Node, NodeStatus, Side, StatusFlags,
+};
+use ca_ui::command::Command;
 use ca_ui::testing::{context, raw_input};
 use ca_ui::view::SessionView;
+use ca_view_folder::selection::{ClickKind, Selection};
 use ca_view_folder::tree::Arena;
 use ca_view_folder::FolderView;
 use std::path::PathBuf;
@@ -109,17 +113,15 @@ fn node(rel: &str, is_dir: bool, status: NodeStatus, children: Vec<Node>) -> Nod
 
 /// A comparison of `folders` times `each` files, plus the folders themselves.
 fn large_tree(folders: u32, each: u32) -> Node {
+    large_tree_with_status(folders, each, NodeStatus::NotCompared)
+}
+
+/// Build a wide comparison with the supplied status on every file row.
+fn large_tree_with_status(folders: u32, each: u32, status: NodeStatus) -> Node {
     let children = (0..folders)
         .map(|outer| {
             let files = (0..each)
-                .map(|inner| {
-                    node(
-                        &format!("d{outer}/f{inner}.bin"),
-                        false,
-                        NodeStatus::NotCompared,
-                        Vec::new(),
-                    )
-                })
+                .map(|inner| node(&format!("d{outer}/f{inner}.bin"), false, status, Vec::new()))
                 .collect();
             node(&format!("d{outer}"), true, NodeStatus::NotCompared, files)
         })
@@ -162,6 +164,75 @@ fn half_a_million_nodes_paint_inside_the_budget_while_results_arrive() {
         },
     );
     assert!(worst <= BUDGET, "worst frame was {worst:?}");
+}
+
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "wall-clock budget holds for release builds"
+)]
+/// Measure ignored-state rebuilds and per-frame navigation over half a million rows.
+fn ignoring_a_half_million_node_tree_rebuilds_and_navigates_within_budget() {
+    const ENTRIES: usize = 500_500;
+    const REBUILD_BUDGET: Duration = Duration::from_secs(20);
+
+    let arena = Arena::from_root(&large_tree_with_status(500, 1_000, NodeStatus::Different));
+    let mut view = FolderView::from_arena(
+        PathBuf::from("left"),
+        PathBuf::from("right"),
+        &context(),
+        2,
+        arena,
+    );
+    assert_eq!(view.rows().len(), ENTRIES);
+
+    let mut selection = Selection::new();
+    for position in (0..ENTRIES).step_by(1_001) {
+        selection.click(
+            Side::Left,
+            position,
+            view.rows(),
+            view.arena(),
+            ClickKind::Toggle,
+        );
+    }
+    *view.selection_mut() = selection;
+
+    let started = Instant::now();
+    view.run(Command::ToggleRowIgnored);
+    view.tick();
+    let rebuild_and_tick = started.elapsed();
+    println!(
+        "ignored 500,000-node rebuild and tick: {:.2} ms",
+        rebuild_and_tick.as_secs_f64() * 1_000.0
+    );
+    assert!(
+        rebuild_and_tick < REBUILD_BUDGET,
+        "ignored rebuild and tick took {rebuild_and_tick:?}"
+    );
+    assert_eq!(view.rows().len(), ENTRIES);
+    assert!(!view.accepts(Command::NextDifference));
+
+    let mut slowest = Duration::ZERO;
+    let mut total = Duration::ZERO;
+    for _ in 0..MEASURED {
+        let started = Instant::now();
+        let commands = view.commands();
+        view.tick();
+        let taken = started.elapsed();
+        slowest = slowest.max(taken);
+        total += taken;
+        assert!(commands
+            .iter()
+            .any(|state| { state.command == Command::NextDifference && !state.enabled }));
+    }
+    let mean = total / u32::try_from(MEASURED).unwrap_or(1);
+    println!(
+        "ignored 500,000-node navigation state: worst {:.2} ms, mean {:.2} ms",
+        slowest.as_secs_f64() * 1_000.0,
+        mean.as_secs_f64() * 1_000.0
+    );
+    assert!(slowest <= BUDGET, "navigation state took {slowest:?}");
 }
 
 /// Correctness half of the frame case, on a tree a debug build paints quickly:

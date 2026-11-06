@@ -435,11 +435,19 @@ impl Arena {
         &self,
         overrides: &HashMap<PathBuf, bool>,
     ) -> (Vec<NodeStatus>, Vec<bool>) {
-        let ignored: Vec<bool> = self
-            .nodes
-            .iter()
-            .map(|node| ignored_at(&node.rel, overrides))
-            .collect();
+        let mut ignored = vec![false; self.nodes.len()];
+        let mut pending = Vec::with_capacity(self.roots.len());
+        pending.extend(self.roots.iter().rev().map(|root| (*root, false)));
+        while let Some((index, inherited)) = pending.pop() {
+            let Some(node) = self.nodes.get(index as usize) else {
+                continue;
+            };
+            let current = overrides.get(&node.rel).copied().unwrap_or(inherited);
+            if let Some(slot) = ignored.get_mut(index as usize) {
+                *slot = current;
+            }
+            pending.extend(node.children.iter().rev().map(|child| (*child, current)));
+        }
         let mut statuses = vec![NodeStatus::NotCompared; self.nodes.len()];
         let mut below = vec![StatusFlags::default(); self.nodes.len()];
         for index in (0..self.nodes.len()).rev() {
@@ -683,19 +691,6 @@ fn side_info(entry: &ca_fs::Entry, folder_size: Option<u64>) -> SideInfo {
         folder_size,
         modified: entry.modified,
     }
-}
-
-/// The nearest row override controls an item. This lets a user restore one
-/// child under an ignored folder without changing the folder's other children.
-pub(crate) fn ignored_at(rel: &Path, overrides: &HashMap<PathBuf, bool>) -> bool {
-    let mut path = Some(rel);
-    while let Some(current) = path {
-        if let Some(ignored) = overrides.get(current) {
-            return *ignored;
-        }
-        path = current.parent();
-    }
-    false
 }
 
 #[cfg(test)]
