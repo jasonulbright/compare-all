@@ -292,6 +292,17 @@ fn attributes_of(path: &Path) -> FileAttributes {
     let Ok(metadata) = std::fs::metadata(path) else {
         return FileAttributes::default();
     };
+    attributes_from_metadata(&metadata)
+}
+
+fn symlink_attributes_of(path: &Path) -> FileAttributes {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return FileAttributes::default();
+    };
+    attributes_from_metadata(&metadata)
+}
+
+fn attributes_from_metadata(metadata: &std::fs::Metadata) -> FileAttributes {
     let mut attributes = FileAttributes {
         size: Some(metadata.len()),
         uid: Some(0),
@@ -309,6 +320,7 @@ fn attributes_of(path: &Path) -> FileAttributes {
     };
     attributes.set_dir(metadata.is_dir());
     attributes.set_regular(metadata.is_file());
+    attributes.set_symlink(metadata.file_type().is_symlink());
     let mode = if metadata.is_dir() { 0o755 } else { 0o644 };
     attributes.permissions = Some(attributes.permissions.unwrap_or(0) | mode);
     attributes
@@ -372,7 +384,7 @@ impl russh_sftp::server::Handler for SftpHandler {
             .flatten()
         {
             let name = entry.file_name().to_string_lossy().into_owned();
-            let attrs = attributes_of(&entry.path());
+            let attrs = symlink_attributes_of(&entry.path());
             files.push(File {
                 filename: name.clone(),
                 longname: name,
@@ -480,7 +492,12 @@ impl russh_sftp::server::Handler for SftpHandler {
     }
 
     async fn lstat(&mut self, id: u32, path: String) -> Result<Attrs, Self::Error> {
-        self.stat(id, path).await
+        let target = self.resolve(&path).ok_or(StatusCode::PermissionDenied)?;
+        let metadata = std::fs::symlink_metadata(&target).map_err(|_| StatusCode::NoSuchFile)?;
+        Ok(Attrs {
+            id,
+            attrs: attributes_from_metadata(&metadata),
+        })
     }
 
     async fn fstat(&mut self, id: u32, handle: String) -> Result<Attrs, Self::Error> {
@@ -508,7 +525,21 @@ impl russh_sftp::server::Handler for SftpHandler {
         let target = self
             .resolve(&filename)
             .ok_or(StatusCode::PermissionDenied)?;
-        std::fs::remove_file(target).map_err(|_| StatusCode::NoSuchFile)?;
+        #[cfg(windows)]
+        let remove = {
+            use std::os::windows::fs::FileTypeExt;
+
+            let metadata =
+                std::fs::symlink_metadata(&target).map_err(|_| StatusCode::NoSuchFile)?;
+            if metadata.file_type().is_symlink_dir() {
+                std::fs::remove_dir(target)
+            } else {
+                std::fs::remove_file(target)
+            }
+        };
+        #[cfg(not(windows))]
+        let remove = std::fs::remove_file(target);
+        remove.map_err(|_| StatusCode::NoSuchFile)?;
         Ok(ok(id))
     }
 

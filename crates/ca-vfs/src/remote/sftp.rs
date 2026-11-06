@@ -703,7 +703,10 @@ impl FileSystem for SftpFs {
         }
         let attributes = self
             .core
-            .run("stat", self.core.session.metadata(self.remote(path)))
+            .run(
+                "lstat",
+                self.core.session.symlink_metadata(self.remote(path)),
+            )
             .map_err(|error| match error {
                 VfsError::Protocol { ref detail } if detail.contains("found nothing") => {
                     VfsError::NotFound { path: path.clone() }
@@ -856,13 +859,55 @@ impl FileSystem for SftpFs {
 
     fn rename(&self, from: &VfsPath, to: &VfsPath, cancel: &Cancel) -> VfsResult<()> {
         cancel.check()?;
-        let _ = self
-            .core
-            .run("delete", self.core.session.remove_file(self.remote(to)));
-        self.core.run(
+        if from == to {
+            return Ok(());
+        }
+        let backup = match self.metadata(to) {
+            Ok(existing) if existing.is_dir() && !existing.is_link() => {
+                return Err(VfsError::AlreadyExists { path: to.clone() });
+            }
+            Ok(_) => {
+                let parent = to.parent().unwrap_or_else(VfsPath::root);
+                let name = to.name().unwrap_or("entry");
+                Some(parent.join(&temporary_name(name, nonce()))?)
+            }
+            Err(VfsError::NotFound { .. }) => None,
+            Err(error) => return Err(error),
+        };
+        if let Some(backup) = &backup {
+            self.core.run(
+                "move existing destination aside",
+                self.core
+                    .session
+                    .rename(self.remote(to), self.remote(backup)),
+            )?;
+        }
+        if let Err(error) = self.core.run(
             "rename",
             self.core.session.rename(self.remote(from), self.remote(to)),
-        )
+        ) {
+            if let Some(backup) = &backup {
+                if let Err(restore_error) = self.core.run(
+                    "restore previous destination",
+                    self.core
+                        .session
+                        .rename(self.remote(backup), self.remote(to)),
+                ) {
+                    return Err(VfsError::protocol(format!(
+                        "the rename failed and the previous destination could not be restored; it remains at {backup}: {restore_error}"
+                    )));
+                }
+            }
+            return Err(error);
+        }
+        if let Some(backup) = backup {
+            self.delete(&backup, cancel).map_err(|error| {
+                VfsError::protocol(format!(
+                    "the rename succeeded, but the previous destination remains at {backup}: {error}"
+                ))
+            })?;
+        }
+        Ok(())
     }
 }
 

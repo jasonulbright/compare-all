@@ -25,6 +25,57 @@ fn creates_and_replaces_complete_files() {
     assert_eq!(names(dir.path()), ["output"]);
 }
 
+#[test]
+fn replacement_refuses_a_file_with_multiple_hard_links() -> io::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let target = dir.path().join("output");
+    let alias = dir.path().join("alias");
+    fs::write(&target, b"original")?;
+    fs::hard_link(&target, &alias)?;
+
+    let error = write_atomic(&target, b"replacement")
+        .err()
+        .ok_or_else(|| io::Error::other("replacement succeeded for a multiply linked file"))?;
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    assert!(error.to_string().contains("multiple hard links"));
+    assert_eq!(fs::read(&target)?, b"original");
+    assert_eq!(fs::read(&alias)?, b"original");
+    Ok(())
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_link_count_probe_needs_no_shared_file_access() -> io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let dir = tempfile::tempdir()?;
+    let target = dir.path().join("output");
+    fs::write(&target, b"original")?;
+    let _held = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(&target)?;
+    let metadata = fs::symlink_metadata(&target)?;
+    assert!(!target_has_multiple_links(&target, &metadata)?);
+    Ok(())
+}
+
+#[test]
+fn appending_and_removing_do_not_refuse_multiple_hard_links() -> io::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let target = dir.path().join("output");
+    let alias = dir.path().join("alias");
+    fs::write(&target, b"original")?;
+    fs::hard_link(&target, &alias)?;
+
+    open_log(&target, true)?.write_all(b" appended")?;
+    assert_eq!(fs::read(&alias)?, b"original appended");
+    remove_file(&target)?;
+    assert!(!target.exists());
+    assert_eq!(fs::read(&alias)?, b"original appended");
+    Ok(())
+}
+
 #[cfg(unix)]
 #[test]
 fn replacement_and_failed_output_keep_the_ordinary_owner_group_and_mode() {
@@ -1111,6 +1162,31 @@ fn symlinks_are_refused_including_dangling_links() {
         .file_type()
         .is_symlink());
     assert_eq!(names(dir.path()), ["link"]);
+}
+
+#[cfg(windows)]
+#[test]
+fn replacement_refuses_a_dangling_symbolic_link_before_following_it() -> io::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let link = dir.path().join("dangling-link");
+    let target = dir.path().join("missing-target");
+    if let Err(error) = std::os::windows::fs::symlink_file(&target, &link) {
+        if std::env::var_os("GITHUB_ACTIONS").is_some() {
+            return Err(error);
+        }
+        eprintln!("skipping symbolic-link test: {error}");
+        return Ok(());
+    }
+
+    let error = write_atomic(&link, b"replacement")
+        .err()
+        .ok_or_else(|| io::Error::other("replacement followed a dangling symbolic link"))?;
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+    assert!(error.to_string().contains("link"), "{error}");
+    assert!(fs::symlink_metadata(&link)?.file_type().is_symlink());
+    assert!(!target.exists());
+    assert_eq!(names(dir.path()), ["dangling-link"]);
+    Ok(())
 }
 
 #[test]

@@ -6,7 +6,7 @@
 //! (best effort if the OS refuses cleanup); unrelated siblings are never removed.
 //!
 //! This is not a power-loss guarantee. Callers own overwrite consent, parent
-//! creation and concurrent-change policy. Existing read-only and
+//! creation and concurrent-change policy. Existing read-only, hard-linked and
 //! non-regular targets (including symlinks) are refused at preparation time.
 //! Unix permission bits are preserved. Existing Windows files use `ReplaceFileW`;
 //! tests cover protected DACLs, the Hidden flag, named streams and creation time.
@@ -69,7 +69,7 @@ pub fn write_atomic_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
 /// parent must already exist.
 pub fn open_log(path: &Path, append: bool) -> io::Result<File> {
     if append {
-        target_permissions(path, false, "append to")?;
+        target_permissions(path, false, "append to", false)?;
     } else {
         write_atomic(path, b"")?;
     }
@@ -83,7 +83,7 @@ pub fn open_log(path: &Path, append: bool) -> io::Result<File> {
 /// Returns [`io::ErrorKind::NotFound`] when the file is absent, or another
 /// error if the target is unsuitable or the removal fails.
 pub fn remove_file(path: &Path) -> io::Result<()> {
-    target_permissions(path, false, "remove")?;
+    target_permissions(path, false, "remove", false)?;
     fs::remove_file(path)
 }
 
@@ -347,7 +347,7 @@ fn replace_impl<T, E: From<io::Error>>(
     let extended_path = windows_extended_path(path)?;
     #[cfg(windows)]
     let path = extended_path.as_deref().unwrap_or(path);
-    let permissions = target_permissions(path, require_absent, "replace")?;
+    let permissions = target_permissions(path, require_absent, "replace", true)?;
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -700,6 +700,7 @@ fn target_permissions(
     path: &Path,
     require_absent: bool,
     operation: &str,
+    reject_multiple_links: bool,
 ) -> io::Result<Option<fs::Permissions>> {
     refuse_other_spelling(path)?;
     match fs::symlink_metadata(path) {
@@ -716,10 +717,26 @@ fn target_permissions(
                 Some("it is a folder")
             } else if !metadata.is_file() {
                 Some("it is not a regular file")
-            } else if metadata.permissions().readonly() {
-                Some("it is read-only")
             } else {
-                None
+                let multiple_links = if reject_multiple_links {
+                    #[cfg(windows)]
+                    {
+                        target_has_multiple_links(path, &metadata)?
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        target_has_multiple_links(path, &metadata)
+                    }
+                } else {
+                    false
+                };
+                if multiple_links {
+                    Some("it has multiple hard links")
+                } else if metadata.permissions().readonly() {
+                    Some("it is read-only")
+                } else {
+                    None
+                }
             };
             if let Some(reason) = refused {
                 return Err(io::Error::new(
@@ -732,6 +749,43 @@ fn target_permissions(
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
     }
+}
+
+#[cfg(unix)]
+fn target_has_multiple_links(_path: &Path, metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    metadata.nlink() > 1
+}
+
+#[cfg(windows)]
+fn target_has_multiple_links(path: &Path, _metadata: &fs::Metadata) -> io::Result<bool> {
+    use winsafe::prelude::*;
+    let name = windows_path(path)?;
+    let (file, _) = winsafe::HFILE::CreateFile(
+        &name,
+        winsafe::co::GENERIC::default(),
+        Some(
+            winsafe::co::FILE_SHARE::READ
+                | winsafe::co::FILE_SHARE::WRITE
+                | winsafe::co::FILE_SHARE::DELETE,
+        ),
+        None,
+        winsafe::co::DISPOSITION::OPEN_EXISTING,
+        winsafe::co::FILE_ATTRIBUTE::NORMAL,
+        None,
+        None,
+        None,
+    )
+    .map_err(|code| io::Error::from_raw_os_error(code.raw().cast_signed()))?;
+    let info = file
+        .GetFileInformationByHandle()
+        .map_err(|code| io::Error::from_raw_os_error(code.raw().cast_signed()))?;
+    Ok(info.nNumberOfLinks > 1)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn target_has_multiple_links(_path: &Path, _metadata: &fs::Metadata) -> bool {
+    false
 }
 
 fn retryable(error: &io::Error) -> bool {

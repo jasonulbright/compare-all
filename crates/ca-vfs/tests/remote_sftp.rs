@@ -72,11 +72,41 @@ fn context() -> RemoteContext {
     context
 }
 
+/// Create a directory symlink, requiring it in hosted CI where the runners support links.
+fn create_directory_symlink(target: &Path, link: &Path) -> bool {
+    #[cfg(unix)]
+    let result = std::os::unix::fs::symlink(target, link);
+    #[cfg(windows)]
+    let result = std::os::windows::fs::symlink_dir(target, link);
+
+    if let Err(error) = result {
+        assert!(
+            std::env::var_os("GITHUB_ACTIONS").is_none(),
+            "hosted CI must support directory symlinks: {error}"
+        );
+        return false;
+    }
+    true
+}
+
 /// A server, a store that already trusts it, and a connected file system.
 fn connected() -> (tempfile::TempDir, tempfile::TempDir, SshTestServer, SftpFs) {
     let directory = fixture();
+    let (settings_dir, _settings, server, fs) = connected_to(directory.path());
+    (directory, settings_dir, server, fs)
+}
+
+/// Connect to a server rooted at an existing directory.
+fn connected_to(root: &Path) -> (tempfile::TempDir, FtpProfile, SshTestServer, SftpFs) {
+    let server = SshTestServer::start(root, "operator", &password());
+    connected_server(server)
+}
+
+/// Trust and connect to a server that has already been started.
+fn connected_server(
+    server: SshTestServer,
+) -> (tempfile::TempDir, FtpProfile, SshTestServer, SftpFs) {
     let settings_dir = tempfile::tempdir().unwrap();
-    let server = SshTestServer::start(directory.path(), "operator", &password());
     let store = KnownHosts::new(settings_dir.path().join("known_hosts"));
     store
         .record(
@@ -88,7 +118,7 @@ fn connected() -> (tempfile::TempDir, tempfile::TempDir, SshTestServer, SftpFs) 
         .unwrap();
     let settings = profile(&server, &settings_dir.path().join("known_hosts"));
     let fs = SftpFs::connect(&settings, &context(), &Cancel::new()).expect("the server accepts");
-    (directory, settings_dir, server, fs)
+    (settings_dir, settings, server, fs)
 }
 
 #[test]
@@ -236,22 +266,167 @@ fn a_refused_replacement_rename_preserves_the_existing_file_and_reports_permissi
 }
 
 #[test]
-fn a_failed_staged_rename_restores_the_file_moved_to_backup() {
+fn a_refused_entry_rename_keeps_the_existing_destination() {
     let directory = fixture();
-    let settings_dir = tempfile::tempdir().unwrap();
+    let source = directory.path().join("source.txt");
+    let destination = directory.path().join("destination.txt");
+    std::fs::write(&source, b"source content").unwrap();
+    std::fs::write(&destination, b"existing destination").unwrap();
+    let server = SshTestServer::start_refusing_renames(directory.path(), "operator", &password());
+    let (_settings_dir, _settings, _server, fs) = connected_server(server);
+
+    assert!(fs
+        .rename(
+            &VfsPath::parse("source.txt").unwrap(),
+            &VfsPath::parse("destination.txt").unwrap(),
+            &Cancel::new(),
+        )
+        .is_err());
+    assert_eq!(std::fs::read(&source).unwrap(), b"source content");
+    assert_eq!(
+        std::fs::read(&destination).unwrap(),
+        b"existing destination"
+    );
+}
+
+#[test]
+fn a_failed_entry_rename_restores_the_existing_destination() {
+    let directory = fixture();
+    let source = directory.path().join("source.txt");
+    let destination = directory.path().join("destination.txt");
+    std::fs::write(&source, b"source content").unwrap();
+    std::fs::write(&destination, b"existing destination").unwrap();
     let server =
         SshTestServer::start_failing_rename_number(directory.path(), "operator", &password(), 2);
-    let store = KnownHosts::new(settings_dir.path().join("known_hosts"));
-    store
-        .record(
-            "127.0.0.1",
-            server.port(),
-            &server.host_key_type,
-            &server.host_key,
+    let (_settings_dir, _settings, _server, fs) = connected_server(server);
+
+    assert!(fs
+        .rename(
+            &VfsPath::parse("source.txt").unwrap(),
+            &VfsPath::parse("destination.txt").unwrap(),
+            &Cancel::new(),
         )
+        .is_err());
+    assert_eq!(std::fs::read(&source).unwrap(), b"source content");
+    assert_eq!(
+        std::fs::read(&destination).unwrap(),
+        b"existing destination"
+    );
+    let names: Vec<String> = std::fs::read_dir(directory.path())
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        !names.iter().any(|name| name.contains("ca-upload")),
+        "{names:?}"
+    );
+}
+
+#[test]
+fn renaming_onto_a_directory_preserves_the_directory_and_source() {
+    let directory = fixture();
+    let source = directory.path().join("source.txt");
+    std::fs::write(&source, b"source content").unwrap();
+    let destination = directory.path().join("destination");
+    std::fs::create_dir(&destination).unwrap();
+    std::fs::write(destination.join("keep.txt"), b"keep this file").unwrap();
+    let (_settings_dir, _settings, _server, fs) = connected_to(directory.path());
+
+    assert!(matches!(
+        fs.rename(
+            &VfsPath::parse("source.txt").unwrap(),
+            &VfsPath::parse("destination").unwrap(),
+            &Cancel::new(),
+        ),
+        Err(VfsError::AlreadyExists { .. })
+    ));
+    assert_eq!(std::fs::read(source).unwrap(), b"source content");
+    assert_eq!(
+        std::fs::read(destination.join("keep.txt")).unwrap(),
+        b"keep this file"
+    );
+}
+
+#[test]
+fn deleting_a_directory_symlink_keeps_its_target() {
+    let directory = fixture();
+    let target = directory.path().join("target");
+    std::fs::create_dir(&target).unwrap();
+    std::fs::write(target.join("keep.txt"), b"keep this file").unwrap();
+    let link = directory.path().join("link");
+    if !create_directory_symlink(&target, &link) {
+        return;
+    }
+    let (_settings_dir, _settings, _server, fs) = connected_to(directory.path());
+
+    fs.delete(&VfsPath::parse("link").unwrap(), &Cancel::new())
         .unwrap();
-    let settings = profile(&server, &settings_dir.path().join("known_hosts"));
-    let fs = SftpFs::connect(&settings, &context(), &Cancel::new()).unwrap();
+
+    assert_eq!(
+        std::fs::read(target.join("keep.txt")).unwrap(),
+        b"keep this file"
+    );
+    assert!(std::fs::symlink_metadata(link).is_err());
+}
+
+#[test]
+fn replacing_a_directory_symlink_keeps_its_target() {
+    let directory = fixture();
+    let source = directory.path().join("source.txt");
+    std::fs::write(&source, b"source content").unwrap();
+    let target = directory.path().join("target");
+    std::fs::create_dir(&target).unwrap();
+    std::fs::write(target.join("keep.txt"), b"keep this file").unwrap();
+    let link = directory.path().join("link");
+    if !create_directory_symlink(&target, &link) {
+        return;
+    }
+    let (_settings_dir, _settings, _server, fs) = connected_to(directory.path());
+
+    fs.rename(
+        &VfsPath::parse("source.txt").unwrap(),
+        &VfsPath::parse("link").unwrap(),
+        &Cancel::new(),
+    )
+    .unwrap();
+
+    assert_eq!(std::fs::read(link).unwrap(), b"source content");
+    assert_eq!(
+        std::fs::read(target.join("keep.txt")).unwrap(),
+        b"keep this file"
+    );
+}
+
+#[test]
+fn replacing_a_dangling_directory_symlink_succeeds() {
+    let directory = fixture();
+    let source = directory.path().join("source.txt");
+    std::fs::write(&source, b"source content").unwrap();
+    let missing_target = directory.path().join("missing-target");
+    let link = directory.path().join("link");
+    if !create_directory_symlink(&missing_target, &link) {
+        return;
+    }
+    let (_settings_dir, _settings, _server, fs) = connected_to(directory.path());
+
+    fs.rename(
+        &VfsPath::parse("source.txt").unwrap(),
+        &VfsPath::parse("link").unwrap(),
+        &Cancel::new(),
+    )
+    .unwrap();
+
+    assert_eq!(std::fs::read(link).unwrap(), b"source content");
+    assert!(!missing_target.exists());
+}
+
+#[test]
+fn a_failed_staged_rename_restores_the_file_moved_to_backup() {
+    let directory = fixture();
+    let server =
+        SshTestServer::start_failing_rename_number(directory.path(), "operator", &password(), 2);
+    let (_settings_dir, _settings, _server, fs) = connected_server(server);
 
     let error = fs
         .write_file(

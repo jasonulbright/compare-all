@@ -170,18 +170,44 @@ impl State {
     }
 
     /// The mount a path belongs to, and the path inside it.
-    fn route(&self, path: &Path) -> Option<(usize, &Mount, VfsPath)> {
+    fn route(&self, path: &Path) -> io::Result<Option<(usize, &Mount, VfsPath)>> {
         for (index, mount) in self.mounts.iter().enumerate() {
             if let Ok(rest) = path.strip_prefix(&mount.prefix) {
                 let mut inside = VfsPath::root();
                 for part in rest.components() {
-                    let text = part.as_os_str().to_string_lossy();
-                    inside = inside.join(&text).ok()?;
+                    // VfsPath stores UTF-8 and treats backslashes as separators.
+                    let text = part.as_os_str().to_str().ok_or_else(|| {
+                        refuse(
+                            io::ErrorKind::InvalidInput,
+                            format!(
+                                "cannot route a path under {}: a component is not valid Unicode",
+                                mount.prefix.display()
+                            ),
+                        )
+                    })?;
+                    if text.contains('\\') {
+                        return Err(refuse(
+                            io::ErrorKind::InvalidInput,
+                            format!(
+                                "cannot route a path under {}: a component contains a path separator",
+                                mount.prefix.display()
+                            ),
+                        ));
+                    }
+                    inside = inside.join(text).map_err(|error| {
+                        refuse(
+                            io::ErrorKind::InvalidInput,
+                            format!(
+                                "cannot route a path under {}: {error}",
+                                mount.prefix.display()
+                            ),
+                        )
+                    })?;
                 }
-                return Some((index, mount, inside));
+                return Ok(Some((index, mount, inside)));
             }
         }
-        None
+        Ok(None)
     }
 
     fn is_batching(&self) -> bool {
@@ -270,7 +296,7 @@ impl State {
 
 impl FileOps for SourceOps {
     fn probe(&self, path: &Path) -> io::Result<TargetState> {
-        let Some((_, mount, inside)) = self.state.route(path) else {
+        let Some((_, mount, inside)) = self.state.route(path)? else {
             return self.state.local.probe(path);
         };
         let entry = mount
@@ -290,7 +316,7 @@ impl FileOps for SourceOps {
     }
 
     fn create_dir(&self, path: &Path) -> io::Result<()> {
-        let Some((index, mount, inside)) = self.state.route(path) else {
+        let Some((index, mount, inside)) = self.state.route(path)? else {
             return self.state.local.create_dir(path);
         };
         self.state
@@ -298,7 +324,7 @@ impl FileOps for SourceOps {
     }
 
     fn open_read(&self, path: &Path) -> io::Result<Box<dyn Read + Send>> {
-        let Some((_, mount, inside)) = self.state.route(path) else {
+        let Some((_, mount, inside)) = self.state.route(path)? else {
             return self.state.local.open_read(path);
         };
         let open = mount
@@ -310,7 +336,7 @@ impl FileOps for SourceOps {
     }
 
     fn create_new(&self, path: &Path) -> io::Result<Box<dyn SyncWrite>> {
-        let Some((index, mount, inside)) = self.state.route(path) else {
+        let Some((index, mount, inside)) = self.state.route(path)? else {
             return self.state.local.create_new(path);
         };
         if !mount.source.is_writable() {
@@ -338,7 +364,7 @@ impl FileOps for SourceOps {
     }
 
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
-        match (self.state.route(from), self.state.route(to)) {
+        match (self.state.route(from)?, self.state.route(to)?) {
             (None, None) => self.state.local.rename(from, to),
             (Some((index, mount, inside_from)), Some((other, _, inside_to))) if index == other => {
                 self.state.edit(
@@ -358,29 +384,31 @@ impl FileOps for SourceOps {
     }
 
     fn rename_no_replace(&self, from: &Path, to: &Path) -> io::Result<()> {
-        if self.state.route(from).is_none() && self.state.route(to).is_none() {
+        if let (None, None) = (self.state.route(from)?, self.state.route(to)?) {
             return self.state.local.rename_no_replace(from, to);
         }
         check_then_rename(self, from, to)
     }
 
     fn replace(&self, from: &Path, to: &Path) -> io::Result<()> {
-        if self.state.route(from).is_none() && self.state.route(to).is_none() {
+        if let (None, None) = (self.state.route(from)?, self.state.route(to)?) {
             return self.state.local.replace(from, to);
         }
         self.rename(from, to)
     }
 
     fn replace_refusal(&self, to: &Path) -> Option<&'static str> {
-        if self.state.route(to).is_none() {
-            return self.state.local.replace_refusal(to);
+        match self.state.route(to) {
+            Ok(None) => return self.state.local.replace_refusal(to),
+            Ok(Some(_)) => {}
+            Err(_) => return Some("the path under a mounted source is not usable"),
         }
         None
     }
 
     fn create_new_like(&self, path: &Path, access: AccessOf<'_>) -> io::Result<Box<dyn SyncWrite>> {
         let (AccessOf::Replaced(model) | AccessOf::Source(model)) = access;
-        if self.state.route(path).is_none() && self.state.route(model).is_none() {
+        if let (None, None) = (self.state.route(path)?, self.state.route(model)?) {
             return self.state.local.create_new_like(path, access);
         }
         self.create_new(path)
@@ -393,7 +421,7 @@ impl FileOps for SourceOps {
         buffer_size: usize,
         model: &Path,
     ) -> io::Result<()> {
-        if self.state.route(target).is_none() && self.state.route(model).is_none() {
+        if let (None, None) = (self.state.route(target)?, self.state.route(model)?) {
             return self
                 .state
                 .local
@@ -408,14 +436,14 @@ impl FileOps for SourceOps {
         reader: &mut dyn Read,
         buffer_size: usize,
     ) -> io::Result<()> {
-        if self.state.route(target).is_none() {
+        if self.state.route(target)?.is_none() {
             return self.state.local.write_new(target, reader, buffer_size);
         }
         write_new_through(self, target, reader, buffer_size)
     }
 
     fn remove_file(&self, path: &Path) -> io::Result<()> {
-        let Some((index, mount, inside)) = self.state.route(path) else {
+        let Some((index, mount, inside)) = self.state.route(path)? else {
             return self.state.local.remove_file(path);
         };
         self.state
@@ -423,7 +451,7 @@ impl FileOps for SourceOps {
     }
 
     fn remove_dir(&self, path: &Path) -> io::Result<()> {
-        let Some((index, mount, inside)) = self.state.route(path) else {
+        let Some((index, mount, inside)) = self.state.route(path)? else {
             return self.state.local.remove_dir(path);
         };
         self.state
@@ -431,7 +459,7 @@ impl FileOps for SourceOps {
     }
 
     fn move_to_trash(&self, path: &Path) -> io::Result<()> {
-        if self.state.route(path).is_none() {
+        if self.state.route(path)?.is_none() {
             return self.state.local.move_to_trash(path);
         }
         Err(refuse(
@@ -443,7 +471,7 @@ impl FileOps for SourceOps {
     /// A container takes a time only with the write the open batch queued for
     /// the same path: a rewrite for a time alone would cost a whole container.
     fn set_modified(&self, path: &Path, time: SystemTime) -> io::Result<()> {
-        let Some((index, _, inside)) = self.state.route(path) else {
+        let Some((index, _, inside)) = self.state.route(path)? else {
             return self.state.local.set_modified(path, time);
         };
         if self.state.stamp_queued_write(index, &inside, time) {
@@ -456,7 +484,7 @@ impl FileOps for SourceOps {
     }
 
     fn set_created(&self, path: &Path, time: SystemTime) -> io::Result<()> {
-        if self.state.route(path).is_none() {
+        if self.state.route(path)?.is_none() {
             return self.state.local.set_created(path, time);
         }
         Err(refuse(
@@ -466,7 +494,7 @@ impl FileOps for SourceOps {
     }
 
     fn set_attributes(&self, path: &Path, change: &AttributeChange) -> io::Result<()> {
-        if self.state.route(path).is_none() {
+        if self.state.route(path)?.is_none() {
             return self.state.local.set_attributes(path, change);
         }
         Err(refuse(
@@ -477,14 +505,14 @@ impl FileOps for SourceOps {
 
     fn same_volume(&self, from: &Path, to: &Path) -> bool {
         match (self.state.route(from), self.state.route(to)) {
-            (None, None) => self.state.local.same_volume(from, to),
-            (Some((left, _, _)), Some((right, _, _))) => left == right,
+            (Ok(None), Ok(None)) => self.state.local.same_volume(from, to),
+            (Ok(Some((left, _, _))), Ok(Some((right, _, _)))) => left == right,
             _ => false,
         }
     }
 
     fn read_dir(&self, path: &Path) -> io::Result<Vec<PathBuf>> {
-        let Some((_, mount, inside)) = self.state.route(path) else {
+        let Some((_, mount, inside)) = self.state.route(path)? else {
             return self.state.local.read_dir(path);
         };
         let listed = mount
@@ -507,7 +535,7 @@ impl FileOps for SourceOps {
     /// A mounted path names one entry and no link stands between it and the
     /// root, so the path is already the real location.
     fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
-        if self.state.route(path).is_none() {
+        if self.state.route(path)?.is_none() {
             return std::fs::canonicalize(path);
         }
         Ok(path.to_path_buf())
@@ -516,14 +544,14 @@ impl FileOps for SourceOps {
     /// An entry of a mounted source has no number of its own; its path is
     /// its identity, which [`FileOps::canonicalize`] states.
     fn identity(&self, path: &Path) -> io::Result<Option<ItemIdentity>> {
-        if self.state.route(path).is_none() {
+        if self.state.route(path)?.is_none() {
             return self.state.local.identity(path);
         }
         Ok(None)
     }
 
     fn volume_identity(&self, path: &Path) -> io::Result<Option<Vec<u8>>> {
-        if self.state.route(path).is_none() {
+        if self.state.route(path)?.is_none() {
             return self.state.local.volume_identity(path);
         }
         Ok(None)
@@ -531,13 +559,14 @@ impl FileOps for SourceOps {
 
     fn keeps_case(&self, path: &Path) -> bool {
         match self.state.route(path) {
-            Some((_, mount, _)) => mount.source.kind() == SourceKind::Archive,
-            None => self.state.local.keeps_case(path),
+            Ok(Some((_, mount, _))) => mount.source.kind() == SourceKind::Archive,
+            Ok(None) => self.state.local.keeps_case(path),
+            Err(_) => true,
         }
     }
 
     fn identity_is_path(&self, path: &Path) -> bool {
-        self.state.route(path).is_some()
+        self.state.route(path).map_or(true, |route| route.is_some())
     }
 }
 
@@ -628,5 +657,60 @@ mod tests {
             .rename(&dir.path().join("mounted/a"), &dir.path().join("b"))
             .unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::CrossesDevices);
+    }
+
+    #[test]
+    fn an_invalid_path_under_a_mount_never_falls_through_to_the_local_disk() -> std::io::Result<()>
+    {
+        let mounted = tempfile::tempdir()?;
+        let prefix = mounted.path().join("mounted");
+        std::fs::create_dir(&prefix)?;
+        let local_target = prefix.join("victim.");
+        std::fs::write(&local_target, b"local file")?;
+
+        let source = tempfile::tempdir()?;
+        let ops = SourceOps::new(vec![Mount::new(prefix, Source::local(source.path()))]);
+        let error = ops
+            .remove_file(&local_target)
+            .err()
+            .ok_or_else(|| std::io::Error::other("invalid mounted path was removed"))?;
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(local_target.exists());
+        assert!(ops.identity_is_path(&local_target));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn routing_refuses_components_that_vfs_paths_would_change() -> std::io::Result<()> {
+        use std::os::unix::ffi::OsStringExt;
+
+        let mounted = tempfile::tempdir()?;
+        let prefix = mounted.path().join("mounted");
+        std::fs::create_dir(&prefix)?;
+        let source = tempfile::tempdir()?;
+        let nested = source.path().join("a");
+        std::fs::create_dir(&nested)?;
+        std::fs::write(nested.join("b"), b"separator target")?;
+        std::fs::write(source.path().join("name\u{fffd}"), b"lossy target")?;
+        let ops = SourceOps::new(vec![Mount::new(
+            prefix.clone(),
+            Source::local(source.path()),
+        )]);
+
+        let separator = prefix.join("a\\b");
+        let error = ops
+            .probe(&separator)
+            .err()
+            .ok_or_else(|| std::io::Error::other("mounted path component was split"))?;
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+
+        let invalid_utf8 = prefix.join(std::ffi::OsString::from_vec(b"name\xff".to_vec()));
+        let error = ops
+            .probe(&invalid_utf8)
+            .err()
+            .ok_or_else(|| std::io::Error::other("non-Unicode mounted path was rewritten"))?;
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        Ok(())
     }
 }

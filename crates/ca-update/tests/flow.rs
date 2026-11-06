@@ -1358,6 +1358,25 @@ fn trickle_server(
 }
 
 #[test]
+fn a_slow_document_ends_at_the_document_timeout() {
+    use ca_update::net::Transport;
+    let body = vec![7u8; 24];
+    let base = trickle_server(body, 1, Duration::from_millis(75), None);
+    let transport = HttpTransport::new(
+        "compare-all/test".to_owned(),
+        ProxyConfig::direct(),
+        Duration::from_millis(300),
+    )
+    .allowing_plain_http();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let started = std::time::Instant::now();
+    let result = transport.get_document(&format!("{base}/latest"), 1024, &cancel);
+    let waited = started.elapsed();
+    assert!(result.is_err(), "{result:?}");
+    assert!(waited < Duration::from_millis(1200), "{waited:?}");
+}
+
+#[test]
 fn a_slow_but_steady_download_outlasts_the_document_timeout() {
     use ca_update::net::Transport;
     let body = vec![7u8; 4000];

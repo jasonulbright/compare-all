@@ -15,6 +15,10 @@
 
 use crate::remote::timestamp::{civil_to_unix, month_number, parse_ftp_stamp, unix_to_civil};
 
+/// The entry metadata ends well before the filename; never tokenize a whole
+/// untrusted filename just to find those columns.
+const MAX_HEADER_TOKENS: usize = 64;
+
 /// What a listing line says an entry is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ListedKind {
@@ -159,7 +163,7 @@ fn parse_unix_line(line: &str, now: i64) -> Option<ListedEntry> {
         return None;
     }
 
-    let tokens: Vec<(usize, &str)> = token_offsets(line);
+    let tokens: Vec<(usize, &str)> = token_offsets(line).take(MAX_HEADER_TOKENS).collect();
     // The date starts at the first month name that is followed by a day and by
     // a time or a year. Scanning for it tolerates the missing owner or group
     // column that some servers leave out.
@@ -260,7 +264,7 @@ fn parse_unix_line(line: &str, now: i64) -> Option<ListedEntry> {
 
 /// Parse a Windows long listing line.
 fn parse_windows_line(line: &str) -> Option<ListedEntry> {
-    let tokens: Vec<(usize, &str)> = token_offsets(line);
+    let tokens: Vec<(usize, &str)> = token_offsets(line).take(MAX_HEADER_TOKENS).collect();
     let (_, date) = tokens.first()?;
     let (_, clock) = tokens.get(1)?;
     let (_, third) = tokens.get(2)?;
@@ -336,27 +340,15 @@ fn parse_windows_line(line: &str) -> Option<ListedEntry> {
     })
 }
 
-/// Byte offset and text of each whitespace separated token.
-fn token_offsets(line: &str) -> Vec<(usize, &str)> {
-    let mut out = Vec::new();
-    let mut start: Option<usize> = None;
-    for (index, ch) in line.char_indices() {
-        if ch.is_whitespace() {
-            if let Some(at) = start.take() {
-                if let Some(text) = line.get(at..index) {
-                    out.push((at, text));
-                }
-            }
-        } else if start.is_none() {
-            start = Some(index);
-        }
-    }
-    if let Some(at) = start {
-        if let Some(text) = line.get(at..) {
-            out.push((at, text));
-        }
-    }
-    out
+/// Byte offset and text of each whitespace separated token, without storing
+/// the tokens. The parsers take only the bounded metadata prefix.
+fn token_offsets(line: &str) -> impl Iterator<Item = (usize, &str)> + '_ {
+    let mut offset = 0usize;
+    line.split_whitespace().filter_map(move |token| {
+        let start = offset + line.get(offset..)?.find(token)?;
+        offset = start + token.len();
+        Some((start, token))
+    })
 }
 
 /// True for `HH:MM` and `HH:MM:SS`.
@@ -475,6 +467,14 @@ mod tests {
         assert_eq!(entry.kind, ListedKind::Link);
         assert_eq!(entry.name, "link");
         assert_eq!(entry.link_target.as_deref(), Some("target"));
+    }
+
+    #[test]
+    fn a_long_filename_is_not_tokenized_as_listing_metadata() {
+        let name = vec!["piece"; 4096].join(" ");
+        let line = format!("-rw-r--r-- 1 owner group 1 Jan 2 03:04 {name}");
+        let entry = parse_plain_line(&line, NOW).unwrap();
+        assert_eq!(entry.name, name);
     }
 
     #[test]
