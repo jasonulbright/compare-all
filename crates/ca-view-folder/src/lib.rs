@@ -1962,6 +1962,7 @@ impl FolderView {
         self.font.row_height(ROW_HEIGHT_RATIO, self.line_spacing)
     }
 
+    /// Recompute effective statuses, totals, filters, navigation order, and rows.
     fn rebuild(&mut self) {
         if self.ignored_overrides.is_empty() {
             self.effective_statuses.clear();
