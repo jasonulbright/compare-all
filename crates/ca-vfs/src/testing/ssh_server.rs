@@ -526,11 +526,11 @@ impl russh_sftp::server::Handler for SftpHandler {
             .resolve(&filename)
             .ok_or(StatusCode::PermissionDenied)?;
         #[cfg(windows)]
-        let metadata = std::fs::symlink_metadata(&target).map_err(|_| StatusCode::NoSuchFile)?;
-        #[cfg(windows)]
         let remove = {
             use std::os::windows::fs::FileTypeExt;
 
+            let metadata =
+                std::fs::symlink_metadata(&target).map_err(|_| StatusCode::NoSuchFile)?;
             if metadata.file_type().is_symlink_dir() {
                 std::fs::remove_dir(target)
             } else {

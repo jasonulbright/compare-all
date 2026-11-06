@@ -98,8 +98,15 @@ fn connected() -> (tempfile::TempDir, tempfile::TempDir, SshTestServer, SftpFs) 
 
 /// Connect to a server rooted at an existing directory.
 fn connected_to(root: &Path) -> (tempfile::TempDir, FtpProfile, SshTestServer, SftpFs) {
-    let settings_dir = tempfile::tempdir().unwrap();
     let server = SshTestServer::start(root, "operator", &password());
+    connected_server(server)
+}
+
+/// Trust and connect to a server that has already been started.
+fn connected_server(
+    server: SshTestServer,
+) -> (tempfile::TempDir, FtpProfile, SshTestServer, SftpFs) {
+    let settings_dir = tempfile::tempdir().unwrap();
     let store = KnownHosts::new(settings_dir.path().join("known_hosts"));
     store
         .record(
@@ -265,19 +272,8 @@ fn a_refused_entry_rename_keeps_the_existing_destination() {
     let destination = directory.path().join("destination.txt");
     std::fs::write(&source, b"source content").unwrap();
     std::fs::write(&destination, b"existing destination").unwrap();
-    let settings_dir = tempfile::tempdir().unwrap();
     let server = SshTestServer::start_refusing_renames(directory.path(), "operator", &password());
-    let store = KnownHosts::new(settings_dir.path().join("known_hosts"));
-    store
-        .record(
-            "127.0.0.1",
-            server.port(),
-            &server.host_key_type,
-            &server.host_key,
-        )
-        .unwrap();
-    let settings = profile(&server, &settings_dir.path().join("known_hosts"));
-    let fs = SftpFs::connect(&settings, &context(), &Cancel::new()).unwrap();
+    let (_settings_dir, _settings, _server, fs) = connected_server(server);
 
     assert!(fs
         .rename(
@@ -300,20 +296,9 @@ fn a_failed_entry_rename_restores_the_existing_destination() {
     let destination = directory.path().join("destination.txt");
     std::fs::write(&source, b"source content").unwrap();
     std::fs::write(&destination, b"existing destination").unwrap();
-    let settings_dir = tempfile::tempdir().unwrap();
     let server =
         SshTestServer::start_failing_rename_number(directory.path(), "operator", &password(), 2);
-    let store = KnownHosts::new(settings_dir.path().join("known_hosts"));
-    store
-        .record(
-            "127.0.0.1",
-            server.port(),
-            &server.host_key_type,
-            &server.host_key,
-        )
-        .unwrap();
-    let settings = profile(&server, &settings_dir.path().join("known_hosts"));
-    let fs = SftpFs::connect(&settings, &context(), &Cancel::new()).unwrap();
+    let (_settings_dir, _settings, _server, fs) = connected_server(server);
 
     assert!(fs
         .rename(

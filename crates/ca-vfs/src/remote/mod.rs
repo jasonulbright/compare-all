@@ -13,13 +13,15 @@
 //!
 //! # Bounds
 //!
-//! Remote operations are bounded by `call_timeout`, with details depending on
-//! the transport. Progress-aware streams renew their inactivity deadline as
-//! bytes arrive, so a steady transfer may outlast `call_timeout`. SFTP applies
-//! it to each operation. Cancellation is checked at transport-defined points
-//! and may not interrupt work already in flight. Listings and reads are
-//! charged against [`Limits`](crate::Limits), so an endless listing costs the
-//! ceiling rather than the caller's memory.
+//! Remote I/O is bounded by `call_timeout`, with details depending on the
+//! transport. Progress-aware streams renew their inactivity deadline as bytes
+//! arrive, so a steady transfer may outlast `call_timeout`; SFTP applies a
+//! hard timeout to each operation. Synchronous address resolution and waiting
+//! for the serialized SFTP session can add time before those bounds begin.
+//! Cancellation is checked at transport-defined points and may not interrupt
+//! work already in flight. Listings and reads are charged against
+//! [`Limits`](crate::Limits), so an endless listing costs the ceiling rather
+//! than the caller's memory.
 //!
 //! # Secrets
 //!
@@ -89,8 +91,8 @@ pub struct RemoteContext {
     pub secrets: Arc<dyn SecretStore>,
     /// Ceilings on what one listing or one read may cost.
     pub limits: Limits,
-    /// Timeout used by remote operations; progress-aware streams renew it as
-    /// bytes arrive.
+    /// Timeout applied by remote transports to I/O; progress-aware streams
+    /// renew it as bytes arrive. Setup and SFTP session-lock waits may add time.
     pub call_timeout: Duration,
     /// Where accepted secure shell host keys are recorded. A profile that
     /// names its own store overrides this.
