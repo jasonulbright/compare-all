@@ -400,17 +400,74 @@ impl Arena {
     /// something visible, so the route to a visible file is never hidden.
     #[must_use]
     pub fn visibility(&self, filter: DisplayFilter, folder: FolderDisplayFilter) -> Vec<bool> {
+        self.visibility_with_statuses(filter, folder, &[])
+    }
+
+    /// Which nodes the two display filters show, using `statuses` in place of
+    /// the comparison status. A short status slice falls back to the arena's
+    /// status for its remaining nodes.
+    #[must_use]
+    pub fn visibility_with_statuses(
+        &self,
+        filter: DisplayFilter,
+        folder: FolderDisplayFilter,
+        statuses: &[NodeStatus],
+    ) -> Vec<bool> {
         let mut visible = vec![false; self.nodes.len()];
         for index in (0..self.nodes.len()).rev() {
             let node = &self.nodes[index];
+            let status = statuses.get(index).copied().unwrap_or(node.status);
             visible[index] = if node.is_dir {
                 let has_visible_child = node.children.iter().any(|child| visible[*child as usize]);
-                ca_fs::display::folder_visible(folder, filter, node.status, has_visible_child)
+                ca_fs::display::folder_visible(folder, filter, status, has_visible_child)
             } else {
-                filter.shows(node.status)
+                filter.shows(status)
             };
         }
         visible
+    }
+
+    /// Statuses after applying session-only ignored overrides, plus the
+    /// inherited ignored state of each row. Ignored differences count as same
+    /// for filters and totals. Errors remain visible.
+    #[must_use]
+    pub fn statuses_with_ignored(
+        &self,
+        overrides: &HashMap<PathBuf, bool>,
+    ) -> (Vec<NodeStatus>, Vec<bool>) {
+        let ignored: Vec<bool> = self
+            .nodes
+            .iter()
+            .map(|node| ignored_at(&node.rel, overrides))
+            .collect();
+        let mut statuses = vec![NodeStatus::NotCompared; self.nodes.len()];
+        let mut below = vec![StatusFlags::default(); self.nodes.len()];
+        for index in (0..self.nodes.len()).rev() {
+            let node = &self.nodes[index];
+            let mut flags = StatusFlags::default();
+            for child in &node.children {
+                let child = *child as usize;
+                if let Some(status) = statuses.get(child).copied() {
+                    flags.record(status);
+                }
+                if let Some(child_flags) = below.get(child).copied() {
+                    flags.merge(child_flags);
+                }
+            }
+            below[index] = flags;
+            statuses[index] = if node.is_dir {
+                if node.status.is_structural() && !ignored[index] {
+                    node.status
+                } else {
+                    ca_fs::folder_status(flags, node.own_error)
+                }
+            } else if ignored[index] && node.status != NodeStatus::Error {
+                NodeStatus::Same
+            } else {
+                node.status
+            };
+        }
+        (statuses, ignored)
     }
 
     /// The rows to paint, given which folders are open and which nodes pass the
@@ -472,11 +529,20 @@ impl Arena {
     /// status bar asks every frame and the count is a pass over every node.
     #[must_use]
     pub fn totals(&self) -> Totals {
+        self.totals_with_statuses(&[])
+    }
+
+    /// Row totals using `statuses` in place of the comparison status. A short
+    /// status slice falls back to the arena's status for its remaining nodes.
+    #[must_use]
+    pub fn totals_with_statuses(&self, statuses: &[NodeStatus]) -> Totals {
         if let Some(totals) = self.totals.get() {
-            return totals;
+            if statuses.is_empty() {
+                return totals;
+            }
         }
         let mut totals = Totals::default();
-        for node in &self.nodes {
+        for (index, node) in self.nodes.iter().enumerate() {
             if node.incomplete {
                 totals.incomplete += 1;
             }
@@ -485,7 +551,7 @@ impl Arena {
                 continue;
             }
             totals.files += 1;
-            match node.status {
+            match statuses.get(index).copied().unwrap_or(node.status) {
                 NodeStatus::Same => totals.same += 1,
                 NodeStatus::NotCompared => totals.not_compared += 1,
                 NodeStatus::LeftOrphan | NodeStatus::RightOrphan => totals.orphans += 1,
@@ -497,7 +563,9 @@ impl Arena {
                 _ => totals.differences += 1,
             }
         }
-        self.totals.set(Some(totals));
+        if statuses.is_empty() {
+            self.totals.set(Some(totals));
+        }
         totals
     }
 
@@ -617,6 +685,19 @@ fn side_info(entry: &ca_fs::Entry, folder_size: Option<u64>) -> SideInfo {
     }
 }
 
+/// The nearest row override controls an item. This lets a user restore one
+/// child under an ignored folder without changing the folder's other children.
+pub(crate) fn ignored_at(rel: &Path, overrides: &HashMap<PathBuf, bool>) -> bool {
+    let mut path = Some(rel);
+    while let Some(current) = path {
+        if let Some(ignored) = overrides.get(current) {
+            return *ignored;
+        }
+        path = current.parent();
+    }
+    false
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -625,6 +706,7 @@ mod tests {
         Attributes, ContentOutcome, ContentUpdate, DisplayFilter, Entry, FolderDisplayFilter, Node,
         NodeStatus,
     };
+    use std::collections::HashMap;
     use std::path::PathBuf;
     use std::time::Instant;
 
@@ -725,6 +807,75 @@ mod tests {
             .collect();
         assert_eq!(names, vec!["src", "a.rs", "b.rs", "readme.md"]);
         assert_eq!(rows[1].depth, 1);
+    }
+
+    #[test]
+    fn ignoring_a_folder_makes_its_differences_match() {
+        let arena = Arena::from_root(&sample());
+        let overrides = HashMap::from([(PathBuf::from("src"), true)]);
+        let (statuses, ignored) = arena.statuses_with_ignored(&overrides);
+        let src = arena.index_of(std::path::Path::new("src")).unwrap() as usize;
+        let same = arena.index_of(std::path::Path::new("src/a.rs")).unwrap() as usize;
+        let different = arena.index_of(std::path::Path::new("src/b.rs")).unwrap() as usize;
+
+        assert_eq!(statuses[src], NodeStatus::Same);
+        assert_eq!(statuses[same], NodeStatus::Same);
+        assert_eq!(statuses[different], NodeStatus::Same);
+        assert!(!ignored.is_empty());
+        assert!(ignored[src]);
+        assert!(ignored[same]);
+        assert!(ignored[different]);
+        assert!(!ignored[arena.index_of(std::path::Path::new("readme.md")).unwrap() as usize]);
+        assert_eq!(arena.totals_with_statuses(&statuses).differences, 0);
+        assert_eq!(arena.totals_with_statuses(&statuses).orphans, 1);
+        let differences = arena.visibility_with_statuses(
+            DisplayFilter::ShowDifferences,
+            FolderDisplayFilter::default(),
+            &statuses,
+        );
+        let same_filter = arena.visibility_with_statuses(
+            DisplayFilter::ShowSame,
+            FolderDisplayFilter::default(),
+            &statuses,
+        );
+        assert!(!differences[src]);
+        assert!(same_filter[src]);
+        assert!(same_filter[same]);
+        assert!(same_filter[different]);
+    }
+
+    #[test]
+    fn a_child_override_restores_its_difference_under_an_ignored_folder() {
+        let arena = Arena::from_root(&sample());
+        let overrides = HashMap::from([
+            (PathBuf::from("src"), true),
+            (PathBuf::from("src/b.rs"), false),
+        ]);
+        let (statuses, ignored) = arena.statuses_with_ignored(&overrides);
+        let src = arena.index_of(std::path::Path::new("src")).unwrap() as usize;
+        let same = arena.index_of(std::path::Path::new("src/a.rs")).unwrap() as usize;
+        let different = arena.index_of(std::path::Path::new("src/b.rs")).unwrap() as usize;
+
+        assert_eq!(statuses[src], NodeStatus::Different);
+        assert_eq!(statuses[same], NodeStatus::Same);
+        assert_eq!(statuses[different], NodeStatus::Different);
+        assert!(ignored[src]);
+        assert!(ignored[same]);
+        assert!(!ignored[different]);
+    }
+
+    #[test]
+    fn ignoring_a_row_does_not_hide_an_error() {
+        let arena = Arena::from_root(&folder("", vec![file("unreadable.txt", NodeStatus::Error)]));
+        let overrides = HashMap::from([(PathBuf::from("unreadable.txt"), true)]);
+        let (statuses, ignored) = arena.statuses_with_ignored(&overrides);
+        let index = arena
+            .index_of(std::path::Path::new("unreadable.txt"))
+            .unwrap() as usize;
+
+        assert_eq!(statuses[index], NodeStatus::Error);
+        assert!(ignored[index]);
+        assert_eq!(arena.totals_with_statuses(&statuses).errors, 1);
     }
 
     #[test]

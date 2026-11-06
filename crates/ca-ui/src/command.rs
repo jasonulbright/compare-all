@@ -255,6 +255,7 @@ commands! {
     ResizeColumnsToFit, "Resize Columns to Fit", View, None, "Make table columns wide enough for their headings and data to be fully visible.";
     ToggleIgnoreSameChanges, "Ignore Same Changes", View, None, "Count a change made the same way on both sides as no change, or stop doing so.";
     ToggleIgnored, "Ignored", View, None, "Show rows the session marks as ignored, or hide them.";
+    ToggleRowIgnored, "Ignored", Actions, None, "Ignore the selected folder rows, or stop ignoring them.";
     ToggleSectionIgnored, "Ignored", View, None, "Ignore the differences of the selected lines or the current section, or stop ignoring them.";
     AlwaysShowFolders, "Always Show Folders", View, None, "Keep folders on screen whatever the filter says.";
     CompareFilesAndFolderStructure, "Compare Files and Folder Structure", View, None, "Pair items by their place in the tree.";

@@ -44,11 +44,12 @@ use opjobs::{
     ProgressState, RecoverMessage, RecoveryNotice, RescanMessage, SelectionRefreshMessage,
 };
 use selection::{ClickKind, Scope, SelectRule, Selection};
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use sync_mode::SyncMode;
-use tree::{Arena, ArenaNode, Expanded, FlatRow, Sort, SortColumn};
+use tree::{ignored_at, Arena, ArenaNode, Expanded, FlatRow, Sort, SortColumn, Totals};
 
 /// Row height as a multiple of the folder listing font size.
 ///
@@ -157,6 +158,7 @@ const HANDLED: &[Command] = &[
     Command::Attributes,
     Command::NewFolder,
     Command::CopyFilename,
+    Command::ToggleRowIgnored,
     Command::Exchange,
     Command::Exclude,
 ];
@@ -361,6 +363,15 @@ pub struct FolderView {
     arena: Arena,
     compared_tree: Option<Box<Node>>,
     expanded: Expanded,
+    /// Explicit session overrides; a folder override also applies to its
+    /// descendants unless a child has its own override.
+    ignored_overrides: HashMap<PathBuf, bool>,
+    /// Statuses after the ignored overrides, indexed like `arena.nodes()`.
+    effective_statuses: Vec<NodeStatus>,
+    /// Inherited ignored state, indexed like `arena.nodes()`.
+    ignored_rows: Vec<bool>,
+    /// Cached totals for the effective row statuses.
+    effective_totals: Option<Totals>,
     visible: Vec<bool>,
     order: navigate::DisplayOrder,
     rows: Vec<FlatRow>,
@@ -552,6 +563,10 @@ impl FolderView {
             arena: Arena::default(),
             compared_tree: None,
             expanded: Expanded::new(),
+            ignored_overrides: HashMap::new(),
+            effective_statuses: Vec::new(),
+            ignored_rows: Vec::new(),
+            effective_totals: None,
             visible: Vec::new(),
             order: navigate::DisplayOrder::default(),
             rows: Vec::new(),
@@ -750,7 +765,13 @@ impl FolderView {
     /// Select every visible row a rule takes, on the sides a scope covers.
     pub fn select(&mut self, rule: SelectRule, scope: Scope) {
         let rows = std::mem::take(&mut self.rows);
-        self.selection.select_rule(rule, scope, &rows, &self.arena);
+        self.selection.select_rule_with_statuses(
+            rule,
+            scope,
+            &rows,
+            &self.arena,
+            &self.effective_statuses,
+        );
         self.rows = rows;
     }
 
@@ -1938,7 +1959,20 @@ impl FolderView {
     }
 
     fn rebuild(&mut self) {
-        self.visible = self.arena.visibility(self.filter, self.folder_filter);
+        if self.ignored_overrides.is_empty() {
+            self.effective_statuses.clear();
+            self.ignored_rows.clear();
+            self.effective_totals = Some(self.arena.totals());
+        } else {
+            (self.effective_statuses, self.ignored_rows) =
+                self.arena.statuses_with_ignored(&self.ignored_overrides);
+            self.effective_totals = Some(self.arena.totals_with_statuses(&self.effective_statuses));
+        }
+        self.visible = self.arena.visibility_with_statuses(
+            self.filter,
+            self.folder_filter,
+            &self.effective_statuses,
+        );
         self.rows = self.arena.flatten(&self.expanded, &self.visible);
         self.order = navigate::DisplayOrder::of(&self.arena, &self.visible);
         if let Some(drag) = &mut self.selection_drag {
@@ -1949,6 +1983,47 @@ impl FolderView {
         self.rebuild_pending = false;
         self.last_rebuild = Instant::now();
         self.rebuilds = self.rebuilds.saturating_add(1);
+    }
+
+    /// The status the current view exposes for an arena row.
+    pub(crate) fn effective_status(&self, node: &ArenaNode) -> NodeStatus {
+        self.arena
+            .index_of(&node.rel)
+            .and_then(|index| self.effective_statuses.get(index as usize))
+            .copied()
+            .unwrap_or(node.status)
+    }
+
+    fn selected_row_paths(&self) -> Vec<PathBuf> {
+        let mut paths = BTreeSet::new();
+        paths.extend(self.selection.side(Side::Left).iter().cloned());
+        paths.extend(self.selection.side(Side::Right).iter().cloned());
+        paths
+            .into_iter()
+            .filter(|rel| self.arena.index_of(rel).is_some())
+            .collect()
+    }
+
+    fn selected_rows_are_ignored(&self) -> bool {
+        let paths = self.selected_row_paths();
+        !paths.is_empty()
+            && paths
+                .iter()
+                .all(|rel| ignored_at(rel, &self.ignored_overrides))
+    }
+
+    fn toggle_selected_ignored(&mut self) {
+        let paths = self.selected_row_paths();
+        if paths.is_empty() {
+            return;
+        }
+        let ignored = !paths
+            .iter()
+            .all(|rel| ignored_at(rel, &self.ignored_overrides));
+        for rel in paths {
+            self.ignored_overrides.insert(rel, ignored);
+        }
+        self.rebuild();
     }
 
     fn apply_fields(&mut self) {
@@ -2036,8 +2111,13 @@ impl FolderView {
         });
         if let Some((select, scope)) = rule {
             let rows = std::mem::take(&mut self.rows);
-            self.selection
-                .select_rule(select, scope, &rows, &self.arena);
+            self.selection.select_rule_with_statuses(
+                select,
+                scope,
+                &rows,
+                &self.arena,
+                &self.effective_statuses,
+            );
             self.rows = rows;
         }
     }
@@ -2293,8 +2373,13 @@ impl FolderView {
             None => {}
         }
         if let Some((select, scope)) = rule {
-            self.selection
-                .select_rule(select, scope, &self.rows, &self.arena);
+            self.selection.select_rule_with_statuses(
+                select,
+                scope,
+                &self.rows,
+                &self.arena,
+                &self.effective_statuses,
+            );
         }
         if rescan {
             self.restart();
@@ -2334,7 +2419,12 @@ impl FolderView {
                 name: node.name.clone(),
                 relative_path: node.rel.to_string_lossy().replace('\\', "/"),
                 is_dir: node.is_dir,
-                status: ca_ui::report::EntryStatus::from(node.status),
+                status: ca_ui::report::EntryStatus::from(
+                    self.effective_statuses
+                        .get(flat.node as usize)
+                        .copied()
+                        .unwrap_or(node.status),
+                ),
                 left: side_facts(node.left.as_ref()),
                 right: side_facts(node.right.as_ref()),
                 link: None,
@@ -2581,7 +2671,7 @@ impl FolderView {
                     );
                 }
                 Status::Ready => {
-                    let totals = self.arena.totals();
+                    let totals = self.effective_totals.unwrap_or_else(|| self.arena.totals());
                     ui.label(format!(
                         "{} folders, {} files: {} same, {} differ, {} orphans, {} not compared",
                         totals.folders,
@@ -2609,7 +2699,10 @@ impl FolderView {
                     toggle_errors = true;
                 }
             }
-            let mismatches = self.arena.totals().kind_mismatches;
+            let mismatches = self
+                .effective_totals
+                .unwrap_or_else(|| self.arena.totals())
+                .kind_mismatches;
             if mismatches > 0 {
                 ui.separator();
                 ui.label(format!("{mismatches} file and folder clashes"));
@@ -2887,7 +2980,22 @@ impl FolderView {
             if position % 2 == 1 {
                 clip.rect_filled(row_rect, 0.0, palette.stripe);
             }
-            let color = palette.folder_row(theme::folder_class(node.status));
+            let effective_status = self
+                .effective_statuses
+                .get(row.node as usize)
+                .copied()
+                .unwrap_or(node.status);
+            let ignored = self
+                .ignored_rows
+                .get(row.node as usize)
+                .copied()
+                .unwrap_or(false)
+                && effective_status == NodeStatus::Same;
+            let color = palette.folder_row(if ignored {
+                theme::FolderClass::Unknown
+            } else {
+                theme::folder_class(effective_status)
+            });
             let expanded = node.is_dir && self.expanded.is_expanded(row.node);
             for (side, pane, info) in [
                 (Side::Left, layout.left, node.left.as_ref()),
@@ -2912,6 +3020,8 @@ impl FolderView {
                     y,
                     pane,
                     node,
+                    effective_status,
+                    ignored,
                     row.depth,
                     expanded,
                     info,
@@ -2925,7 +3035,7 @@ impl FolderView {
             if !row_rect.contains(cursor) {
                 continue;
             }
-            if let Some(tip) = node_tooltip(node) {
+            if let Some(tip) = node_tooltip_with_ignored(node, ignored) {
                 egui::show_tooltip_at(
                     ui.ctx(),
                     ui.layer_id(),
@@ -3399,6 +3509,8 @@ fn paint_pane(
     y: f32,
     pane: Pane,
     node: &ArenaNode,
+    status: NodeStatus,
+    ignored: bool,
     depth: u16,
     expanded: bool,
     side: Option<&tree::SideInfo>,
@@ -3427,12 +3539,22 @@ fn paint_pane(
             color,
         );
     }
-    ca_ui::icons::node_status_icon(node.status, node.content, node.incomplete).paint_in_row(
-        &clip,
-        egui::pos2(pane.name.start + indent + 26.0, middle),
-        row_height,
-        color,
-    );
+    if ignored {
+        clip.text(
+            egui::pos2(pane.name.start + indent + 26.0, middle),
+            egui::Align2::CENTER_CENTER,
+            "I",
+            font.clone(),
+            color,
+        );
+    } else {
+        ca_ui::icons::node_status_icon(status, node.content, node.incomplete).paint_in_row(
+            &clip,
+            egui::pos2(pane.name.start + indent + 26.0, middle),
+            row_height,
+            color,
+        );
+    }
     let item_icon = if node.is_dir {
         if expanded {
             ca_ui::icons::Icon::FolderOpen
@@ -3506,6 +3628,11 @@ pub fn node_tooltip(node: &ArenaNode) -> Option<&'static str> {
         return Some("Contents were not read: the file is not stored locally");
     }
     None
+}
+
+/// The explanation shown for a row whose differences are ignored.
+fn node_tooltip_with_ignored(node: &ArenaNode, ignored: bool) -> Option<&'static str> {
+    node_tooltip(node).or_else(|| ignored.then_some("Differences in this item are ignored"))
 }
 
 /// The glyph shown in front of a name for a status.
@@ -3957,6 +4084,7 @@ impl SessionView for FolderView {
             Command::OnlyCompareFiles => {
                 self.folder_filter == FolderDisplayFilter::OnlyCompareFiles
             }
+            Command::ToggleRowIgnored => self.selected_rows_are_ignored(),
             _ => return None,
         })
     }
@@ -4028,6 +4156,13 @@ impl SessionView for FolderView {
                     && self.selection_refresh_job.is_none()
                     && self.preview_job.is_none()
             }
+            Command::ToggleRowIgnored => {
+                self.mode == Mode::Compare
+                    && self.status == Status::Ready
+                    && idle
+                    && !self.selection.is_empty()
+                    && !self.selected_row_paths().is_empty()
+            }
             Command::NextDifference => self.has_difference(true),
             Command::PreviousDifference => self.has_difference(false),
             Command::FindNext | Command::FindPrevious => self.has_name_match(),
@@ -4077,6 +4212,7 @@ impl SessionView for FolderView {
             Command::ClearSelection => self.selection.clear(),
             Command::InvertSelection => self.selection.invert_visible(&self.rows, &self.arena),
             Command::CopyFilename => self.copy_filenames(),
+            Command::ToggleRowIgnored => self.toggle_selected_ignored(),
             Command::CopyToRight => self.copy_to(Side::Right),
             Command::CopyToLeft => self.copy_to(Side::Left),
             Command::SwapSides => {
@@ -4088,8 +4224,13 @@ impl SessionView for FolderView {
             other => {
                 if let Some(rule) = select_rule_of(other) {
                     let rows = std::mem::take(&mut self.rows);
-                    self.selection
-                        .select_rule(rule, Scope::Both, &rows, &self.arena);
+                    self.selection.select_rule_with_statuses(
+                        rule,
+                        Scope::Both,
+                        &rows,
+                        &self.arena,
+                        &self.effective_statuses,
+                    );
                     self.rows = rows;
                 } else if let Some(operation) = operation_of(other) {
                     self.start_operation(operation);

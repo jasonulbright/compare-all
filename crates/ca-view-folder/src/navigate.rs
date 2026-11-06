@@ -18,8 +18,8 @@ pub const NO_DIFFERENCE: &str = "There is no difference to move to";
 ///
 /// A folder counts only when it exists on one side or has the wrong kind,
 /// because every other folder differs only through rows below it.
-fn is_difference(node: &ArenaNode) -> bool {
-    node.status.is_difference() && (!node.is_dir || node.status.is_structural())
+fn is_difference(node: &ArenaNode, status: ca_fs::NodeStatus) -> bool {
+    status.is_difference() && (!node.is_dir || status.is_structural())
 }
 
 /// Where a node stands in the order of shown nodes.
@@ -174,13 +174,17 @@ impl FolderView {
     /// True when a move to the next or previous difference has a target. The
     /// move does not wrap, so each direction runs out on its own.
     pub(crate) fn has_difference(&self, forward: bool) -> bool {
-        self.next_node(forward, false, false, &is_difference)
-            .is_some()
+        self.next_node(forward, false, false, &|node| {
+            is_difference(node, self.effective_status(node))
+        })
+        .is_some()
     }
 
     /// Move the cursor to the next or previous difference.
     pub(crate) fn step_difference(&mut self, forward: bool) {
-        if let Some(index) = self.next_node(forward, false, false, &is_difference) {
+        if let Some(index) = self.next_node(forward, false, false, &|node| {
+            is_difference(node, self.effective_status(node))
+        }) {
             self.reveal_node(index);
         }
     }
