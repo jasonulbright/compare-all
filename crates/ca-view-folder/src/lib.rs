@@ -1511,6 +1511,7 @@ impl FolderView {
         };
         let messages = job.drain();
         let finished = job.is_finished();
+        let mut terminal_status = None;
         for message in messages {
             match message {
                 ContentMessage::Update(update) => {
@@ -1520,21 +1521,30 @@ impl FolderView {
                     if let Some(tree) = tree {
                         self.compared_tree = Some(tree);
                     }
-                    self.status = if complete {
+                    terminal_status = Some(if complete {
                         Status::Ready
                     } else {
                         Status::Cancelled
-                    };
+                    });
                     self.rebuild_pending = true;
                 }
-                ContentMessage::Failed(reason) => self.status = Status::Failed(reason),
+                ContentMessage::Failed(reason) => {
+                    terminal_status = Some(Status::Failed(reason));
+                }
             }
         }
         if finished {
             self.content_job = None;
-            if self.status.is_running() {
-                self.status = Status::Cancelled;
+            if terminal_status.is_none() && self.status.is_running() {
+                terminal_status = Some(Status::Cancelled);
             }
+        }
+        if let Some(status) = terminal_status {
+            if self.rebuild_pending {
+                self.arena.roll_up();
+                self.rebuild();
+            }
+            self.status = status;
         }
     }
 
@@ -5001,6 +5011,91 @@ mod stale_results {
 
     fn shows_stale(view: &FolderView) -> bool {
         view.arena().index_of(Path::new("stale.txt")).is_some()
+    }
+
+    /// Complete a content comparison inside the rebuild interval and refresh an ignored row.
+    #[test]
+    fn content_completion_rebuilds_ignored_read_errors_before_ready() {
+        use crate::jobs::ContentMessage;
+        use ca_fs::{ContentFailure, ContentUpdate, PairFacts, StatusFlags};
+
+        let dir = tempfile::tempdir().unwrap();
+        let rel = PathBuf::from("different.txt");
+        let file = Node {
+            name: "different.txt".to_owned(),
+            rel: rel.clone(),
+            is_dir: false,
+            left: None,
+            right: None,
+            facts: PairFacts::default(),
+            status: NodeStatus::Different,
+            flags: StatusFlags::default(),
+            quick: None,
+            content: None,
+            error: None,
+            incomplete: false,
+            scan_cancelled: false,
+            children: Vec::new(),
+        };
+        let root = Node {
+            name: String::new(),
+            rel: PathBuf::new(),
+            is_dir: true,
+            left: None,
+            right: None,
+            facts: PairFacts::default(),
+            status: NodeStatus::NotCompared,
+            flags: StatusFlags::default(),
+            quick: None,
+            content: None,
+            error: None,
+            incomplete: false,
+            scan_cancelled: false,
+            children: vec![file],
+        };
+        let mut view = FolderView::from_arena(
+            dir.path().join("left"),
+            dir.path().join("right"),
+            &ca_ui::testing::context(),
+            1,
+            Arena::from_root(&root),
+        );
+        view.ignored_overrides.insert(rel.clone(), true);
+        view.rebuild();
+        // Keep the periodic rebuild deferred so completion must refresh the rows.
+        view.last_rebuild = Instant::now() + Duration::from_secs(1);
+        let index = view.arena.index_of(&rel).unwrap();
+        assert_eq!(
+            view.effective_status_at(index, view.arena.node(index).unwrap()),
+            NodeStatus::Same
+        );
+
+        view.content_job = Some(Job::spawn(move |emitter, _cancel| {
+            emitter.send(ContentMessage::Update(Box::new(ContentUpdate {
+                rel,
+                outcome: Err(ContentFailure::Io {
+                    path: "different.txt".to_owned(),
+                    message: "read failed".to_owned(),
+                }),
+            })));
+            emitter.send(ContentMessage::Done {
+                tree: None,
+                complete: true,
+            });
+        }));
+        let deadline = Instant::now() + PATIENCE;
+        while view.content_job.is_some() && Instant::now() < deadline {
+            view.tick();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(view.content_job.is_none(), "the content job did not finish");
+        assert!(view.is_ready());
+
+        assert_eq!(
+            view.effective_status_at(index, view.arena.node(index).unwrap()),
+            NodeStatus::Error
+        );
+        assert_eq!(view.effective_totals.unwrap().errors, 1);
     }
 
     #[test]
