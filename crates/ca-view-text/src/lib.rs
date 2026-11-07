@@ -419,6 +419,10 @@ pub struct TextView {
     wrap_layout_revision: u64,
     /// Whether the last frame used the variable-height layout.
     wrap_active: bool,
+    /// Whether a caret change must be revealed after the wrap layout is ready.
+    wrap_reveal_pending: bool,
+    /// Active pane and text carets at the last caret-follow check.
+    last_followed_carets: Option<(Side, editor::Caret, editor::Caret)>,
     /// The width the current frame needs a layout for.
     wrap_columns: Option<usize>,
     /// Preferred horizontal position while moving through wrapped visual rows.
@@ -741,6 +745,8 @@ impl TextView {
             wrap_scroll: TextScroll::default(),
             wrap_layout_revision: 0,
             wrap_active: false,
+            wrap_reveal_pending: false,
+            last_followed_carets: None,
             wrap_columns: None,
             wrap_goal_column: None,
             wrap_job: None,
@@ -1454,6 +1460,7 @@ impl TextView {
                     {
                         self.message = Some(WRAP_LIMIT_MESSAGE.to_owned());
                         self.word_wrap = false;
+                        self.wrap_reveal_pending = false;
                         too_large = true;
                     }
                 }
@@ -1683,8 +1690,13 @@ impl TextView {
         let viewport = f64::from(self.viewport_height / self.row_height());
         self.wrap_scroll
             .set_position(&self.wrap_heights, position, fraction, viewport);
+        self.horizontal = 0.0;
         self.wrap_active = true;
         self.line_cache.clear();
+        if self.wrap_reveal_pending {
+            self.wrap_reveal_pending = false;
+            self.reveal_wrapped_caret();
+        }
     }
 
     fn deactivate_wrap(&mut self) {
@@ -2339,6 +2351,18 @@ impl TextView {
         )
     }
 
+    fn reveal_wrapped_caret(&mut self) {
+        if let Some(visual_line) = self.wrapped_caret_visual_line(self.active) {
+            self.wrap_scroll.reveal_visual_line(
+                &self.wrap_heights,
+                visual_line,
+                f64::from(self.viewport_height / self.row_height()),
+            );
+        } else {
+            self.clamp_scroll();
+        }
+    }
+
     /// Put the row caret back on the line the text caret is on.
     ///
     /// A row a move made current stays current while the text is unchanged,
@@ -2346,6 +2370,11 @@ impl TextView {
     /// active, through any comparison of that text; any other caret position
     /// makes the caret's own row current.
     fn follow_caret(&mut self) {
+        let carets = (self.active, self.left_pane.caret(), self.right_pane.caret());
+        let caret_changed = match self.last_followed_carets.replace(carets) {
+            Some(previous) => previous != carets,
+            None => true,
+        };
         if let Some(anchor) = self.anchor {
             let held = anchor.revision == self.revision
                 && anchor.active == self.active
@@ -2362,16 +2391,16 @@ impl TextView {
             }
         }
         if self.wrap_active {
-            if let Some(visual_line) = self.wrapped_caret_visual_line(self.active) {
-                self.wrap_scroll.reveal_visual_line(
-                    &self.wrap_heights,
-                    visual_line,
-                    f64::from(self.viewport_height / self.row_height()),
-                );
+            if caret_changed {
+                self.wrap_reveal_pending = false;
+                self.reveal_wrapped_caret();
             } else {
                 self.clamp_scroll();
             }
         } else {
+            if self.word_wrap && caret_changed {
+                self.wrap_reveal_pending = true;
+            }
             self.clamp_scroll();
         }
     }
@@ -4588,10 +4617,10 @@ impl TextView {
                         .scroll_by(-delta.y, body.height(), row_height, total);
                 }
             }
-            if !self.word_wrap && delta.x.abs() > f32::EPSILON {
+            if !wrap_active && delta.x.abs() > f32::EPSILON {
                 self.set_horizontal(
                     self.horizontal - delta.x / char_width * HORIZONTAL_STEP,
-                    body.width(),
+                    pane_width,
                     char_width,
                 );
             }
@@ -4952,6 +4981,9 @@ impl TextView {
             let Some(position) = self.visible.position_of(model_row) else {
                 return;
             };
+            if self.visible.row_at(position) != Some(model_row) {
+                return;
+            }
             let Some(wraps) = self.wrap_layout.as_ref().map(|layout| match side {
                 Side::Left => &layout.left,
                 Side::Right => &layout.right,
@@ -5181,13 +5213,17 @@ impl TextView {
     }
 
     fn set_horizontal(&mut self, columns: f32, viewport: f32, char_width: f32) {
-        if self.word_wrap {
+        if self.wrap_active {
             self.horizontal = 0.0;
             return;
         }
         let visible_columns = viewport / char_width;
+        let pane = self.active_pane();
+        let caret = pane.caret();
+        let caret_column =
+            editor::display_column(&pane.line_text(caret.line), caret.index, pane.tabs());
         #[allow(clippy::cast_precision_loss)]
-        let widest = self.data.widest as f32;
+        let widest = self.data.widest.max(caret_column) as f32;
         self.horizontal = columns.clamp(0.0, (widest - visible_columns).max(0.0));
     }
 
@@ -6439,6 +6475,7 @@ impl SessionView for TextView {
                 self.word_wrap = !self.word_wrap;
                 self.horizontal = 0.0;
                 if !self.word_wrap {
+                    self.wrap_reveal_pending = false;
                     self.invalidate_wrap_layout();
                 }
             }
@@ -8011,6 +8048,125 @@ mod tests {
         let _ = view.handle_key(egui::Key::PageDown, egui::Modifiers::default(), 1);
         assert_eq!(view.pane(Side::Left).caret().index, expected);
         assert!(view.wrap_scroll.offset() > 0.0);
+    }
+
+    #[test]
+    fn wrapped_frames_keep_manual_scroll_when_the_caret_does_not_change() {
+        use super::TextView;
+        use ca_ui::view::SessionView;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let left = dir.path().join("left.txt");
+        let right = dir.path().join("right.txt");
+        let tail = "line\n".repeat(100);
+        let text = format!("{}\n{tail}", "x".repeat(8_000));
+        std::fs::write(&left, &text).unwrap();
+        std::fs::write(&right, &text).unwrap();
+        let context = ca_ui::testing::context();
+        let mut view = TextView::new(left, right, &context, 1);
+        let ctx = egui::Context::default();
+        settle_frames(&mut view, &ctx);
+
+        view.run(ca_ui::Command::ToggleWordWrap);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !view.wrap_active && Instant::now() < deadline {
+            view.tick();
+            clipboard_frame(&ctx, &mut view, Vec::new());
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(view.wrap_active);
+
+        let viewport = f64::from(view.body_rect().height() / view.row_pixels());
+        let last_visual_line = view.wrap_heights.total().saturating_sub(1);
+        view.wrap_scroll
+            .reveal_visual_line(&view.wrap_heights, last_visual_line, viewport);
+        let before = view.wrap_scroll.offset();
+        assert!(before > 0.0);
+
+        clipboard_frame(&ctx, &mut view, Vec::new());
+        assert!((view.wrap_scroll.offset() - before).abs() < 0.01);
+
+        view.deactivate_wrap();
+        view.activate_wrap();
+        view.follow_caret();
+        assert!((view.wrap_scroll.offset() - before).abs() < 0.01);
+    }
+
+    #[test]
+    fn wrapped_vertical_moves_leave_a_filtered_out_caret_in_place() {
+        use super::{DisplayFilter, Side, TextView};
+        use ca_ui::view::SessionView;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let left = dir.path().join("left.txt");
+        let right = dir.path().join("right.txt");
+        std::fs::write(&left, b"same\nleft change\nsame\n").unwrap();
+        std::fs::write(&right, b"same\nright change\nsame\n").unwrap();
+        let context = ca_ui::testing::context();
+        let mut view = TextView::new(left, right, &context, 1);
+        let ctx = egui::Context::default();
+        settle_frames(&mut view, &ctx);
+        view.set_filter(DisplayFilter::Differences);
+        view.run(ca_ui::Command::ToggleWordWrap);
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !view.wrap_active && Instant::now() < deadline {
+            view.tick();
+            clipboard_frame(&ctx, &mut view, Vec::new());
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(view.wrap_active);
+
+        let hidden_row = view.data.model.row_of_left_line(0).unwrap();
+        let hidden_position = view.visible.position_of(hidden_row).unwrap();
+        assert_ne!(view.visible.row_at(hidden_position), Some(hidden_row));
+        view.pane_mut(Side::Left)
+            .place(super::editor::Caret::new(0, 0), false);
+        let before = view.pane(Side::Left).caret();
+
+        view.move_wrapped_caret(1, false, false);
+
+        assert_eq!(view.pane(Side::Left).caret(), before);
+    }
+
+    #[test]
+    fn horizontal_scrolling_works_while_the_wrapped_layout_is_pending() {
+        use super::{Side, TextView};
+
+        let dir = tempfile::tempdir().unwrap();
+        let left = dir.path().join("left.txt");
+        let right = dir.path().join("right.txt");
+        let long_line = format!("{}\n", "x".repeat(200));
+        std::fs::write(&left, &long_line).unwrap();
+        std::fs::write(&right, &long_line).unwrap();
+        let mut view = TextView::new(left, right, &ca_ui::testing::context(), 1);
+        let ctx = egui::Context::default();
+        settle_frames(&mut view, &ctx);
+
+        view.data.widest = 10;
+        view.word_wrap = true;
+        view.invalidate_wrap_layout();
+        view.pane_mut(Side::Left)
+            .place(super::editor::Caret::new(0, 150), false);
+        let body = view.body_rect();
+
+        clipboard_frame(
+            &ctx,
+            &mut view,
+            vec![
+                egui::Event::PointerMoved(body.center()),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(-500.0, 0.0),
+                    modifiers: egui::Modifiers::default(),
+                },
+            ],
+        );
+
+        assert!(!view.wrap_active);
+        assert!(view.horizontal > 0.0);
     }
 
     #[test]

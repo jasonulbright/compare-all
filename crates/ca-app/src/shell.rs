@@ -200,7 +200,10 @@ const TEXT_MENUS: &[(&str, &[Entry])] = &[
                 Command::CompareStructure,
                 "Choose two JSON files or two XML files",
             ),
-            Entry::Run(Command::ToggleWordWrap, "Text Compare is not ready"),
+            Entry::Run(
+                Command::ToggleWordWrap,
+                "Word wrap requires a ready text comparison",
+            ),
             Entry::Rule,
             Entry::Soon(Command::SideBySideLayout),
             Entry::Soon(Command::OverUnderLayout),
