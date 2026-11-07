@@ -7,6 +7,7 @@ use ca_session::{SessionId, SessionKind, SessionStore};
 use ca_ui::command::Command;
 use ca_ui::dialog::{self, DialogMessage, Pick};
 use ca_ui::sessions::StoreHandle;
+use ca_ui::spacing::TOKENS;
 use ca_ui::view::{OpenRequest, SessionView, ViewAction, ViewContext};
 use ca_ui::widgets;
 use ca_ui::worker::Job;
@@ -23,12 +24,6 @@ pub type HomeOutbox = Rc<RefCell<Vec<HomeAction>>>;
 
 /// A notice the shell writes and whichever launcher is open reads.
 pub type SharedNotice = Arc<std::sync::Mutex<Option<String>>>;
-
-/// Indent one level of the tree takes.
-const INDENT: f32 = 14.0;
-
-/// Width the name of a row is drawn in.
-const ROW_NAME_WIDTH: f32 = 260.0;
 
 /// A banner is a bounded summary, not a history of failed background jobs.
 const MAX_NOTICE_BYTES: usize = 32 * 1024;
@@ -682,7 +677,7 @@ impl HomeView {
     fn row(&mut self, ui: &mut egui::Ui, row: &Row) {
         ui.horizontal(|ui| {
             #[allow(clippy::cast_precision_loss)]
-            ui.add_space(row.depth as f32 * INDENT);
+            ui.add_space(row.depth as f32 * TOKENS.panes.tree_indent);
             if row.is_folder {
                 let (icon, label) = if row.is_open {
                     (ca_ui::icons::Icon::ChevronDown, "Collapse Folder")
@@ -697,7 +692,10 @@ impl HomeView {
                 if id == &row.id {
                     let id = id.clone();
                     let mut accept = false;
-                    ui.add(egui::TextEdit::singleline(name).desired_width(180.0));
+                    ui.add(
+                        egui::TextEdit::singleline(name)
+                            .desired_width(TOKENS.forms.launcher_name_edit_width),
+                    );
                     accept = accept || ui.small_button("Rename").clicked();
                     let cancel = ui.small_button("Cancel").clicked();
                     if accept {
@@ -722,17 +720,26 @@ impl HomeView {
                 },
                 ca_ui::icons::session_icon,
             );
-            let response = widgets::sized(ui, ROW_NAME_WIDTH.min(ui.available_width()), |ui| {
-                ui.add(
-                    widgets::IconButton::new(
-                        &widgets::elide_to_width(ui, &label, ROW_NAME_WIDTH - 24.0),
-                        Some(icon),
+            let response = widgets::sized(
+                ui,
+                TOKENS.forms.launcher_name_width.min(ui.available_width()),
+                |ui| {
+                    ui.add(
+                        widgets::IconButton::new(
+                            &widgets::elide_to_width(
+                                ui,
+                                &label,
+                                TOKENS.forms.launcher_name_width
+                                    - TOKENS.forms.launcher_name_elision_padding,
+                            ),
+                            Some(icon),
+                        )
+                        .inline()
+                        .selected(picked),
                     )
-                    .inline()
-                    .selected(picked),
-                )
-                .on_hover_text(label.clone())
-            });
+                    .on_hover_text(label.clone())
+                },
+            );
             response.widget_info(|| {
                 egui::WidgetInfo::selected(
                     egui::WidgetType::SelectableLabel,

@@ -35,18 +35,14 @@ use std::sync::{Arc, Mutex};
 
 /// Height of one row.
 const ROW_HEIGHT: f32 = 18.0;
-/// Indent added per tree level.
-const INDENT: f32 = 14.0;
-/// Width the display filter drop down is laid out in.
-const FILTER_COMBO_WIDTH: f32 = 170.0;
 /// Width of the column that states the planned action.
 const ACTION_WIDTH: f32 = 110.0;
 /// Why a merge cannot run when no output folder is named.
 const NO_OUTPUT: &str = "Name an output folder in the session settings first";
-/// Why a command waits for the comparison.
 /// Why a merge does not write into a container.
 const ARCHIVE_OUTPUT: &str =
     "The output is an archive. A merge writes into a local folder only. Name a folder as the output.";
+/// Why toolbar commands wait for the comparison.
 const NOT_READY: &str = "Available once the comparison finishes";
 const FAILED_RELOAD: &str = "The comparison failed. Use Reload Files to compare again";
 const OPERATION_BUSY: &str = "Available once the current operation finishes";
@@ -2008,7 +2004,10 @@ impl FolderMergeView {
     pub fn toolbar_items(&self) -> Vec<toolbar::Item> {
         let ready = self.ready();
         vec![
-            toolbar::Item::widget("filter", FILTER_COMBO_WIDTH),
+            toolbar::Item::widget(
+                "filter",
+                ca_ui::spacing::TOKENS.toolbar.folder_merge_items.filter,
+            ),
             toolbar::Item::separator("separator-1"),
             toolbar::Item::command(
                 "previous-conflict",
@@ -2127,7 +2126,7 @@ impl FolderMergeView {
             |ui, name| {
                 if name == "filter" {
                     egui::ComboBox::from_id_salt(id.with("filter"))
-                        .width(FILTER_COMBO_WIDTH - 10.0)
+                        .width(ca_ui::spacing::TOKENS.toolbar.folder_merge_items.filter - 10.0)
                         .selected_text(current.label())
                         .show_ui(ui, |ui| {
                             for option in MergeFilter::ALL {
@@ -2254,7 +2253,7 @@ impl FolderMergeView {
                         painter.rect_filled(rect, 0.0, context.palette.folder_selection);
                     }
                     let text_color = palette.text(class_of(row.status, self.ignore_same));
-                    let indent = INDENT * row.depth as f32;
+                    let indent = ca_ui::spacing::TOKENS.panes.tree_indent * row.depth as f32;
                     for (column_index, column) in columns.iter().enumerate() {
                         let left = rect.left() + column_width * column_index as f32;
                         let cell = egui::Rect::from_min_size(

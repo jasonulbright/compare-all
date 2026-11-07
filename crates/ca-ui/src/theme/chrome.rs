@@ -123,6 +123,7 @@ pub fn visuals(variant: Variant) -> egui::Visuals {
 ///
 /// The light visuals and the choice between the two stay with egui.
 pub fn install(ctx: &egui::Context) {
+    crate::spacing::install(ctx);
     let wanted = visuals(Variant::Dark);
     if ctx.style_of(egui::Theme::Dark).visuals != wanted {
         ctx.set_visuals_of(egui::Theme::Dark, wanted);

@@ -32,6 +32,7 @@ pub mod scroll;
 pub mod sessions;
 pub mod settings;
 pub mod share;
+pub mod spacing;
 pub mod testing;
 pub mod theme;
 pub mod thumbnail;

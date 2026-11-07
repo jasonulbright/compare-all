@@ -52,11 +52,6 @@ use std::time::Instant;
 
 /// Width of the overview strip.
 const THUMBNAIL_WIDTH: f32 = 26.0;
-/// Width of the splitter between the two panes.
-///
-/// The panes meet at a splitter one line of each separator color wide, so the
-/// room between them is a rule rather than a column.
-const CENTER_WIDTH: f32 = 2.0;
 /// Thickness of a scrollbar.
 const SCROLLBAR: f32 = 12.0;
 /// Display font size a new view starts at.
@@ -2430,16 +2425,22 @@ impl TextView {
         let rows = self.rows_current();
         let rows_reason = self.rows_reason();
         vec![
-            toolbar::Item::widget("home", 70.0),
-            toolbar::Item::widget("sessions", 90.0),
+            toolbar::Item::widget("home", ca_ui::spacing::TOKENS.toolbar.common_items.home),
+            toolbar::Item::widget(
+                "sessions",
+                ca_ui::spacing::TOKENS.toolbar.common_items.sessions,
+            ),
             toolbar::Item::separator("separator-1"),
-            toolbar::Item::widget("all", 46.0),
-            toolbar::Item::widget("diffs", 56.0),
-            toolbar::Item::widget("same", 56.0),
-            toolbar::Item::widget("context", 130.0),
-            toolbar::Item::widget("minor", 60.0),
-            toolbar::Item::widget("rules", 70.0),
-            toolbar::Item::widget("format", 74.0),
+            toolbar::Item::widget("all", ca_ui::spacing::TOKENS.toolbar.common_items.all),
+            toolbar::Item::widget(
+                "diffs",
+                ca_ui::spacing::TOKENS.toolbar.common_items.differences,
+            ),
+            toolbar::Item::widget("same", ca_ui::spacing::TOKENS.toolbar.common_items.same),
+            toolbar::Item::widget("context", ca_ui::spacing::TOKENS.toolbar.text_items.context),
+            toolbar::Item::widget("minor", ca_ui::spacing::TOKENS.toolbar.common_items.minor),
+            toolbar::Item::widget("rules", ca_ui::spacing::TOKENS.toolbar.text_items.rules),
+            toolbar::Item::widget("format", ca_ui::spacing::TOKENS.toolbar.text_items.format),
             toolbar::Item::separator("separator-2"),
             toolbar::Item::command(
                 "copy",
@@ -2729,7 +2730,7 @@ impl TextView {
     /// The left edge of the splitter between the panes and its width.
     #[must_use]
     pub const fn splitter(&self) -> (f32, f32) {
-        (self.center_x, CENTER_WIDTH)
+        (self.center_x, ca_ui::spacing::TOKENS.panes.text_center_gap)
     }
 
     /// The two colors the splitter paints, left line first.
@@ -3604,10 +3605,11 @@ impl TextView {
         let range = self.scroll.visible(body.height(), row_height, total);
         self.viewport_rows = range.len();
 
-        let pane_width = ((body.width() - 2.0 * gutter - CENTER_WIDTH) / 2.0).max(0.0);
+        let center_gap = ca_ui::spacing::TOKENS.panes.text_center_gap;
+        let pane_width = ((body.width() - 2.0 * gutter - center_gap) / 2.0).max(0.0);
         let left_text_x = body.left() + gutter;
         let center_x = left_text_x + pane_width;
-        let right_gutter_x = center_x + CENTER_WIDTH;
+        let right_gutter_x = center_x + center_gap;
         let right_text_x = right_gutter_x + gutter;
         self.center_x = center_x;
         self.gutter_x = (body.left(), right_gutter_x, gutter);
@@ -3623,14 +3625,17 @@ impl TextView {
         let column_shift = (self.horizontal - first_column) * char_width;
 
         let clip = painter.with_clip_rect(body);
+        let separator_width = ca_ui::spacing::TOKENS
+            .panes
+            .text_center_separator_line_width;
         for (x, color) in [
             (center_x, palette.separator_strong),
-            (right_gutter_x - 1.0, palette.separator),
+            (right_gutter_x - separator_width, palette.separator),
         ] {
             clip.rect_filled(
                 egui::Rect::from_min_max(
                     egui::pos2(x, body.top()),
-                    egui::pos2(x + 1.0, body.bottom()),
+                    egui::pos2(x + separator_width, body.bottom()),
                 ),
                 0.0,
                 color,
@@ -4250,7 +4255,7 @@ impl TextView {
             egui::pos2(body.right(), body.bottom() + SCROLLBAR),
         );
         painter.rect_filled(track, 0.0, palette.gutter_background);
-        let pane = ((body.width() - CENTER_WIDTH) / 2.0).max(1.0);
+        let pane = ((body.width() - ca_ui::spacing::TOKENS.panes.text_center_gap) / 2.0).max(1.0);
         let visible_columns = (pane / char_width).max(1.0);
         #[allow(clippy::cast_precision_loss)]
         let widest = (self.data.widest as f32).max(visible_columns);

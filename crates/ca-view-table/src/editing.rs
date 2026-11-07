@@ -1200,7 +1200,9 @@ impl TableView {
             egui::TextEdit::singleline(&mut editor.text)
                 .id(id)
                 .font(egui::FontId::monospace(self.font.points()))
-                .margin(egui::Margin::same(1)),
+                .margin(egui::Margin::same(
+                    ca_ui::spacing::TOKENS.panes.editor_frame_margin,
+                )),
         );
         if !editor.focused {
             response.request_focus();

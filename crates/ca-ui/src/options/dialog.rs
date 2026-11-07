@@ -9,20 +9,12 @@ use super::schema::{self, OptionField, OptionPage, PageKind, ARCHIVE_PAGE_NOTE, 
 use crate::command::{bindings, Command, Keystroke, MenuView, ShortcutTable};
 use crate::pack::remote::PackServices;
 use crate::settings::field::{FieldShape, FieldValue};
+use crate::spacing::TOKENS;
 use crate::theme::slots::{self, to_color, to_stored};
 use crate::theme::{Palette, Variant};
 use crate::toolbar::{self, ToolbarView};
 use ca_session::options::{ColorGroup, OpenWithEntry, ProgramOptions, WorkingFolder};
 use ca_session::AdminPolicies;
-
-/// Width the label column takes before the controls start.
-const LABEL_WIDTH: f32 = 230.0;
-
-/// Width a control takes when the window is at its narrowest.
-const CONTROL_WIDTH: f32 = 170.0;
-
-/// Room the dialog keeps for its own frame inside the window.
-const DIALOG_MARGIN: f32 = 24.0;
 
 /// What the toolbar page reaches.
 const TOOLBAR_NOTE: &str =
@@ -402,7 +394,8 @@ impl OptionsDialog {
         }
         let mut outcome = None;
         let mut open = true;
-        let width = (ctx.screen_rect().width() - DIALOG_MARGIN).max(CONTROL_WIDTH);
+        let width = (ctx.screen_rect().width() - TOKENS.forms.dialog_screen_margin)
+            .max(TOKENS.forms.options_control_width);
         egui::Window::new("Options")
             .id(self.id)
             .open(&mut open)
@@ -575,7 +568,10 @@ impl OptionsDialog {
         let blocked = field.blocked_by(self.policies);
         let stated = field.read(&ProgramOptions::default()) != value;
         ui.horizontal_wrapped(|ui| {
-            let label_width = LABEL_WIDTH.min((ui.available_width() - CONTROL_WIDTH).max(80.0));
+            let label_width = TOKENS.forms.options_label_width.min(
+                (ui.available_width() - TOKENS.forms.options_control_width)
+                    .max(TOKENS.forms.minimum_label_width),
+            );
             crate::widgets::sized(ui, label_width, |ui| {
                 let text = egui::RichText::new(field.label).color(if stated {
                     palette.settings_overridden
@@ -647,7 +643,10 @@ impl OptionsDialog {
             }
             let mut color = self.color(group, variant, slot.name);
             ui.horizontal_wrapped(|ui| {
-                let label_width = LABEL_WIDTH.min((ui.available_width() - CONTROL_WIDTH).max(80.0));
+                let label_width = TOKENS.forms.options_label_width.min(
+                    (ui.available_width() - TOKENS.forms.options_control_width)
+                        .max(TOKENS.forms.minimum_label_width),
+                );
                 crate::widgets::sized(ui, label_width, |ui| {
                     ui.add(egui::Label::new(slot.label).truncate())
                         .on_hover_text(slot.name);
@@ -688,11 +687,11 @@ impl OptionsDialog {
         });
         ui.horizontal_wrapped(|ui| {
             ui.label("Search");
-            crate::widgets::sized(ui, CONTROL_WIDTH, |ui| {
+            crate::widgets::sized(ui, TOKENS.forms.options_control_width, |ui| {
                 ui.add(
                     egui::TextEdit::singleline(&mut self.search)
                         .hint_text("Name or description")
-                        .desired_width(CONTROL_WIDTH),
+                        .desired_width(TOKENS.forms.options_control_width),
                 );
             });
             if ui.button("Reset all").clicked() {
@@ -711,7 +710,10 @@ impl OptionsDialog {
         let mut reset: Option<Command> = None;
         for command in listed {
             ui.horizontal_wrapped(|ui| {
-                let label_width = LABEL_WIDTH.min((ui.available_width() - CONTROL_WIDTH).max(80.0));
+                let label_width = TOKENS.forms.options_label_width.min(
+                    (ui.available_width() - TOKENS.forms.options_control_width)
+                        .max(TOKENS.forms.minimum_label_width),
+                );
                 crate::widgets::sized(ui, label_width, |ui| {
                     if ui
                         .selectable_label(
@@ -883,15 +885,15 @@ impl OptionsDialog {
         }
         let mut arguments = entry.arguments.join("\n");
         ui.horizontal_wrapped(|ui| {
-            crate::widgets::sized(ui, LABEL_WIDTH, |ui| {
+            crate::widgets::sized(ui, TOKENS.forms.options_label_width, |ui| {
                 ui.add(egui::Label::new("Arguments, one per line").truncate())
                     .on_hover_text("Variables: %f %l %n %p %x %b %F %P, with 1 or 2 for the side");
             });
-            crate::widgets::sized(ui, CONTROL_WIDTH, |ui| {
+            crate::widgets::sized(ui, TOKENS.forms.options_control_width, |ui| {
                 if ui
                     .add(
                         egui::TextEdit::multiline(&mut arguments)
-                            .desired_width(CONTROL_WIDTH)
+                            .desired_width(TOKENS.forms.options_control_width)
                             .desired_rows(3),
                     )
                     .changed()
@@ -907,11 +909,11 @@ impl OptionsDialog {
         });
         text_row(ui, "Shortcut", &mut entry.shortcut);
         ui.horizontal_wrapped(|ui| {
-            crate::widgets::sized(ui, LABEL_WIDTH, |ui| {
+            crate::widgets::sized(ui, TOKENS.forms.options_label_width, |ui| {
                 ui.add(egui::Label::new("Working folder").truncate());
             });
             let mut chosen = entry.working_folder.id().to_owned();
-            crate::widgets::sized(ui, CONTROL_WIDTH, |ui| {
+            crate::widgets::sized(ui, TOKENS.forms.options_control_width, |ui| {
                 egui::ComboBox::from_id_salt(ui.id().with("working-folder"))
                     .selected_text(working_folder_label(&chosen))
                     .show_ui(ui, |ui| {
@@ -995,12 +997,15 @@ fn pressed(ctx: &egui::Context) -> Option<Keystroke> {
 fn text_row(ui: &mut egui::Ui, label: &str, value: &mut String) -> bool {
     let mut changed = false;
     ui.horizontal_wrapped(|ui| {
-        crate::widgets::sized(ui, LABEL_WIDTH, |ui| {
+        crate::widgets::sized(ui, TOKENS.forms.options_label_width, |ui| {
             ui.add(egui::Label::new(label).truncate());
         });
-        crate::widgets::sized(ui, CONTROL_WIDTH, |ui| {
+        crate::widgets::sized(ui, TOKENS.forms.options_control_width, |ui| {
             changed = ui
-                .add(egui::TextEdit::singleline(value).desired_width(CONTROL_WIDTH))
+                .add(
+                    egui::TextEdit::singleline(value)
+                        .desired_width(TOKENS.forms.options_control_width),
+                )
                 .changed();
         });
     });
@@ -1010,7 +1015,7 @@ fn text_row(ui: &mut egui::Ui, label: &str, value: &mut String) -> bool {
 /// One labeled check box.
 fn flag_row(ui: &mut egui::Ui, label: &str, value: &mut bool) {
     ui.horizontal_wrapped(|ui| {
-        crate::widgets::sized(ui, LABEL_WIDTH, |ui| {
+        crate::widgets::sized(ui, TOKENS.forms.options_label_width, |ui| {
             ui.add(egui::Label::new(label).truncate());
         });
         ui.checkbox(value, "");
@@ -1067,7 +1072,10 @@ fn control(
     value: &FieldValue,
     reason: Option<&str>,
 ) -> Option<FieldValue> {
-    let width = CONTROL_WIDTH.min(ui.available_width().max(60.0));
+    let width = TOKENS
+        .forms
+        .options_control_width
+        .min(ui.available_width().max(TOKENS.forms.minimum_control_width));
     match (field.shape, value) {
         (FieldShape::Flag, FieldValue::Flag(on)) => {
             let mut on = *on;
