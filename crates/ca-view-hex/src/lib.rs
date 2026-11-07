@@ -36,8 +36,6 @@ use std::time::{Duration, Instant};
 
 /// Width of the overview strip.
 const THUMBNAIL_WIDTH: f32 = 26.0;
-/// Width of the column between the two panes.
-const CENTER_WIDTH: f32 = 14.0;
 /// Thickness of a scrollbar.
 const SCROLLBAR: f32 = 12.0;
 /// Row height as a multiple of the display font size.
@@ -46,8 +44,6 @@ const ROW_HEIGHT_RATIO: f32 = ca_ui::font::CONTENT_ROW_HEIGHT_RATIO;
 const DEFAULT_FONT_SIZE: f32 = ca_session::options::provisional::HEX_POINT_SIZE;
 /// How long the last change is waited out before the comparison runs again.
 const REDIFF_DEBOUNCE: Duration = Duration::from_millis(300);
-/// Width the drop downs on the toolbar are laid out in.
-const COMBO_WIDTH: f32 = 116.0;
 /// Why a toolbar button refuses while the comparison is still running.
 const NOT_READY: &str = "Available once the comparison finishes";
 /// Reason shown on a copy after the comparison failed.
@@ -1502,16 +1498,28 @@ impl HexView {
                 NOT_READY,
             ),
             toolbar::Item::separator("separator-1"),
-            toolbar::Item::widget("filter", COMBO_WIDTH + 60.0),
+            toolbar::Item::widget("filter", ca_ui::spacing::TOKENS.toolbar.hex_items.filter),
             toolbar::Item::separator("separator-2"),
-            toolbar::Item::widget("alignment", COMBO_WIDTH),
-            toolbar::Item::widget("encoding", COMBO_WIDTH),
+            toolbar::Item::widget("alignment", ca_ui::spacing::TOKENS.toolbar.hex_combo_width),
+            toolbar::Item::widget("encoding", ca_ui::spacing::TOKENS.toolbar.hex_combo_width),
             toolbar::Item::separator("separator-3"),
-            toolbar::Item::widget("width", 140.0),
-            toolbar::Item::widget("hex-addresses", 120.0),
-            toolbar::Item::widget("addresses", 100.0),
-            toolbar::Item::widget("thumbnail", 100.0),
-            toolbar::Item::widget("file-info", 90.0),
+            toolbar::Item::widget("width", ca_ui::spacing::TOKENS.toolbar.hex_items.width),
+            toolbar::Item::widget(
+                "hex-addresses",
+                ca_ui::spacing::TOKENS.toolbar.hex_items.hex_addresses,
+            ),
+            toolbar::Item::widget(
+                "addresses",
+                ca_ui::spacing::TOKENS.toolbar.hex_items.addresses,
+            ),
+            toolbar::Item::widget(
+                "thumbnail",
+                ca_ui::spacing::TOKENS.toolbar.hex_items.thumbnail,
+            ),
+            toolbar::Item::widget(
+                "file-info",
+                ca_ui::spacing::TOKENS.toolbar.hex_items.file_info,
+            ),
             toolbar::Item::separator("separator-4"),
             toolbar::Item::command(
                 "copy-left",
@@ -1536,8 +1544,14 @@ impl HexView {
                 "",
             ),
             toolbar::Item::command("reload", Command::Reload, Command::Reload.label(), true, ""),
-            toolbar::Item::widget("text-compare", 120.0),
-            toolbar::Item::widget("parent-folders", 130.0),
+            toolbar::Item::widget(
+                "text-compare",
+                ca_ui::spacing::TOKENS.toolbar.hex_items.text_compare,
+            ),
+            toolbar::Item::widget(
+                "parent-folders",
+                ca_ui::spacing::TOKENS.toolbar.hex_items.parent_folders,
+            ),
             toolbar::Item::command(
                 "report",
                 Command::CompareReport,
@@ -1546,7 +1560,7 @@ impl HexView {
                 self.refusal(Command::CompareReport).unwrap_or(""),
             ),
             toolbar::Item::separator("separator-6"),
-            toolbar::Item::widget("font", 140.0),
+            toolbar::Item::widget("font", ca_ui::spacing::TOKENS.toolbar.hex_items.font),
         ]
     }
 
@@ -1582,7 +1596,7 @@ impl HexView {
             |ui, name| match name {
                 "filter" => {
                     egui::ComboBox::from_id_salt(id.with("filter"))
-                        .width(COMBO_WIDTH)
+                        .width(ca_ui::spacing::TOKENS.toolbar.hex_combo_width)
                         .selected_text(filter.label())
                         .show_ui(ui, |ui| {
                             for option in [
@@ -1600,7 +1614,7 @@ impl HexView {
                 }
                 "alignment" => {
                     egui::ComboBox::from_id_salt(id.with("alignment"))
-                        .width(COMBO_WIDTH)
+                        .width(ca_ui::spacing::TOKENS.toolbar.hex_combo_width)
                         .selected_text(alignment_label(alignment))
                         .show_ui(ui, |ui| {
                             for option in [
@@ -1618,7 +1632,7 @@ impl HexView {
                 }
                 "encoding" => {
                     egui::ComboBox::from_id_salt(id.with("encoding"))
-                        .width(COMBO_WIDTH)
+                        .width(ca_ui::spacing::TOKENS.toolbar.hex_combo_width)
                         .selected_text(encoding.label())
                         .show_ui(ui, |ui| {
                             for option in chars::ENCODINGS {
@@ -1855,9 +1869,9 @@ impl HexView {
         let id = self.id;
         let kind = &mut self.find_kind;
         let request = self.find.show_find_with(ui, controls, |ui| {
-            widgets::sized(ui, COMBO_WIDTH, |ui| {
+            widgets::sized(ui, ca_ui::spacing::TOKENS.toolbar.hex_combo_width, |ui| {
                 egui::ComboBox::from_id_salt(id.with("find-kind"))
-                    .width(COMBO_WIDTH)
+                    .width(ca_ui::spacing::TOKENS.toolbar.hex_combo_width)
                     .selected_text(kind.label())
                     .show_ui(ui, |ui| {
                         for option in [PatternKind::Bytes, PatternKind::Text] {
@@ -2286,7 +2300,8 @@ impl HexView {
         let _ = ui.allocate_rect(full, egui::Sense::hover());
         self.claim_keyboard(ui, body);
         let painter = ui.painter_at(full);
-        let pane_width = ((body.width() - CENTER_WIDTH) / 2.0).max(1.0);
+        let center_gap = ca_ui::spacing::TOKENS.panes.hex_center_gap;
+        let pane_width = ((body.width() - center_gap) / 2.0).max(1.0);
         if self.auto_width {
             let wanted = self.fit_bytes_per_row(pane_width, char_width);
             self.set_bytes_per_row(wanted);
@@ -2305,7 +2320,7 @@ impl HexView {
         for side in [Side::Left, Side::Right] {
             let left = match side {
                 Side::Left => body.left(),
-                Side::Right => self.center_x + CENTER_WIDTH,
+                Side::Right => self.center_x + center_gap,
             };
             let rect = egui::Rect::from_min_max(
                 egui::pos2(left, body.top()),
@@ -2322,7 +2337,7 @@ impl HexView {
         let geometry = |side: Side, y: f32| PaneGeometry {
             left: match side {
                 Side::Left => body.left(),
-                Side::Right => self.center_x + CENTER_WIDTH,
+                Side::Right => self.center_x + center_gap,
             } - self.horizontal,
             width: pane_width,
             char_width,
@@ -2701,7 +2716,7 @@ impl HexView {
         };
         let pane_left = match side {
             Side::Left => self.body.left(),
-            Side::Right => self.center_x + CENTER_WIDTH,
+            Side::Right => self.center_x + ca_ui::spacing::TOKENS.panes.hex_center_gap,
         } - self.horizontal;
         let address = if self.show_addresses {
             self.address_columns()

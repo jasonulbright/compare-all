@@ -32,16 +32,10 @@ pub mod editing;
 const ROW_HEIGHT_RATIO: f32 = ca_ui::font::CONTENT_ROW_HEIGHT_RATIO;
 /// Height of the column header row.
 const HEADER_HEIGHT: f32 = 22.0;
-/// Width of the gap between the two panes.
-const SEPARATOR: f32 = 6.0;
 /// Thickness of the scrollbar.
 const SCROLLBAR: f32 = 12.0;
 /// Width of the thumbnail strip.
 const STRIP_WIDTH: f32 = 14.0;
-/// Room kept for text inside a column.
-const CELL_PAD: f32 = 4.0;
-/// Indent of one tree level.
-const INDENT: f32 = 14.0;
 /// Width of the open and close mark in front of a key.
 const EXPANDER: f32 = 14.0;
 /// Share of a pane the name column takes.
@@ -55,8 +49,6 @@ const HATCH_STEP: f32 = 10.0;
 const PANE_TEXT_LIMIT: usize = 400;
 /// Characters of a value the details area shows at most.
 const DETAILS_TEXT_LIMIT: usize = 4_000;
-/// Width the display filter drop down is laid out in.
-const FILTER_COMBO_WIDTH: f32 = 150.0;
 /// Room the details area takes under the panes.
 const DETAILS_HEIGHT: f32 = 58.0;
 /// Room the hex details area takes under the panes.
@@ -953,8 +945,11 @@ impl RecordsView {
         let running = self.progress.is_running();
         let ready = self.has_comparison();
         vec![
-            toolbar::Item::widget("filter", FILTER_COMBO_WIDTH),
-            toolbar::Item::widget("minor", 70.0),
+            toolbar::Item::widget(
+                "filter",
+                ca_ui::spacing::TOKENS.toolbar.records_items.filter,
+            ),
+            toolbar::Item::widget("minor", ca_ui::spacing::TOKENS.toolbar.records_items.minor),
             toolbar::Item::separator("separator-1"),
             toolbar::Item::command(
                 "previous-difference",
@@ -1016,9 +1011,12 @@ impl RecordsView {
                 NOT_COMPARED,
             ),
             toolbar::Item::separator("separator-4"),
-            toolbar::Item::widget("strip", 110.0),
-            toolbar::Item::widget("details", 90.0),
-            toolbar::Item::widget("hex", 110.0),
+            toolbar::Item::widget("strip", ca_ui::spacing::TOKENS.toolbar.records_items.strip),
+            toolbar::Item::widget(
+                "details",
+                ca_ui::spacing::TOKENS.toolbar.records_items.details,
+            ),
+            toolbar::Item::widget("hex", ca_ui::spacing::TOKENS.toolbar.records_items.hex),
         ]
     }
 
@@ -1045,7 +1043,7 @@ impl RecordsView {
             |ui, name| match name {
                 "filter" => {
                     egui::ComboBox::from_id_salt(id.with("filter"))
-                        .width(FILTER_COMBO_WIDTH)
+                        .width(ca_ui::spacing::TOKENS.toolbar.records_items.filter)
                         .selected_text(filter.label())
                         .show_ui(ui, |ui| {
                             for option in DisplayFilter::ALL {
@@ -1187,10 +1185,16 @@ impl RecordsView {
             rows,
             left: egui::Rect::from_min_max(
                 rows.left_top(),
-                egui::pos2((middle - SEPARATOR / 2.0).max(full.left()), rows.bottom()),
+                egui::pos2(
+                    (middle - ca_ui::spacing::TOKENS.panes.pane_separator / 2.0).max(full.left()),
+                    rows.bottom(),
+                ),
             ),
             right: egui::Rect::from_min_max(
-                egui::pos2((middle + SEPARATOR / 2.0).min(body_right), rows.top()),
+                egui::pos2(
+                    (middle + ca_ui::spacing::TOKENS.panes.pane_separator / 2.0).min(body_right),
+                    rows.top(),
+                ),
                 rows.right_bottom(),
             ),
             strip: egui::Rect::from_min_max(
@@ -1228,7 +1232,7 @@ impl RecordsView {
         for (side, pane) in [(Side::Left, areas.left), (Side::Right, areas.right)] {
             self.paint_pane(&painter, palette, side, pane, &range);
         }
-        let middle = areas.left.right() + SEPARATOR / 2.0;
+        let middle = areas.left.right() + ca_ui::spacing::TOKENS.panes.pane_separator / 2.0;
         painter.line_segment(
             [
                 egui::pos2(middle, areas.header.top()),
@@ -1292,6 +1296,7 @@ impl RecordsView {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn paint_pane(
         &self,
         painter: &egui::Painter,
@@ -1333,7 +1338,8 @@ impl RecordsView {
                 clipped.rect_filled(rect, 0.0, background);
             }
             #[allow(clippy::cast_precision_loss)]
-            let indent = columns.name + INDENT * node.depth as f32;
+            let indent =
+                columns.name + ca_ui::spacing::TOKENS.panes.tree_indent * node.depth as f32;
             let middle = rect.center().y;
             if node.is_group {
                 if self.listing.has_children(row) {
@@ -1362,8 +1368,11 @@ impl RecordsView {
                 continue;
             };
             let name_clip = painter.with_clip_rect(
-                egui::Rect::from_x_y_ranges(pane.left()..=columns.kind - CELL_PAD, rect.y_range())
-                    .intersect(pane),
+                egui::Rect::from_x_y_ranges(
+                    pane.left()..=columns.kind - ca_ui::spacing::TOKENS.panes.cell_padding,
+                    rect.y_range(),
+                )
+                .intersect(pane),
             );
             name_clip.text(
                 egui::pos2(indent + EXPANDER, middle),
@@ -1373,8 +1382,11 @@ impl RecordsView {
                 text,
             );
             let type_clip = painter.with_clip_rect(
-                egui::Rect::from_x_y_ranges(columns.kind..=columns.data - CELL_PAD, rect.y_range())
-                    .intersect(pane),
+                egui::Rect::from_x_y_ranges(
+                    columns.kind..=columns.data - ca_ui::spacing::TOKENS.panes.cell_padding,
+                    rect.y_range(),
+                )
+                .intersect(pane),
             );
             type_clip.text(
                 egui::pos2(columns.kind, middle),
@@ -1539,7 +1551,7 @@ impl RecordsView {
             return;
         }
         #[allow(clippy::cast_precision_loss)]
-        let mark = Columns::of(pane).name + INDENT * depth as f32;
+        let mark = Columns::of(pane).name + ca_ui::spacing::TOKENS.panes.tree_indent * depth as f32;
         let on_mark = (mark..=mark + EXPANDER).contains(&pointer.x);
         if response.double_clicked() {
             if !on_mark {
@@ -1557,7 +1569,9 @@ impl RecordsView {
         let node = self.listing.node_at(self.listing.cursor());
         egui::Frame::new()
             .fill(palette.details_background)
-            .inner_margin(egui::Margin::same(4))
+            .inner_margin(egui::Margin::same(
+                ca_ui::spacing::TOKENS.panes.cell_frame_margin,
+            ))
             .show(ui, |ui| {
                 if self.show_details {
                     for (label, side) in [("Left", Side::Left), ("Right", Side::Right)] {
@@ -1674,7 +1688,7 @@ impl Columns {
     fn of(pane: egui::Rect) -> Self {
         let kind = pane.left() + pane.width() * NAME_SHARE;
         Self {
-            name: pane.left() + CELL_PAD,
+            name: pane.left() + ca_ui::spacing::TOKENS.panes.cell_padding,
             kind,
             data: kind + pane.width() * TYPE_SHARE,
         }

@@ -56,18 +56,12 @@ const ROW_HEIGHT_RATIO: f32 = ca_ui::font::CONTENT_ROW_HEIGHT_RATIO;
 const HEADER_HEIGHT: f32 = 22.0;
 /// Width of the row number and status gutter.
 const GUTTER_WIDTH: f32 = 54.0;
-/// Width of the gap between the two grids.
-const SEPARATOR: f32 = 6.0;
 /// Thickness of a scrollbar.
 const SCROLLBAR: f32 = 12.0;
 /// Width of the difference strip.
 const STRIP_WIDTH: f32 = 14.0;
 /// How wide the grab area of a column edge is.
 const GRIP: f32 = 4.0;
-/// Room kept for text inside a cell.
-const CELL_PAD: f32 = 4.0;
-/// Width the display filter drop down is laid out in.
-const FILTER_COMBO_WIDTH: f32 = 160.0;
 /// Size of the mark drawn on a key column's heading.
 const MARKER: f32 = 5.0;
 /// Why table actions that need aligned rows wait for a finished comparison.
@@ -1161,10 +1155,16 @@ impl TableView {
         let running = self.status.is_running();
         let ready = self.has_comparison();
         vec![
-            toolbar::Item::widget("filter", FILTER_COMBO_WIDTH),
-            toolbar::Item::widget("minor", 70.0),
-            toolbar::Item::widget("hide-same", 160.0),
-            toolbar::Item::widget("unhide-column", 150.0),
+            toolbar::Item::widget("filter", ca_ui::spacing::TOKENS.toolbar.table_items.filter),
+            toolbar::Item::widget("minor", ca_ui::spacing::TOKENS.toolbar.table_items.minor),
+            toolbar::Item::widget(
+                "hide-same",
+                ca_ui::spacing::TOKENS.toolbar.table_items.hide_same,
+            ),
+            toolbar::Item::widget(
+                "unhide-column",
+                ca_ui::spacing::TOKENS.toolbar.table_items.unhide_column,
+            ),
             toolbar::Item::separator("separator-1"),
             toolbar::Item::command(
                 "previous-difference",
@@ -1211,9 +1211,15 @@ impl TableView {
                 self.refusal(Command::CompareReport).unwrap_or(NOT_COMPARED),
             ),
             toolbar::Item::separator("separator-3"),
-            toolbar::Item::widget("row-numbers", 120.0),
-            toolbar::Item::widget("strip", 110.0),
-            toolbar::Item::widget("details", 100.0),
+            toolbar::Item::widget(
+                "row-numbers",
+                ca_ui::spacing::TOKENS.toolbar.table_items.row_numbers,
+            ),
+            toolbar::Item::widget("strip", ca_ui::spacing::TOKENS.toolbar.table_items.strip),
+            toolbar::Item::widget(
+                "details",
+                ca_ui::spacing::TOKENS.toolbar.table_items.details,
+            ),
         ]
     }
 
@@ -1246,7 +1252,7 @@ impl TableView {
             |ui, name| match name {
                 "filter" => {
                     egui::ComboBox::from_id_salt(id.with("filter"))
-                        .width(FILTER_COMBO_WIDTH)
+                        .width(ca_ui::spacing::TOKENS.toolbar.table_items.filter)
                         .selected_text(filter.label())
                         .show_ui(ui, |ui| {
                             for option in [
@@ -1494,7 +1500,9 @@ impl TableView {
         }
         egui::Frame::new()
             .fill(palette.notice_background)
-            .inner_margin(egui::Margin::same(4))
+            .inner_margin(egui::Margin::same(
+                ca_ui::spacing::TOKENS.panes.cell_frame_margin,
+            ))
             .show(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.colored_label(palette.notice_text, format!("{} notices", notices.len()));
@@ -1517,7 +1525,9 @@ impl TableView {
         let right = self.grid.cell_text(cursor.row, cursor.column, Side::Right);
         egui::Frame::new()
             .fill(palette.details_background)
-            .inner_margin(egui::Margin::same(4))
+            .inner_margin(egui::Margin::same(
+                ca_ui::spacing::TOKENS.panes.cell_frame_margin,
+            ))
             .show(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.colored_label(palette.details_text, "Left");
@@ -1622,10 +1632,16 @@ impl TableView {
         let middle = f32::midpoint(full.left(), body_right);
         let left = egui::Rect::from_min_max(
             egui::pos2(full.left(), rows.top()),
-            egui::pos2((middle - SEPARATOR / 2.0).max(full.left()), rows.bottom()),
+            egui::pos2(
+                (middle - ca_ui::spacing::TOKENS.panes.pane_separator / 2.0).max(full.left()),
+                rows.bottom(),
+            ),
         );
         let right = egui::Rect::from_min_max(
-            egui::pos2((middle + SEPARATOR / 2.0).min(body_right), rows.top()),
+            egui::pos2(
+                (middle + ca_ui::spacing::TOKENS.panes.pane_separator / 2.0).min(body_right),
+                rows.top(),
+            ),
             egui::pos2(body_right, rows.bottom()),
         );
         Areas {
@@ -1694,8 +1710,14 @@ impl TableView {
         }
         painter.line_segment(
             [
-                egui::pos2(areas.left.right() + SEPARATOR / 2.0, areas.rows.top()),
-                egui::pos2(areas.left.right() + SEPARATOR / 2.0, areas.rows.bottom()),
+                egui::pos2(
+                    areas.left.right() + ca_ui::spacing::TOKENS.panes.pane_separator / 2.0,
+                    areas.rows.top(),
+                ),
+                egui::pos2(
+                    areas.left.right() + ca_ui::spacing::TOKENS.panes.pane_separator / 2.0,
+                    areas.rows.bottom(),
+                ),
             ],
             egui::Stroke::new(1.0, palette.separator),
         );
@@ -1785,7 +1807,7 @@ impl TableView {
                     egui::vec2(width, areas.header.height()),
                 );
                 clipped.text(
-                    cell.left_center() + egui::vec2(CELL_PAD, 0.0),
+                    cell.left_center() + egui::vec2(ca_ui::spacing::TOKENS.panes.cell_padding, 0.0),
                     egui::Align2::LEFT_CENTER,
                     &info.name,
                     font.clone(),
@@ -1805,7 +1827,8 @@ impl TableView {
                 if info.key {
                     ca_ui::icons::Icon::Key.paint_in_row(
                         &clipped,
-                        cell.right_center() - egui::vec2(CELL_PAD + 8.0, 0.0),
+                        cell.right_center()
+                            - egui::vec2(ca_ui::spacing::TOKENS.panes.cell_padding + 8.0, 0.0),
                         cell.height(),
                         palette.key_marker,
                     );
@@ -1813,7 +1836,8 @@ impl TableView {
                 if info.unimportant {
                     ca_ui::icons::Icon::StateUnimportant.paint_in_row(
                         &clipped,
-                        cell.right_center() - egui::vec2(CELL_PAD + 26.0, 0.0),
+                        cell.right_center()
+                            - egui::vec2(ca_ui::spacing::TOKENS.panes.cell_padding + 26.0, 0.0),
                         cell.height(),
                         palette.unimportant_marker,
                     );
@@ -1899,7 +1923,8 @@ impl TableView {
                 if !value.is_empty() {
                     let inner = clipped.with_clip_rect(cell.intersect(cells));
                     inner.text(
-                        cell.left_center() + egui::vec2(CELL_PAD, 0.0),
+                        cell.left_center()
+                            + egui::vec2(ca_ui::spacing::TOKENS.panes.cell_padding, 0.0),
                         egui::Align2::LEFT_CENTER,
                         value.as_ref(),
                         font.clone(),

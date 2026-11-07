@@ -4467,7 +4467,9 @@ impl App {
                 .frame(egui::Frame::NONE)
                 .show(ctx, &mut show_content);
         } else {
-            egui::CentralPanel::default().show(ctx, &mut show_content);
+            egui::CentralPanel::default()
+                .frame(ca_ui::spacing::shell_frame(ctx.style().as_ref()))
+                .show(ctx, &mut show_content);
         }
         actions
     }

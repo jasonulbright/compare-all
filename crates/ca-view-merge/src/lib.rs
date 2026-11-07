@@ -56,7 +56,6 @@ const INPUT_SHARE: f32 = 0.55;
 /// Points between the diagonal lines of a gap row's hatch.
 const HATCH_STEP: f32 = 7.0;
 /// Width of the rule between two panes.
-const SEPARATOR: f32 = 2.0;
 /// Reason shown on a control that needs a finished merge.
 const NOT_MERGED: &str = "Available once the merge finishes";
 /// Reason shown on a line that needs a merge after the merge failed.
@@ -115,7 +114,6 @@ const CHANGES_OUTPUT: &[Command] = &[
     Command::ToggleOverwrite,
 ];
 /// Width of the display filter control on the toolbar.
-const FILTER_COMBO_WIDTH: f32 = 150.0;
 /// The filters the toolbar control lists. Show None stays off the control and
 /// off the menus, and is reached through a shortcut the commands page binds.
 const LISTED_FILTERS: [MergeFilter; 8] = [
@@ -2006,7 +2004,7 @@ impl MergeView {
                 self.refusal(Command::CompareReport).unwrap_or(""),
             ),
             toolbar::Item::separator("separator-3"),
-            toolbar::Item::widget("filter", FILTER_COMBO_WIDTH),
+            toolbar::Item::widget("filter", ca_ui::spacing::TOKENS.toolbar.merge_items.filter),
             toolbar::Item::toggle(
                 "minor",
                 Command::ToggleIgnoreUnimportant,
@@ -2037,7 +2035,7 @@ impl MergeView {
             |ui, name| {
                 if name == "filter" {
                     egui::ComboBox::from_id_salt(id.with("filter"))
-                        .width(FILTER_COMBO_WIDTH - 10.0)
+                        .width(ca_ui::spacing::TOKENS.toolbar.merge_items.filter - 10.0)
                         .selected_text(current.label())
                         .show_ui(ui, |ui| {
                             for option in LISTED_FILTERS {
@@ -2277,13 +2275,21 @@ impl MergeView {
             area.min,
             egui::pos2(area.right(), area.top() + input_height),
         );
-        let bottom =
-            egui::Rect::from_min_max(egui::pos2(area.left(), top.bottom() + SEPARATOR), area.max);
+        let bottom = egui::Rect::from_min_max(
+            egui::pos2(
+                area.left(),
+                top.bottom() + ca_ui::spacing::TOKENS.panes.merge_pane_gap,
+            ),
+            area.max,
+        );
         let count = as_f32(inputs.len().max(1));
-        let width = ((top.width() - SEPARATOR * (count - 1.0)) / count).max(1.0);
+        let width = ((top.width() - ca_ui::spacing::TOKENS.panes.merge_pane_gap * (count - 1.0))
+            / count)
+            .max(1.0);
         let clicked = self.handle_scroll(ui, area);
         for (index, pane) in inputs.iter().enumerate() {
-            let left = top.left() + (width + SEPARATOR) * as_f32(index);
+            let left =
+                top.left() + (width + ca_ui::spacing::TOKENS.panes.merge_pane_gap) * as_f32(index);
             let rect = egui::Rect::from_min_max(
                 egui::pos2(left, top.top()),
                 egui::pos2((left + width).min(top.right()), top.bottom()),

@@ -48,15 +48,6 @@ const CONTROLS_WIDTH: f32 = 210.0;
 /// Smallest side a pane is given before the layout stops dividing.
 const MIN_PANE_SIDE: f32 = 40.0;
 
-/// Width a toolbar drop down is laid out in.
-const COMBO_WIDTH: f32 = 148.0;
-
-/// Width a toolbar slider is laid out in.
-const SLIDER_WIDTH: f32 = 160.0;
-
-/// Width a numeric field is laid out in.
-const FIELD_WIDTH: f32 = 84.0;
-
 /// Image pixels one wheel notch moves the panes.
 const WHEEL_STEP: f32 = 48.0;
 
@@ -1151,14 +1142,26 @@ impl PictureView {
     #[must_use]
     pub fn toolbar_items(&self) -> Vec<toolbar::Item> {
         vec![
-            toolbar::Item::widget("home", 70.0),
-            toolbar::Item::widget("mode", COMBO_WIDTH),
-            toolbar::Item::widget("tolerance", SLIDER_WIDTH),
-            toolbar::Item::widget("zoom-in", 90.0),
-            toolbar::Item::widget("zoom-out", 100.0),
-            toolbar::Item::widget("actual-size", 60.0),
-            toolbar::Item::widget("fit", 60.0),
-            toolbar::Item::widget("panes", 320.0),
+            toolbar::Item::widget("home", ca_ui::spacing::TOKENS.toolbar.common_items.home),
+            toolbar::Item::widget("mode", ca_ui::spacing::TOKENS.toolbar.picture_combo_width),
+            toolbar::Item::widget(
+                "tolerance",
+                ca_ui::spacing::TOKENS.toolbar.picture_slider_width,
+            ),
+            toolbar::Item::widget(
+                "zoom-in",
+                ca_ui::spacing::TOKENS.toolbar.picture_items.zoom_in,
+            ),
+            toolbar::Item::widget(
+                "zoom-out",
+                ca_ui::spacing::TOKENS.toolbar.picture_items.zoom_out,
+            ),
+            toolbar::Item::widget(
+                "actual-size",
+                ca_ui::spacing::TOKENS.toolbar.picture_items.actual_size,
+            ),
+            toolbar::Item::widget("fit", ca_ui::spacing::TOKENS.toolbar.picture_items.fit),
+            toolbar::Item::widget("panes", ca_ui::spacing::TOKENS.toolbar.picture_items.panes),
             toolbar::Item::separator("separator-1"),
             toolbar::Item::command(
                 "report",
@@ -1167,7 +1170,7 @@ impl PictureView {
                 self.is_ready(),
                 "Available once the comparison finishes",
             ),
-            toolbar::Item::widget("more", 80.0),
+            toolbar::Item::widget("more", ca_ui::spacing::TOKENS.toolbar.picture_items.more),
         ]
     }
 
@@ -1271,7 +1274,7 @@ impl PictureView {
             "mode" => {
                 egui::ComboBox::from_id_salt(self.id.with("mode"))
                     .selected_text(mode_label(self.settings.mode))
-                    .width(COMBO_WIDTH - 8.0)
+                    .width(ca_ui::spacing::TOKENS.toolbar.picture_combo_width - 8.0)
                     .show_ui(ui, |ui| {
                         for mode in MODES {
                             if ui
@@ -1336,18 +1339,23 @@ impl PictureView {
         actions: &mut Vec<ViewAction>,
         changed: &mut Option<Stage>,
     ) {
-        widgets::sized(ui, SLIDER_WIDTH, |ui| {
-            let enabled = self.settings.mode == DisplayMode::Blend;
-            if ui
-                .add_enabled(
-                    enabled,
-                    egui::Slider::new(&mut self.settings.blend_percent, 0..=100).text("Blend %"),
-                )
-                .changed()
-            {
-                *changed = Some(Stage::Compare);
-            }
-        });
+        widgets::sized(
+            ui,
+            ca_ui::spacing::TOKENS.toolbar.picture_slider_width,
+            |ui| {
+                let enabled = self.settings.mode == DisplayMode::Blend;
+                if ui
+                    .add_enabled(
+                        enabled,
+                        egui::Slider::new(&mut self.settings.blend_percent, 0..=100)
+                            .text("Blend %"),
+                    )
+                    .changed()
+                {
+                    *changed = Some(Stage::Compare);
+                }
+            },
+        );
         if ui
             .selectable_label(self.settings.side == Side::Right, "Blend toggle")
             .clicked()
@@ -1382,21 +1390,25 @@ impl PictureView {
         {
             *changed = Some(Stage::Compare);
         }
-        widgets::sized(ui, COMBO_WIDTH, |ui| {
-            egui::ComboBox::from_id_salt(self.id.with("side"))
-                .selected_text(format!("Acts on: {}", side_label(self.active_side)))
-                .width(COMBO_WIDTH - 8.0)
-                .show_ui(ui, |ui| {
-                    for side in [Side::Left, Side::Right] {
-                        if ui
-                            .selectable_label(self.active_side == side, side_label(side))
-                            .clicked()
-                        {
-                            self.active_side = side;
+        widgets::sized(
+            ui,
+            ca_ui::spacing::TOKENS.toolbar.picture_combo_width,
+            |ui| {
+                egui::ComboBox::from_id_salt(self.id.with("side"))
+                    .selected_text(format!("Acts on: {}", side_label(self.active_side)))
+                    .width(ca_ui::spacing::TOKENS.toolbar.picture_combo_width - 8.0)
+                    .show_ui(ui, |ui| {
+                        for side in [Side::Left, Side::Right] {
+                            if ui
+                                .selectable_label(self.active_side == side, side_label(side))
+                                .clicked()
+                            {
+                                self.active_side = side;
+                            }
                         }
-                    }
-                });
-        });
+                    });
+            },
+        );
         let side = self.active_side;
         if widgets::with_toolbar_icon(ui, ca_ui::icons::Icon::RotateClockwise, true, |ui| {
             widgets::toolbar_button(ui, "Rotate right", true, "")
@@ -1975,22 +1987,32 @@ impl PictureView {
         let mut reported = Vec::new();
         ui.horizontal(|ui| {
             let mut apply = false;
-            widgets::sized(ui, FIELD_WIDTH, |ui| {
-                let response = ui.add(
-                    egui::TextEdit::singleline(&mut self.offset_x_text)
-                        .desired_width(FIELD_WIDTH - 10.0),
-                );
-                reported.push(("Offset x", response.rect));
-                apply |= response.lost_focus();
-            });
-            widgets::sized(ui, FIELD_WIDTH, |ui| {
-                let response = ui.add(
-                    egui::TextEdit::singleline(&mut self.offset_y_text)
-                        .desired_width(FIELD_WIDTH - 10.0),
-                );
-                reported.push(("Offset y", response.rect));
-                apply |= response.lost_focus();
-            });
+            widgets::sized(
+                ui,
+                ca_ui::spacing::TOKENS.toolbar.picture_field_width,
+                |ui| {
+                    let response = ui.add(
+                        egui::TextEdit::singleline(&mut self.offset_x_text).desired_width(
+                            ca_ui::spacing::TOKENS.toolbar.picture_field_width - 10.0,
+                        ),
+                    );
+                    reported.push(("Offset x", response.rect));
+                    apply |= response.lost_focus();
+                },
+            );
+            widgets::sized(
+                ui,
+                ca_ui::spacing::TOKENS.toolbar.picture_field_width,
+                |ui| {
+                    let response = ui.add(
+                        egui::TextEdit::singleline(&mut self.offset_y_text).desired_width(
+                            ca_ui::spacing::TOKENS.toolbar.picture_field_width - 10.0,
+                        ),
+                    );
+                    reported.push(("Offset y", response.rect));
+                    apply |= response.lost_focus();
+                },
+            );
             if apply {
                 let x = self.offset_x_text.trim().parse::<i32>();
                 let y = self.offset_y_text.trim().parse::<i32>();

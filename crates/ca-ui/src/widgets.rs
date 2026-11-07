@@ -2,6 +2,7 @@
 
 use crate::command::{Command, MenuView};
 use crate::icons::Icon;
+use crate::spacing::TOKENS;
 use egui::NumExt;
 
 /// A button with an icon above its unchanged accessible label.
@@ -65,7 +66,11 @@ impl egui::Widget for IconButton<'_> {
         let galley =
             ui.painter()
                 .layout_no_wrap(self.label.to_owned(), font, ui.visuals().text_color());
-        let size = if self.above { 24.0 } else { 16.0 };
+        let size = if self.above {
+            TOKENS.toolbar.icon_above
+        } else {
+            TOKENS.toolbar.icon_inline
+        };
         let gap = ui.spacing().icon_spacing;
         let padding = ui.spacing().button_padding;
         let check_column = if self.reserve_check { size + gap } else { 0.0 };
@@ -186,7 +191,7 @@ pub fn icon_menu<R>(
             .x
             .max(1.0);
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let count = ((16.0 + ui.spacing().icon_spacing) / space)
+        let count = ((TOKENS.toolbar.menu_icon_size + ui.spacing().icon_spacing) / space)
             .ceil()
             .clamp(1.0, 32.0) as usize;
         let result = ui.menu_button(format!("{}{label}", " ".repeat(count)), contents);
@@ -197,10 +202,12 @@ pub fn icon_menu<R>(
             ui.painter(),
             egui::Rect::from_center_size(
                 egui::pos2(
-                    result.response.rect.left() + ui.spacing().button_padding.x + 8.0,
+                    result.response.rect.left()
+                        + ui.spacing().button_padding.x
+                        + TOKENS.toolbar.menu_icon_left_offset,
                     result.response.rect.center().y,
                 ),
-                egui::vec2(16.0, 16.0),
+                egui::Vec2::splat(TOKENS.toolbar.menu_icon_size),
             ),
             ui.style().interact(&result.response).fg_stroke.color,
         );
@@ -246,17 +253,20 @@ pub fn icon_only_with_hover(
     icon: Icon,
     tint: Option<egui::Color32>,
 ) -> egui::Response {
-    if icon.texture(ui.ctx(), 16.0).is_none() {
+    if icon.texture(ui.ctx(), TOKENS.toolbar.icon_inline).is_none() {
         return ui.button(label).on_hover_text(hover);
     }
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::click());
+    let (rect, response) = ui.allocate_exact_size(
+        egui::Vec2::splat(TOKENS.toolbar.toggle_hit_size),
+        egui::Sense::click(),
+    );
     response.widget_info(|| {
         egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
     });
     let visuals = ui.style().interact(&response);
     icon.paint(
         ui.painter(),
-        egui::Rect::from_center_size(rect.center(), egui::vec2(16.0, 16.0)),
+        egui::Rect::from_center_size(rect.center(), egui::Vec2::splat(TOKENS.toolbar.icon_inline)),
         tint.unwrap_or(visuals.fg_stroke.color),
     );
     response.on_hover_text(hover)
@@ -510,12 +520,10 @@ pub fn path_bar_with_titles(
 }
 
 /// Room a toolbar keeps for the button that opens what did not fit.
-const CHEVRON_WIDTH: f32 = 34.0;
-
 /// Height reserved by a toolbar button with an icon above its label.
 #[must_use]
 pub fn toolbar_height(ui: &egui::Ui) -> f32 {
-    (24.0
+    (TOKENS.toolbar.icon_above
         + ui.spacing().icon_spacing
         + ui.text_style_height(&egui::TextStyle::Button)
         + ui.spacing().button_padding.y * 2.0)
@@ -569,7 +577,7 @@ impl Overflow {
             .unwrap_or(0.0);
         Self {
             id,
-            collapsed: room <= CHEVRON_WIDTH * 2.0 || needed > room,
+            collapsed: room <= TOKENS.toolbar.overflow_width * 2.0 || needed > room,
         }
     }
 

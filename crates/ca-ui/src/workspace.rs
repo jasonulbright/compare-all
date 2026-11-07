@@ -4,10 +4,8 @@
 //! showing. Saving one takes a snapshot of the open tabs; loading one closes
 //! what is open and reopens the snapshot.
 
+use crate::spacing::TOKENS;
 use ca_session::{SessionStore, Workspace, WorkspaceTab, WorkspaceWindow};
-
-/// Width the name column of the manager takes.
-const NAME_WIDTH: f32 = 220.0;
 
 /// What the workspace manager was asked to do this frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,7 +102,7 @@ impl WorkspaceManager {
             .open(&mut open)
             .collapsible(false)
             .resizable(true)
-            .max_width((ctx.screen_rect().width() - 24.0).max(200.0))
+            .max_width((ctx.screen_rect().width() - TOKENS.forms.dialog_screen_margin).max(200.0))
             .show(ctx, |ui| {
                 action = self.body(ui, store);
             });
@@ -115,6 +113,7 @@ impl WorkspaceManager {
     }
 
     /// Draw the dialog into a panel, for a headless frame.
+    #[allow(clippy::too_many_lines)]
     pub fn body(&mut self, ui: &mut egui::Ui, store: &SessionStore) -> Option<WorkspaceAction> {
         let mut action = None;
         if let Some(name) = self.confirming.clone() {
@@ -138,13 +137,14 @@ impl WorkspaceManager {
                 for workspace in &store.workspaces {
                     let chosen = self.selected.as_deref() == Some(workspace.name.as_str());
                     ui.horizontal_wrapped(|ui| {
-                        crate::widgets::sized(ui, NAME_WIDTH, |ui| {
+                        crate::widgets::sized(ui, TOKENS.forms.workspace_name_width, |ui| {
                             let response = ui.selectable_label(
                                 chosen,
                                 crate::widgets::elide_to_width(
                                     ui,
                                     &workspace.name,
-                                    NAME_WIDTH - 8.0,
+                                    TOKENS.forms.workspace_name_width
+                                        - TOKENS.forms.workspace_name_elision_padding,
                                 ),
                             );
                             if response.clicked() {
@@ -176,8 +176,11 @@ impl WorkspaceManager {
             let from = from.clone();
             ui.horizontal_wrapped(|ui| {
                 ui.label("New name");
-                crate::widgets::sized(ui, NAME_WIDTH, |ui| {
-                    ui.add(egui::TextEdit::singleline(to).desired_width(NAME_WIDTH));
+                crate::widgets::sized(ui, TOKENS.forms.workspace_name_width, |ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(to)
+                            .desired_width(TOKENS.forms.workspace_name_width),
+                    );
                 });
                 if ui.button("Rename").clicked() {
                     action = Some(WorkspaceAction::Rename {
@@ -193,8 +196,11 @@ impl WorkspaceManager {
         ui.separator();
         ui.horizontal_wrapped(|ui| {
             ui.label("Name");
-            crate::widgets::sized(ui, NAME_WIDTH, |ui| {
-                ui.add(egui::TextEdit::singleline(&mut self.name).desired_width(NAME_WIDTH));
+            crate::widgets::sized(ui, TOKENS.forms.workspace_name_width, |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.name)
+                        .desired_width(TOKENS.forms.workspace_name_width),
+                );
             });
             let named = !self.name.trim().is_empty();
             if crate::widgets::toolbar_button(ui, "Save Workspace", named, "Enter a name first") {

@@ -14,9 +14,6 @@ use ca_fs::{ExecutionReport, OperationPlan, PathOption, StepOutcome, Verify};
 use ca_ui::format::{format_bytes, format_stamp};
 use ca_ui::widgets::{path_line, path_text, wrapped_text};
 
-/// Room left between a dialog and the edge of the window.
-const MARGIN: f32 = 12.0;
-
 /// Width a dialog takes when the window has room for it.
 const PREFERRED_WIDTH: f32 = 560.0;
 
@@ -45,7 +42,8 @@ pub(crate) fn modal<R>(
     add: impl FnOnce(&mut egui::Ui) -> R,
 ) -> Option<R> {
     let screen = ui.ctx().screen_rect();
-    let width = (screen.width() - MARGIN * 2.0).clamp(80.0, PREFERRED_WIDTH);
+    let margin = ca_ui::spacing::TOKENS.panes.folder_dialog_margin;
+    let width = (screen.width() - margin * 2.0).clamp(80.0, PREFERRED_WIDTH);
     egui::Window::new(title)
         .id(id)
         .collapsible(false)
@@ -378,8 +376,10 @@ pub fn progress(ui: &egui::Ui, id: egui::Id, state: &ProgressState) -> bool {
         ));
         path_line(ui, "", &state.current);
         ui.add(
-            egui::ProgressBar::new(fraction(state.steps_done, state.steps_total))
-                .desired_width((ui.available_width() - MARGIN).max(40.0)),
+            egui::ProgressBar::new(fraction(state.steps_done, state.steps_total)).desired_width(
+                (ui.available_width() - ca_ui::spacing::TOKENS.panes.folder_dialog_margin)
+                    .max(40.0),
+            ),
         );
         ui.horizontal_wrapped(|ui| ui.button("Cancel").clicked())
             .inner

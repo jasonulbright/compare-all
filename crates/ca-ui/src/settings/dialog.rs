@@ -2,19 +2,11 @@
 
 use super::field::{Field, FieldShape, FieldValue};
 use super::schema::{self, Tab};
+use crate::spacing::TOKENS;
 use crate::theme::Palette;
 use ca_session::settings::table::ColumnHandling;
 use ca_session::settings::{ReplacementItem, SessionSettings, SessionSettingsOverride};
 use ca_session::{SessionKind, SettingsLayers};
-
-/// Width the label column takes before the controls start.
-const LABEL_WIDTH: f32 = 220.0;
-
-/// Width a control takes when the window is at its narrowest.
-const CONTROL_WIDTH: f32 = 180.0;
-
-/// Room the dialog keeps for its own frame inside the window.
-const DIALOG_MARGIN: f32 = 24.0;
 
 /// Which layers an edit is written to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -239,7 +231,8 @@ impl SettingsDialog {
         }
         let mut outcome = None;
         let mut open = true;
-        let width = (ctx.screen_rect().width() - DIALOG_MARGIN).max(CONTROL_WIDTH);
+        let width = (ctx.screen_rect().width() - TOKENS.forms.dialog_screen_margin)
+            .max(TOKENS.forms.settings_control_width);
         egui::Window::new(format!("{} Session Settings", self.kind.title()))
             .id(self.id)
             .open(&mut open)
@@ -314,7 +307,10 @@ impl SettingsDialog {
         };
         let overridden = field.is_overridden(&self.current, &self.defaults);
         ui.horizontal_wrapped(|ui| {
-            let label_width = LABEL_WIDTH.min((ui.available_width() - CONTROL_WIDTH).max(80.0));
+            let label_width = TOKENS.forms.settings_label_width.min(
+                (ui.available_width() - TOKENS.forms.settings_control_width)
+                    .max(TOKENS.forms.minimum_label_width),
+            );
             crate::widgets::sized(ui, label_width, |ui| {
                 let text = egui::RichText::new(field.label).color(if overridden {
                     palette.settings_overridden
@@ -409,7 +405,10 @@ fn control(
 }
 
 fn field_control_width(ui: &egui::Ui) -> f32 {
-    CONTROL_WIDTH.min(ui.available_width().max(60.0))
+    TOKENS
+        .forms
+        .settings_control_width
+        .min(ui.available_width().max(TOKENS.forms.minimum_control_width))
 }
 
 fn control_flag(

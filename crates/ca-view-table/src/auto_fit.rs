@@ -213,15 +213,16 @@ fn measure_batch(
 
 /// Cell padding plus room for the optional header markers.
 fn column_inset(column: &model::ColumnInfo) -> f32 {
-    use super::{CELL_PAD, MARKER};
+    use super::MARKER;
+    let cell_padding = ca_ui::spacing::TOKENS.panes.cell_padding;
     let marker_room = if column.key || column.unimportant {
         // The outer marker ends 24 points before the column edge; four more
         // points leave a clear gap between it and the text.
-        MARKER * 4.8 + CELL_PAD
+        MARKER * 4.8 + cell_padding
     } else {
         0.0
     };
-    CELL_PAD * 2.0 + marker_room
+    cell_padding * 2.0 + marker_room
 }
 
 #[cfg(test)]

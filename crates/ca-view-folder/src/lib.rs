@@ -61,8 +61,6 @@ const ARCHIVE_SIDE_REFUSAL: &str =
     "A side is an archive read as a folder. File operations need two local folders.";
 /// Height of the column header row.
 const HEADER_HEIGHT: f32 = 22.0;
-/// Width of the splitter between the two panes.
-const SPLITTER_WIDTH: f32 = 6.0;
 /// Narrowest share of the width either pane may be dragged to.
 const MINIMUM_SPLIT: f32 = 0.1;
 /// Starting width of a size column.
@@ -73,20 +71,8 @@ const TIME_WIDTH: f32 = 160.0;
 const MINIMUM_COLUMN: f32 = 36.0;
 /// How wide the grab area of a column edge is.
 const GRIP: f32 = 5.0;
-/// Indent added per tree level.
-const INDENT: f32 = 14.0;
 /// Thickness of the vertical scrollbar.
 const SCROLLBAR: f32 = 12.0;
-/// Width the display filter drop down is laid out in.
-const FILTER_COMBO_WIDTH: f32 = 230.0;
-/// Width the folder handling drop down is laid out in.
-const FOLDER_COMBO_WIDTH: f32 = 250.0;
-/// Width the content method drop down is laid out in.
-const METHOD_COMBO_WIDTH: f32 = 120.0;
-/// Width the name filter label and field are laid out in.
-const NAME_FILTER_WIDTH: f32 = 190.0;
-/// Width the synchronisation method drop down is laid out in.
-const SYNC_COMBO_WIDTH: f32 = 170.0;
 /// Height the synchronisation preview is given.
 const PREVIEW_HEIGHT: f32 = 220.0;
 /// What a control this build does not carry says when hovered.
@@ -2190,16 +2176,25 @@ impl FolderView {
         let running = self.status.is_running() || self.stage.is_busy();
         let has_tree = self.compared_tree.is_some();
         vec![
-            toolbar::Item::widget("home", 70.0),
-            toolbar::Item::widget("sessions", 90.0),
+            toolbar::Item::widget("home", ca_ui::spacing::TOKENS.toolbar.common_items.home),
+            toolbar::Item::widget(
+                "sessions",
+                ca_ui::spacing::TOKENS.toolbar.common_items.sessions,
+            ),
             toolbar::Item::separator("separator-1"),
-            toolbar::Item::widget("all", 46.0),
-            toolbar::Item::widget("diffs", 56.0),
-            toolbar::Item::widget("same", 56.0),
-            toolbar::Item::widget("filter", FILTER_COMBO_WIDTH),
-            toolbar::Item::widget("structure", FOLDER_COMBO_WIDTH),
-            toolbar::Item::widget("minor", 60.0),
-            toolbar::Item::widget("rules", 60.0),
+            toolbar::Item::widget("all", ca_ui::spacing::TOKENS.toolbar.common_items.all),
+            toolbar::Item::widget(
+                "diffs",
+                ca_ui::spacing::TOKENS.toolbar.common_items.differences,
+            ),
+            toolbar::Item::widget("same", ca_ui::spacing::TOKENS.toolbar.common_items.same),
+            toolbar::Item::widget("filter", ca_ui::spacing::TOKENS.toolbar.folder_items.filter),
+            toolbar::Item::widget(
+                "structure",
+                ca_ui::spacing::TOKENS.toolbar.folder_items.structure,
+            ),
+            toolbar::Item::widget("minor", ca_ui::spacing::TOKENS.toolbar.common_items.minor),
+            toolbar::Item::widget("rules", ca_ui::spacing::TOKENS.toolbar.common_items.rules),
             toolbar::Item::separator("separator-2"),
             toolbar::Item::command(
                 "copy",
@@ -2208,11 +2203,14 @@ impl FolderView {
                 self.accepts(Command::CopyToOtherSide),
                 self.refusal(Command::CopyToOtherSide).unwrap_or(""),
             ),
-            toolbar::Item::widget("expand", 80.0),
-            toolbar::Item::widget("collapse", 90.0),
-            toolbar::Item::widget("select", 80.0),
-            toolbar::Item::widget("files", 60.0),
-            toolbar::Item::widget("method", METHOD_COMBO_WIDTH),
+            toolbar::Item::widget("expand", ca_ui::spacing::TOKENS.toolbar.folder_items.expand),
+            toolbar::Item::widget(
+                "collapse",
+                ca_ui::spacing::TOKENS.toolbar.folder_items.collapse,
+            ),
+            toolbar::Item::widget("select", ca_ui::spacing::TOKENS.toolbar.folder_items.select),
+            toolbar::Item::widget("files", ca_ui::spacing::TOKENS.toolbar.folder_items.files),
+            toolbar::Item::widget("method", ca_ui::spacing::TOKENS.toolbar.folder_items.method),
             toolbar::Item::command(
                 "compare-contents",
                 Command::CompareContents,
@@ -2242,8 +2240,11 @@ impl FolderView {
                 "Nothing is running",
             ),
             toolbar::Item::separator("separator-3"),
-            toolbar::Item::widget("name-filter", NAME_FILTER_WIDTH),
-            toolbar::Item::widget("peek", 60.0),
+            toolbar::Item::widget(
+                "name-filter",
+                ca_ui::spacing::TOKENS.toolbar.folder_items.name_filter,
+            ),
+            toolbar::Item::widget("peek", ca_ui::spacing::TOKENS.toolbar.common_items.peek),
             toolbar::Item::command(
                 "report",
                 Command::CompareReport,
@@ -2305,7 +2306,7 @@ impl FolderView {
                 }
                 "filter" => {
                     egui::ComboBox::from_id_salt(id.with("filter"))
-                        .width(FILTER_COMBO_WIDTH)
+                        .width(ca_ui::spacing::TOKENS.toolbar.folder_items.filter)
                         .selected_text(filter_label(filter))
                         .show_ui(ui, |ui| {
                             for option in DISPLAY_FILTERS {
@@ -2315,7 +2316,7 @@ impl FolderView {
                 }
                 "structure" => {
                     egui::ComboBox::from_id_salt(id.with("folders"))
-                        .width(FOLDER_COMBO_WIDTH)
+                        .width(ca_ui::spacing::TOKENS.toolbar.folder_items.structure)
                         .selected_text(folder_filter_label(folder_filter))
                         .show_ui(ui, |ui| {
                             for option in [
@@ -2369,7 +2370,7 @@ impl FolderView {
                 }
                 "method" => {
                     egui::ComboBox::from_id_salt(id.with("method"))
-                        .width(METHOD_COMBO_WIDTH)
+                        .width(ca_ui::spacing::TOKENS.toolbar.folder_items.method)
                         .selected_text(method_label(method))
                         .show_ui(ui, |ui| {
                             for option in [ContentMethod::Binary, ContentMethod::Crc32] {
@@ -2590,16 +2591,20 @@ impl FolderView {
         let mut accept = false;
         let mut start = false;
         ui.horizontal_wrapped(|ui| {
-            widgets::sized(ui, SYNC_COMBO_WIDTH, |ui| {
-                egui::ComboBox::from_id_salt(self.id.with("sync-method"))
-                    .width(SYNC_COMBO_WIDTH)
-                    .selected_text(method.label())
-                    .show_ui(ui, |ui| {
-                        for option in sync_mode::PRESETS {
-                            ui.selectable_value(&mut method, option, option.label());
-                        }
-                    });
-            });
+            widgets::sized(
+                ui,
+                ca_ui::spacing::TOKENS.toolbar.folder_items.sync_method,
+                |ui| {
+                    egui::ComboBox::from_id_salt(self.id.with("sync-method"))
+                        .width(ca_ui::spacing::TOKENS.toolbar.folder_items.sync_method)
+                        .selected_text(method.label())
+                        .show_ui(ui, |ui| {
+                            for option in sync_mode::PRESETS {
+                                ui.selectable_value(&mut method, option, option.label());
+                            }
+                        });
+                },
+            );
             ui.checkbox(
                 &mut self.form.options.use_recycle_bin,
                 "Use recycle bin if possible",
@@ -3119,7 +3124,9 @@ impl FolderView {
                 } else {
                     layout.left
                 };
-                let marker_end = pane.name.start + f32::from(row.depth) * INDENT + 14.0;
+                let marker_end = pane.name.start
+                    + f32::from(row.depth) * ca_ui::spacing::TOKENS.panes.tree_indent
+                    + 14.0;
                 if clicked && !suppress_click && cursor.x <= marker_end {
                     toggle = Some(row.node);
                     continue;
@@ -3525,7 +3532,7 @@ impl Layout {
     /// `split` is the share of the room the left pane takes.
     #[must_use]
     pub fn new(rect: egui::Rect, size_width: f32, time_width: f32, split: f32) -> Self {
-        let room = (rect.width() - SPLITTER_WIDTH).max(0.0);
+        let room = (rect.width() - ca_ui::spacing::TOKENS.panes.folder_splitter_width).max(0.0);
         let split = split.clamp(MINIMUM_SPLIT, 1.0 - MINIMUM_SPLIT);
         let left_width = room * split;
         let right_width = room - left_width;
@@ -3547,7 +3554,7 @@ impl Layout {
         };
         let left_start = rect.left();
         let splitter_start = left_start + left_width;
-        let right_start = splitter_start + SPLITTER_WIDTH;
+        let right_start = splitter_start + ca_ui::spacing::TOKENS.panes.folder_splitter_width;
         Self {
             left: pane_at(left_start, left_width),
             splitter: Span::new(splitter_start, right_start),
@@ -3582,7 +3589,7 @@ fn paint_pane(
     let Some(side) = side else {
         return;
     };
-    let indent = f32::from(depth) * INDENT;
+    let indent = f32::from(depth) * ca_ui::spacing::TOKENS.panes.tree_indent;
     let clip = painter.with_clip_rect(egui::Rect::from_min_max(
         egui::pos2(pane.name.start, y),
         egui::pos2(pane.name.end, y + row_height),
