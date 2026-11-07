@@ -35,7 +35,16 @@ pub struct WorkspaceManager {
     renaming: Option<(String, String)>,
     confirming: Option<String>,
     open: bool,
+    focus_requested: Option<WorkspaceFocus>,
+    accept_focused_text: Option<egui::Id>,
     id: egui::Id,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkspaceFocus {
+    Name,
+    Rename,
+    Keep,
 }
 
 impl WorkspaceManager {
@@ -48,6 +57,8 @@ impl WorkspaceManager {
             renaming: None,
             confirming: None,
             open: true,
+            focus_requested: Some(WorkspaceFocus::Name),
+            accept_focused_text: None,
             id: egui::Id::new(("workspaces", instance)),
         }
     }
@@ -115,17 +126,68 @@ impl WorkspaceManager {
     /// Draw the dialog into a panel, for a headless frame.
     #[allow(clippy::too_many_lines)]
     pub fn body(&mut self, ui: &mut egui::Ui, store: &SessionStore) -> Option<WorkspaceAction> {
+        match crate::widgets::dialog_key_action_with_text_focus(ui.ctx(), self.accept_focused_text)
+        {
+            Some(crate::widgets::DialogKeyAction::Cancel) => {
+                if self.confirming.take().is_some() {
+                    if self.focus_requested == Some(WorkspaceFocus::Keep) {
+                        self.focus_requested = None;
+                    }
+                } else if self.renaming.take().is_some() {
+                    if self.focus_requested == Some(WorkspaceFocus::Rename) {
+                        self.focus_requested = None;
+                    }
+                    self.accept_focused_text = None;
+                } else {
+                    self.close();
+                }
+                return None;
+            }
+            Some(crate::widgets::DialogKeyAction::Accept) => {
+                if self.confirming.take().is_some() {
+                    // Keep is the focused safe default when the delete
+                    // question opens, so Enter dismisses the question.
+                    if self.focus_requested == Some(WorkspaceFocus::Keep) {
+                        self.focus_requested = None;
+                    }
+                    return None;
+                }
+                if let Some((from, to)) = self.renaming.take() {
+                    if self.focus_requested == Some(WorkspaceFocus::Rename) {
+                        self.focus_requested = None;
+                    }
+                    self.accept_focused_text = None;
+                    return Some(WorkspaceAction::Rename { from, to });
+                }
+                let name = self.name.trim();
+                if !name.is_empty() {
+                    return Some(WorkspaceAction::Save(name.to_owned()));
+                }
+            }
+            None => {}
+        }
         let mut action = None;
         if let Some(name) = self.confirming.clone() {
             let text = format!("Delete the workspace {name}? The open tabs are not affected.");
             crate::widgets::wrapped_text(ui, &text);
             ui.horizontal_wrapped(|ui| {
-                if ui.button("Delete").clicked() {
+                let (delete, keep) = crate::widgets::dialog_button_pair(ui, "Delete", "Keep");
+                if self.focus_requested == Some(WorkspaceFocus::Keep) {
+                    keep.request_focus();
+                    self.focus_requested = None;
+                }
+                if delete.clicked() {
                     action = Some(WorkspaceAction::Delete(name.clone()));
                     self.confirming = None;
+                    if self.focus_requested == Some(WorkspaceFocus::Keep) {
+                        self.focus_requested = None;
+                    }
                 }
-                if ui.button("Keep").clicked() {
+                if keep.clicked() {
                     self.confirming = None;
+                    if self.focus_requested == Some(WorkspaceFocus::Keep) {
+                        self.focus_requested = None;
+                    }
                 }
             });
             ui.separator();
@@ -161,9 +223,11 @@ impl WorkspaceManager {
                         }
                         if ui.small_button("Rename").clicked() {
                             self.renaming = Some((workspace.name.clone(), workspace.name.clone()));
+                            self.focus_requested = Some(WorkspaceFocus::Rename);
                         }
                         if ui.small_button("Delete").clicked() {
                             self.confirming = Some(workspace.name.clone());
+                            self.focus_requested = Some(WorkspaceFocus::Keep);
                         }
                     });
                 }
@@ -175,12 +239,21 @@ impl WorkspaceManager {
             ui.separator();
             let from = from.clone();
             ui.horizontal_wrapped(|ui| {
-                ui.label("New name");
+                crate::widgets::sized(ui, TOKENS.forms.dialog_label_width, |ui| {
+                    ui.label("New name");
+                });
                 crate::widgets::sized(ui, TOKENS.forms.workspace_name_width, |ui| {
-                    ui.add(
+                    let response = ui.add(
                         egui::TextEdit::singleline(to)
                             .desired_width(TOKENS.forms.workspace_name_width),
                     );
+                    if self.focus_requested == Some(WorkspaceFocus::Rename) {
+                        response.request_focus();
+                        self.accept_focused_text = Some(response.id);
+                        self.focus_requested = None;
+                    } else if response.has_focus() || response.clicked() {
+                        self.accept_focused_text = Some(response.id);
+                    }
                 });
                 if ui.button("Rename").clicked() {
                     action = Some(WorkspaceAction::Rename {
@@ -191,16 +264,29 @@ impl WorkspaceManager {
             });
             if action.is_some() || ui.button("Cancel rename").clicked() {
                 self.renaming = None;
+                if self.focus_requested == Some(WorkspaceFocus::Rename) {
+                    self.focus_requested = None;
+                }
+                self.accept_focused_text = None;
             }
         }
         ui.separator();
         ui.horizontal_wrapped(|ui| {
-            ui.label("Name");
+            crate::widgets::sized(ui, TOKENS.forms.dialog_label_width, |ui| {
+                ui.label("Name");
+            });
             crate::widgets::sized(ui, TOKENS.forms.workspace_name_width, |ui| {
-                ui.add(
+                let response = ui.add(
                     egui::TextEdit::singleline(&mut self.name)
                         .desired_width(TOKENS.forms.workspace_name_width),
                 );
+                if self.focus_requested == Some(WorkspaceFocus::Name) {
+                    response.request_focus();
+                    self.accept_focused_text = Some(response.id);
+                    self.focus_requested = None;
+                } else if response.has_focus() || response.clicked() {
+                    self.accept_focused_text = Some(response.id);
+                }
             });
             let named = !self.name.trim().is_empty();
             if crate::widgets::toolbar_button(ui, "Save Workspace", named, "Enter a name first") {
@@ -257,6 +343,20 @@ mod tests {
     use super::{one_window, tab_count, WorkspaceManager};
     use ca_session::{SavedSession, SessionId, SessionKind, SessionStore, WorkspaceTab};
 
+    fn key_input(key: egui::Key) -> egui::RawInput {
+        crate::testing::event_input(
+            800.0,
+            600.0,
+            vec![egui::Event::Key {
+                key,
+                physical_key: Some(key),
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        )
+    }
+
     #[test]
     fn a_workspace_of_one_window_counts_its_tabs() {
         let workspace = one_window(
@@ -312,5 +412,60 @@ mod tests {
         manager.select("Nightly");
         assert_eq!(manager.selected(), Some("Nightly"));
         assert_eq!(manager.name(), "Nightly");
+    }
+
+    #[test]
+    fn enter_keeps_the_safe_default_on_a_workspace_delete_question() {
+        let mut manager = WorkspaceManager::new(1);
+        manager.confirming = Some("Daily".to_owned());
+        let store = SessionStore::default();
+        let ctx = egui::Context::default();
+        let mut action = None;
+        let _ = ctx.run(key_input(egui::Key::Enter), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                action = manager.body(ui, &store);
+            });
+        });
+        assert_eq!(action, None);
+        assert!(manager.confirming.is_none());
+    }
+
+    #[test]
+    fn enter_saves_a_named_workspace_when_no_question_is_open() {
+        let mut manager = WorkspaceManager::with_name(1, "Daily");
+        let store = SessionStore::default();
+        let ctx = egui::Context::default();
+        let mut action = None;
+        let _ = ctx.run(key_input(egui::Key::Enter), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                action = manager.body(ui, &store);
+            });
+        });
+        assert_eq!(
+            action,
+            Some(super::WorkspaceAction::Save("Daily".to_owned()))
+        );
+    }
+
+    #[test]
+    fn enter_saves_from_the_initially_focused_workspace_name_field() {
+        let mut manager = WorkspaceManager::with_name(1, "Daily");
+        let store = SessionStore::default();
+        let ctx = egui::Context::default();
+        let _ = ctx.run(crate::testing::sized_input(800.0, 600.0), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = manager.body(ui, &store);
+            });
+        });
+        let mut action = None;
+        let _ = ctx.run(key_input(egui::Key::Enter), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                action = manager.body(ui, &store);
+            });
+        });
+        assert_eq!(
+            action,
+            Some(super::WorkspaceAction::Save("Daily".to_owned()))
+        );
     }
 }

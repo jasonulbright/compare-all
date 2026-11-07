@@ -232,12 +232,10 @@ pub struct FolderMergeToolbarItemTokens {
 /// Widths used by forms, launch rows and their controls.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FormTokens {
-    /// Options form label width.
-    pub options_label_width: f32,
+    /// Label column width shared by forms in native dialogs.
+    pub dialog_label_width: f32,
     /// Options form control width.
     pub options_control_width: f32,
-    /// Settings form label width.
-    pub settings_label_width: f32,
     /// Settings form control width.
     pub settings_control_width: f32,
     /// Minimum form label width when the window is narrow.
@@ -399,9 +397,8 @@ pub const TOKENS: Tokens = Tokens {
         folder_merge_items: FolderMergeToolbarItemTokens { filter: 170.0 },
     },
     forms: FormTokens {
-        options_label_width: 230.0,
+        dialog_label_width: 220.0,
         options_control_width: 170.0,
-        settings_label_width: 220.0,
         settings_control_width: 180.0,
         minimum_label_width: 80.0,
         minimum_control_width: 60.0,

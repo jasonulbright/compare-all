@@ -59,6 +59,7 @@ pub struct SettingsDialog {
     active: usize,
     scope: Scope,
     open: bool,
+    focus_accept_requested: bool,
     id: egui::Id,
 }
 
@@ -86,6 +87,7 @@ impl SettingsDialog {
             active: 0,
             scope: Scope::ThisViewOnly,
             open: true,
+            focus_accept_requested: true,
             id: egui::Id::new(("session-settings", instance)),
         }
     }
@@ -251,6 +253,14 @@ impl SettingsDialog {
 
     /// Draw the dialog into a panel rather than a window, for a headless frame.
     pub fn body(&mut self, ui: &mut egui::Ui, palette: &Palette) -> Option<SettingsOutcome> {
+        match crate::widgets::dialog_key_action(ui.ctx()) {
+            Some(crate::widgets::DialogKeyAction::Accept) => return Some(self.accept()),
+            Some(crate::widgets::DialogKeyAction::Cancel) => {
+                self.cancel();
+                return None;
+            }
+            None => {}
+        }
         if self.tabs.is_empty() {
             crate::widgets::wrapped_text(ui, "This build has no settings for this session type.");
             return None;
@@ -307,7 +317,7 @@ impl SettingsDialog {
         };
         let overridden = field.is_overridden(&self.current, &self.defaults);
         ui.horizontal_wrapped(|ui| {
-            let label_width = TOKENS.forms.settings_label_width.min(
+            let label_width = TOKENS.forms.dialog_label_width.min(
                 (ui.available_width() - TOKENS.forms.settings_control_width)
                     .max(TOKENS.forms.minimum_label_width),
             );
@@ -344,6 +354,7 @@ impl SettingsDialog {
 
     fn footer(&mut self, ui: &mut egui::Ui) -> Option<SettingsOutcome> {
         let mut outcome = None;
+        let focus_accept = std::mem::take(&mut self.focus_accept_requested);
         ui.horizontal_wrapped(|ui| {
             crate::widgets::sized(ui, 240.0, |ui| {
                 egui::ComboBox::from_id_salt(self.id.with("scope"))
@@ -360,10 +371,14 @@ impl SettingsDialog {
             if ui.button("Reset All").clicked() {
                 self.reset_all();
             }
-            if ui.button("OK").clicked() {
+            let (ok, cancel) = crate::widgets::dialog_button_pair(ui, "OK", "Cancel");
+            if focus_accept {
+                ok.request_focus();
+            }
+            if ok.clicked() {
                 outcome = Some(self.accept());
             }
-            if ui.button("Cancel").clicked() {
+            if cancel.clicked() {
                 self.cancel();
             }
         });
@@ -719,6 +734,65 @@ mod tests {
         let layers = SettingsLayers::new();
         let empty = SessionSettingsOverride::empty_for(&kind);
         SettingsDialog::new(kind, &empty, &layers, 1)
+    }
+
+    fn key_input(key: egui::Key) -> egui::RawInput {
+        crate::testing::event_input(
+            800.0,
+            600.0,
+            vec![egui::Event::Key {
+                key,
+                physical_key: Some(key),
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        )
+    }
+
+    #[test]
+    fn escape_cancels_settings_from_the_dialog_body() {
+        let mut dialog = dialog(SessionKind::TextCompare);
+        let ctx = egui::Context::default();
+        let _ = ctx.run(key_input(egui::Key::Escape), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = dialog.body(ui, &crate::theme::LIGHT);
+            });
+        });
+        assert!(!dialog.is_open());
+    }
+
+    #[test]
+    fn enter_accepts_settings_from_the_dialog_body() {
+        let mut dialog = dialog(SessionKind::TextCompare);
+        let ctx = egui::Context::default();
+        let mut outcome = None;
+        let _ = ctx.run(key_input(egui::Key::Enter), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                outcome = dialog.body(ui, &crate::theme::LIGHT);
+            });
+        });
+        assert!(outcome.is_some());
+        assert!(!dialog.is_open());
+    }
+
+    #[test]
+    fn enter_activates_the_focused_ok_button_after_the_dialog_opens() {
+        let mut dialog = dialog(SessionKind::TextCompare);
+        let ctx = egui::Context::default();
+        let _ = ctx.run(crate::testing::sized_input(800.0, 600.0), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = dialog.body(ui, &crate::theme::LIGHT);
+            });
+        });
+        let mut outcome = None;
+        let _ = ctx.run(key_input(egui::Key::Enter), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                outcome = dialog.body(ui, &crate::theme::LIGHT);
+            });
+        });
+        assert!(outcome.is_some());
+        assert!(!dialog.is_open());
     }
 
     #[test]

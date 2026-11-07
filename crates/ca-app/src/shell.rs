@@ -1035,6 +1035,8 @@ pub struct App {
     startup_wait_since: Option<std::time::Instant>,
     /// True while the question raised before several tabs are closed is open.
     exit_question: bool,
+    /// Focus the safe action when the tab-close question opens.
+    exit_question_focus_requested: bool,
     /// The workspace a load waits to open while a tab asks about edits that
     /// are not written, or while the work of a tab runs. The load runs again
     /// once a tab closes after its answer, or once that work ends, and is
@@ -1241,6 +1243,7 @@ impl App {
             startup_wait_reported: false,
             startup_wait_since: None,
             exit_question: false,
+            exit_question_focus_requested: false,
             pending_workspace: None,
             pending_busy_tab: None,
             workspace_notice: None,
@@ -1855,6 +1858,7 @@ impl App {
         self.session_save = None;
         self.active = 0;
         self.exit_question = false;
+        self.exit_question_focus_requested = false;
         self.closing = true;
     }
 
@@ -1909,6 +1913,7 @@ impl App {
         }
         if self.tabs.len() > 1 && self.resolved.stored.tabs.confirm_closing_several_tabs {
             self.exit_question = true;
+            self.exit_question_focus_requested = true;
         } else {
             self.try_leave();
         }
@@ -1926,6 +1931,7 @@ impl App {
             return;
         }
         self.exit_question = false;
+        self.exit_question_focus_requested = false;
         if leave {
             self.try_leave();
         } else {
@@ -3682,6 +3688,12 @@ impl App {
     }
 
     fn keyboard(&mut self, ctx: &egui::Context, context: &ViewContext) {
+        if self.exit_question {
+            if ca_ui::widgets::dialog_key_action(ctx).is_some() {
+                self.answer_exit(false);
+            }
+            return;
+        }
         let strokes = ctx.input(|input| Keystroke::pressed_in(&input.events));
         let view = self.menu_view();
         let table = self.resolved.shortcuts.clone();
@@ -4285,6 +4297,10 @@ impl App {
         if !self.exit_question {
             return;
         }
+        if ca_ui::widgets::dialog_key_action(ctx).is_some() {
+            self.answer_exit(false);
+            return;
+        }
         let mut answer = None;
         egui::Window::new("Close every tab?")
             .collapsible(false)
@@ -4298,10 +4314,16 @@ impl App {
                     &format!("{} tabs are open.", self.tabs.len()),
                 );
                 ui.horizontal(|ui| {
-                    if ui.button("Close them").clicked() {
+                    let (close, keep) =
+                        widgets::dialog_button_pair(ui, "Close them", "Keep them open");
+                    if self.exit_question_focus_requested {
+                        keep.request_focus();
+                        self.exit_question_focus_requested = false;
+                    }
+                    if close.clicked() {
                         answer = Some(true);
                     }
-                    if ui.button("Keep them open").clicked() {
+                    if keep.clicked() {
                         answer = Some(false);
                     }
                 });

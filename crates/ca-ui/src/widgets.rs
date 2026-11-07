@@ -530,6 +530,70 @@ pub fn toolbar_height(ui: &egui::Ui) -> f32 {
         .max(ui.spacing().interact_size.y)
 }
 
+/// The action requested by a dialog-level Enter or Escape key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DialogKeyAction {
+    /// Accept the dialog's default action.
+    Accept,
+    /// Cancel the dialog or dismiss its current question.
+    Cancel,
+}
+
+/// Read Enter and Escape when no widget currently owns Enter.
+///
+/// Focused buttons handle Enter themselves. Text fields keep Enter for their
+/// edit behavior. Escape always cancels the dialog action.
+#[must_use]
+pub fn dialog_key_action(ctx: &egui::Context) -> Option<DialogKeyAction> {
+    dialog_key_action_with_text_focus(ctx, None)
+}
+
+/// Read dialog keys and also accept Enter when `focused_text` owns focus.
+///
+/// This is for dialogs whose focused single-line name field should submit on
+/// Enter. Matching the field ID keeps Enter on focused buttons and multiline
+/// editors available to those widgets.
+#[must_use]
+pub fn dialog_key_action_with_text_focus(
+    ctx: &egui::Context,
+    focused_text: Option<egui::Id>,
+) -> Option<DialogKeyAction> {
+    let focused = ctx.memory(egui::Memory::focused);
+    let text_field_has_focus = focused_text.is_some_and(|id| focused == Some(id));
+    ctx.input_mut(|input| {
+        if input.consume_key(egui::Modifiers::NONE, egui::Key::Escape) {
+            Some(DialogKeyAction::Cancel)
+        } else if (focused.is_none() || text_field_has_focus)
+            && input.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
+        {
+            Some(DialogKeyAction::Accept)
+        } else {
+            None
+        }
+    })
+}
+
+/// Whether affirmative buttons come before cancel buttons on this platform.
+#[must_use]
+pub const fn affirmative_button_first() -> bool {
+    cfg!(target_os = "windows")
+}
+
+/// Draw an affirmative and a cancel button in the platform order.
+pub fn dialog_button_pair(
+    ui: &mut egui::Ui,
+    affirmative: &str,
+    cancel: &str,
+) -> (egui::Response, egui::Response) {
+    if affirmative_button_first() {
+        (ui.button(affirmative), ui.button(cancel))
+    } else {
+        let cancel = ui.button(cancel);
+        let affirmative = ui.button(affirmative);
+        (affirmative, cancel)
+    }
+}
+
 /// Place a control in a box of a stated width.
 ///
 /// A wrapped layout chooses where to break from the size it is given before a
@@ -855,7 +919,101 @@ pub fn wrapped_text(ui: &mut egui::Ui, text: &str) -> egui::Response {
 
 #[cfg(test)]
 mod tests {
-    use super::{elide_middle, FileInfo};
+    use super::{
+        affirmative_button_first, dialog_button_pair, dialog_key_action,
+        dialog_key_action_with_text_focus, elide_middle, DialogKeyAction, FileInfo,
+    };
+
+    fn key_input(key: egui::Key) -> egui::RawInput {
+        crate::testing::event_input(
+            400.0,
+            300.0,
+            vec![egui::Event::Key {
+                key,
+                physical_key: Some(key),
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        )
+    }
+
+    #[test]
+    fn dialog_escape_requests_cancel() {
+        let ctx = egui::Context::default();
+        let mut action = None;
+        let _ = ctx.run(key_input(egui::Key::Escape), |ctx| {
+            action = dialog_key_action(ctx);
+        });
+        assert_eq!(action, Some(DialogKeyAction::Cancel));
+    }
+
+    #[test]
+    fn dialog_enter_requests_accept_without_a_focused_widget() {
+        let ctx = egui::Context::default();
+        let mut action = None;
+        let _ = ctx.run(key_input(egui::Key::Enter), |ctx| {
+            action = dialog_key_action(ctx);
+        });
+        assert_eq!(action, Some(DialogKeyAction::Accept));
+    }
+
+    #[test]
+    fn enter_activates_a_focused_button_without_a_second_accept_action() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(crate::testing::sized_input(400.0, 300.0), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.button("Accept").request_focus();
+            });
+        });
+        let mut clicked = false;
+        let mut action = None;
+        let _ = ctx.run(key_input(egui::Key::Enter), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                clicked = ui.button("Accept").clicked();
+            });
+            action = dialog_key_action(ctx);
+        });
+        assert!(clicked);
+        assert_eq!(action, None);
+    }
+
+    #[test]
+    fn dialog_enter_accepts_a_registered_focused_single_line_field() {
+        let ctx = egui::Context::default();
+        let mut field_id = None;
+        let mut text = String::new();
+        let _ = ctx.run(crate::testing::sized_input(400.0, 300.0), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let response = ui.text_edit_singleline(&mut text);
+                response.request_focus();
+                field_id = Some(response.id);
+            });
+        });
+        let mut action = None;
+        let _ = ctx.run(key_input(egui::Key::Enter), |ctx| {
+            action = dialog_key_action_with_text_focus(ctx, field_id);
+        });
+        assert_eq!(action, Some(DialogKeyAction::Accept));
+    }
+
+    #[test]
+    fn affirmative_buttons_are_first_on_windows() {
+        assert_eq!(affirmative_button_first(), cfg!(target_os = "windows"));
+        let ctx = egui::Context::default();
+        let mut affirmative_x = 0.0;
+        let mut cancel_x = 0.0;
+        let _ = ctx.run(crate::testing::sized_input(400.0, 300.0), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    let (affirmative, cancel) = dialog_button_pair(ui, "OK", "Cancel");
+                    affirmative_x = affirmative.rect.left();
+                    cancel_x = cancel.rect.left();
+                });
+            });
+        });
+        assert_eq!(affirmative_x < cancel_x, affirmative_button_first());
+    }
 
     #[test]
     fn a_side_with_nothing_known_reads_as_a_dash() {
