@@ -20,6 +20,7 @@ pub mod settings;
 pub mod sidecopy;
 pub mod structure;
 pub mod syntax;
+pub mod wrap;
 
 use ca_diff::Importance;
 use ca_text::{EolStyle, LoadedText, TextBuffer};
@@ -49,6 +50,7 @@ use sidecopy::Side;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
+use wrap::{TextScroll, VisibleHeights, WrapLayout};
 
 /// Width of the overview strip.
 const THUMBNAIL_WIDTH: f32 = 26.0;
@@ -114,6 +116,76 @@ const STOPPED_LOCKED: &str = "The comparison was stopped";
 /// What the message panel says when the display filter shows no difference
 /// to move to.
 const FILTER_HIDES: &str = "The display filter hides every difference.";
+const WRAP_LIMIT_MESSAGE: &str = "Word Wrap is unavailable for comparisons exceeding 2,000,000 lines, 10,000,000 wrapped segments per pane, or 20,000,000 displayed lines.";
+
+/// What the word-wrap layout worker posts back.
+#[derive(Debug)]
+enum WrapMessage {
+    Ready {
+        revision: u64,
+        layout: Box<WrapLayout>,
+    },
+    TooLarge {
+        revision: u64,
+        columns: usize,
+        model_lines: Arc<Vec<(Option<u32>, Option<u32>)>>,
+    },
+    Cancelled,
+}
+
+impl Terminal for WrapMessage {
+    fn is_terminal(&self) -> bool {
+        true
+    }
+
+    fn cancelled() -> Self {
+        Self::Cancelled
+    }
+
+    fn panicked(_detail: String) -> Self {
+        Self::Cancelled
+    }
+}
+
+#[derive(Debug)]
+enum WrapPrefixMessage {
+    Ready {
+        revision: u64,
+        columns: usize,
+        model_lines: Arc<Vec<(Option<u32>, Option<u32>)>>,
+        visible: Arc<Visible>,
+        prefix: Vec<u64>,
+    },
+    Cancelled,
+}
+
+impl Terminal for WrapPrefixMessage {
+    fn is_terminal(&self) -> bool {
+        true
+    }
+
+    fn cancelled() -> Self {
+        Self::Cancelled
+    }
+
+    fn panicked(_detail: String) -> Self {
+        Self::Cancelled
+    }
+}
+
+struct WrapRequest {
+    revision: u64,
+    columns: usize,
+    model_lines: Arc<Vec<(Option<u32>, Option<u32>)>>,
+    visible: Arc<Visible>,
+}
+
+struct WrapPrefixRequest {
+    revision: u64,
+    columns: usize,
+    model_lines: Arc<Vec<(Option<u32>, Option<u32>)>>,
+    visible: Arc<Visible>,
+}
 
 const fn command_is_save_or_overwrite(command: Command) -> bool {
     matches!(
@@ -161,6 +233,7 @@ const HANDLED: &[Command] = &[
     Command::ToggleLineDetails,
     Command::ToggleLineNumbers,
     Command::ToggleSyntaxHighlighting,
+    Command::ToggleWordWrap,
     Command::PrettifyForComparison,
     Command::CompareStructure,
     Command::CopyToOtherSide,
@@ -302,7 +375,7 @@ pub struct TextView {
     /// The context line count the options last stated. The toolbar count
     /// stays until the options state a different one.
     followed_context_lines: Option<u32>,
-    visible: Visible,
+    visible: Arc<Visible>,
     caret: usize,
     /// The row a move made current, held while the text is unchanged and both
     /// text carets stay where that move put them.
@@ -332,6 +405,34 @@ pub struct TextView {
     /// The pane the last frame darkened, where it darkened one.
     painted_dim: Option<Side>,
     scroll: RowScroll,
+    /// Word wrap is enabled for this comparison.
+    word_wrap: bool,
+    /// The latest measured layout, where one is available.
+    wrap_layout: Option<Arc<WrapLayout>>,
+    /// Prefix sums for rows the current filter shows.
+    wrap_heights: VisibleHeights,
+    /// The filter snapshot represented by `wrap_heights`.
+    wrap_heights_visible: Option<Arc<Visible>>,
+    /// Variable-height scroll offset, in visual lines.
+    wrap_scroll: TextScroll,
+    /// Text edit revision the current measured layout belongs to.
+    wrap_layout_revision: u64,
+    /// Whether the last frame used the variable-height layout.
+    wrap_active: bool,
+    /// Whether the caret must be revealed after the wrap layout is ready.
+    wrap_reveal_pending: bool,
+    /// Active pane and text carets at the last caret-follow check.
+    last_followed_carets: Option<(Side, editor::Caret, editor::Caret)>,
+    /// The width the current frame needs a layout for.
+    wrap_columns: Option<usize>,
+    /// Preferred horizontal position while moving through wrapped visual rows.
+    wrap_goal_column: Option<usize>,
+    /// Background layout work and its input key.
+    wrap_job: Option<Job<WrapMessage>>,
+    wrap_request: Option<WrapRequest>,
+    /// Background prefix construction after a filter changes during layout.
+    wrap_prefix_job: Option<Job<WrapPrefixMessage>>,
+    wrap_prefix_request: Option<WrapPrefixRequest>,
     /// How far the panes are scrolled sideways, in columns.
     horizontal: f32,
     strip: Strip<TextClass>,
@@ -621,7 +722,7 @@ impl TextView {
             filter: DisplayFilter::All,
             context_lines: ca_session::options::TextEditingOptions::default().context_lines,
             followed_context_lines: None,
-            visible: Visible::All(0),
+            visible: Arc::new(Visible::All(0)),
             caret: 0,
             anchor: None,
             advance_after_copy: None,
@@ -637,6 +738,21 @@ impl TextView {
             painted_rulers: Vec::new(),
             painted_dim: None,
             scroll: RowScroll::top(),
+            word_wrap: false,
+            wrap_layout: None,
+            wrap_heights: VisibleHeights::default(),
+            wrap_heights_visible: None,
+            wrap_scroll: TextScroll::default(),
+            wrap_layout_revision: 0,
+            wrap_active: false,
+            wrap_reveal_pending: false,
+            last_followed_carets: None,
+            wrap_columns: None,
+            wrap_goal_column: None,
+            wrap_job: None,
+            wrap_request: None,
+            wrap_prefix_job: None,
+            wrap_prefix_request: None,
             horizontal: 0.0,
             strip: Strip::default(),
             strip_stale: true,
@@ -749,7 +865,26 @@ impl TextView {
     /// The scroll position, in rows.
     #[must_use]
     pub fn scroll_position(&self) -> RowScroll {
-        self.scroll
+        if !self.wrap_active {
+            return self.scroll;
+        }
+        let (position, fraction) = self.wrap_scroll.position(&self.wrap_heights);
+        let mut scroll = RowScroll::top();
+        scroll.go_to(
+            position,
+            self.viewport_height,
+            self.row_height(),
+            self.visible.len(),
+        );
+        #[allow(clippy::cast_possible_truncation)]
+        let fraction = fraction as f32;
+        scroll.scroll_by(
+            fraction * self.row_height(),
+            self.viewport_height,
+            self.row_height(),
+            self.visible.len(),
+        );
+        scroll
     }
 
     /// The rectangle the rows were painted in on the last frame.
@@ -792,6 +927,7 @@ impl TextView {
         if self.locked {
             return;
         }
+        self.invalidate_wrap_layout();
         if let Some(job) = self.format_job.take() {
             job.cancel();
         }
@@ -806,7 +942,7 @@ impl TextView {
         self.started = Some(Instant::now());
         self.load_time = None;
         self.data = TextData::default();
-        self.visible = Visible::All(0);
+        self.visible = Arc::new(Visible::All(0));
         self.caret = 0;
         self.anchor = None;
         self.advance_after_copy = None;
@@ -1147,6 +1283,7 @@ impl TextView {
         buffers: PreparedBuffers,
         comparison: Option<Box<TextData>>,
     ) {
+        self.invalidate_wrap_layout();
         self.rediff.clear();
         self.left_pane.reset(buffers.left);
         self.right_pane.reset(buffers.right);
@@ -1258,7 +1395,332 @@ impl TextView {
     fn poll(&mut self) {
         self.poll_format();
         self.poll_comparison();
+        self.poll_wrap();
+        self.poll_wrap_prefix();
         self.poll_picker();
+    }
+
+    fn poll_wrap(&mut self) {
+        let (messages, finished) = match self.wrap_job.as_mut() {
+            Some(job) => (job.drain(), job.is_finished()),
+            None => return,
+        };
+        let mut too_large = false;
+        for message in messages {
+            match message {
+                WrapMessage::Ready { revision, layout } => {
+                    let current_rows = self.data.model.row_lines();
+                    let requested_visible = self
+                        .wrap_request
+                        .as_ref()
+                        .map(|request| Arc::clone(&request.visible));
+                    let request_matches = self.wrap_request.as_ref().is_some_and(|request| {
+                        request.revision == revision
+                            && request.columns == layout.columns
+                            && Arc::ptr_eq(&request.model_lines, &layout.model_lines)
+                            && Arc::ptr_eq(&request.visible, &layout.initial_visible)
+                    });
+                    if request_matches
+                        && revision == self.revision
+                        && self.wrap_columns == Some(layout.columns)
+                        && Arc::ptr_eq(current_rows, &layout.model_lines)
+                    {
+                        let layout = Arc::new(*layout);
+                        if requested_visible
+                            .as_ref()
+                            .is_some_and(|visible| Arc::ptr_eq(visible, &self.visible))
+                        {
+                            self.wrap_heights = VisibleHeights::new(&layout, &self.visible);
+                            self.wrap_heights_visible = Some(Arc::clone(&self.visible));
+                        } else {
+                            self.wrap_heights_visible = None;
+                        }
+                        self.wrap_layout_revision = revision;
+                        self.wrap_layout = Some(Arc::clone(&layout));
+                        if self.wrap_heights_visible.is_none() {
+                            self.request_wrap_prefix(layout, Arc::clone(&self.visible));
+                        }
+                        self.strip_stale = true;
+                    }
+                }
+                WrapMessage::TooLarge {
+                    revision,
+                    columns,
+                    model_lines,
+                } => {
+                    let request_matches = self.wrap_request.as_ref().is_some_and(|request| {
+                        request.revision == revision
+                            && request.columns == columns
+                            && Arc::ptr_eq(&request.model_lines, &model_lines)
+                    });
+                    if request_matches
+                        && revision == self.revision
+                        && self.wrap_columns == Some(columns)
+                        && Arc::ptr_eq(self.data.model.row_lines(), &model_lines)
+                    {
+                        self.message = Some(WRAP_LIMIT_MESSAGE.to_owned());
+                        self.word_wrap = false;
+                        self.wrap_reveal_pending = false;
+                        too_large = true;
+                    }
+                }
+                WrapMessage::Cancelled => {}
+            }
+        }
+        if finished {
+            self.wrap_job = None;
+            self.wrap_request = None;
+        }
+        if too_large {
+            self.invalidate_wrap_layout();
+        }
+    }
+
+    fn poll_wrap_prefix(&mut self) {
+        let (messages, finished) = match self.wrap_prefix_job.as_mut() {
+            Some(job) => (job.drain(), job.is_finished()),
+            None => return,
+        };
+        for message in messages {
+            match message {
+                WrapPrefixMessage::Ready {
+                    revision,
+                    columns,
+                    model_lines,
+                    visible,
+                    prefix,
+                } => {
+                    let request_matches =
+                        self.wrap_prefix_request.as_ref().is_some_and(|request| {
+                            request.revision == revision
+                                && request.columns == columns
+                                && Arc::ptr_eq(&request.model_lines, &model_lines)
+                                && Arc::ptr_eq(&request.visible, &visible)
+                        });
+                    let layout_matches = self.wrap_layout.as_ref().is_some_and(|layout| {
+                        layout.columns == columns && Arc::ptr_eq(&layout.model_lines, &model_lines)
+                    });
+                    if request_matches
+                        && layout_matches
+                        && revision == self.revision
+                        && self.wrap_columns == Some(columns)
+                        && Arc::ptr_eq(&self.visible, &visible)
+                    {
+                        self.wrap_heights = VisibleHeights::from_prefix(prefix);
+                        self.wrap_heights_visible = Some(visible);
+                        self.strip_stale = true;
+                    }
+                }
+                WrapPrefixMessage::Cancelled => {}
+            }
+        }
+        if finished {
+            self.wrap_prefix_job = None;
+            self.wrap_prefix_request = None;
+        }
+    }
+
+    fn request_wrap_layout(&mut self, columns: usize) {
+        if self.wrap_columns != Some(columns) {
+            self.wrap_goal_column = None;
+        }
+        self.wrap_columns = Some(columns);
+        if !self.word_wrap || !self.rows_current() {
+            if self.wrap_active {
+                self.deactivate_wrap();
+            }
+            return;
+        }
+        let model_lines = Arc::clone(self.data.model.row_lines());
+        let visible = Arc::clone(&self.visible);
+        let current_layout = self.wrap_layout.as_ref().filter(|layout| {
+            self.wrap_layout_revision == self.revision
+                && layout.columns == columns
+                && Arc::ptr_eq(&layout.model_lines, &model_lines)
+        });
+        if let Some(layout) = current_layout {
+            if !self
+                .wrap_heights_visible
+                .as_ref()
+                .is_some_and(|heights_visible| Arc::ptr_eq(heights_visible, &visible))
+            {
+                self.request_wrap_prefix(Arc::clone(layout), visible);
+            }
+            return;
+        }
+        if self.wrap_request.as_ref().is_some_and(|request| {
+            request.revision == self.revision
+                && request.columns == columns
+                && Arc::ptr_eq(&request.model_lines, &model_lines)
+        }) {
+            return;
+        }
+        if self.wrap_active {
+            self.deactivate_wrap();
+        }
+        if let Some(job) = self.wrap_job.take() {
+            job.cancel();
+        }
+        self.cancel_wrap_prefix_job();
+        self.wrap_heights_visible = None;
+        let revision = self.revision;
+        let left = self.left_pane.buffer().edit_snapshot();
+        let right = self.right_pane.buffer().edit_snapshot();
+        let worker_rows = Arc::clone(&model_lines);
+        let worker_visible = Arc::clone(&visible);
+        self.wrap_request = Some(WrapRequest {
+            revision,
+            columns,
+            model_lines,
+            visible,
+        });
+        self.wrap_job = Some(Job::spawn_notifying(
+            move |emitter, cancel| {
+                let message_rows = Arc::clone(&worker_rows);
+                match wrap::build(&left, &right, worker_rows, worker_visible, columns, cancel) {
+                    Ok(layout) => {
+                        let _ = emitter.send(WrapMessage::Ready {
+                            revision,
+                            layout: Box::new(layout),
+                        });
+                    }
+                    Err(wrap::BuildError::TooLarge) => {
+                        let _ = emitter.send(WrapMessage::TooLarge {
+                            revision,
+                            columns,
+                            model_lines: message_rows,
+                        });
+                    }
+                    Err(wrap::BuildError::Cancelled) => {
+                        let _ = emitter.send(WrapMessage::Cancelled);
+                    }
+                }
+            },
+            self.notify.clone(),
+        ));
+    }
+
+    fn request_wrap_prefix(&mut self, layout: Arc<WrapLayout>, visible: Arc<Visible>) {
+        if self
+            .wrap_heights_visible
+            .as_ref()
+            .is_some_and(|heights_visible| Arc::ptr_eq(heights_visible, &visible))
+        {
+            return;
+        }
+        if self.wrap_prefix_request.as_ref().is_some_and(|request| {
+            request.revision == self.revision
+                && request.columns == layout.columns
+                && Arc::ptr_eq(&request.model_lines, &layout.model_lines)
+                && Arc::ptr_eq(&request.visible, &visible)
+        }) {
+            return;
+        }
+        self.cancel_wrap_prefix_job();
+        if std::ptr::eq(layout.initial_visible.as_ref(), visible.as_ref())
+            || matches!(&*visible, Visible::All(count) if *count == layout.row_lines.len())
+        {
+            self.wrap_heights = VisibleHeights::new(&layout, &visible);
+            self.wrap_heights_visible = Some(visible);
+            return;
+        }
+
+        let revision = self.revision;
+        let columns = layout.columns;
+        let model_lines = Arc::clone(&layout.model_lines);
+        let worker_visible = Arc::clone(&visible);
+        self.wrap_prefix_request = Some(WrapPrefixRequest {
+            revision,
+            columns,
+            model_lines: Arc::clone(&model_lines),
+            visible,
+        });
+        self.wrap_prefix_job = Some(Job::spawn_notifying(
+            move |emitter, cancel| match wrap::visible_prefix(
+                &layout.row_lines,
+                &worker_visible,
+                cancel,
+            ) {
+                Ok(prefix) => {
+                    let _ = emitter.send(WrapPrefixMessage::Ready {
+                        revision,
+                        columns,
+                        model_lines,
+                        visible: worker_visible,
+                        prefix,
+                    });
+                }
+                Err(wrap::BuildError::Cancelled | wrap::BuildError::TooLarge) => {
+                    let _ = emitter.send(WrapPrefixMessage::Cancelled);
+                }
+            },
+            self.notify.clone(),
+        ));
+    }
+
+    fn cancel_wrap_prefix_job(&mut self) {
+        if let Some(job) = self.wrap_prefix_job.take() {
+            job.cancel();
+        }
+        self.wrap_prefix_request = None;
+    }
+
+    fn invalidate_wrap_layout(&mut self) {
+        self.wrap_goal_column = None;
+        if self.wrap_active {
+            self.deactivate_wrap();
+        }
+        if let Some(job) = self.wrap_job.take() {
+            job.cancel();
+        }
+        self.wrap_request = None;
+        self.cancel_wrap_prefix_job();
+        self.wrap_layout = None;
+        self.wrap_heights = VisibleHeights::default();
+        self.wrap_heights_visible = None;
+        self.wrap_layout_revision = 0;
+    }
+
+    fn activate_wrap(&mut self) {
+        if self.wrap_active {
+            return;
+        }
+        let position = self.scroll.first_row();
+        let fraction = f64::from(self.scroll.fraction());
+        let viewport = f64::from(self.viewport_height / self.row_height());
+        self.wrap_scroll
+            .set_position(&self.wrap_heights, position, fraction, viewport);
+        self.horizontal = 0.0;
+        self.wrap_active = true;
+        self.line_cache.clear();
+        if self.wrap_reveal_pending {
+            self.wrap_reveal_pending = false;
+            self.reveal_wrapped_caret();
+        }
+    }
+
+    fn deactivate_wrap(&mut self) {
+        if !self.wrap_active {
+            return;
+        }
+        let (position, fraction) = self.wrap_scroll.position(&self.wrap_heights);
+        self.scroll = RowScroll::top();
+        self.scroll.go_to(
+            position,
+            self.viewport_height,
+            self.row_height(),
+            self.visible.len(),
+        );
+        #[allow(clippy::cast_possible_truncation)]
+        let fraction = fraction as f32;
+        self.scroll.scroll_by(
+            fraction * self.row_height(),
+            self.viewport_height,
+            self.row_height(),
+            self.visible.len(),
+        );
+        self.wrap_active = false;
+        self.line_cache.clear();
     }
 
     fn poll_comparison(&mut self) {
@@ -1386,13 +1848,66 @@ impl TextView {
     }
 
     fn refilter(&mut self) {
+        let anchor = if self.wrap_active {
+            let (position, fraction) = self.wrap_scroll.position(&self.wrap_heights);
+            self.visible.row_at(position).map(|row| (row, fraction))
+        } else {
+            None
+        };
         let filter = match self.filter {
             DisplayFilter::Context(_) => DisplayFilter::Context(self.context_lines),
             other => other,
         };
         self.filter = filter;
-        self.visible = self.data.model.visible(filter);
+        let layout = self
+            .wrap_layout
+            .as_ref()
+            .filter(|layout| {
+                self.wrap_layout_revision == self.revision
+                    && Arc::ptr_eq(&layout.model_lines, self.data.model.row_lines())
+            })
+            .cloned();
+        if self.wrap_active {
+            self.deactivate_wrap();
+        }
+        if layout.is_some() {
+            self.cancel_wrap_prefix_job();
+        }
+        if let Some(layout) = layout.as_ref() {
+            if filter == DisplayFilter::All {
+                self.visible = Arc::new(self.data.model.visible(filter));
+                self.wrap_heights = VisibleHeights::new(layout, &self.visible);
+                self.wrap_heights_visible = Some(Arc::clone(&self.visible));
+            } else {
+                self.visible = Arc::new(self.data.model.visible(filter));
+                self.wrap_heights_visible = None;
+                self.request_wrap_prefix(Arc::clone(layout), Arc::clone(&self.visible));
+            }
+        } else {
+            self.cancel_wrap_prefix_job();
+            self.wrap_heights_visible = None;
+            self.visible = Arc::new(self.data.model.visible(filter));
+        }
         self.strip_stale = true;
+        if let Some((row, fraction)) = anchor {
+            if let Some(position) = anchor_position(&self.visible, row) {
+                self.scroll = RowScroll::top();
+                self.scroll.go_to(
+                    position,
+                    self.viewport_height,
+                    self.row_height(),
+                    self.visible.len(),
+                );
+                #[allow(clippy::cast_possible_truncation)]
+                let fraction = fraction as f32;
+                self.scroll.scroll_by(
+                    fraction * self.row_height(),
+                    self.viewport_height,
+                    self.row_height(),
+                    self.visible.len(),
+                );
+            }
+        }
         self.scroll
             .clamp(self.viewport_height, self.row_height(), self.visible.len());
     }
@@ -1405,6 +1920,52 @@ impl TextView {
 
     fn row_height(&self) -> f32 {
         self.font.row_height(ROW_HEIGHT_RATIO, self.line_spacing)
+    }
+
+    fn clamp_scroll(&mut self) {
+        if self.wrap_active {
+            self.wrap_scroll.clamp(
+                &self.wrap_heights,
+                f64::from(self.viewport_height / self.row_height()),
+            );
+        } else {
+            self.scroll
+                .clamp(self.viewport_height, self.row_height(), self.visible.len());
+        }
+    }
+
+    fn reveal_position(&mut self, position: usize) {
+        if self.wrap_active {
+            self.wrap_scroll.reveal(
+                &self.wrap_heights,
+                position,
+                f64::from(self.viewport_height / self.row_height()),
+            );
+        } else {
+            self.scroll.reveal(
+                position,
+                self.viewport_height,
+                self.row_height(),
+                self.visible.len(),
+            );
+        }
+    }
+
+    fn go_to_position(&mut self, position: usize) {
+        if self.wrap_active {
+            self.wrap_scroll.go_to(
+                &self.wrap_heights,
+                position,
+                f64::from(self.viewport_height / self.row_height()),
+            );
+        } else {
+            self.scroll.go_to(
+                position,
+                self.viewport_height,
+                self.row_height(),
+                self.visible.len(),
+            );
+        }
     }
 
     /// The point size the panes draw at.
@@ -1448,21 +2009,11 @@ impl TextView {
         let Some(position) = self.visible.position_of(self.caret) else {
             return;
         };
-        self.scroll.reveal(
-            position,
-            self.viewport_height,
-            self.row_height(),
-            self.visible.len(),
-        );
+        self.reveal_position(position);
     }
 
     fn scroll_to_position(&mut self, position: usize) {
-        self.scroll.go_to(
-            position,
-            self.viewport_height,
-            self.row_height(),
-            self.visible.len(),
-        );
+        self.go_to_position(position);
         if let Some(row) = self.visible.row_at(position) {
             self.caret = row;
         }
@@ -1599,6 +2150,7 @@ impl TextView {
     /// followed an edit replaces only the alignment, so the text the user is
     /// typing into is never rolled back.
     fn install(&mut self, data: TextData, keep_carets: bool) {
+        self.invalidate_wrap_layout();
         let mut data = data;
         data.model.set_ignore_unimportant(self.ignore_unimportant);
         // A load replaces the text without counting an edit, so a held line
@@ -1752,6 +2304,103 @@ impl TextView {
         }
     }
 
+    fn wrapped_caret_visual_line(&self, side: Side) -> Option<u64> {
+        let pane = self.pane(side);
+        let caret = pane.caret();
+        let model_row = match side {
+            Side::Left => self.data.model.row_of_left_line(caret.line),
+            Side::Right => self.data.model.row_of_right_line(caret.line),
+        }?;
+        let position = self.visible.position_of(model_row)?;
+        if self.visible.row_at(position) != Some(model_row) {
+            return None;
+        }
+        let wraps = self.wrap_layout.as_ref().map(|layout| match side {
+            Side::Left => &layout.left,
+            Side::Right => &layout.right,
+        })?;
+        let count = wraps.line_count(caret.line);
+        if count == 0 {
+            return None;
+        }
+        let byte_columns = wraps.uses_byte_columns(caret.line);
+        let here = if byte_columns {
+            usize::try_from(caret.index).ok()?
+        } else {
+            usize::try_from(editor::display_column(
+                &pane.line_text(caret.line),
+                caret.index,
+                pane.tabs(),
+            ))
+            .ok()?
+        };
+        let segment = (0..count).find_map(|segment| {
+            let range = if byte_columns {
+                wraps.character_segment(caret.line, segment)
+            } else {
+                wraps.segment(caret.line, segment)
+            }?;
+            (here >= range.start
+                && (here < range.end || (segment + 1 == count && here == range.end)))
+                .then_some(segment)
+        })?;
+        Some(
+            self.wrap_heights
+                .top(position)
+                .saturating_add(u64::try_from(segment).ok()?),
+        )
+    }
+
+    /// True when the active caret lies in the unwrapped viewport.
+    fn caret_visible_in_unwrapped_view(&self) -> bool {
+        let side = self.active;
+        let pane = self.pane(side);
+        let caret = pane.caret();
+        let Some(model_row) = (match side {
+            Side::Left => self.data.model.row_of_left_line(caret.line),
+            Side::Right => self.data.model.row_of_right_line(caret.line),
+        }) else {
+            return false;
+        };
+        let Some(position) = self.visible.position_of(model_row) else {
+            return false;
+        };
+        if self.visible.row_at(position) != Some(model_row)
+            || !self
+                .scroll
+                .visible(self.viewport_height, self.row_height(), self.visible.len())
+                .contains(&position)
+        {
+            return false;
+        }
+        let Some(columns) = self
+            .wrap_columns
+            .and_then(|columns| u32::try_from(columns).ok())
+        else {
+            return false;
+        };
+        let caret_column = f64::from(editor::display_column(
+            &pane.line_text(caret.line),
+            caret.index,
+            pane.tabs(),
+        ));
+        let left = f64::from(self.horizontal);
+        caret_column >= left && caret_column < left + f64::from(columns)
+    }
+
+    /// Reveal the active text caret in the variable-height layout.
+    fn reveal_wrapped_caret(&mut self) {
+        if let Some(visual_line) = self.wrapped_caret_visual_line(self.active) {
+            self.wrap_scroll.reveal_visual_line(
+                &self.wrap_heights,
+                visual_line,
+                f64::from(self.viewport_height / self.row_height()),
+            );
+        } else {
+            self.clamp_scroll();
+        }
+    }
+
     /// Put the row caret back on the line the text caret is on.
     ///
     /// A row a move made current stays current while the text is unchanged,
@@ -1759,6 +2408,11 @@ impl TextView {
     /// active, through any comparison of that text; any other caret position
     /// makes the caret's own row current.
     fn follow_caret(&mut self) {
+        let carets = (self.active, self.left_pane.caret(), self.right_pane.caret());
+        let caret_changed = match self.last_followed_carets.replace(carets) {
+            Some(previous) => previous != carets,
+            None => true,
+        };
         if let Some(anchor) = self.anchor {
             let held = anchor.revision == self.revision
                 && anchor.active == self.active
@@ -1774,8 +2428,19 @@ impl TextView {
                 self.caret = row;
             }
         }
-        self.scroll
-            .clamp(self.viewport_height, self.row_height(), self.visible.len());
+        if self.wrap_active {
+            if caret_changed {
+                self.wrap_reveal_pending = false;
+                self.reveal_wrapped_caret();
+            } else {
+                self.clamp_scroll();
+            }
+        } else {
+            if self.word_wrap && caret_changed {
+                self.wrap_reveal_pending = true;
+            }
+            self.clamp_scroll();
+        }
     }
 
     /// Reveal `row`, make it current and put both text carets on it.
@@ -1917,6 +2582,7 @@ impl TextView {
     /// Record that an edit made the comparison stale.
     fn note_edit(&mut self) {
         self.revision = self.revision.saturating_add(1);
+        self.invalidate_wrap_layout();
         self.rediff.mark_stale(Instant::now());
         self.anchor = None;
         self.advance_after_copy = None;
@@ -2964,6 +3630,7 @@ impl TextView {
                     gutter_width: 0.0,
                     y,
                     row_height,
+                    total_height: row_height,
                     char_width,
                     first_column: first_column_index,
                     columns,
@@ -2973,6 +3640,7 @@ impl TextView {
                     line: None,
                     text: text.as_deref(),
                     metrics,
+                    visible_segments: 0..1,
                     syntax: None,
                     spans: inline.map(|diff| match side {
                         Side::Left => diff.left.as_slice(),
@@ -2987,6 +3655,8 @@ impl TextView {
                             && inline.is_none()),
                     is_difference: class != TextClass::Same && class != TextClass::Gap,
                     gap: line.is_none(),
+                    wrap_ends: None,
+                    wrap_bytes: None,
                 },
                 palette,
                 &font,
@@ -3554,7 +4224,12 @@ impl TextView {
         if strip.is_empty() {
             return;
         }
-        let marker = strip.viewport_marker(self.scroll.first_row(), self.viewport_rows);
+        let first_row = if self.wrap_active {
+            self.wrap_scroll.position(&self.wrap_heights).0
+        } else {
+            self.scroll.first_row()
+        };
+        let marker = strip.viewport_marker(first_row, self.viewport_rows);
         painter.rect_stroke(
             egui::Rect::from_min_max(
                 egui::pos2(rect.left(), rect.top() + marker.start),
@@ -3594,16 +4269,16 @@ impl TextView {
         let full = ui.available_rect_before_wrap();
         let body = egui::Rect::from_min_max(
             full.left_top(),
-            egui::pos2(full.right() - SCROLLBAR, full.bottom() - SCROLLBAR),
+            egui::pos2(
+                full.right() - SCROLLBAR,
+                full.bottom() - if self.word_wrap { 0.0 } else { SCROLLBAR },
+            ),
         );
         let response = ui.allocate_rect(full, egui::Sense::hover());
         let painter = ui.painter_at(full);
 
         self.body = body;
         self.viewport_height = body.height();
-        self.scroll.clamp(body.height(), row_height, total);
-        let range = self.scroll.visible(body.height(), row_height, total);
-        self.viewport_rows = range.len();
 
         let center_gap = ca_ui::spacing::TOKENS.panes.text_center_gap;
         let pane_width = ((body.width() - 2.0 * gutter - center_gap) / 2.0).max(0.0);
@@ -3614,15 +4289,56 @@ impl TextView {
         self.center_x = center_x;
         self.gutter_x = (body.left(), right_gutter_x, gutter);
 
+        let wrap_columns = (pane_width / char_width).floor().max(1.0);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let wrap_columns = wrap_columns as usize;
+        self.request_wrap_layout(wrap_columns);
+        let layout_ready = self.word_wrap
+            && self.rows_current()
+            && self
+                .wrap_heights_visible
+                .as_ref()
+                .is_some_and(|visible| Arc::ptr_eq(visible, &self.visible))
+            && self.wrap_layout.as_ref().is_some_and(|layout| {
+                self.wrap_layout_revision == self.revision
+                    && layout.columns == wrap_columns
+                    && Arc::ptr_eq(&layout.model_lines, self.data.model.row_lines())
+            });
+        if layout_ready && !self.wrap_active {
+            self.activate_wrap();
+        } else if !layout_ready && self.wrap_active {
+            self.deactivate_wrap();
+        }
+        let wrap_active = self.wrap_active;
+        let wrap_layout = wrap_active.then(|| self.wrap_layout.clone()).flatten();
+        let range = if wrap_active {
+            self.wrap_scroll
+                .clamp(&self.wrap_heights, f64::from(body.height() / row_height));
+            self.wrap_scroll
+                .visible(&self.wrap_heights, f64::from(body.height() / row_height))
+        } else {
+            self.scroll.clamp(body.height(), row_height, total);
+            self.scroll.visible(body.height(), row_height, total)
+        };
+        self.viewport_rows = range.len();
+
         let pane_columns = (pane_width / char_width).ceil().max(0.0);
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let pane_columns = pane_columns as usize + 1;
-        let first_column = self.horizontal.floor().max(0.0);
+        let first_column = if wrap_active {
+            0.0
+        } else {
+            self.horizontal.floor().max(0.0)
+        };
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let first_column_index = first_column as usize;
         // The sub-column remainder is a pixel shift, so scrolling sideways is
         // smooth without the slice changing.
-        let column_shift = (self.horizontal - first_column) * char_width;
+        let column_shift = if wrap_active {
+            0.0
+        } else {
+            (self.horizontal - first_column) * char_width
+        };
 
         let clip = painter.with_clip_rect(body);
         let separator_width = ca_ui::spacing::TOKENS
@@ -3656,7 +4372,30 @@ impl TextView {
             let Some(row) = self.data.model.row(index).copied() else {
                 continue;
             };
-            let y = body.top() + self.scroll.row_y(position, row_height);
+            let row_units = if wrap_active {
+                u32::try_from(self.wrap_heights.row_height(position).max(1)).unwrap_or(u32::MAX)
+            } else {
+                1
+            };
+            let visible_segments = if wrap_active {
+                self.wrap_scroll.row_segments(
+                    &self.wrap_heights,
+                    position,
+                    f64::from(body.height() / row_height),
+                )
+            } else {
+                0..1
+            };
+            #[allow(clippy::cast_precision_loss)]
+            let total_height = row_height * row_units as f32;
+            #[allow(clippy::cast_possible_truncation)]
+            let y = if wrap_active {
+                body.top()
+                    + (self.wrap_scroll.row_y(&self.wrap_heights, position) * f64::from(row_height))
+                        as f32
+            } else {
+                body.top() + self.scroll.row_y(position, row_height)
+            };
             let class = self.row_class(&row);
             let row_differs = class != TextClass::Same && class != TextClass::Gap;
             let inline = self
@@ -3670,9 +4409,14 @@ impl TextView {
                 gutter_width: gutter,
                 y,
                 row_height,
+                total_height,
                 char_width,
                 first_column: first_column_index,
-                columns: pane_columns,
+                columns: if wrap_active {
+                    wrap_columns
+                } else {
+                    pane_columns
+                },
                 column_shift,
             };
             // The text comes from the buffers rather than from the comparison,
@@ -3687,6 +4431,20 @@ impl TextView {
                 (Side::Right, right_text, &right_geometry),
             ] {
                 let line = side.line_of(&row);
+                let wrap_ends = wrap_layout.as_ref().and_then(|layout| {
+                    line.map(|line| match side {
+                        Side::Left => layout.left.ends_for(line),
+                        Side::Right => layout.right.ends_for(line),
+                    })
+                });
+                let wrap_ends = wrap_ends.filter(|ends| !ends.is_empty());
+                let wrap_bytes = wrap_layout.as_ref().and_then(|layout| {
+                    line.map(|line| match side {
+                        Side::Left => layout.left.source_ends_for(line),
+                        Side::Right => layout.right.source_ends_for(line),
+                    })
+                });
+                let wrap_bytes = wrap_bytes.filter(|ends| !ends.is_empty());
                 let focused = side == self.active;
                 // A side with no line on this row carries the pane's normal
                 // background under the hatch. A difference color there would
@@ -3729,15 +4487,18 @@ impl TextView {
                                 && inline.is_none()),
                         is_difference: class != TextClass::Same && class != TextClass::Gap,
                         gap: line.is_none(),
+                        wrap_ends,
+                        wrap_bytes,
+                        visible_segments: visible_segments.clone(),
                     },
                     palette,
                     &font,
                     &mut runs,
                 );
-                gaps.mark(side, line.is_none(), y, y + row_height);
+                gaps.mark(side, line.is_none(), y, y + total_height);
             }
             if index == caret_row && class != TextClass::Same && class != TextClass::Gap {
-                for edge in [y, y + row_height - 1.0] {
+                for edge in [y, y + total_height - 1.0] {
                     clip.rect_filled(
                         egui::Rect::from_min_max(
                             egui::pos2(left_text_x, edge),
@@ -3760,6 +4521,8 @@ impl TextView {
                     &font,
                     left_text.map_or_else(lines::LineMetrics::default, |entry| entry.metrics),
                 ),
+                wrap_layout.as_ref().map(|layout| &layout.left),
+                visible_segments.clone(),
             );
             paint_caret(
                 &clip,
@@ -3773,6 +4536,8 @@ impl TextView {
                     &font,
                     right_text.map_or_else(lines::LineMetrics::default, |entry| entry.metrics),
                 ),
+                wrap_layout.as_ref().map(|layout| &layout.right),
+                visible_segments.clone(),
             );
             if let Some(section) = row.section {
                 for (side, geometry, seen) in [
@@ -3788,7 +4553,7 @@ impl TextView {
                         section,
                         rect: egui::Rect::from_min_size(
                             egui::pos2(geometry.gutter_x, y),
-                            egui::vec2(ARROW_WIDTH, row_height),
+                            egui::vec2(ARROW_WIDTH, total_height),
                         ),
                     });
                 }
@@ -3796,8 +4561,8 @@ impl TextView {
             if self.bookmarks.marks(index) {
                 ca_ui::icons::Icon::Bookmark.paint_in_row(
                     &clip,
-                    egui::pos2(body.left() + 8.0, y + row_height / 2.0),
-                    row_height,
+                    egui::pos2(body.left() + 8.0, y + total_height / 2.0),
+                    total_height,
                     palette.thumbnail_caret,
                 );
             }
@@ -3862,11 +4627,14 @@ impl TextView {
                 char_width,
                 row_height,
                 first_column: first_column_index,
+                wrap_active,
             },
         );
 
         self.vertical_scrollbar(ui, &painter, palette, body, (row_height, total));
-        self.horizontal_scrollbar(ui, &painter, palette, body, char_width);
+        if !self.word_wrap {
+            self.horizontal_scrollbar(ui, &painter, palette, body, char_width);
+        }
 
         let hovered = ui
             .ctx()
@@ -3875,13 +4643,22 @@ impl TextView {
         if hovered {
             let delta = ui.input(|input| input.smooth_scroll_delta);
             if delta.y.abs() > f32::EPSILON {
-                self.scroll
-                    .scroll_by(-delta.y, body.height(), row_height, total);
+                if wrap_active {
+                    self.wrap_scroll.scroll_by(
+                        &self.wrap_heights,
+                        -delta.y,
+                        row_height,
+                        f64::from(body.height() / row_height),
+                    );
+                } else {
+                    self.scroll
+                        .scroll_by(-delta.y, body.height(), row_height, total);
+                }
             }
-            if delta.x.abs() > f32::EPSILON {
+            if !wrap_active && delta.x.abs() > f32::EPSILON {
                 self.set_horizontal(
                     self.horizontal - delta.x / char_width * HORIZONTAL_STEP,
-                    body.width(),
+                    pane_width,
                     char_width,
                 );
             }
@@ -3916,6 +4693,7 @@ impl TextView {
     }
 
     /// Place or extend the caret from the pointer.
+    #[allow(clippy::too_many_lines)]
     fn pane_pointer(&mut self, ui: &egui::Ui, body: egui::Rect, geometry: &PointerGeometry) {
         let (pointer, pressed, down, shift) = ui.input(|input| {
             (
@@ -3940,9 +4718,25 @@ impl TextView {
             Side::Left => geometry.left_text_x,
             Side::Right => geometry.right_text_x,
         };
-        let position = self
-            .scroll
-            .row_under(pointer.y - body.top(), geometry.row_height);
+        let relative_y = pointer.y - body.top();
+        let (position, visual_row) = if geometry.wrap_active {
+            let position =
+                self.wrap_scroll
+                    .row_under(&self.wrap_heights, relative_y, geometry.row_height);
+            let visual = self.wrap_scroll.offset()
+                + f64::from(relative_y.max(0.0) / geometry.row_height.max(1.0));
+            #[allow(
+                clippy::cast_precision_loss,
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss
+            )]
+            let visual_row = (visual - self.wrap_heights.top(position) as f64)
+                .floor()
+                .max(0.0) as usize;
+            (position, visual_row)
+        } else {
+            (self.scroll.row_under(relative_y, geometry.row_height), 0)
+        };
         let Some(index) = self.visible.row_at(position) else {
             return;
         };
@@ -3950,30 +4744,88 @@ impl TextView {
         // real line of the same pane, which keeps the click inside the pane the
         // user aimed at.
         let direct = self.data.model.row(index).and_then(|row| side.line_of(row));
+        let mut direct_character = None;
         let (index, line, column) = if let Some(line) = direct {
+            let segment = if geometry.wrap_active {
+                self.wrap_layout.as_ref().and_then(|layout| {
+                    let wraps = match side {
+                        Side::Left => &layout.left,
+                        Side::Right => &layout.right,
+                    };
+                    let last = wraps.line_count(line).saturating_sub(1);
+                    wraps.segment(line, visual_row.min(last))
+                })
+            } else {
+                None
+            };
+            let first_column = segment
+                .as_ref()
+                .map_or(geometry.first_column, |range| range.start);
+            let last_column = segment.as_ref().map_or(usize::MAX, |range| range.end);
             let column = ((pointer.x - text_x) / geometry.char_width)
                 .floor()
                 .max(0.0);
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let mut column = geometry.first_column + column as usize;
+            let mut column = first_column + column as usize;
             // The buffer text painted on this row, not the comparison's copy:
             // after an edit the two differ until the comparison catches up.
             if let Some(entry) = self.cached_line(side, Some(line)) {
                 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                let columns = (body.width() / geometry.char_width).ceil() as usize + 2;
+                let columns = segment.as_ref().map_or_else(
+                    || (body.width() / geometry.char_width).ceil() as usize + 2,
+                    |range| range.end.saturating_sub(range.start),
+                );
                 #[allow(clippy::cast_precision_loss)]
-                let shift = (self.horizontal - geometry.first_column as f32) * geometry.char_width;
+                let shift = if geometry.wrap_active {
+                    0.0
+                } else {
+                    (self.horizontal - geometry.first_column as f32) * geometry.char_width
+                };
                 if let Some(hit) = glyph_column_at_x(
                     ui.painter(),
                     &entry.text,
                     entry.metrics,
-                    geometry.first_column..geometry.first_column.saturating_add(columns),
+                    first_column..first_column.saturating_add(columns),
                     &egui::FontId::monospace(self.font_size()),
                     pointer.x - text_x + shift,
                 ) {
                     column = hit;
                 }
+                if geometry.wrap_active && entry.metrics.direct {
+                    let wraps = self.wrap_layout.as_ref().map(|layout| match side {
+                        Side::Left => &layout.left,
+                        Side::Right => &layout.right,
+                    });
+                    if let Some(wraps) = wraps.filter(|wraps| wraps.uses_byte_columns(line)) {
+                        if let Some(characters) = wraps.character_segment(
+                            line,
+                            visual_row.min(wraps.line_count(line).saturating_sub(1)),
+                        ) {
+                            let displayed = lines::window(
+                                &entry.text,
+                                entry.metrics,
+                                first_column,
+                                last_column.saturating_sub(first_column),
+                            );
+                            let galley = ui.painter().layout_no_wrap(
+                                displayed.into_owned(),
+                                egui::FontId::monospace(self.font_size()),
+                                ui.visuals().text_color(),
+                            );
+                            let local = galley
+                                .cursor_from_pos(egui::vec2(pointer.x - text_x, 0.0))
+                                .ccursor
+                                .index
+                                .min(characters.end.saturating_sub(characters.start));
+                            direct_character = Some(
+                                u32::try_from(characters.start.saturating_add(local))
+                                    .unwrap_or(u32::MAX),
+                            );
+                        }
+                    }
+                }
             }
+            column = column.min(last_column);
             (index, line, u32::try_from(column).unwrap_or(u32::MAX))
         } else {
             let Some((index, line)) = self.nearest_line(index, side) else {
@@ -3983,9 +4835,14 @@ impl TextView {
         };
         if pressed {
             self.active = side;
-            self.pane_mut(side).place_at_column(line, column, shift);
+        }
+        self.wrap_goal_column = None;
+        let extend = shift || !pressed;
+        let pane = self.pane_mut(side);
+        if let Some(index) = direct_character {
+            pane.place(editor::Caret::new(line, index), extend);
         } else {
-            self.pane_mut(side).place_at_column(line, column, true);
+            pane.place_at_column(line, column, extend);
         }
         self.caret = index;
         self.anchor = None;
@@ -4143,7 +5000,182 @@ impl TextView {
         ))
     }
 
-    /// One key press. Returns true when it changed the text.
+    /// Move one wrapped step and report whether the caret moved.
+    #[allow(clippy::too_many_lines)]
+    fn move_wrapped_caret(&mut self, direction: i8, is_page_move: bool, extend: bool) -> bool {
+        if !self.wrap_active || !self.rows_current() {
+            return false;
+        }
+        let side = self.active;
+        let before = self.pane(side).caret();
+        let (target, goal) = {
+            let pane = self.pane(side);
+            let caret = pane.caret();
+            let Some(model_row) = (match side {
+                Side::Left => self.data.model.row_of_left_line(caret.line),
+                Side::Right => self.data.model.row_of_right_line(caret.line),
+            }) else {
+                return false;
+            };
+            let Some(position) = self.visible.position_of(model_row) else {
+                return false;
+            };
+            if self.visible.row_at(position) != Some(model_row) {
+                return false;
+            }
+            let Some(wraps) = self.wrap_layout.as_ref().map(|layout| match side {
+                Side::Left => &layout.left,
+                Side::Right => &layout.right,
+            }) else {
+                return false;
+            };
+            let count = wraps.line_count(caret.line);
+            if count == 0 {
+                return false;
+            }
+            let text = pane.line_text(caret.line);
+            let byte_columns = wraps.uses_byte_columns(caret.line);
+            let caret_position = usize::try_from(caret.index).unwrap_or(usize::MAX);
+            let column = usize::try_from(editor::display_column(&text, caret.index, pane.tabs()))
+                .unwrap_or(usize::MAX);
+            let segment = (0..count).find(|segment| {
+                let range = if byte_columns {
+                    wraps.character_segment(caret.line, *segment)
+                } else {
+                    wraps.segment(caret.line, *segment)
+                };
+                let Some(range) = range else {
+                    return false;
+                };
+                let here = if byte_columns { caret_position } else { column };
+                here >= range.start
+                    && (here < range.end || (*segment + 1 == count && here == range.end))
+            });
+            let Some(segment) = segment else {
+                return false;
+            };
+            let current_range = if byte_columns {
+                wraps.character_segment(caret.line, segment)
+            } else {
+                wraps.segment(caret.line, segment)
+            };
+            let Some(current_range) = current_range else {
+                return false;
+            };
+            let here = if byte_columns { caret_position } else { column };
+            let goal = self
+                .wrap_goal_column
+                .unwrap_or_else(|| here.saturating_sub(current_range.start));
+            let current_visual = self
+                .wrap_heights
+                .top(position)
+                .saturating_add(u64::try_from(segment).unwrap_or(u64::MAX));
+            let step = if is_page_move {
+                let rows = (self.viewport_height / self.row_height()).floor().max(1.0);
+                #[allow(
+                    clippy::cast_precision_loss,
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss
+                )]
+                let rows = rows as u64;
+                rows
+            } else {
+                1
+            };
+            let last = self.wrap_heights.total().saturating_sub(1);
+            let mut target_visual = if direction < 0 {
+                current_visual.saturating_sub(step)
+            } else {
+                current_visual.saturating_add(step).min(last)
+            };
+            let target = loop {
+                if target_visual >= self.wrap_heights.total() {
+                    return false;
+                }
+                #[allow(clippy::cast_precision_loss)]
+                let target_position = self.wrap_heights.row_at(target_visual as f64);
+                let Some(target_row) = self.visible.row_at(target_position) else {
+                    return false;
+                };
+                let target_top = self.wrap_heights.top(target_position);
+                let target_line = self.data.model.row(target_row).and_then(|row| match side {
+                    Side::Left => row.left,
+                    Side::Right => row.right,
+                });
+                let Some(target_line) = target_line else {
+                    let row_height = self.wrap_heights.row_height(target_position);
+                    if direction < 0 {
+                        if target_top == 0 {
+                            return false;
+                        }
+                        target_visual = target_top - 1;
+                    } else {
+                        target_visual = target_top.saturating_add(row_height);
+                    }
+                    continue;
+                };
+                let mut target_segment =
+                    usize::try_from(target_visual.saturating_sub(target_top)).unwrap_or(usize::MAX);
+                let target_segment_count = wraps.line_count(target_line);
+                if target_segment_count == 0 {
+                    let row_height = self.wrap_heights.row_height(target_position);
+                    if direction < 0 {
+                        if target_top == 0 {
+                            return false;
+                        }
+                        target_visual = target_top - 1;
+                    } else {
+                        target_visual = target_top.saturating_add(row_height);
+                    }
+                    continue;
+                }
+                if target_segment >= target_segment_count {
+                    if direction < 0 {
+                        target_segment = target_segment_count - 1;
+                        target_visual = target_top
+                            .saturating_add(u64::try_from(target_segment).unwrap_or(u64::MAX));
+                    } else {
+                        let row_height = self.wrap_heights.row_height(target_position);
+                        target_visual = target_top.saturating_add(row_height);
+                        continue;
+                    }
+                }
+                let target_is_byte = wraps.uses_byte_columns(target_line);
+                let range = if target_is_byte {
+                    wraps.character_segment(target_line, target_segment)
+                } else {
+                    wraps.segment(target_line, target_segment)
+                };
+                let Some(range) = range else {
+                    return false;
+                };
+                let column = range.start.saturating_add(goal).min(range.end);
+                let column = u32::try_from(column).unwrap_or(u32::MAX);
+                break (target_visual, target_line, target_is_byte, column);
+            };
+            (target, goal)
+        };
+        self.wrap_goal_column = Some(goal);
+        let (visual_line, line, byte_columns, column) = target;
+        {
+            let pane = self.pane_mut(side);
+            if byte_columns {
+                pane.place(editor::Caret::new(line, column), extend);
+            } else {
+                pane.place_at_column(line, column, extend);
+            }
+        }
+        if self.pane(side).caret() == before {
+            return false;
+        }
+        self.wrap_scroll.reveal_visual_line(
+            &self.wrap_heights,
+            visual_line,
+            f64::from(self.viewport_height / self.row_height()),
+        );
+        true
+    }
+
     fn handle_key(&mut self, key: egui::Key, modifiers: egui::Modifiers, page_rows: u32) -> bool {
         use egui::Key;
         let shift = modifiers.shift;
@@ -4152,6 +5184,21 @@ impl TextView {
         if modifiers.alt || (shift && !word && key == Key::Delete) {
             return false;
         }
+        if self.wrap_active {
+            let wrapped = match key {
+                Key::ArrowUp => Some((-1, false)),
+                Key::ArrowDown => Some((1, false)),
+                Key::PageUp => Some((-1, true)),
+                Key::PageDown => Some((1, true)),
+                _ => None,
+            };
+            if let Some((direction, page)) = wrapped {
+                if self.move_wrapped_caret(direction, page, shift) {
+                    return false;
+                }
+            }
+        }
+        self.wrap_goal_column = None;
         let motion = match key {
             Key::ArrowLeft => Some(if word { Motion::WordLeft } else { Motion::Left }),
             Key::ArrowRight => Some(if word {
@@ -4202,9 +5249,17 @@ impl TextView {
     }
 
     fn set_horizontal(&mut self, columns: f32, viewport: f32, char_width: f32) {
+        if self.wrap_active {
+            self.horizontal = 0.0;
+            return;
+        }
         let visible_columns = viewport / char_width;
+        let pane = self.active_pane();
+        let caret = pane.caret();
+        let caret_column =
+            editor::display_column(&pane.line_text(caret.line), caret.index, pane.tabs());
         #[allow(clippy::cast_precision_loss)]
-        let widest = self.data.widest as f32;
+        let widest = self.data.widest.max(caret_column.saturating_add(1)) as f32;
         self.horizontal = columns.clamp(0.0, (widest - visible_columns).max(0.0));
     }
 
@@ -4222,9 +5277,16 @@ impl TextView {
             egui::pos2(body.right() + SCROLLBAR, body.bottom()),
         );
         painter.rect_filled(track, 0.0, palette.gutter_background);
-        let thumb = self
-            .scroll
-            .thumb(track.height(), body.height(), row_height, total);
+        let thumb = if self.wrap_active {
+            self.wrap_scroll.thumb(
+                &self.wrap_heights,
+                track.height(),
+                f64::from(body.height() / row_height),
+            )
+        } else {
+            self.scroll
+                .thumb(track.height(), body.height(), row_height, total)
+        };
         let thumb_rect = egui::Rect::from_min_max(
             egui::pos2(track.left() + 2.0, track.top() + thumb.start),
             egui::pos2(track.right() - 2.0, track.top() + thumb.end),
@@ -4237,8 +5299,17 @@ impl TextView {
         );
         if let Some(pointer) = response.interact_pointer_pos() {
             let top = pointer.y - track.top() - (thumb.end - thumb.start) / 2.0;
-            self.scroll =
-                RowScroll::from_thumb(top, track.height(), body.height(), row_height, total);
+            if self.wrap_active {
+                self.wrap_scroll.from_thumb(
+                    &self.wrap_heights,
+                    top,
+                    track.height(),
+                    f64::from(body.height() / row_height),
+                );
+            } else {
+                self.scroll =
+                    RowScroll::from_thumb(top, track.height(), body.height(), row_height, total);
+            }
         }
     }
 
@@ -4372,17 +5443,16 @@ impl GapRuns {
 
 /// Fill a rectangle with evenly spaced diagonal lines.
 ///
-/// The count of lines follows the rectangle, so the cost of a frame follows the
-/// gap rows the viewport shows and nothing else.
+/// The count follows its visible intersection, so off-screen gap height adds no
+/// frame work.
 fn paint_hatch(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
-    if rect.width() <= 0.0 || rect.height() <= 0.0 {
+    let Some((mut x, end)) = hatch_x_bounds(rect, painter.clip_rect()) else {
         return;
-    }
+    };
     let clip = painter.with_clip_rect(rect);
     let stroke = egui::Stroke::new(1.0, color);
     let height = rect.height();
-    let mut x = rect.left() - height;
-    while x < rect.right() {
+    while x < end {
         clip.line_segment(
             [
                 egui::pos2(x, rect.bottom()),
@@ -4392,6 +5462,23 @@ fn paint_hatch(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) 
         );
         x += HATCH_STEP;
     }
+}
+
+/// Bound hatch generation to diagonals that can reach the visible part of a gap.
+fn hatch_x_bounds(rect: egui::Rect, clip: egui::Rect) -> Option<(f32, f32)> {
+    if rect.width() <= 0.0 || rect.height() <= 0.0 {
+        return None;
+    }
+    let visible = rect.intersect(clip);
+    if visible.width() <= 0.0 || visible.height() <= 0.0 {
+        return None;
+    }
+    let height = rect.height();
+    let first_full = rect.left() - height;
+    let first_visible = visible.left() - (rect.bottom() - visible.top());
+    let end_visible = visible.right() - (rect.bottom() - visible.bottom());
+    let steps = ((first_visible - first_full) / HATCH_STEP).ceil().max(0.0);
+    Some((first_full + steps * HATCH_STEP, end_visible))
 }
 
 /// Split a line into colored runs.
@@ -4457,6 +5544,7 @@ fn build_runs(
     }
 }
 
+#[derive(Clone, Copy)]
 struct PaneGeometry {
     gutter_x: f32,
     text_x: f32,
@@ -4464,6 +5552,7 @@ struct PaneGeometry {
     gutter_width: f32,
     y: f32,
     row_height: f32,
+    total_height: f32,
     char_width: f32,
     first_column: usize,
     columns: usize,
@@ -4480,6 +5569,7 @@ struct PointerGeometry {
     char_width: f32,
     row_height: f32,
     first_column: usize,
+    wrap_active: bool,
 }
 
 /// The distance one column of monospaced text advances when painted.
@@ -4525,6 +5615,7 @@ fn glyph_column_at_x(
 ///
 /// Only the columns the pane covers are drawn, so the cost follows the pane
 /// rather than the length of the line.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn paint_caret(
     painter: &egui::Painter,
     geometry: &PaneGeometry,
@@ -4533,87 +5624,223 @@ fn paint_caret(
     text: &str,
     active: bool,
     style: (&Palette, &egui::FontId, lines::LineMetrics),
+    wrap_layout: Option<&wrap::SideWraps>,
+    visible_segments: std::ops::Range<usize>,
 ) {
     let (palette, font, metrics) = style;
     let Some(line) = line else {
         return;
     };
-    let row_rect = egui::Rect::from_min_size(
-        egui::pos2(geometry.text_x, geometry.y),
-        egui::vec2(geometry.width, geometry.row_height),
-    );
-    let clip = painter.with_clip_rect(row_rect);
-    let origin = geometry.text_x - geometry.column_shift;
-    let galley = (!metrics.direct && !text.is_ascii()).then(|| {
-        let window = lines::window(text, metrics, geometry.first_column, geometry.columns);
-        painter.layout_no_wrap(window.into_owned(), font.clone(), palette.same_text)
+    let wraps = wrap_layout.filter(|wraps| wraps.line_count(line) > 0);
+    let wrap_ends = wraps.map(|wraps| wraps.ends_for(line));
+    let byte_columns = wraps.is_some_and(|wraps| wraps.uses_byte_columns(line));
+    let segment_count = wrap_ends.map_or(1, <[u32]>::len);
+    let segment_range = if wrap_ends.is_some() {
+        visible_segments.start.min(segment_count)..visible_segments.end.min(segment_count)
+    } else {
+        0..1
+    };
+    let selection = pane
+        .selection()
+        .filter(|(start, end)| line >= start.line && line <= end.line);
+    let selection_columns = selection.map(|(start, end)| {
+        let from = if line == start.line {
+            editor::display_column(text, start.index, pane.tabs())
+        } else {
+            0
+        };
+        let to = if line == end.line {
+            editor::display_column(text, end.index, pane.tabs())
+        } else {
+            editor::display_column(text, u32::MAX, pane.tabs()).saturating_add(1)
+        };
+        (from, to)
     });
-    let column_x = |column: u32| {
-        if let Some(galley) = &galley {
-            if let Some(index) = usize::try_from(column)
-                .ok()
-                .and_then(|column| column.checked_sub(geometry.first_column))
+    let selection_indices = selection.map(|(start, end)| {
+        let from = if line == start.line {
+            usize::try_from(start.index).unwrap_or(usize::MAX)
+        } else {
+            0
+        };
+        let to = if line == end.line {
+            usize::try_from(end.index).unwrap_or(usize::MAX)
+        } else {
+            text.chars().count()
+        };
+        (from, to)
+    });
+    let caret_column = (active && pane.caret().line == line)
+        .then(|| editor::display_column(text, pane.caret().index, pane.tabs()));
+    let caret_index = (active && pane.caret().line == line)
+        .then(|| usize::try_from(pane.caret().index).unwrap_or(usize::MAX));
+    let mut first_column = segment_range
+        .start
+        .checked_sub(1)
+        .and_then(|previous| wrap_ends.and_then(|ends| ends.get(previous)))
+        .and_then(|end| usize::try_from(*end).ok())
+        .unwrap_or(0);
+    for segment in segment_range {
+        let (start, end) = if let Some(ends) = wrap_ends {
+            let end = usize::try_from(ends[segment]).unwrap_or(usize::MAX);
+            (first_column, end)
+        } else {
+            (
+                geometry.first_column,
+                geometry.first_column.saturating_add(geometry.columns),
+            )
+        };
+        let mut segment_geometry = *geometry;
+        #[allow(clippy::cast_precision_loss)]
+        {
+            segment_geometry.y += segment as f32 * geometry.row_height;
+        }
+        segment_geometry.first_column = start;
+        segment_geometry.columns = end.saturating_sub(start);
+        if wrap_ends.is_some() {
+            segment_geometry.column_shift = 0.0;
+        }
+        let row_rect = egui::Rect::from_min_size(
+            egui::pos2(segment_geometry.text_x, segment_geometry.y),
+            egui::vec2(segment_geometry.width, segment_geometry.row_height),
+        );
+        let clip = painter.with_clip_rect(row_rect);
+        let origin = segment_geometry.text_x - segment_geometry.column_shift;
+        let source_byte_start = wraps
+            .and_then(|wraps| wraps.source_byte_segment(line, segment))
+            .map_or(0, |range| range.start);
+        let source_column_start = if wraps.is_some() { start } else { 0 };
+        let displayed = lines::window_from_byte(
+            text,
+            metrics,
+            source_byte_start,
+            source_column_start,
+            start,
+            end.saturating_sub(start),
+        )
+        .into_owned();
+        let galley = (byte_columns || (!metrics.direct && !displayed.is_ascii()))
+            .then(|| painter.layout_no_wrap(displayed.clone(), font.clone(), palette.same_text));
+        let column_x = |column: u32| {
+            if let Some(galley) = &galley {
+                if let Some(index) = usize::try_from(column)
+                    .ok()
+                    .and_then(|column| column.checked_sub(start))
+                {
+                    if index <= galley.job.text.chars().count() {
+                        return origin
+                            + galley
+                                .pos_from_ccursor(egui::text::CCursor::new(index))
+                                .left();
+                    }
+                }
+            }
+            #[allow(clippy::cast_precision_loss)]
+            let steps = column as f32 - start as f32;
+            steps.mul_add(segment_geometry.char_width, origin)
+        };
+        if byte_columns {
+            if let Some(character_range) =
+                wraps.and_then(|wraps| wraps.character_segment(line, segment))
             {
-                if index <= galley.job.text.chars().count() {
-                    return origin
-                        + galley
-                            .pos_from_ccursor(egui::text::CCursor::new(index))
-                            .left();
+                let character_x = |index: usize| {
+                    let local = index.saturating_sub(character_range.start);
+                    galley.as_ref().map_or_else(
+                        || {
+                            #[allow(clippy::cast_precision_loss)]
+                            let local = local as f32;
+                            origin + local * segment_geometry.char_width
+                        },
+                        |galley| {
+                            origin
+                                + galley
+                                    .pos_from_ccursor(egui::text::CCursor::new(local))
+                                    .left()
+                        },
+                    )
+                };
+                if let Some((from, to)) = selection_indices {
+                    let selected_from = from.max(character_range.start);
+                    let selected_to = to.min(character_range.end);
+                    if selected_from < selected_to {
+                        let x0 = character_x(selected_from);
+                        let x1 = character_x(selected_to).max(x0 + 2.0);
+                        clip.rect_filled(
+                            egui::Rect::from_min_max(
+                                egui::pos2(x0, segment_geometry.y),
+                                egui::pos2(x1, segment_geometry.y + segment_geometry.row_height),
+                            ),
+                            0.0,
+                            palette.selection,
+                        );
+                    }
+                }
+                if let Some(index) = caret_index {
+                    let final_segment = segment + 1 == segment_count;
+                    if index >= character_range.start
+                        && (index < character_range.end
+                            || (final_segment && index == character_range.end))
+                    {
+                        let x = character_x(index);
+                        clip.line_segment(
+                            [
+                                egui::pos2(x, segment_geometry.y),
+                                egui::pos2(x, segment_geometry.y + segment_geometry.row_height),
+                            ],
+                            egui::Stroke::new(
+                                if pane.is_overwrite() { 3.0 } else { 1.5 },
+                                palette.thumbnail_caret,
+                            ),
+                        );
+                    }
+                }
+            }
+        } else if let Some((from, to)) = selection_columns {
+            let selected_from = usize::try_from(from).unwrap_or(usize::MAX).max(start);
+            let selected_to = usize::try_from(to).unwrap_or(usize::MAX).min(end);
+            if selected_from < selected_to {
+                let x0 = column_x(u32::try_from(selected_from).unwrap_or(u32::MAX));
+                let x1 = column_x(u32::try_from(selected_to).unwrap_or(u32::MAX)).max(x0 + 2.0);
+                clip.rect_filled(
+                    egui::Rect::from_min_max(
+                        egui::pos2(x0, segment_geometry.y),
+                        egui::pos2(x1, segment_geometry.y + segment_geometry.row_height),
+                    ),
+                    0.0,
+                    palette.selection,
+                );
+            }
+        }
+        if !byte_columns {
+            if let Some(column) = caret_column {
+                let column = usize::try_from(column).unwrap_or(usize::MAX);
+                let final_segment = segment + 1 == segment_count;
+                if column >= start && (column < end || (final_segment && column == end)) {
+                    let x = column_x(u32::try_from(column).unwrap_or(u32::MAX));
+                    clip.line_segment(
+                        [
+                            egui::pos2(x, segment_geometry.y),
+                            egui::pos2(x, segment_geometry.y + segment_geometry.row_height),
+                        ],
+                        egui::Stroke::new(
+                            if pane.is_overwrite() { 3.0 } else { 1.5 },
+                            palette.thumbnail_caret,
+                        ),
+                    );
                 }
             }
         }
-        #[allow(clippy::cast_precision_loss)]
-        let steps = column as f32 - geometry.first_column as f32;
-        steps.mul_add(geometry.char_width, origin)
-    };
-    if let Some((start, end)) = pane.selection() {
-        if line >= start.line && line <= end.line {
-            let from = if line == start.line {
-                editor::display_column(text, start.index, pane.tabs())
-            } else {
-                0
-            };
-            let to = if line == end.line {
-                editor::display_column(text, end.index, pane.tabs())
-            } else {
-                editor::display_column(text, u32::MAX, pane.tabs()).saturating_add(1)
-            };
-            let x0 = column_x(from);
-            let x1 = column_x(to).max(x0 + 2.0);
-            clip.rect_filled(
-                egui::Rect::from_min_max(
-                    egui::pos2(x0, geometry.y),
-                    egui::pos2(x1, geometry.y + geometry.row_height),
-                ),
-                0.0,
-                palette.selection,
-            );
+        if wrap_ends.is_some() {
+            first_column = end;
         }
     }
-    if !active || pane.caret().line != line {
-        return;
-    }
-    let x = column_x(editor::display_column(
-        text,
-        pane.caret().index,
-        pane.tabs(),
-    ));
-    clip.line_segment(
-        [
-            egui::pos2(x, geometry.y),
-            egui::pos2(x, geometry.y + geometry.row_height),
-        ],
-        egui::Stroke::new(
-            if pane.is_overwrite() { 3.0 } else { 1.5 },
-            palette.thumbnail_caret,
-        ),
-    );
 }
 
 struct PaneContent<'a> {
     line: Option<u32>,
     text: Option<&'a str>,
     metrics: Option<lines::LineMetrics>,
+    /// Wrapped subrows that intersect the viewport.
+    visible_segments: std::ops::Range<usize>,
     /// The syntax runs of the line, in columns.
     syntax: Option<&'a [syntax::Span]>,
     spans: Option<&'a [ColumnSpan]>,
@@ -4627,6 +5854,8 @@ struct PaneContent<'a> {
     /// The row differs, so syntax coloring gives way where the two meet.
     is_difference: bool,
     gap: bool,
+    wrap_ends: Option<&'a [u32]>,
+    wrap_bytes: Option<&'a [u32]>,
 }
 
 /// Paint one row of one pane.
@@ -4644,17 +5873,20 @@ fn paint_side(
 ) {
     let row_rect = egui::Rect::from_min_size(
         egui::pos2(geometry.text_x, geometry.y),
-        egui::vec2(geometry.width, geometry.row_height),
+        egui::vec2(geometry.width, geometry.total_height),
     );
     painter.rect_filled(row_rect, 0.0, content.background);
     let gutter_rect = egui::Rect::from_min_size(
         egui::pos2(geometry.gutter_x, geometry.y),
-        egui::vec2(geometry.gutter_width, geometry.row_height),
+        egui::vec2(geometry.gutter_width, geometry.total_height),
     );
     painter.rect_filled(gutter_rect, 0.0, palette.gutter_background);
     if let Some(line) = content.line {
         painter.text(
-            gutter_rect.right_center() - egui::vec2(3.0, 0.0),
+            egui::pos2(
+                gutter_rect.right() - 3.0,
+                geometry.y + geometry.row_height / 2.0,
+            ),
             egui::Align2::RIGHT_CENTER,
             (line + 1).to_string(),
             font.clone(),
@@ -4667,23 +5899,113 @@ fn paint_side(
     let (Some(text), Some(metrics)) = (content.text, content.metrics) else {
         return;
     };
-    let origin = geometry.text_x - geometry.column_shift;
-    let clip = painter.with_clip_rect(row_rect);
     if metrics.columns == 0 {
         return;
     }
+    let segment_count = content.wrap_ends.map_or(1, <[u32]>::len);
+    let segment_range = if content.wrap_ends.is_some() {
+        content.visible_segments.start.min(segment_count)
+            ..content.visible_segments.end.min(segment_count)
+    } else {
+        0..1
+    };
+    let mut first_column = segment_range
+        .start
+        .checked_sub(1)
+        .and_then(|previous| content.wrap_ends.and_then(|ends| ends.get(previous)))
+        .and_then(|end| usize::try_from(*end).ok())
+        .unwrap_or(0);
+    for segment in segment_range {
+        let (start, end) = if let Some(ends) = content.wrap_ends {
+            let end = usize::try_from(ends[segment]).unwrap_or(usize::MAX);
+            (first_column, end)
+        } else {
+            (
+                geometry.first_column,
+                geometry.first_column.saturating_add(geometry.columns),
+            )
+        };
+        let mut line_geometry = *geometry;
+        #[allow(clippy::cast_precision_loss)]
+        {
+            line_geometry.y += segment as f32 * geometry.row_height;
+        }
+        line_geometry.first_column = start;
+        line_geometry.columns = end.saturating_sub(start);
+        if content.wrap_ends.is_some() {
+            line_geometry.column_shift = 0.0;
+        }
+        let source_byte_start = content
+            .wrap_bytes
+            .and_then(|ends| {
+                segment
+                    .checked_sub(1)
+                    .and_then(|previous| ends.get(previous))
+            })
+            .copied()
+            .map_or(0, |byte| usize::try_from(byte).unwrap_or(usize::MAX));
+        let source_column_start = if content.wrap_ends.is_some() {
+            start
+        } else {
+            0
+        };
+        paint_side_segment(
+            painter,
+            &line_geometry,
+            content,
+            palette,
+            font,
+            runs,
+            source_byte_start,
+            source_column_start,
+            text,
+            metrics,
+        );
+        if content.wrap_ends.is_some() {
+            first_column = end;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn paint_side_segment(
+    painter: &egui::Painter,
+    geometry: &PaneGeometry,
+    content: &PaneContent<'_>,
+    palette: &Palette,
+    font: &egui::FontId,
+    runs: &mut Vec<Run>,
+    source_byte_start: usize,
+    source_column_start: usize,
+    text: &str,
+    metrics: lines::LineMetrics,
+) {
+    let row_rect = egui::Rect::from_min_size(
+        egui::pos2(geometry.text_x, geometry.y),
+        egui::vec2(geometry.width, geometry.row_height),
+    );
+    let origin = geometry.text_x - geometry.column_shift;
+    let clip = painter.with_clip_rect(row_rect);
     // A plain row with no grammar and no inline runs behind it paints in one
     // call, which is what a plain text comparison costs.
     let plain = content.syntax.is_none() && (content.whole_line_differs || content.spans.is_none());
     if plain {
-        let window = lines::window(text, metrics, geometry.first_column, geometry.columns);
+        let window = lines::window_from_byte(
+            text,
+            metrics,
+            source_byte_start,
+            source_column_start,
+            geometry.first_column,
+            geometry.columns,
+        )
+        .into_owned();
         if window.is_empty() {
             return;
         }
         clip.text(
             egui::pos2(origin, geometry.y),
             egui::Align2::LEFT_TOP,
-            window.as_ref(),
+            &window,
             font.clone(),
             if content.whole_line_differs {
                 content.difference_color
@@ -4730,9 +6052,11 @@ fn paint_side(
         if run.end as usize <= geometry.first_column || run.start as usize >= last {
             continue;
         }
-        let piece = lines::window(
+        let piece = lines::window_from_byte(
             text,
             metrics,
+            source_byte_start,
+            source_column_start,
             run.start as usize,
             (run.end - run.start) as usize,
         );
@@ -4949,6 +6273,7 @@ impl SessionView for TextView {
             Command::ToggleLineDetails => self.show_details,
             Command::ToggleLineNumbers => self.show_line_numbers,
             Command::ToggleSyntaxHighlighting => self.syntax_highlighting,
+            Command::ToggleWordWrap => self.word_wrap,
             _ => return None,
         })
     }
@@ -5004,7 +6329,8 @@ impl SessionView for TextView {
             | Command::Copy
             | Command::ToggleOverwrite
             | Command::ClearBookmarks
-            | Command::CompareReport => self.status == Status::Ready,
+            | Command::CompareReport
+            | Command::ToggleWordWrap => self.status == Status::Ready,
             Command::IncreaseFontSize
             | Command::DecreaseFontSize
             | Command::ResetFontSize
@@ -5110,7 +6436,9 @@ impl SessionView for TextView {
         (!self.rows_current()).then(|| self.rows_reason())
     }
 
+    #[allow(clippy::too_many_lines)]
     fn run(&mut self, command: Command) {
+        self.wrap_goal_column = None;
         match command {
             Command::NextDifference
             | Command::PreviousDifference
@@ -5176,6 +6504,21 @@ impl SessionView for TextView {
             | Command::DecreaseIndent => self.run_buffer_edit(command),
             Command::ToggleLineDetails => self.show_details = !self.show_details,
             Command::ToggleLineNumbers => self.show_line_numbers = !self.show_line_numbers,
+            Command::ToggleWordWrap => {
+                if self.message.as_deref() == Some(WRAP_LIMIT_MESSAGE) {
+                    self.message = None;
+                }
+                if self.word_wrap {
+                    self.word_wrap = false;
+                    self.horizontal = 0.0;
+                    self.wrap_reveal_pending = false;
+                    self.invalidate_wrap_layout();
+                } else {
+                    self.wrap_reveal_pending |= self.caret_visible_in_unwrapped_view();
+                    self.word_wrap = true;
+                    self.horizontal = 0.0;
+                }
+            }
             Command::ToggleIgnoreUnimportant => {
                 self.set_ignore_unimportant(!self.ignore_unimportant);
             }
@@ -5299,10 +6642,39 @@ impl SessionView for TextView {
     }
 }
 
+fn anchor_position(visible: &Visible, row: usize) -> Option<usize> {
+    visible
+        .position_of(row)
+        .or_else(|| visible.len().checked_sub(1))
+}
+
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     #[test]
+    fn hatch_generation_scales_with_the_visible_part_of_a_tall_gap() {
+        let gap = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(100.0, 1_000_000.0));
+        let viewport = egui::Rect::from_min_max(egui::pos2(0.0, 500.0), egui::pos2(100.0, 520.0));
+        let (mut x, end) = super::hatch_x_bounds(gap, viewport).unwrap();
+        let mut lines = 0;
+        while x < end {
+            lines += 1;
+            x += super::HATCH_STEP;
+        }
+        assert!(lines <= 20, "visible hatch generated {lines} lines");
+        assert!(lines > 0);
+    }
+
+    #[test]
+    fn a_filtered_wrap_anchor_uses_the_next_row_or_the_last_shown_row() {
+        let visible = super::Visible::Subset(vec![2, 4, 6]);
+        assert_eq!(super::anchor_position(&visible, 5), Some(2));
+        assert_eq!(super::anchor_position(&visible, 8), Some(2));
+        assert_eq!(super::anchor_position(&super::Visible::default(), 8), None);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
     fn unicode_caret_and_selection_edges_follow_the_painted_glyphs() {
         let context = egui::Context::default();
         for text in ["日本語x", "e\u{301}xy", "שלום עולם"] {
@@ -5324,6 +6696,7 @@ mod tests {
                         gutter_width: 20.0,
                         y: 10.0,
                         row_height: 20.0,
+                        total_height: 20.0,
                         char_width: ui.fonts(|fonts| fonts.glyph_width(&font, '0')),
                         first_column: 0,
                         columns: 80,
@@ -5333,6 +6706,7 @@ mod tests {
                         line: None,
                         text: Some(text),
                         metrics: Some(super::lines::measure(text)),
+                        visible_segments: 0..1,
                         syntax: None,
                         spans: None,
                         background: palette.same_line,
@@ -5341,6 +6715,8 @@ mod tests {
                         whole_line_differs: false,
                         is_difference: false,
                         gap: false,
+                        wrap_ends: None,
+                        wrap_bytes: None,
                     };
                     super::paint_side(
                         ui.painter(),
@@ -5358,6 +6734,8 @@ mod tests {
                         text,
                         true,
                         (&palette, &font, super::lines::measure(text)),
+                        None,
+                        0..1,
                     );
                 });
             });
@@ -5431,6 +6809,7 @@ mod tests {
                                     line: None,
                                     text: Some(text),
                                     metrics: Some(super::lines::measure(text)),
+                                    visible_segments: 0..1,
                                     syntax: None,
                                     spans: highlighted.then_some(spans.as_slice()),
                                     background: ca_ui::testing::context().palette.same_line,
@@ -5441,6 +6820,8 @@ mod tests {
                                     whole_line_differs: false,
                                     is_difference: highlighted,
                                     gap: false,
+                                    wrap_ends: None,
+                                    wrap_bytes: None,
                                 };
                                 let geometry = super::PaneGeometry {
                                     gutter_x: 0.0,
@@ -5449,6 +6830,7 @@ mod tests {
                                     gutter_width: 20.0,
                                     y: 10.0,
                                     row_height: 20.0,
+                                    total_height: 20.0,
                                     char_width: ui.fonts(|fonts| fonts.glyph_width(&font, '0')),
                                     first_column,
                                     columns: 80,
@@ -6407,6 +7789,570 @@ mod tests {
                 "{scale}: caret {caret}, glyph {glyph_x}"
             );
         }
+    }
+
+    #[test]
+    fn word_wrap_uses_the_taller_pane_and_maps_pointer_and_caret_to_its_segment() {
+        use super::{Side, TextView};
+        use ca_ui::view::SessionView;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let left = dir.path().join("left.txt");
+        let right = dir.path().join("right.txt");
+        let left_text = format!("{}\nnext-left\n", "x".repeat(240));
+        std::fs::write(&left, left_text.as_bytes()).unwrap();
+        std::fs::write(&right, b"short\nnext-right\n").unwrap();
+        let context = ca_ui::testing::context();
+        let mut view = TextView::new(left, right, &context, 1);
+        let ctx = egui::Context::default();
+        settle_frames(&mut view, &ctx);
+
+        assert!(view.accepts(ca_ui::Command::ToggleWordWrap));
+        view.run(ca_ui::Command::ToggleWordWrap);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !view.wrap_active && Instant::now() < deadline {
+            view.tick();
+            clipboard_frame(&ctx, &mut view, Vec::new());
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(view.wrap_active);
+        let layout = view.wrap_layout.as_ref().expect("wrap layout");
+        let first_segment_end = layout.left.segment(0, 0).expect("first segment").end;
+        let visual_rows = view.wrap_heights.row_height(0);
+        assert!(visual_rows > 1);
+
+        let output = clipboard_frame(&ctx, &mut view, Vec::new());
+        let body = view.body_rect();
+        let next = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.job.text == "next-left" => Some(text),
+                _ => None,
+            })
+            .expect("next line is painted");
+        #[allow(clippy::cast_precision_loss)]
+        let expected_y = body.top() + visual_rows as f32 * view.row_pixels();
+        assert!((next.pos.y - expected_y).abs() < 0.1);
+
+        let first = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text)
+                    if text.galley.job.text.starts_with('x') && body.contains(text.pos) =>
+                {
+                    Some(text)
+                }
+                _ => None,
+            })
+            .expect("first wrapped segment is painted");
+        let glyphs = &first.galley.rows[0].glyphs;
+        let pitch = glyphs[1].pos.x - glyphs[0].pos.x;
+        let clicked_column = first_segment_end + 2;
+        let point = egui::pos2(
+            first.pos.x + pitch * 2.0,
+            body.top() + view.row_pixels() * 1.5,
+        );
+        let _ = clipboard_frame(
+            &ctx,
+            &mut view,
+            vec![
+                egui::Event::PointerMoved(point),
+                egui::Event::PointerButton {
+                    pos: point,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ],
+        );
+        assert_eq!(view.pane(Side::Left).caret().line, 0);
+        assert_eq!(
+            view.pane(Side::Left).caret().index,
+            u32::try_from(clicked_column).unwrap()
+        );
+        let _ = view.handle_key(egui::Key::ArrowUp, egui::Modifiers::default(), 1);
+        assert_eq!(view.pane(Side::Left).caret().index, 2);
+        let _ = view.handle_key(egui::Key::ArrowDown, egui::Modifiers::default(), 1);
+        assert_eq!(
+            view.pane(Side::Left).caret().index,
+            u32::try_from(clicked_column).unwrap()
+        );
+
+        let output = clipboard_frame(&ctx, &mut view, Vec::new());
+        let caret_y = body.top() + view.row_pixels();
+        assert!(output.shapes.iter().any(|shape| match &shape.shape {
+            egui::Shape::LineSegment { points, .. } => {
+                (points[0].y - caret_y).abs() < 0.1
+                    && (points[1].y - points[0].y - view.row_pixels()).abs() < 0.1
+            }
+            _ => false,
+        }));
+    }
+
+    #[test]
+    fn changing_the_filter_does_not_restart_wrap_measurement() {
+        use super::{DisplayFilter, TextView};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let left = dir.path().join("left.txt");
+        let right = dir.path().join("right.txt");
+        std::fs::write(&left, b"one two three\nnext").unwrap();
+        std::fs::write(&right, b"one two four\nnext").unwrap();
+        let context = ca_ui::testing::context();
+        let mut view = TextView::new(left, right, &context, 1);
+        let ctx = egui::Context::default();
+        settle_frames(&mut view, &ctx);
+
+        view.word_wrap = true;
+        view.request_wrap_layout(5);
+        let requested_visible =
+            Arc::clone(&view.wrap_request.as_ref().expect("wrap request").visible);
+        view.set_filter(DisplayFilter::Differences);
+        view.request_wrap_layout(5);
+
+        assert!(Arc::ptr_eq(
+            &requested_visible,
+            &view
+                .wrap_request
+                .as_ref()
+                .expect("original wrap request remains active")
+                .visible
+        ));
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !view
+            .wrap_heights_visible
+            .as_ref()
+            .is_some_and(|visible| Arc::ptr_eq(visible, &view.visible))
+            && Instant::now() < deadline
+        {
+            view.poll();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(view
+            .wrap_heights_visible
+            .as_ref()
+            .is_some_and(|visible| Arc::ptr_eq(visible, &view.visible)));
+        let layout = view.wrap_layout.as_ref().expect("wrap layout");
+        let expected_total: u64 = (0..view.visible.len())
+            .filter_map(|position| view.visible.row_at(position))
+            .map(|row| u64::from(layout.row_lines[row]))
+            .sum();
+        assert_eq!(view.wrap_heights.total(), expected_total);
+
+        view.set_filter(DisplayFilter::Same);
+        assert!(view.wrap_heights_visible.is_none());
+        assert!(view.wrap_prefix_job.is_some());
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !view
+            .wrap_heights_visible
+            .as_ref()
+            .is_some_and(|visible| Arc::ptr_eq(visible, &view.visible))
+            && Instant::now() < deadline
+        {
+            view.poll();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(view
+            .wrap_heights_visible
+            .as_ref()
+            .is_some_and(|visible| Arc::ptr_eq(visible, &view.visible)));
+        let layout = view.wrap_layout.as_ref().expect("wrap layout");
+        let expected_total: u64 = (0..view.visible.len())
+            .filter_map(|position| view.visible.row_at(position))
+            .map(|row| u64::from(layout.row_lines[row]))
+            .sum();
+        assert_eq!(view.wrap_heights.total(), expected_total);
+    }
+
+    #[test]
+    fn wrapped_long_unicode_lines_map_pointer_and_caret_by_character_index() {
+        use super::{Side, TextView};
+        use ca_ui::view::SessionView;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let left = dir.path().join("left.txt");
+        let right = dir.path().join("right.txt");
+        std::fs::write(&left, "é".repeat(40_000)).unwrap();
+        std::fs::write(&right, b"short").unwrap();
+        let context = ca_ui::testing::context();
+        let mut view = TextView::new(left, right, &context, 1);
+        let ctx = egui::Context::default();
+        settle_frames(&mut view, &ctx);
+        view.run(ca_ui::Command::ToggleWordWrap);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !view.wrap_active && Instant::now() < deadline {
+            view.tick();
+            clipboard_frame(&ctx, &mut view, Vec::new());
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(view.wrap_active);
+        let wraps = &view.wrap_layout.as_ref().unwrap().left;
+        assert!(wraps.uses_byte_columns(0));
+        let characters = wraps.character_segment(0, 1).unwrap();
+        let row_height = view.row_pixels();
+        let body = view.body_rect();
+        let second_top = body.top() + row_height;
+        let output = clipboard_frame(&ctx, &mut view, Vec::new());
+        let second = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text)
+                    if text.galley.job.text.starts_with('é')
+                        && (text.pos.y - second_top).abs() < 0.1 =>
+                {
+                    Some(text)
+                }
+                _ => None,
+            })
+            .unwrap();
+        let glyphs = &second.galley.rows[0].glyphs;
+        let pitch = glyphs[1].pos.x - glyphs[0].pos.x;
+        let point = egui::pos2(second.pos.x + 2.0 * pitch, second_top + row_height / 2.0);
+        let _ = clipboard_frame(
+            &ctx,
+            &mut view,
+            vec![
+                egui::Event::PointerMoved(point),
+                egui::Event::PointerButton {
+                    pos: point,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ],
+        );
+        assert_eq!(
+            view.pane(Side::Left).caret().index,
+            u32::try_from(characters.start + 2).unwrap()
+        );
+        let _ = view.handle_key(egui::Key::ArrowUp, egui::Modifiers::default(), 1);
+        assert_eq!(view.pane(Side::Left).caret().index, 2);
+        let _ = view.handle_key(egui::Key::ArrowDown, egui::Modifiers::default(), 1);
+        assert_eq!(
+            view.pane(Side::Left).caret().index,
+            u32::try_from(characters.start + 2).unwrap()
+        );
+
+        let output = clipboard_frame(&ctx, &mut view, Vec::new());
+        let expected_x = second.pos.x + glyphs[2].pos.x;
+        assert!(output.shapes.iter().any(|shape| match &shape.shape {
+            egui::Shape::LineSegment { points, .. } => {
+                (points[0].y - second_top).abs() < 0.1 && (points[0].x - expected_x).abs() < 0.1
+            }
+            _ => false,
+        }));
+    }
+
+    #[test]
+    fn page_navigation_uses_the_wrapped_viewport_height() {
+        use super::{Side, TextView};
+        use ca_ui::view::SessionView;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let left = dir.path().join("left.txt");
+        let right = dir.path().join("right.txt");
+        let long_line = format!("{}\n", "x".repeat(4_000));
+        std::fs::write(&left, long_line.as_bytes()).unwrap();
+        std::fs::write(&right, long_line.as_bytes()).unwrap();
+        let context = ca_ui::testing::context();
+        let mut view = TextView::new(left, right, &context, 1);
+        let ctx = egui::Context::default();
+        settle_frames(&mut view, &ctx);
+
+        view.run(ca_ui::Command::ToggleWordWrap);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !view.wrap_active && Instant::now() < deadline {
+            view.tick();
+            clipboard_frame(&ctx, &mut view, Vec::new());
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(view.wrap_active);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let visible_lines = (view.body_rect().height() / view.row_pixels()).floor() as usize;
+        let wraps = &view.wrap_layout.as_ref().unwrap().left;
+        assert!(wraps.line_count(0) > visible_lines);
+        let segment = visible_lines.min(wraps.line_count(0) - 1);
+        let expected = u32::try_from(wraps.segment(0, segment).unwrap().start).unwrap();
+
+        view.pane_mut(Side::Left)
+            .place(super::editor::Caret::new(0, 0), false);
+        let _ = view.handle_key(egui::Key::PageDown, egui::Modifiers::default(), 1);
+        assert_eq!(view.pane(Side::Left).caret().index, expected);
+        assert!(view.wrap_scroll.offset() > 0.0);
+    }
+
+    #[test]
+    fn wrapped_frames_keep_manual_scroll_when_the_caret_does_not_change() {
+        use super::TextView;
+        use ca_ui::view::SessionView;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let left = dir.path().join("left.txt");
+        let right = dir.path().join("right.txt");
+        let tail = "line\n".repeat(100);
+        let text = format!("{}\n{tail}", "x".repeat(8_000));
+        std::fs::write(&left, &text).unwrap();
+        std::fs::write(&right, &text).unwrap();
+        let context = ca_ui::testing::context();
+        let mut view = TextView::new(left, right, &context, 1);
+        let ctx = egui::Context::default();
+        settle_frames(&mut view, &ctx);
+
+        view.run(ca_ui::Command::ToggleWordWrap);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !view.wrap_active && Instant::now() < deadline {
+            view.tick();
+            clipboard_frame(&ctx, &mut view, Vec::new());
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(view.wrap_active);
+
+        let viewport = f64::from(view.body_rect().height() / view.row_pixels());
+        let last_visual_line = view.wrap_heights.total().saturating_sub(1);
+        view.wrap_scroll
+            .reveal_visual_line(&view.wrap_heights, last_visual_line, viewport);
+        let before = view.wrap_scroll.offset();
+        assert!(before > 0.0);
+
+        clipboard_frame(&ctx, &mut view, Vec::new());
+        assert!((view.wrap_scroll.offset() - before).abs() < 0.01);
+
+        view.deactivate_wrap();
+        view.activate_wrap();
+        view.follow_caret();
+        assert!((view.wrap_scroll.offset() - before).abs() < 0.01);
+    }
+
+    #[test]
+    fn wrapped_vertical_moves_fall_back_for_a_filtered_out_caret() {
+        use super::{DisplayFilter, Side, TextView};
+        use ca_ui::view::SessionView;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let left = dir.path().join("left.txt");
+        let right = dir.path().join("right.txt");
+        std::fs::write(&left, b"same\nleft change\nsame\n").unwrap();
+        std::fs::write(&right, b"same\nright change\nsame\n").unwrap();
+        let context = ca_ui::testing::context();
+        let mut view = TextView::new(left, right, &context, 1);
+        let ctx = egui::Context::default();
+        settle_frames(&mut view, &ctx);
+        view.set_filter(DisplayFilter::Differences);
+        view.run(ca_ui::Command::ToggleWordWrap);
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !view.wrap_active && Instant::now() < deadline {
+            view.tick();
+            clipboard_frame(&ctx, &mut view, Vec::new());
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(view.wrap_active);
+
+        let hidden_row = view.data.model.row_of_left_line(0).unwrap();
+        let hidden_position = view.visible.position_of(hidden_row).unwrap();
+        assert_ne!(view.visible.row_at(hidden_position), Some(hidden_row));
+        view.pane_mut(Side::Left)
+            .place(super::editor::Caret::new(0, 0), false);
+        let before = view.pane(Side::Left).caret();
+
+        assert!(!view.move_wrapped_caret(1, false, false));
+        assert_eq!(view.pane(Side::Left).caret(), before);
+
+        assert!(!view.handle_key(egui::Key::ArrowDown, egui::Modifiers::default(), 1));
+        assert_eq!(view.pane(Side::Left).caret().line, before.line + 1);
+    }
+
+    #[test]
+    fn horizontal_scrolling_works_while_the_wrapped_layout_is_pending() {
+        use super::{Side, TextView};
+
+        let dir = tempfile::tempdir().unwrap();
+        let left = dir.path().join("left.txt");
+        let right = dir.path().join("right.txt");
+        let long_line = format!("{}\n", "x".repeat(200));
+        std::fs::write(&left, &long_line).unwrap();
+        std::fs::write(&right, &long_line).unwrap();
+        let mut view = TextView::new(left, right, &ca_ui::testing::context(), 1);
+        let ctx = egui::Context::default();
+        settle_frames(&mut view, &ctx);
+
+        view.data.widest = 10;
+        view.word_wrap = true;
+        view.invalidate_wrap_layout();
+        view.pane_mut(Side::Left)
+            .place(super::editor::Caret::new(0, 150), false);
+        let body = view.body_rect();
+
+        clipboard_frame(
+            &ctx,
+            &mut view,
+            vec![
+                egui::Event::PointerMoved(body.center()),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(-500.0, 0.0),
+                    modifiers: egui::Modifiers::default(),
+                },
+            ],
+        );
+
+        assert!(!view.wrap_active);
+        assert!(view.horizontal > 0.0);
+        view.set_horizontal(500.0, 50.0, 1.0);
+        assert!((view.horizontal - 101.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn enabling_word_wrap_keeps_a_caret_visible_that_was_visible_before_toggle() {
+        use super::{Side, TextView};
+        use ca_ui::view::SessionView;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let left = dir.path().join("left.txt");
+        let right = dir.path().join("right.txt");
+        let text = format!("{}\n{}", "x".repeat(8_000), "tail\n".repeat(100));
+        std::fs::write(&left, &text).unwrap();
+        std::fs::write(&right, &text).unwrap();
+        let context = ca_ui::testing::context();
+        let mut view = TextView::new(left, right, &context, 1);
+        let ctx = egui::Context::default();
+        settle_frames(&mut view, &ctx);
+
+        #[allow(clippy::cast_precision_loss)]
+        let columns = view.wrap_columns.unwrap() as f32;
+        view.pane_mut(Side::Left)
+            .place(super::editor::Caret::new(0, 8_000), false);
+        view.set_horizontal(8_000.0 - columns / 2.0, columns, 1.0);
+        let caret_column = f64::from(super::editor::display_column(
+            &view.pane(Side::Left).line_text(0),
+            8_000,
+            view.pane(Side::Left).tabs(),
+        ));
+        assert!(caret_column >= f64::from(view.horizontal));
+        assert!(caret_column < f64::from(view.horizontal + columns));
+        view.follow_caret();
+
+        view.run(ca_ui::Command::ToggleWordWrap);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !view.wrap_active && Instant::now() < deadline {
+            view.tick();
+            clipboard_frame(&ctx, &mut view, Vec::new());
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(view.wrap_active);
+        let visual_line =
+            f64::from(u32::try_from(view.wrapped_caret_visual_line(Side::Left).unwrap()).unwrap());
+        let viewport = f64::from(view.body_rect().height() / view.row_pixels());
+        assert!(visual_line >= view.wrap_scroll.offset());
+        assert!(visual_line < view.wrap_scroll.offset() + viewport);
+    }
+
+    #[test]
+    fn enabling_word_wrap_preserves_scroll_when_the_caret_was_offscreen() {
+        use super::{Side, TextView};
+        use ca_ui::view::SessionView;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let left = dir.path().join("left.txt");
+        let right = dir.path().join("right.txt");
+        let text = format!("{}\n{}", "x".repeat(8_000), "tail\n".repeat(100));
+        std::fs::write(&left, &text).unwrap();
+        std::fs::write(&right, &text).unwrap();
+        let context = ca_ui::testing::context();
+        let mut view = TextView::new(left, right, &context, 1);
+        let ctx = egui::Context::default();
+        settle_frames(&mut view, &ctx);
+
+        view.pane_mut(Side::Left)
+            .place(super::editor::Caret::new(0, 0), false);
+        view.scroll.go_to(
+            60,
+            view.viewport_height,
+            view.row_height(),
+            view.visible.len(),
+        );
+        assert!(view.scroll.first_row() > 0);
+        view.run(ca_ui::Command::ToggleWordWrap);
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !view.wrap_active && Instant::now() < deadline {
+            view.tick();
+            clipboard_frame(&ctx, &mut view, Vec::new());
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(view.wrap_active);
+        let visual_line =
+            f64::from(u32::try_from(view.wrapped_caret_visual_line(Side::Left).unwrap()).unwrap());
+        assert!(view.wrap_scroll.offset() > visual_line);
+    }
+
+    #[test]
+    fn vertical_navigation_skips_aligned_subrows_missing_from_the_active_pane() {
+        use super::{Side, TextView};
+        use ca_ui::view::SessionView;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let left = dir.path().join("left.txt");
+        let right = dir.path().join("right.txt");
+        std::fs::write(&left, format!("{}\nafter-left\n", "x".repeat(2_400))).unwrap();
+        std::fs::write(&right, b"short\nafter-right\n").unwrap();
+        let context = ca_ui::testing::context();
+        let mut view = TextView::new(left, right, &context, 1);
+        let ctx = egui::Context::default();
+        settle_frames(&mut view, &ctx);
+        view.data.model = super::model::build(&[ca_diff::ClassifiedHunk {
+            hunk: ca_diff::Hunk {
+                kind: ca_diff::HunkKind::Changed,
+                left: 0..2,
+                right: 0..2,
+            },
+            importance: Some(ca_diff::Importance::Important),
+            left_lines: vec![ca_diff::Importance::Important; 2],
+            right_lines: vec![ca_diff::Importance::Important; 2],
+        }]);
+        view.refilter();
+
+        view.run(ca_ui::Command::ToggleWordWrap);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !view.wrap_active && Instant::now() < deadline {
+            view.tick();
+            clipboard_frame(&ctx, &mut view, Vec::new());
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(view.wrap_active);
+        assert!(
+            view.wrap_heights.row_height(0) > 1,
+            "row height {}, columns {}, left wraps {}, model height {}, visible row {:?}, pair {:?}",
+            view.wrap_heights.row_height(0),
+            view.wrap_layout.as_ref().unwrap().columns,
+            view.wrap_layout.as_ref().unwrap().left.line_count(0),
+            view.wrap_layout.as_ref().unwrap().row_lines[0],
+            view.visible.row_at(0),
+            view.wrap_layout.as_ref().unwrap().model_lines[0]
+        );
+        view.active = Side::Right;
+        view.pane_mut(Side::Right)
+            .place(super::editor::Caret::new(0, 0), false);
+        let _ = view.handle_key(egui::Key::ArrowDown, egui::Modifiers::default(), 1);
+        assert_eq!(view.pane(Side::Right).caret().line, 1);
+        assert_eq!(view.pane(Side::Right).caret().index, 0);
+        let _ = view.handle_key(egui::Key::ArrowUp, egui::Modifiers::default(), 1);
+        assert_eq!(view.pane(Side::Right).caret().line, 0);
+        assert_eq!(view.pane(Side::Right).caret().index, 0);
     }
 
     fn clipboard_view() -> (super::TextView, tempfile::TempDir) {

@@ -12,6 +12,7 @@ use ca_diff::{ClassifiedHunk, HunkKind, Importance};
 use ca_ui::filter;
 pub use ca_ui::filter::Visible;
 use std::ops::Range;
+use std::sync::Arc;
 
 /// What a row shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,6 +121,8 @@ pub const fn line_status(row: &Row, ignore_unimportant: bool) -> LineStatus {
 #[derive(Debug, Clone, Default)]
 pub struct RowModel {
     rows: Vec<Row>,
+    /// Line pairs shared with the asynchronous wrap-layout worker.
+    row_lines: Arc<Vec<(Option<u32>, Option<u32>)>>,
     sections: Vec<Range<u32>>,
     left_to_row: Vec<u32>,
     right_to_row: Vec<u32>,
@@ -228,6 +231,7 @@ impl RowModel {
         if let Some(line) = row.right {
             grow_to(&mut self.right_to_row, line, index);
         }
+        Arc::make_mut(&mut self.row_lines).push((row.left, row.right));
         self.rows.push(row);
     }
 
@@ -323,6 +327,12 @@ impl RowModel {
     #[must_use]
     pub fn rows(&self) -> &[Row] {
         &self.rows
+    }
+
+    /// Line pairs for every row, shared with layout workers without a copy.
+    #[must_use]
+    pub fn row_lines(&self) -> &Arc<Vec<(Option<u32>, Option<u32>)>> {
+        &self.row_lines
     }
 
     /// Number of rows.
