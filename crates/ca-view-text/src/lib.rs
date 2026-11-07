@@ -419,7 +419,7 @@ pub struct TextView {
     wrap_layout_revision: u64,
     /// Whether the last frame used the variable-height layout.
     wrap_active: bool,
-    /// Whether a caret change must be revealed after the wrap layout is ready.
+    /// Whether the caret must be revealed after the wrap layout is ready.
     wrap_reveal_pending: bool,
     /// Active pane and text carets at the last caret-follow check.
     last_followed_carets: Option<(Side, editor::Caret, editor::Caret)>,
@@ -2351,6 +2351,44 @@ impl TextView {
         )
     }
 
+    /// True when the active caret lies in the unwrapped viewport.
+    fn caret_visible_in_unwrapped_view(&self) -> bool {
+        let side = self.active;
+        let pane = self.pane(side);
+        let caret = pane.caret();
+        let Some(model_row) = (match side {
+            Side::Left => self.data.model.row_of_left_line(caret.line),
+            Side::Right => self.data.model.row_of_right_line(caret.line),
+        }) else {
+            return false;
+        };
+        let Some(position) = self.visible.position_of(model_row) else {
+            return false;
+        };
+        if self.visible.row_at(position) != Some(model_row)
+            || !self
+                .scroll
+                .visible(self.viewport_height, self.row_height(), self.visible.len())
+                .contains(&position)
+        {
+            return false;
+        }
+        let Some(columns) = self
+            .wrap_columns
+            .and_then(|columns| u32::try_from(columns).ok())
+        else {
+            return false;
+        };
+        let caret_column = f64::from(editor::display_column(
+            &pane.line_text(caret.line),
+            caret.index,
+            pane.tabs(),
+        ));
+        let left = f64::from(self.horizontal);
+        caret_column >= left && caret_column < left + f64::from(columns)
+    }
+
+    /// Reveal the active text caret in the variable-height layout.
     fn reveal_wrapped_caret(&mut self) {
         if let Some(visual_line) = self.wrapped_caret_visual_line(self.active) {
             self.wrap_scroll.reveal_visual_line(
@@ -5223,7 +5261,7 @@ impl TextView {
         let caret_column =
             editor::display_column(&pane.line_text(caret.line), caret.index, pane.tabs());
         #[allow(clippy::cast_precision_loss)]
-        let widest = self.data.widest.max(caret_column) as f32;
+        let widest = self.data.widest.max(caret_column.saturating_add(1)) as f32;
         self.horizontal = columns.clamp(0.0, (widest - visible_columns).max(0.0));
     }
 
@@ -6472,11 +6510,15 @@ impl SessionView for TextView {
                 if self.message.as_deref() == Some(WRAP_LIMIT_MESSAGE) {
                     self.message = None;
                 }
-                self.word_wrap = !self.word_wrap;
-                self.horizontal = 0.0;
-                if !self.word_wrap {
+                if self.word_wrap {
+                    self.word_wrap = false;
+                    self.horizontal = 0.0;
                     self.wrap_reveal_pending = false;
                     self.invalidate_wrap_layout();
+                } else {
+                    self.wrap_reveal_pending |= self.caret_visible_in_unwrapped_view();
+                    self.word_wrap = true;
+                    self.horizontal = 0.0;
                 }
             }
             Command::ToggleIgnoreUnimportant => {
@@ -8167,6 +8209,94 @@ mod tests {
 
         assert!(!view.wrap_active);
         assert!(view.horizontal > 0.0);
+        view.set_horizontal(500.0, 50.0, 1.0);
+        assert!((view.horizontal - 101.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn enabling_word_wrap_keeps_a_caret_visible_that_was_visible_before_toggle() {
+        use super::{Side, TextView};
+        use ca_ui::view::SessionView;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let left = dir.path().join("left.txt");
+        let right = dir.path().join("right.txt");
+        let text = format!("{}\n{}", "x".repeat(8_000), "tail\n".repeat(100));
+        std::fs::write(&left, &text).unwrap();
+        std::fs::write(&right, &text).unwrap();
+        let context = ca_ui::testing::context();
+        let mut view = TextView::new(left, right, &context, 1);
+        let ctx = egui::Context::default();
+        settle_frames(&mut view, &ctx);
+
+        #[allow(clippy::cast_precision_loss)]
+        let columns = view.wrap_columns.unwrap() as f32;
+        view.pane_mut(Side::Left)
+            .place(super::editor::Caret::new(0, 8_000), false);
+        view.set_horizontal(8_000.0 - columns / 2.0, columns, 1.0);
+        let caret_column = f64::from(super::editor::display_column(
+            &view.pane(Side::Left).line_text(0),
+            8_000,
+            view.pane(Side::Left).tabs(),
+        ));
+        assert!(caret_column >= f64::from(view.horizontal));
+        assert!(caret_column < f64::from(view.horizontal + columns));
+        view.follow_caret();
+
+        view.run(ca_ui::Command::ToggleWordWrap);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !view.wrap_active && Instant::now() < deadline {
+            view.tick();
+            clipboard_frame(&ctx, &mut view, Vec::new());
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(view.wrap_active);
+        let visual_line =
+            f64::from(u32::try_from(view.wrapped_caret_visual_line(Side::Left).unwrap()).unwrap());
+        let viewport = f64::from(view.body_rect().height() / view.row_pixels());
+        assert!(visual_line >= view.wrap_scroll.offset());
+        assert!(visual_line < view.wrap_scroll.offset() + viewport);
+    }
+
+    #[test]
+    fn enabling_word_wrap_preserves_scroll_when_the_caret_was_offscreen() {
+        use super::{Side, TextView};
+        use ca_ui::view::SessionView;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let left = dir.path().join("left.txt");
+        let right = dir.path().join("right.txt");
+        let text = format!("{}\n{}", "x".repeat(8_000), "tail\n".repeat(100));
+        std::fs::write(&left, &text).unwrap();
+        std::fs::write(&right, &text).unwrap();
+        let context = ca_ui::testing::context();
+        let mut view = TextView::new(left, right, &context, 1);
+        let ctx = egui::Context::default();
+        settle_frames(&mut view, &ctx);
+
+        view.pane_mut(Side::Left)
+            .place(super::editor::Caret::new(0, 0), false);
+        view.scroll.go_to(
+            60,
+            view.viewport_height,
+            view.row_height(),
+            view.visible.len(),
+        );
+        assert!(view.scroll.first_row() > 0);
+        view.run(ca_ui::Command::ToggleWordWrap);
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !view.wrap_active && Instant::now() < deadline {
+            view.tick();
+            clipboard_frame(&ctx, &mut view, Vec::new());
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(view.wrap_active);
+        let visual_line =
+            f64::from(u32::try_from(view.wrapped_caret_visual_line(Side::Left).unwrap()).unwrap());
+        assert!(view.wrap_scroll.offset() > visual_line);
     }
 
     #[test]
