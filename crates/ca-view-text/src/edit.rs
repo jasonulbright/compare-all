@@ -769,6 +769,7 @@ impl TextEditView {
                 gutter_width: gutter,
                 y,
                 row_height,
+                total_height: row_height,
                 char_width,
                 first_column: first_column_index,
                 columns,
@@ -782,6 +783,7 @@ impl TextEditView {
                     line: self.show_line_numbers.then_some(line),
                     text: entry.map(|entry| entry.text.as_str()),
                     metrics: entry.map(|entry| entry.metrics),
+                    visible_segments: 0..1,
                     syntax: entry.and_then(|entry| entry.spans.as_deref()),
                     spans: None,
                     background,
@@ -790,6 +792,8 @@ impl TextEditView {
                     whole_line_differs: false,
                     is_difference: false,
                     gap: false,
+                    wrap_ends: None,
+                    wrap_bytes: None,
                 },
                 palette,
                 &font,
@@ -807,6 +811,8 @@ impl TextEditView {
                     &font,
                     entry.map_or_else(lines::LineMetrics::default, |entry| entry.metrics),
                 ),
+                None,
+                0..1,
             );
             if self.bookmarks.marks(position) {
                 ca_ui::icons::Icon::Bookmark.paint_in_row(

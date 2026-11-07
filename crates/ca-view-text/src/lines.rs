@@ -132,6 +132,36 @@ pub fn column_of_byte(line: &str, byte: usize) -> u32 {
     u32::try_from(column).unwrap_or(u32::MAX)
 }
 
+/// Source byte offsets for increasing display-column boundaries.
+///
+/// A boundary inside a tab maps to the tab byte, so the next window can emit
+/// only the visible tail of that tab. The scan visits the source once.
+#[must_use]
+pub fn byte_offsets_at_columns(line: &str, columns: &[u32]) -> Vec<u32> {
+    let mut offsets = Vec::with_capacity(columns.len());
+    let mut byte = 0usize;
+    let mut column = 0usize;
+    for target in columns.iter().copied().map(|column| column as usize) {
+        while column < target && byte < line.len() {
+            let Some(character) = line.get(byte..).and_then(|tail| tail.chars().next()) else {
+                break;
+            };
+            let next_column = advance(column, character);
+            if next_column >= target {
+                if next_column == target {
+                    byte = byte.saturating_add(character.len_utf8());
+                    column = next_column;
+                }
+                break;
+            }
+            byte = byte.saturating_add(character.len_utf8());
+            column = next_column;
+        }
+        offsets.push(u32::try_from(byte).unwrap_or(u32::MAX));
+    }
+    offsets
+}
+
 /// The text covering `span` columns starting at `from`, with tabs already
 /// expanded so the caller can place it at a fixed column pitch.
 ///
@@ -172,6 +202,52 @@ pub fn window(line: &str, metrics: LineMetrics, from: usize, span: usize) -> Cow
     Cow::Owned(out)
 }
 
+/// A window whose source starts at a known byte offset near `from`.
+///
+/// `byte_start` must be the character at or before `from`, and
+/// `column_at_byte_start` gives its display column. A tab can cover `from`, so
+/// the function emits only the visible part of that tab. This avoids scanning
+/// the hidden prefix of a wrapped line for every visible segment.
+#[must_use]
+pub fn window_from_byte(
+    line: &str,
+    metrics: LineMetrics,
+    byte_start: usize,
+    column_at_byte_start: usize,
+    from: usize,
+    span: usize,
+) -> Cow<'_, str> {
+    if metrics.direct {
+        return window(line, metrics, from, span);
+    }
+    if span == 0 || from >= metrics.columns as usize {
+        return Cow::Borrowed("");
+    }
+    let Some(source) = line.get(byte_start.min(line.len())..) else {
+        return Cow::Borrowed("");
+    };
+    let end = from.saturating_add(span);
+    let mut out = String::with_capacity(span);
+    let mut column = column_at_byte_start;
+    for character in source.chars() {
+        if column >= end {
+            break;
+        }
+        let next = advance(column, character);
+        if next > from {
+            if character == '\t' {
+                for _ in column.max(from)..next.min(end) {
+                    out.push(' ');
+                }
+            } else if column >= from {
+                out.push(character);
+            }
+        }
+        column = next;
+    }
+    Cow::Owned(out)
+}
+
 /// The largest character boundary at or below `byte`.
 fn floor_boundary(line: &str, byte: usize) -> usize {
     let mut byte = byte.min(line.len());
@@ -184,7 +260,10 @@ fn floor_boundary(line: &str, byte: usize) -> usize {
 #[cfg(test)]
 #[allow(clippy::cast_possible_truncation)]
 mod tests {
-    use super::{column_of_byte, measure, window, Columns, LineMetrics, TAB_WIDTH};
+    use super::{
+        byte_offsets_at_columns, column_of_byte, measure, window, window_from_byte, Columns,
+        LineMetrics, TAB_WIDTH,
+    };
 
     #[test]
     fn a_plain_line_measures_as_its_bytes() {
@@ -231,6 +310,12 @@ mod tests {
     }
 
     #[test]
+    fn byte_offsets_at_columns_keep_a_tab_byte_for_split_tab_windows() {
+        let line = "a\t日本語x";
+        assert_eq!(byte_offsets_at_columns(line, &[4, 8, 10]), [1, 2, 8]);
+    }
+
+    #[test]
     fn a_window_takes_only_the_columns_asked_for() {
         let line = "abcdefghij";
         let metrics = measure(line);
@@ -258,6 +343,22 @@ mod tests {
         // The window opens inside the tab's run, so only its tail arrives.
         assert_eq!(window(line, metrics, 4, 4).as_ref(), "    ");
         assert_eq!(window(line, metrics, 8, 1).as_ref(), "b");
+    }
+
+    #[test]
+    fn a_window_from_a_known_byte_matches_tab_and_unicode_columns() {
+        let line = "a\t日本語x";
+        let metrics = measure(line);
+        let tab = 1;
+        assert_eq!(
+            window_from_byte(line, metrics, tab, 1, 4, 4),
+            window(line, metrics, 4, 4)
+        );
+        let after_tab = 2;
+        assert_eq!(
+            window_from_byte(line, metrics, after_tab, 8, 8, 3),
+            window(line, metrics, 8, 3)
+        );
     }
 
     #[test]

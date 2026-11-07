@@ -200,7 +200,7 @@ const TEXT_MENUS: &[(&str, &[Entry])] = &[
                 Command::CompareStructure,
                 "Choose two JSON files or two XML files",
             ),
-            Entry::Soon(Command::ToggleWordWrap),
+            Entry::Run(Command::ToggleWordWrap, "Text Compare is not ready"),
             Entry::Rule,
             Entry::Soon(Command::SideBySideLayout),
             Entry::Soon(Command::OverUnderLayout),
@@ -8173,6 +8173,51 @@ mod tests {
             .contains(&egui::ViewportCommand::Fullscreen(true)));
         assert!(!wants_fullscreen.get());
         assert!(!app.fullscreen_owned);
+    }
+
+    #[test]
+    fn text_compare_word_wrap_toggles_from_its_accessible_view_menu_label() {
+        use ca_ui::testing::probe::Probe;
+        use std::cell::RefCell;
+
+        let view_context = context();
+        let files = tempfile::tempdir().unwrap();
+        let left = files.path().join("left.txt");
+        let right = files.path().join("right.txt");
+        std::fs::write(&left, format!("{}\n", "left ".repeat(40))).unwrap();
+        std::fs::write(&right, format!("{}\n", "right ".repeat(40))).unwrap();
+
+        let (_settings, mut app) = empty_app();
+        assert!(ca_ui::testing::wait_until(
+            std::time::Duration::from_secs(10),
+            || {
+                app.poll_store();
+                app.store().borrow().is_ready()
+            }
+        ));
+        app.open_kind(&SessionKind::TextCompare, left, right, &view_context);
+        assert!(ca_ui::testing::wait_until(
+            std::time::Duration::from_secs(20),
+            || {
+                app.tabs[0].tick();
+                app.tabs[0].is_ready()
+            }
+        ));
+
+        let app = RefCell::new(app);
+        let mut probe = Probe::new(1280.0, 800.0);
+        let mut run = |ctx: &egui::Context| app.borrow_mut().frame(ctx);
+        probe.idle(&mut run);
+        probe.idle(&mut run);
+        probe.click("View", &mut run).unwrap();
+        let label = Command::ToggleWordWrap.label_in(MenuView::Text);
+        assert!(probe.find(label).unwrap().enabled);
+        assert_eq!(probe.find(label).unwrap().toggled, Some(false));
+        probe.click(label, &mut run).unwrap();
+        assert_eq!(
+            app.borrow().tabs[0].checked(Command::ToggleWordWrap),
+            Some(true)
+        );
     }
 
     #[test]
