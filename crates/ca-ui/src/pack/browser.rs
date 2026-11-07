@@ -116,6 +116,7 @@ pub struct PackBrowser {
     receiver: Option<Receiver<Message>>,
     cancel: Arc<AtomicBool>,
     page_request: Option<String>,
+    focus_close_requested: bool,
 }
 
 impl PackBrowser {
@@ -131,6 +132,7 @@ impl PackBrowser {
             receiver: None,
             cancel: Arc::new(AtomicBool::new(false)),
             page_request: None,
+            focus_close_requested: false,
         }
     }
 
@@ -151,6 +153,13 @@ impl PackBrowser {
         !matches!(self.state, State::Closed)
     }
 
+    #[cfg(test)]
+    /// Open with an empty list for dialog keyboard tests.
+    pub(crate) fn open_empty_for_test(&mut self) {
+        self.state = State::NoList;
+        self.focus_close_requested = true;
+    }
+
     /// The release page the person asked to open, once.
     pub fn take_page_request(&mut self) -> Option<String> {
         self.page_request.take()
@@ -163,6 +172,7 @@ impl PackBrowser {
         };
         self.close();
         self.cancel = Arc::new(AtomicBool::new(false));
+        self.focus_close_requested = true;
         let (sender, receiver) = channel();
         self.sender = Some(sender.clone());
         self.receiver = Some(receiver);
@@ -183,6 +193,7 @@ impl PackBrowser {
         self.state = State::Closed;
         self.sender = None;
         self.receiver = None;
+        self.focus_close_requested = false;
     }
 
     /// Take in what the workers reported.
@@ -259,6 +270,10 @@ impl PackBrowser {
         if !self.is_open() {
             return;
         }
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+            self.close();
+            return;
+        }
         let mut open = true;
         let mut close = false;
         egui::Window::new("Theme packs")
@@ -314,7 +329,12 @@ impl PackBrowser {
                     });
             }
         }
-        let close = ui.button(CLOSE_LABEL).clicked();
+        let close_button = ui.button(CLOSE_LABEL);
+        if self.focus_close_requested {
+            close_button.request_focus();
+            self.focus_close_requested = false;
+        }
+        let close = close_button.clicked();
         if want_page {
             self.page_request = self.services.as_ref().map(|s| s.locations.page.clone());
         }

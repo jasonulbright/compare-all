@@ -558,6 +558,9 @@ pub fn dialog_key_action_with_text_focus(
     ctx: &egui::Context,
     focused_text: Option<egui::Id>,
 ) -> Option<DialogKeyAction> {
+    if ctx.memory(egui::Memory::any_popup_open) {
+        return None;
+    }
     let focused = ctx.memory(egui::Memory::focused);
     let text_field_has_focus = focused_text.is_some_and(|id| focused == Some(id));
     ctx.input_mut(|input| {
@@ -946,6 +949,18 @@ mod tests {
             action = dialog_key_action(ctx);
         });
         assert_eq!(action, Some(DialogKeyAction::Cancel));
+    }
+
+    #[test]
+    fn dialog_keys_are_left_for_an_open_popup() {
+        let ctx = egui::Context::default();
+        ctx.memory_mut(|memory| memory.open_popup(egui::Id::new("dialog popup")));
+        let mut action = None;
+        let _ = ctx.run(key_input(egui::Key::Escape), |ctx| {
+            action = dialog_key_action(ctx);
+        });
+        assert_eq!(action, None);
+        assert!(ctx.input(|input| input.key_pressed(egui::Key::Escape)));
     }
 
     #[test]

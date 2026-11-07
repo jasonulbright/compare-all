@@ -36,7 +36,7 @@ pub struct WorkspaceManager {
     confirming: Option<String>,
     open: bool,
     focus_requested: Option<WorkspaceFocus>,
-    accept_focused_text: Option<egui::Id>,
+    accept_focused_text: Option<(WorkspaceFocus, egui::Id)>,
     id: egui::Id,
 }
 
@@ -45,6 +45,11 @@ enum WorkspaceFocus {
     Name,
     Rename,
     Keep,
+}
+
+enum KeyHandling {
+    Continue,
+    Return(Option<WorkspaceAction>),
 }
 
 impl WorkspaceManager {
@@ -80,6 +85,57 @@ impl WorkspaceManager {
     /// Close the dialog.
     pub fn close(&mut self) {
         self.open = false;
+    }
+
+    fn clear_focus_request(&mut self, target: WorkspaceFocus) {
+        if self.focus_requested == Some(target) {
+            self.focus_requested = None;
+        }
+    }
+
+    fn handle_key(
+        &mut self,
+        action: crate::widgets::DialogKeyAction,
+        focused: Option<egui::Id>,
+    ) -> KeyHandling {
+        match action {
+            crate::widgets::DialogKeyAction::Cancel => {
+                if self.confirming.take().is_some() {
+                    self.clear_focus_request(WorkspaceFocus::Keep);
+                    self.accept_focused_text = None;
+                } else if self.renaming.take().is_some() {
+                    self.clear_focus_request(WorkspaceFocus::Rename);
+                    self.accept_focused_text = None;
+                } else {
+                    self.close();
+                }
+                KeyHandling::Return(None)
+            }
+            crate::widgets::DialogKeyAction::Accept => {
+                if self.confirming.take().is_some() {
+                    // Keep is the focused safe default when the delete
+                    // question opens, so Enter dismisses the question.
+                    self.clear_focus_request(WorkspaceFocus::Keep);
+                    self.accept_focused_text = None;
+                    return KeyHandling::Return(None);
+                }
+                if self.accept_focused_text.is_some_and(|(target, id)| {
+                    target == WorkspaceFocus::Rename && focused == Some(id)
+                }) {
+                    if let Some((from, to)) = self.renaming.take() {
+                        self.clear_focus_request(WorkspaceFocus::Rename);
+                        self.accept_focused_text = None;
+                        return KeyHandling::Return(Some(WorkspaceAction::Rename { from, to }));
+                    }
+                }
+                let name = self.name.trim();
+                if name.is_empty() {
+                    KeyHandling::Continue
+                } else {
+                    KeyHandling::Return(Some(WorkspaceAction::Save(name.to_owned())))
+                }
+            }
+        }
     }
 
     /// The workspace the list has selected.
@@ -126,45 +182,15 @@ impl WorkspaceManager {
     /// Draw the dialog into a panel, for a headless frame.
     #[allow(clippy::too_many_lines)]
     pub fn body(&mut self, ui: &mut egui::Ui, store: &SessionStore) -> Option<WorkspaceAction> {
-        match crate::widgets::dialog_key_action_with_text_focus(ui.ctx(), self.accept_focused_text)
+        let focused_text = self.accept_focused_text.map(|(_, id)| id);
+        let focused = ui.ctx().memory(egui::Memory::focused);
+        if let Some(action) =
+            crate::widgets::dialog_key_action_with_text_focus(ui.ctx(), focused_text)
         {
-            Some(crate::widgets::DialogKeyAction::Cancel) => {
-                if self.confirming.take().is_some() {
-                    if self.focus_requested == Some(WorkspaceFocus::Keep) {
-                        self.focus_requested = None;
-                    }
-                } else if self.renaming.take().is_some() {
-                    if self.focus_requested == Some(WorkspaceFocus::Rename) {
-                        self.focus_requested = None;
-                    }
-                    self.accept_focused_text = None;
-                } else {
-                    self.close();
-                }
-                return None;
+            match self.handle_key(action, focused) {
+                KeyHandling::Continue => {}
+                KeyHandling::Return(action) => return action,
             }
-            Some(crate::widgets::DialogKeyAction::Accept) => {
-                if self.confirming.take().is_some() {
-                    // Keep is the focused safe default when the delete
-                    // question opens, so Enter dismisses the question.
-                    if self.focus_requested == Some(WorkspaceFocus::Keep) {
-                        self.focus_requested = None;
-                    }
-                    return None;
-                }
-                if let Some((from, to)) = self.renaming.take() {
-                    if self.focus_requested == Some(WorkspaceFocus::Rename) {
-                        self.focus_requested = None;
-                    }
-                    self.accept_focused_text = None;
-                    return Some(WorkspaceAction::Rename { from, to });
-                }
-                let name = self.name.trim();
-                if !name.is_empty() {
-                    return Some(WorkspaceAction::Save(name.to_owned()));
-                }
-            }
-            None => {}
         }
         let mut action = None;
         if let Some(name) = self.confirming.clone() {
@@ -174,20 +200,16 @@ impl WorkspaceManager {
                 let (delete, keep) = crate::widgets::dialog_button_pair(ui, "Delete", "Keep");
                 if self.focus_requested == Some(WorkspaceFocus::Keep) {
                     keep.request_focus();
-                    self.focus_requested = None;
+                    self.clear_focus_request(WorkspaceFocus::Keep);
                 }
                 if delete.clicked() {
                     action = Some(WorkspaceAction::Delete(name.clone()));
                     self.confirming = None;
-                    if self.focus_requested == Some(WorkspaceFocus::Keep) {
-                        self.focus_requested = None;
-                    }
+                    self.clear_focus_request(WorkspaceFocus::Keep);
                 }
                 if keep.clicked() {
                     self.confirming = None;
-                    if self.focus_requested == Some(WorkspaceFocus::Keep) {
-                        self.focus_requested = None;
-                    }
+                    self.clear_focus_request(WorkspaceFocus::Keep);
                 }
             });
             ui.separator();
@@ -228,6 +250,7 @@ impl WorkspaceManager {
                         if ui.small_button("Delete").clicked() {
                             self.confirming = Some(workspace.name.clone());
                             self.focus_requested = Some(WorkspaceFocus::Keep);
+                            self.accept_focused_text = None;
                         }
                     });
                 }
@@ -238,6 +261,7 @@ impl WorkspaceManager {
         if let Some((from, to)) = self.renaming.as_mut() {
             ui.separator();
             let from = from.clone();
+            let mut clear_rename_focus_request = false;
             ui.horizontal_wrapped(|ui| {
                 crate::widgets::sized(ui, TOKENS.forms.dialog_label_width, |ui| {
                     ui.label("New name");
@@ -249,10 +273,10 @@ impl WorkspaceManager {
                     );
                     if self.focus_requested == Some(WorkspaceFocus::Rename) {
                         response.request_focus();
-                        self.accept_focused_text = Some(response.id);
-                        self.focus_requested = None;
+                        self.accept_focused_text = Some((WorkspaceFocus::Rename, response.id));
+                        clear_rename_focus_request = true;
                     } else if response.has_focus() || response.clicked() {
-                        self.accept_focused_text = Some(response.id);
+                        self.accept_focused_text = Some((WorkspaceFocus::Rename, response.id));
                     }
                 });
                 if ui.button("Rename").clicked() {
@@ -262,11 +286,12 @@ impl WorkspaceManager {
                     });
                 }
             });
+            if clear_rename_focus_request {
+                self.clear_focus_request(WorkspaceFocus::Rename);
+            }
             if action.is_some() || ui.button("Cancel rename").clicked() {
                 self.renaming = None;
-                if self.focus_requested == Some(WorkspaceFocus::Rename) {
-                    self.focus_requested = None;
-                }
+                self.clear_focus_request(WorkspaceFocus::Rename);
                 self.accept_focused_text = None;
             }
         }
@@ -282,10 +307,10 @@ impl WorkspaceManager {
                 );
                 if self.focus_requested == Some(WorkspaceFocus::Name) {
                     response.request_focus();
-                    self.accept_focused_text = Some(response.id);
-                    self.focus_requested = None;
+                    self.accept_focused_text = Some((WorkspaceFocus::Name, response.id));
+                    self.clear_focus_request(WorkspaceFocus::Name);
                 } else if response.has_focus() || response.clicked() {
-                    self.accept_focused_text = Some(response.id);
+                    self.accept_focused_text = Some((WorkspaceFocus::Name, response.id));
                 }
             });
             let named = !self.name.trim().is_empty();
@@ -340,7 +365,7 @@ pub fn one_window(name: impl Into<String>, tabs: Vec<WorkspaceTab>, active: usiz
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
-    use super::{one_window, tab_count, WorkspaceManager};
+    use super::{one_window, tab_count, WorkspaceFocus, WorkspaceManager};
     use ca_session::{SavedSession, SessionId, SessionKind, SessionStore, WorkspaceTab};
 
     fn key_input(key: egui::Key) -> egui::RawInput {
@@ -431,6 +456,37 @@ mod tests {
     }
 
     #[test]
+    fn canceling_a_delete_question_clears_the_previous_text_target() {
+        let mut manager = WorkspaceManager::with_name(1, "Daily");
+        manager.renaming = Some(("Old".to_owned(), "New".to_owned()));
+        manager.confirming = Some("Old".to_owned());
+        manager.focus_requested = Some(WorkspaceFocus::Keep);
+        manager.accept_focused_text = Some((WorkspaceFocus::Rename, egui::Id::new("rename")));
+        let store = SessionStore::default();
+        let ctx = egui::Context::default();
+        let mut action = None;
+
+        let _ = ctx.run(key_input(egui::Key::Escape), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                action = manager.body(ui, &store);
+            });
+        });
+        assert_eq!(action, None);
+        assert!(manager.renaming.is_some());
+        assert!(manager.accept_focused_text.is_none());
+
+        let _ = ctx.run(key_input(egui::Key::Enter), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                action = manager.body(ui, &store);
+            });
+        });
+        assert_eq!(
+            action,
+            Some(super::WorkspaceAction::Save("Daily".to_owned()))
+        );
+    }
+
+    #[test]
     fn enter_saves_a_named_workspace_when_no_question_is_open() {
         let mut manager = WorkspaceManager::with_name(1, "Daily");
         let store = SessionStore::default();
@@ -467,5 +523,93 @@ mod tests {
             action,
             Some(super::WorkspaceAction::Save("Daily".to_owned()))
         );
+    }
+
+    #[test]
+    fn enter_saves_the_name_field_while_a_rename_row_is_open() {
+        let mut manager = WorkspaceManager::with_name(1, "Daily");
+        manager.renaming = Some(("Old".to_owned(), "New".to_owned()));
+        manager.focus_requested = Some(WorkspaceFocus::Name);
+        let store = SessionStore::default();
+        let ctx = egui::Context::default();
+        let _ = ctx.run(crate::testing::sized_input(800.0, 600.0), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = manager.body(ui, &store);
+            });
+        });
+        assert!(matches!(
+            manager.accept_focused_text,
+            Some((WorkspaceFocus::Name, _))
+        ));
+        let mut action = None;
+
+        let _ = ctx.run(key_input(egui::Key::Enter), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                action = manager.body(ui, &store);
+            });
+        });
+
+        assert_eq!(
+            action,
+            Some(super::WorkspaceAction::Save("Daily".to_owned()))
+        );
+        assert!(manager.renaming.is_some());
+    }
+
+    #[test]
+    fn enter_renames_when_the_rename_field_owns_focus() {
+        let mut manager = WorkspaceManager::with_name(1, "Daily");
+        manager.renaming = Some(("Old".to_owned(), "New".to_owned()));
+        manager.focus_requested = Some(WorkspaceFocus::Rename);
+        let store = SessionStore::default();
+        let ctx = egui::Context::default();
+        let _ = ctx.run(crate::testing::sized_input(800.0, 600.0), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = manager.body(ui, &store);
+            });
+        });
+        assert!(matches!(
+            manager.accept_focused_text,
+            Some((WorkspaceFocus::Rename, _))
+        ));
+        let mut action = None;
+
+        let _ = ctx.run(key_input(egui::Key::Enter), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                action = manager.body(ui, &store);
+            });
+        });
+
+        assert_eq!(
+            action,
+            Some(super::WorkspaceAction::Rename {
+                from: "Old".to_owned(),
+                to: "New".to_owned(),
+            })
+        );
+        assert!(manager.renaming.is_none());
+    }
+
+    #[test]
+    fn enter_without_text_focus_does_not_rename_from_a_stale_target() {
+        let mut manager = WorkspaceManager::with_name(1, "Daily");
+        manager.renaming = Some(("Old".to_owned(), "New".to_owned()));
+        manager.accept_focused_text =
+            Some((WorkspaceFocus::Rename, egui::Id::new("stale rename target")));
+        let store = SessionStore::default();
+        let ctx = egui::Context::default();
+        let mut action = None;
+
+        let _ = ctx.run(key_input(egui::Key::Enter), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                action = manager.body(ui, &store);
+            });
+        });
+
+        assert_eq!(
+            action,
+            Some(super::WorkspaceAction::Save("Daily".to_owned()))
+        );
+        assert!(manager.renaming.is_some());
     }
 }

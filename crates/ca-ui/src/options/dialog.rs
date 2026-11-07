@@ -428,7 +428,7 @@ impl OptionsDialog {
 
     /// Draw the dialog into a panel rather than a window, for a headless frame.
     pub fn body(&mut self, ui: &mut egui::Ui, palette: &Palette) -> Option<OptionsOutcome> {
-        if !self.capturing {
+        if !self.capturing && !self.browser.is_open() {
             match crate::widgets::dialog_key_action(ui.ctx()) {
                 Some(crate::widgets::DialogKeyAction::Accept) => return Some(self.accept()),
                 Some(crate::widgets::DialogKeyAction::Cancel) => return Some(self.cancel()),
@@ -1278,6 +1278,36 @@ mod tests {
         });
         assert!(outcome.is_some_and(|outcome| outcome.closed));
         assert!(!dialog.is_open());
+    }
+
+    #[test]
+    fn escape_closes_the_pack_browser_before_options() {
+        let mut dialog = dialog();
+        dialog.browser.open_empty_for_test();
+        let ctx = egui::Context::default();
+        let _ = ctx.run(crate::testing::sized_input(800.0, 600.0), |ctx| {
+            let _ = dialog.show(ctx, &crate::theme::LIGHT);
+        });
+        let _ = ctx.run(key_input(egui::Key::Escape), |ctx| {
+            let _ = dialog.show(ctx, &crate::theme::LIGHT);
+        });
+        assert!(dialog.is_open());
+        assert!(!dialog.browser.is_open());
+    }
+
+    #[test]
+    fn enter_activates_the_browser_close_action_without_accepting_options() {
+        let mut dialog = dialog();
+        dialog.browser.open_empty_for_test();
+        let ctx = egui::Context::default();
+        let _ = ctx.run(crate::testing::sized_input(800.0, 600.0), |ctx| {
+            let _ = dialog.show(ctx, &crate::theme::LIGHT);
+        });
+        let _ = ctx.run(key_input(egui::Key::Enter), |ctx| {
+            let _ = dialog.show(ctx, &crate::theme::LIGHT);
+        });
+        assert!(dialog.is_open());
+        assert!(!dialog.browser.is_open());
     }
 
     #[test]
