@@ -43,6 +43,7 @@ pub struct OptionsDialog {
     policies: AdminPolicies,
     active: usize,
     open: bool,
+    focus_accept_requested: bool,
     id: egui::Id,
     color_group: ColorGroup,
     color_variant: Variant,
@@ -68,6 +69,7 @@ impl OptionsDialog {
             policies,
             active: 0,
             open: true,
+            focus_accept_requested: true,
             id: egui::Id::new(("program-options", instance)),
             color_group: ColorGroup::Text,
             color_variant: Variant::Dark,
@@ -426,6 +428,13 @@ impl OptionsDialog {
 
     /// Draw the dialog into a panel rather than a window, for a headless frame.
     pub fn body(&mut self, ui: &mut egui::Ui, palette: &Palette) -> Option<OptionsOutcome> {
+        if !self.capturing && !self.browser.is_open() {
+            match crate::widgets::dialog_key_action(ui.ctx()) {
+                Some(crate::widgets::DialogKeyAction::Accept) => return Some(self.accept()),
+                Some(crate::widgets::DialogKeyAction::Cancel) => return Some(self.cancel()),
+                None => {}
+            }
+        }
         self.page_strip(ui);
         ui.separator();
         let page = schema::PAGES.get(self.active).copied();
@@ -568,7 +577,7 @@ impl OptionsDialog {
         let blocked = field.blocked_by(self.policies);
         let stated = field.read(&ProgramOptions::default()) != value;
         ui.horizontal_wrapped(|ui| {
-            let label_width = TOKENS.forms.options_label_width.min(
+            let label_width = TOKENS.forms.dialog_label_width.min(
                 (ui.available_width() - TOKENS.forms.options_control_width)
                     .max(TOKENS.forms.minimum_label_width),
             );
@@ -643,7 +652,7 @@ impl OptionsDialog {
             }
             let mut color = self.color(group, variant, slot.name);
             ui.horizontal_wrapped(|ui| {
-                let label_width = TOKENS.forms.options_label_width.min(
+                let label_width = TOKENS.forms.dialog_label_width.min(
                     (ui.available_width() - TOKENS.forms.options_control_width)
                         .max(TOKENS.forms.minimum_label_width),
                 );
@@ -710,7 +719,7 @@ impl OptionsDialog {
         let mut reset: Option<Command> = None;
         for command in listed {
             ui.horizontal_wrapped(|ui| {
-                let label_width = TOKENS.forms.options_label_width.min(
+                let label_width = TOKENS.forms.dialog_label_width.min(
                     (ui.available_width() - TOKENS.forms.options_control_width)
                         .max(TOKENS.forms.minimum_label_width),
                 );
@@ -885,7 +894,7 @@ impl OptionsDialog {
         }
         let mut arguments = entry.arguments.join("\n");
         ui.horizontal_wrapped(|ui| {
-            crate::widgets::sized(ui, TOKENS.forms.options_label_width, |ui| {
+            crate::widgets::sized(ui, TOKENS.forms.dialog_label_width, |ui| {
                 ui.add(egui::Label::new("Arguments, one per line").truncate())
                     .on_hover_text("Variables: %f %l %n %p %x %b %F %P, with 1 or 2 for the side");
             });
@@ -909,7 +918,7 @@ impl OptionsDialog {
         });
         text_row(ui, "Shortcut", &mut entry.shortcut);
         ui.horizontal_wrapped(|ui| {
-            crate::widgets::sized(ui, TOKENS.forms.options_label_width, |ui| {
+            crate::widgets::sized(ui, TOKENS.forms.dialog_label_width, |ui| {
                 ui.add(egui::Label::new("Working folder").truncate());
             });
             let mut chosen = entry.working_folder.id().to_owned();
@@ -958,14 +967,22 @@ impl OptionsDialog {
 
     fn footer(&mut self, ui: &mut egui::Ui) -> Option<OptionsOutcome> {
         let mut outcome = None;
+        let focus_accept = std::mem::take(&mut self.focus_accept_requested);
         ui.horizontal_wrapped(|ui| {
-            if ui.button("OK").clicked() {
+            if !crate::widgets::affirmative_button_first() && ui.button("Apply").clicked() {
+                outcome = Some(self.apply());
+            }
+            let (ok, cancel) = crate::widgets::dialog_button_pair(ui, "OK", "Cancel");
+            if focus_accept {
+                ok.request_focus();
+            }
+            if ok.clicked() {
                 outcome = Some(self.accept());
             }
-            if ui.button("Cancel").clicked() {
+            if cancel.clicked() {
                 outcome = Some(self.cancel());
             }
-            if ui.button("Apply").clicked() {
+            if crate::widgets::affirmative_button_first() && ui.button("Apply").clicked() {
                 outcome = Some(self.apply());
             }
         });
@@ -997,7 +1014,7 @@ fn pressed(ctx: &egui::Context) -> Option<Keystroke> {
 fn text_row(ui: &mut egui::Ui, label: &str, value: &mut String) -> bool {
     let mut changed = false;
     ui.horizontal_wrapped(|ui| {
-        crate::widgets::sized(ui, TOKENS.forms.options_label_width, |ui| {
+        crate::widgets::sized(ui, TOKENS.forms.dialog_label_width, |ui| {
             ui.add(egui::Label::new(label).truncate());
         });
         crate::widgets::sized(ui, TOKENS.forms.options_control_width, |ui| {
@@ -1015,7 +1032,7 @@ fn text_row(ui: &mut egui::Ui, label: &str, value: &mut String) -> bool {
 /// One labeled check box.
 fn flag_row(ui: &mut egui::Ui, label: &str, value: &mut bool) {
     ui.horizontal_wrapped(|ui| {
-        crate::widgets::sized(ui, TOKENS.forms.options_label_width, |ui| {
+        crate::widgets::sized(ui, TOKENS.forms.dialog_label_width, |ui| {
             ui.add(egui::Label::new(label).truncate());
         });
         ui.checkbox(value, "");
@@ -1233,6 +1250,97 @@ mod tests {
 
     fn dialog() -> OptionsDialog {
         OptionsDialog::new(&ProgramOptions::default(), AdminPolicies::default(), 1)
+    }
+
+    fn key_input(key: egui::Key) -> egui::RawInput {
+        crate::testing::event_input(
+            800.0,
+            600.0,
+            vec![egui::Event::Key {
+                key,
+                physical_key: Some(key),
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        )
+    }
+
+    #[test]
+    fn escape_cancels_options_from_the_dialog_body() {
+        let mut dialog = dialog();
+        let ctx = egui::Context::default();
+        let mut outcome = None;
+        let _ = ctx.run(key_input(egui::Key::Escape), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                outcome = dialog.body(ui, &crate::theme::LIGHT);
+            });
+        });
+        assert!(outcome.is_some_and(|outcome| outcome.closed));
+        assert!(!dialog.is_open());
+    }
+
+    #[test]
+    fn escape_closes_the_pack_browser_before_options() {
+        let mut dialog = dialog();
+        dialog.browser.open_empty_for_test();
+        let ctx = egui::Context::default();
+        let _ = ctx.run(crate::testing::sized_input(800.0, 600.0), |ctx| {
+            let _ = dialog.show(ctx, &crate::theme::LIGHT);
+        });
+        let _ = ctx.run(key_input(egui::Key::Escape), |ctx| {
+            let _ = dialog.show(ctx, &crate::theme::LIGHT);
+        });
+        assert!(dialog.is_open());
+        assert!(!dialog.browser.is_open());
+    }
+
+    #[test]
+    fn enter_activates_the_browser_close_action_without_accepting_options() {
+        let mut dialog = dialog();
+        dialog.browser.open_empty_for_test();
+        let ctx = egui::Context::default();
+        let _ = ctx.run(crate::testing::sized_input(800.0, 600.0), |ctx| {
+            let _ = dialog.show(ctx, &crate::theme::LIGHT);
+        });
+        let _ = ctx.run(key_input(egui::Key::Enter), |ctx| {
+            let _ = dialog.show(ctx, &crate::theme::LIGHT);
+        });
+        assert!(dialog.is_open());
+        assert!(!dialog.browser.is_open());
+    }
+
+    #[test]
+    fn enter_accepts_options_from_the_dialog_body() {
+        let mut dialog = dialog();
+        let ctx = egui::Context::default();
+        let mut outcome = None;
+        let _ = ctx.run(key_input(egui::Key::Enter), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                outcome = dialog.body(ui, &crate::theme::LIGHT);
+            });
+        });
+        assert!(outcome.is_some_and(|outcome| outcome.closed));
+        assert!(!dialog.is_open());
+    }
+
+    #[test]
+    fn enter_activates_the_focused_ok_button_after_the_dialog_opens() {
+        let mut dialog = dialog();
+        let ctx = egui::Context::default();
+        let _ = ctx.run(crate::testing::sized_input(800.0, 600.0), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = dialog.body(ui, &crate::theme::LIGHT);
+            });
+        });
+        let mut outcome = None;
+        let _ = ctx.run(key_input(egui::Key::Enter), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                outcome = dialog.body(ui, &crate::theme::LIGHT);
+            });
+        });
+        assert!(outcome.is_some_and(|outcome| outcome.closed));
+        assert!(!dialog.is_open());
     }
 
     #[test]

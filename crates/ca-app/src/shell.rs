@@ -1035,6 +1035,8 @@ pub struct App {
     startup_wait_since: Option<std::time::Instant>,
     /// True while the question raised before several tabs are closed is open.
     exit_question: bool,
+    /// Focus the safe action when the tab-close question opens.
+    exit_question_focus_requested: bool,
     /// The workspace a load waits to open while a tab asks about edits that
     /// are not written, or while the work of a tab runs. The load runs again
     /// once a tab closes after its answer, or once that work ends, and is
@@ -1241,6 +1243,7 @@ impl App {
             startup_wait_reported: false,
             startup_wait_since: None,
             exit_question: false,
+            exit_question_focus_requested: false,
             pending_workspace: None,
             pending_busy_tab: None,
             workspace_notice: None,
@@ -1855,6 +1858,7 @@ impl App {
         self.session_save = None;
         self.active = 0;
         self.exit_question = false;
+        self.exit_question_focus_requested = false;
         self.closing = true;
     }
 
@@ -1909,6 +1913,7 @@ impl App {
         }
         if self.tabs.len() > 1 && self.resolved.stored.tabs.confirm_closing_several_tabs {
             self.exit_question = true;
+            self.exit_question_focus_requested = true;
         } else {
             self.try_leave();
         }
@@ -1926,6 +1931,7 @@ impl App {
             return;
         }
         self.exit_question = false;
+        self.exit_question_focus_requested = false;
         if leave {
             self.try_leave();
         } else {
@@ -3681,7 +3687,34 @@ impl App {
         }
     }
 
+    fn has_open_embedded_dialog(&self, fullscreen: bool) -> bool {
+        (self
+            .options_dialog
+            .as_ref()
+            .is_some_and(OptionsDialog::is_open)
+            && self.options_window.last_frame_was_embedded())
+            || (!fullscreen
+                && ((self.settings.as_ref().is_some_and(SettingsDialog::is_open)
+                    && self.settings_window.last_frame_was_embedded())
+                    || (self
+                        .workspaces
+                        .as_ref()
+                        .is_some_and(WorkspaceManager::is_open)
+                        && self.workspaces_window.last_frame_was_embedded())
+                    || (self
+                        .profiles
+                        .as_ref()
+                        .is_some_and(crate::profiles::ProfileManager::is_open)
+                        && self.profiles_window.last_frame_was_embedded())))
+    }
+
     fn keyboard(&mut self, ctx: &egui::Context, context: &ViewContext) {
+        if self.exit_question {
+            if ca_ui::widgets::dialog_key_action(ctx).is_some() {
+                self.answer_exit(false);
+            }
+            return;
+        }
         let strokes = ctx.input(|input| Keystroke::pressed_in(&input.events));
         let view = self.menu_view();
         let table = self.resolved.shortcuts.clone();
@@ -3692,6 +3725,12 @@ impl App {
                 .tabs
                 .get(self.active)
                 .is_some_and(|tab| tab.wants_fullscreen());
+            if self.has_open_embedded_dialog(fullscreen)
+                && stroke == Keystroke::plain(egui::Key::Escape)
+            {
+                ran.push(index);
+                continue;
+            }
             if stroke == Keystroke::plain(egui::Key::Escape) && fullscreen {
                 if let Some(tab) = self.tabs.get_mut(self.active) {
                     tab.set_fullscreen(false);
@@ -3699,6 +3738,9 @@ impl App {
                 if self.fullscreen_owned {
                     self.request_fullscreen(ctx, false);
                 }
+                ctx.input_mut(|input| {
+                    input.consume_key(egui::Modifiers::NONE, egui::Key::Escape);
+                });
                 ran.push(index);
                 continue;
             }
@@ -4285,6 +4327,10 @@ impl App {
         if !self.exit_question {
             return;
         }
+        if ca_ui::widgets::dialog_key_action(ctx).is_some() {
+            self.answer_exit(false);
+            return;
+        }
         let mut answer = None;
         egui::Window::new("Close every tab?")
             .collapsible(false)
@@ -4298,10 +4344,16 @@ impl App {
                     &format!("{} tabs are open.", self.tabs.len()),
                 );
                 ui.horizontal(|ui| {
-                    if ui.button("Close them").clicked() {
+                    let (close, keep) =
+                        widgets::dialog_button_pair(ui, "Close them", "Keep them open");
+                    if self.exit_question_focus_requested {
+                        keep.request_focus();
+                        self.exit_question_focus_requested = false;
+                    }
+                    if close.clicked() {
                         answer = Some(true);
                     }
-                    if ui.button("Keep them open").clicked() {
+                    if keep.clicked() {
                         answer = Some(false);
                     }
                 });
@@ -5679,6 +5731,73 @@ mod tests {
             window,
             &egui::ViewportCommand::Close
         ));
+    }
+
+    #[test]
+    fn escape_cancels_embedded_options_without_closing_the_active_tab() {
+        let (_settings, mut app) = empty_app();
+        let view_context = context();
+        let ctx = egui::Context::default();
+        frames_until(&mut app, |app| app.options.is_ready());
+        app.open_home(&view_context);
+        app.run(Command::Options, &view_context);
+
+        let _ = ctx.run(raw_input(), |ctx| app.frame(ctx));
+        assert!(app.options_dialog.is_some());
+
+        let input = ca_ui::testing::event_input(
+            1_280.0,
+            800.0,
+            vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        let _ = ctx.run(input, |ctx| app.frame(ctx));
+
+        assert_eq!(app.tab_count(), 1, "Escape must leave the active tab open");
+        assert!(
+            app.options_dialog.is_none(),
+            "Escape must cancel the dialog"
+        );
+    }
+
+    #[test]
+    fn escape_in_the_main_window_still_closes_a_tab_behind_native_options() {
+        let (_settings, mut app) = empty_app();
+        let view_context = context();
+        let ctx = egui::Context::default();
+        let _close = native_backend(&ctx);
+        frames_until(&mut app, |app| app.options.is_ready());
+        app.open_home(&view_context);
+        app.run(Command::Options, &view_context);
+
+        let _ = ctx.run(raw_input(), |ctx| app.frame(ctx));
+        assert!(app.options_dialog.is_some());
+        assert!(!app.options_window.last_frame_was_embedded());
+
+        let input = ca_ui::testing::event_input(
+            1_280.0,
+            800.0,
+            vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        let _ = ctx.run(input, |ctx| app.frame(ctx));
+
+        assert_eq!(
+            app.tab_count(),
+            0,
+            "the main window keeps its Escape action"
+        );
+        assert!(app.options_dialog.is_some(), "the native dialog stays open");
     }
 
     #[test]
@@ -7908,6 +8027,82 @@ mod tests {
         assert_eq!(specs.0, Some(left_folder));
         assert_eq!(specs.1, Some(right_folder));
         assert!(!app.accepts(Command::CompareParentFolders));
+    }
+
+    #[test]
+    fn escape_exits_fullscreen_before_a_hidden_embedded_dialog_handles_it(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let view_context = context();
+        let files = tempfile::tempdir()?;
+        let left_folder = files.path().join("left");
+        let right_folder = files.path().join("right");
+        std::fs::create_dir(&left_folder)?;
+        std::fs::create_dir(&right_folder)?;
+        let left = left_folder.join("left.png");
+        let right = right_folder.join("right.png");
+        let image = include_bytes!("../../../assets/packs/bold-outline/icons/16/bookmark.png");
+        std::fs::write(&left, image)?;
+        std::fs::write(&right, image)?;
+
+        let (_settings, mut app) = empty_app();
+        assert!(ca_ui::testing::wait_until(
+            std::time::Duration::from_secs(10),
+            || {
+                app.poll_store();
+                app.store().borrow().is_ready()
+            }
+        ));
+        app.open_kind(&SessionKind::PictureCompare, left, right, &view_context);
+        assert!(ca_ui::testing::wait_until(
+            std::time::Duration::from_secs(20),
+            || {
+                app.tabs[0].tick();
+                app.tabs[0].is_ready()
+            }
+        ));
+        app.run(Command::SessionSettings, &view_context);
+
+        let ctx = egui::Context::default();
+        let _ = ctx.run(raw_input(), |ctx| app.frame(ctx));
+        assert!(app.settings.is_some());
+        assert!(app.settings_window.last_frame_was_embedded());
+
+        let input = |key, fullscreen| {
+            let mut input = ca_ui::testing::event_input(
+                1_280.0,
+                800.0,
+                vec![egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+            input
+                .viewports
+                .entry(egui::ViewportId::ROOT)
+                .or_default()
+                .fullscreen = Some(fullscreen);
+            input
+        };
+
+        let output = ctx.run(input(egui::Key::F11, false), |ctx| {
+            app.keyboard(ctx, &view_context);
+        });
+        assert!(output.viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .contains(&egui::ViewportCommand::Fullscreen(true)));
+
+        let output = ctx.run(input(egui::Key::Escape, true), |ctx| {
+            app.keyboard(ctx, &view_context);
+        });
+        assert!(output.viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .contains(&egui::ViewportCommand::Fullscreen(false)));
+        assert_eq!(app.tab_count(), 1);
+        assert!(app.settings.is_some());
+        Ok(())
     }
 
     #[test]

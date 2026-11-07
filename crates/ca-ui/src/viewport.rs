@@ -47,6 +47,7 @@ pub struct NativeWindow {
     size: [f32; 2],
     min_size: [f32; 2],
     focus_requested: bool,
+    last_frame_native: Option<bool>,
 }
 
 impl NativeWindow {
@@ -67,6 +68,7 @@ impl NativeWindow {
             size,
             min_size,
             focus_requested: false,
+            last_frame_native: None,
         }
     }
 
@@ -74,6 +76,12 @@ impl NativeWindow {
     #[must_use]
     pub fn id(&self) -> ViewportId {
         self.id
+    }
+
+    /// Whether the last shown frame used a native window rather than the root window.
+    #[must_use]
+    pub fn last_frame_was_embedded(&self) -> bool {
+        self.last_frame_native == Some(false)
     }
 
     /// Bring the window to the front on the next frame, as when the command
@@ -90,7 +98,7 @@ impl NativeWindow {
             .with_inner_size(self.size)
             .with_min_inner_size(self.min_size);
         let focus_requested = std::mem::take(&mut self.focus_requested);
-        ctx.show_viewport_immediate(self.id, builder, |viewport, class| {
+        let frame = ctx.show_viewport_immediate(self.id, builder, |viewport, class| {
             if class == ViewportClass::Embedded {
                 return Frame {
                     produced: draw(Host::Embedded(viewport)),
@@ -111,7 +119,9 @@ impl NativeWindow {
                 close_requested,
                 native: true,
             }
-        })
+        });
+        self.last_frame_native = Some(frame.native);
+        frame
     }
 
     /// Close the native window now, without waiting for the frame that no
