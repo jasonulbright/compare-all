@@ -5000,13 +5000,14 @@ impl TextView {
         ))
     }
 
-    /// One key press. Returns true when it changed the text.
+    /// Move one wrapped step and report whether the caret moved.
     #[allow(clippy::too_many_lines)]
-    fn move_wrapped_caret(&mut self, direction: i8, is_page_move: bool, extend: bool) {
+    fn move_wrapped_caret(&mut self, direction: i8, is_page_move: bool, extend: bool) -> bool {
         if !self.wrap_active || !self.rows_current() {
-            return;
+            return false;
         }
         let side = self.active;
+        let before = self.pane(side).caret();
         let (target, goal) = {
             let pane = self.pane(side);
             let caret = pane.caret();
@@ -5014,23 +5015,23 @@ impl TextView {
                 Side::Left => self.data.model.row_of_left_line(caret.line),
                 Side::Right => self.data.model.row_of_right_line(caret.line),
             }) else {
-                return;
+                return false;
             };
             let Some(position) = self.visible.position_of(model_row) else {
-                return;
+                return false;
             };
             if self.visible.row_at(position) != Some(model_row) {
-                return;
+                return false;
             }
             let Some(wraps) = self.wrap_layout.as_ref().map(|layout| match side {
                 Side::Left => &layout.left,
                 Side::Right => &layout.right,
             }) else {
-                return;
+                return false;
             };
             let count = wraps.line_count(caret.line);
             if count == 0 {
-                return;
+                return false;
             }
             let text = pane.line_text(caret.line);
             let byte_columns = wraps.uses_byte_columns(caret.line);
@@ -5051,7 +5052,7 @@ impl TextView {
                     && (here < range.end || (*segment + 1 == count && here == range.end))
             });
             let Some(segment) = segment else {
-                return;
+                return false;
             };
             let current_range = if byte_columns {
                 wraps.character_segment(caret.line, segment)
@@ -5059,7 +5060,7 @@ impl TextView {
                 wraps.segment(caret.line, segment)
             };
             let Some(current_range) = current_range else {
-                return;
+                return false;
             };
             let here = if byte_columns { caret_position } else { column };
             let goal = self
@@ -5089,12 +5090,12 @@ impl TextView {
             };
             let target = loop {
                 if target_visual >= self.wrap_heights.total() {
-                    return;
+                    return false;
                 }
                 #[allow(clippy::cast_precision_loss)]
                 let target_position = self.wrap_heights.row_at(target_visual as f64);
                 let Some(target_row) = self.visible.row_at(target_position) else {
-                    return;
+                    return false;
                 };
                 let target_top = self.wrap_heights.top(target_position);
                 let target_line = self.data.model.row(target_row).and_then(|row| match side {
@@ -5105,7 +5106,7 @@ impl TextView {
                     let row_height = self.wrap_heights.row_height(target_position);
                     if direction < 0 {
                         if target_top == 0 {
-                            return;
+                            return false;
                         }
                         target_visual = target_top - 1;
                     } else {
@@ -5120,7 +5121,7 @@ impl TextView {
                     let row_height = self.wrap_heights.row_height(target_position);
                     if direction < 0 {
                         if target_top == 0 {
-                            return;
+                            return false;
                         }
                         target_visual = target_top - 1;
                     } else {
@@ -5146,7 +5147,7 @@ impl TextView {
                     wraps.segment(target_line, target_segment)
                 };
                 let Some(range) = range else {
-                    return;
+                    return false;
                 };
                 let column = range.start.saturating_add(goal).min(range.end);
                 let column = u32::try_from(column).unwrap_or(u32::MAX);
@@ -5164,11 +5165,15 @@ impl TextView {
                 pane.place_at_column(line, column, extend);
             }
         }
+        if self.pane(side).caret() == before {
+            return false;
+        }
         self.wrap_scroll.reveal_visual_line(
             &self.wrap_heights,
             visual_line,
             f64::from(self.viewport_height / self.row_height()),
         );
+        true
     }
 
     fn handle_key(&mut self, key: egui::Key, modifiers: egui::Modifiers, page_rows: u32) -> bool {
@@ -5180,24 +5185,17 @@ impl TextView {
             return false;
         }
         if self.wrap_active {
-            match key {
-                Key::ArrowUp => {
-                    self.move_wrapped_caret(-1, false, shift);
+            let wrapped = match key {
+                Key::ArrowUp => Some((-1, false)),
+                Key::ArrowDown => Some((1, false)),
+                Key::PageUp => Some((-1, true)),
+                Key::PageDown => Some((1, true)),
+                _ => None,
+            };
+            if let Some((direction, page)) = wrapped {
+                if self.move_wrapped_caret(direction, page, shift) {
                     return false;
                 }
-                Key::ArrowDown => {
-                    self.move_wrapped_caret(1, false, shift);
-                    return false;
-                }
-                Key::PageUp => {
-                    self.move_wrapped_caret(-1, true, shift);
-                    return false;
-                }
-                Key::PageDown => {
-                    self.move_wrapped_caret(1, true, shift);
-                    return false;
-                }
-                _ => {}
             }
         }
         self.wrap_goal_column = None;
@@ -8136,7 +8134,7 @@ mod tests {
     }
 
     #[test]
-    fn wrapped_vertical_moves_leave_a_filtered_out_caret_in_place() {
+    fn wrapped_vertical_moves_fall_back_for_a_filtered_out_caret() {
         use super::{DisplayFilter, Side, TextView};
         use ca_ui::view::SessionView;
         use std::time::{Duration, Instant};
@@ -8168,9 +8166,11 @@ mod tests {
             .place(super::editor::Caret::new(0, 0), false);
         let before = view.pane(Side::Left).caret();
 
-        view.move_wrapped_caret(1, false, false);
-
+        assert!(!view.move_wrapped_caret(1, false, false));
         assert_eq!(view.pane(Side::Left).caret(), before);
+
+        assert!(!view.handle_key(egui::Key::ArrowDown, egui::Modifiers::default(), 1));
+        assert_eq!(view.pane(Side::Left).caret().line, before.line + 1);
     }
 
     #[test]
