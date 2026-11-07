@@ -7,6 +7,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use ca_ui::spacing::TOKENS;
 use ca_ui::worker::{Job, Terminal};
 use ca_vfs::remote::profile::{
     CloudProfile, FtpProfile, FtpProtocol, HttpAuthScheme, S3Auth, S3Profile, ServiceProfile,
@@ -39,6 +40,10 @@ pub struct ProfileManager {
     job: Option<Job<ProfileMessage>>,
     job_kind: Option<ProfileJobKind>,
     focus_requested: bool,
+    focus_field_requested: bool,
+    accept_focused_text: Option<egui::Id>,
+    focus_delete_cancel_requested: bool,
+    focus_discard_keep_requested: bool,
     exit_after_job: bool,
     exit_allowed: bool,
 }
@@ -83,6 +88,10 @@ impl ProfileManager {
             job: Some(job),
             job_kind: Some(ProfileJobKind::Loading),
             focus_requested: false,
+            focus_field_requested: true,
+            accept_focused_text: None,
+            focus_delete_cancel_requested: false,
+            focus_discard_keep_requested: false,
             exit_after_job: false,
             exit_allowed: false,
         };
@@ -94,6 +103,7 @@ impl ProfileManager {
     pub fn show(&mut self, ctx: &egui::Context) -> bool {
         let was_open = self.open;
         self.poll_job();
+        self.handle_dialog_keys(ctx);
         if self.focus_requested {
             ctx.move_to_top(egui::LayerId::new(
                 egui::Order::Middle,
@@ -124,6 +134,7 @@ impl ProfileManager {
             self.open = true;
             self.confirm_discard = true;
             self.discard_action = Some(DiscardAction::Close);
+            self.focus_discard_keep_requested = true;
         }
         self.confirmations(ctx);
         !self.open
@@ -136,6 +147,7 @@ impl ProfileManager {
     /// the manager reports it has closed through [`Self::is_open`].
     pub fn body(&mut self, ui: &mut egui::Ui) {
         self.poll_job();
+        self.handle_dialog_keys(ui.ctx());
         self.contents(ui);
         self.confirmations(ui.ctx());
     }
@@ -164,6 +176,7 @@ impl ProfileManager {
         if self.is_dirty() {
             self.confirm_discard = true;
             self.discard_action = Some(DiscardAction::Exit);
+            self.focus_discard_keep_requested = true;
             return false;
         }
         true
@@ -180,7 +193,36 @@ impl ProfileManager {
         self.exit_allowed = false;
         if matches!(self.discard_action, Some(DiscardAction::Exit)) {
             self.confirm_discard = false;
+            self.focus_discard_keep_requested = false;
             self.discard_action = None;
+        }
+    }
+
+    fn handle_dialog_keys(&mut self, ctx: &egui::Context) {
+        match ca_ui::widgets::dialog_key_action_with_text_focus(ctx, self.accept_focused_text) {
+            Some(ca_ui::widgets::DialogKeyAction::Cancel) => {
+                if self.confirm_delete {
+                    self.confirm_delete = false;
+                    self.focus_delete_cancel_requested = false;
+                } else if self.confirm_discard {
+                    self.keep_editing();
+                } else {
+                    self.request_close();
+                }
+            }
+            Some(ca_ui::widgets::DialogKeyAction::Accept) => {
+                if self.confirm_delete {
+                    self.confirm_delete = false;
+                    self.focus_delete_cancel_requested = false;
+                } else if self.confirm_discard {
+                    self.keep_editing();
+                } else if self.is_dirty() {
+                    self.save();
+                } else {
+                    self.request_close();
+                }
+            }
+            None => {}
         }
     }
 
@@ -231,6 +273,7 @@ impl ProfileManager {
                 .clicked()
             {
                 self.confirm_delete = true;
+                self.focus_delete_cancel_requested = true;
             }
         });
     }
@@ -246,15 +289,29 @@ impl ProfileManager {
             .num_columns(2)
             .spacing([12.0, 8.0])
             .show(ui, |ui| {
-                ui.label("Profile name");
+                profile_label(ui, "Profile name");
                 if self.saved_name.is_some() {
                     ui.label(&self.draft.name);
                 } else {
-                    ui.text_edit_singleline(&mut self.draft.name);
+                    let response = ui.text_edit_singleline(&mut self.draft.name);
+                    if self.focus_field_requested && ui.is_enabled() {
+                        response.request_focus();
+                        self.accept_focused_text = Some(response.id);
+                        self.focus_field_requested = false;
+                    } else if response.has_focus() || response.clicked() {
+                        self.accept_focused_text = Some(response.id);
+                    }
                 }
                 ui.end_row();
-                ui.label("Description");
-                ui.text_edit_singleline(&mut self.draft.description);
+                profile_label(ui, "Description");
+                let response = ui.text_edit_singleline(&mut self.draft.description);
+                if self.focus_field_requested && ui.is_enabled() {
+                    response.request_focus();
+                    self.accept_focused_text = Some(response.id);
+                    self.focus_field_requested = false;
+                } else if response.has_focus() || response.clicked() {
+                    self.accept_focused_text = Some(response.id);
+                }
                 ui.end_row();
             });
         ui.separator();
@@ -281,15 +338,30 @@ impl ProfileManager {
     fn service_editor(&mut self, ui: &mut egui::Ui) {
         let mut selected = profile_kind(&self.draft.service);
         let service_is_unknown = matches!(self.draft.service, ServiceProfile::Unknown(_));
-        ui.add_enabled_ui(!service_is_unknown, |ui| {
-            egui::ComboBox::from_label("Service")
-                .selected_text(selected.label())
-                .show_ui(ui, |ui| {
-                    for kind in ProfileKind::ALL {
-                        ui.selectable_value(&mut selected, kind, kind.label());
-                    }
+        egui::Grid::new("profile-service-field")
+            .num_columns(2)
+            .spacing([12.0, 8.0])
+            .show(ui, |ui| {
+                profile_label(ui, "Service");
+                ui.add_enabled_ui(!service_is_unknown, |ui| {
+                    let response = egui::ComboBox::from_id_salt("profile-service")
+                        .selected_text(selected.label())
+                        .show_ui(ui, |ui| {
+                            for kind in ProfileKind::ALL {
+                                ui.selectable_value(&mut selected, kind, kind.label());
+                            }
+                        })
+                        .response;
+                    response.widget_info(|| {
+                        egui::WidgetInfo::labeled(
+                            egui::WidgetType::ComboBox,
+                            response.enabled(),
+                            "Service",
+                        )
+                    });
                 });
-        });
+                ui.end_row();
+            });
         change_service(&mut self.draft.service, selected);
 
         match &mut self.draft.service {
@@ -298,7 +370,7 @@ impl ProfileManager {
                     .num_columns(2)
                     .spacing([12.0, 8.0])
                     .show(ui, |ui| {
-                        ui.label("Protocol");
+                        profile_label(ui, "Protocol");
                         egui::ComboBox::from_id_salt("profile-ftp-protocol")
                             .selected_text(protocol_label(&ftp.login.protocol))
                             .show_ui(ui, |ui| {
@@ -312,20 +384,42 @@ impl ProfileManager {
                                 }
                             });
                         ui.end_row();
-                        text_field(ui, "Server", &mut ftp.login.host);
-                        ui.label("Port");
+                        text_field(
+                            ui,
+                            "Server",
+                            &mut ftp.login.host,
+                            &mut self.accept_focused_text,
+                        );
+                        profile_label(ui, "Port");
                         let mut port = ftp
                             .login
                             .port
                             .unwrap_or_else(|| ftp.login.protocol.default_port())
                             .to_string();
-                        if ui.text_edit_singleline(&mut port).changed() {
+                        let response = ui.text_edit_singleline(&mut port);
+                        remember_focused_text(&response, &mut self.accept_focused_text);
+                        if response.changed() {
                             ftp.login.port = port.parse::<u16>().ok();
                         }
                         ui.end_row();
-                        text_field(ui, "Username", &mut ftp.login.username);
-                        text_field(ui, "Starting folder", &mut ftp.root_path);
-                        text_field_ref(ui, "Password reference", &mut ftp.login.password);
+                        text_field(
+                            ui,
+                            "Username",
+                            &mut ftp.login.username,
+                            &mut self.accept_focused_text,
+                        );
+                        text_field(
+                            ui,
+                            "Starting folder",
+                            &mut ftp.root_path,
+                            &mut self.accept_focused_text,
+                        );
+                        text_field_ref(
+                            ui,
+                            "Password reference",
+                            &mut ftp.login.password,
+                            &mut self.accept_focused_text,
+                        );
                     });
                 secret_note(ui);
             }
@@ -334,10 +428,25 @@ impl ProfileManager {
                     .num_columns(2)
                     .spacing([12.0, 8.0])
                     .show(ui, |ui| {
-                        text_field(ui, "Share URL", &mut webdav.url);
-                        text_field(ui, "Username", &mut webdav.username);
-                        text_field_ref(ui, "Password reference", &mut webdav.password);
-                        ui.label("Authentication");
+                        text_field(
+                            ui,
+                            "Share URL",
+                            &mut webdav.url,
+                            &mut self.accept_focused_text,
+                        );
+                        text_field(
+                            ui,
+                            "Username",
+                            &mut webdav.username,
+                            &mut self.accept_focused_text,
+                        );
+                        text_field_ref(
+                            ui,
+                            "Password reference",
+                            &mut webdav.password,
+                            &mut self.accept_focused_text,
+                        );
+                        profile_label(ui, "Authentication");
                         egui::ComboBox::from_id_salt("profile-webdav-auth")
                             .selected_text(auth_label(&webdav.auth))
                             .show_ui(ui, |ui| {
@@ -367,13 +476,18 @@ impl ProfileManager {
                     .num_columns(2)
                     .spacing([12.0, 8.0])
                     .show(ui, |ui| {
-                        text_field(ui, "Bucket", &mut s3.bucket);
-                        text_field(ui, "Region", &mut s3.region);
-                        text_field(ui, "Service endpoint", &mut s3.endpoint);
-                        ui.label("Path style");
+                        text_field(ui, "Bucket", &mut s3.bucket, &mut self.accept_focused_text);
+                        text_field(ui, "Region", &mut s3.region, &mut self.accept_focused_text);
+                        text_field(
+                            ui,
+                            "Service endpoint",
+                            &mut s3.endpoint,
+                            &mut self.accept_focused_text,
+                        );
+                        profile_label(ui, "Path style");
                         ui.checkbox(&mut s3.path_style, "Use bucket in the URL path");
                         ui.end_row();
-                        ui.label("Credentials");
+                        profile_label(ui, "Credentials");
                         let mut auth = s3_auth_kind(&s3.auth);
                         egui::ComboBox::from_id_salt("profile-s3-auth")
                             .selected_text(auth.label())
@@ -393,18 +507,48 @@ impl ProfileManager {
                                 session_token,
                                 ..
                             } => {
-                                text_field(ui, "Access key ID", access_key_id);
-                                text_field_ref(ui, "Secret key reference", secret_access_key);
-                                text_field_ref(ui, "Session token reference", session_token);
+                                text_field(
+                                    ui,
+                                    "Access key ID",
+                                    access_key_id,
+                                    &mut self.accept_focused_text,
+                                );
+                                text_field_ref(
+                                    ui,
+                                    "Secret key reference",
+                                    secret_access_key,
+                                    &mut self.accept_focused_text,
+                                );
+                                text_field_ref(
+                                    ui,
+                                    "Session token reference",
+                                    session_token,
+                                    &mut self.accept_focused_text,
+                                );
                             }
                             S3Auth::CredentialsFile {
                                 path, profile_name, ..
                             } => {
-                                text_field(ui, "Credentials file", path);
-                                text_field(ui, "Section name", profile_name);
+                                text_field(
+                                    ui,
+                                    "Credentials file",
+                                    path,
+                                    &mut self.accept_focused_text,
+                                );
+                                text_field(
+                                    ui,
+                                    "Section name",
+                                    profile_name,
+                                    &mut self.accept_focused_text,
+                                );
                             }
                             S3Auth::Environment { profile_name, .. } => {
-                                text_field(ui, "Section name", profile_name);
+                                text_field(
+                                    ui,
+                                    "Section name",
+                                    profile_name,
+                                    &mut self.accept_focused_text,
+                                );
                             }
                             S3Auth::Anonymous { .. } | S3Auth::Unknown(_) => {}
                         }
@@ -416,9 +560,24 @@ impl ProfileManager {
                     .num_columns(2)
                     .spacing([12.0, 8.0])
                     .show(ui, |ui| {
-                        text_field(ui, "Account", &mut cloud.account);
-                        text_field(ui, "Client ID", &mut cloud.client_id);
-                        text_field_ref(ui, "Refresh token reference", &mut cloud.refresh_token);
+                        text_field(
+                            ui,
+                            "Account",
+                            &mut cloud.account,
+                            &mut self.accept_focused_text,
+                        );
+                        text_field(
+                            ui,
+                            "Client ID",
+                            &mut cloud.client_id,
+                            &mut self.accept_focused_text,
+                        );
+                        text_field_ref(
+                            ui,
+                            "Refresh token reference",
+                            &mut cloud.refresh_token,
+                            &mut self.accept_focused_text,
+                        );
                     });
                 secret_note(ui);
                 ui.label("Cloud connection support still needs the service registration and authentication flow.");
@@ -428,11 +587,23 @@ impl ProfileManager {
                     .num_columns(2)
                     .spacing([12.0, 8.0])
                     .show(ui, |ui| {
-                        text_field(ui, "Repository URL", &mut svn.url);
-                        text_field(ui, "Username", &mut svn.username);
-                        ui.label("Revision");
+                        text_field(
+                            ui,
+                            "Repository URL",
+                            &mut svn.url,
+                            &mut self.accept_focused_text,
+                        );
+                        text_field(
+                            ui,
+                            "Username",
+                            &mut svn.username,
+                            &mut self.accept_focused_text,
+                        );
+                        profile_label(ui, "Revision");
                         let mut revision = svn.revision.map_or_else(String::new, |n| n.to_string());
-                        if ui.text_edit_singleline(&mut revision).changed() {
+                        let response = ui.text_edit_singleline(&mut revision);
+                        remember_focused_text(&response, &mut self.accept_focused_text);
+                        if response.changed() {
                             svn.revision = if revision.trim().is_empty() {
                                 None
                             } else {
@@ -440,7 +611,7 @@ impl ProfileManager {
                             };
                         }
                         ui.end_row();
-                        ui.label("Password reference");
+                        profile_label(ui, "Password reference");
                         ui.label("Use the svn client's credential provider");
                         ui.end_row();
                     });
@@ -463,8 +634,10 @@ impl ProfileManager {
         self.saved_name = Some(profile.name.clone());
         self.saved_draft = Some(profile.clone());
         self.draft = profile;
+        self.focus_field_requested = true;
         self.notice = None;
         self.confirm_delete = false;
+        self.focus_delete_cancel_requested = false;
     }
 
     fn is_dirty(&self) -> bool {
@@ -502,6 +675,7 @@ impl ProfileManager {
         if self.is_dirty() {
             self.confirm_discard = true;
             self.discard_action = Some(DiscardAction::Select(name));
+            self.focus_discard_keep_requested = true;
         } else {
             self.select(index);
         }
@@ -521,6 +695,7 @@ impl ProfileManager {
 
     fn discard_changes(&mut self) {
         self.confirm_discard = false;
+        self.focus_discard_keep_requested = false;
         self.exit_after_job = false;
         match self.discard_action.take() {
             Some(DiscardAction::Close) => self.open = false,
@@ -540,6 +715,7 @@ impl ProfileManager {
 
     fn keep_editing(&mut self) {
         self.confirm_discard = false;
+        self.focus_discard_keep_requested = false;
         self.discard_action = None;
         self.exit_after_job = false;
     }
@@ -551,6 +727,7 @@ impl ProfileManager {
         if self.is_dirty() {
             self.confirm_discard = true;
             self.discard_action = Some(DiscardAction::New);
+            self.focus_discard_keep_requested = true;
         } else {
             self.new_draft();
         }
@@ -567,6 +744,7 @@ impl ProfileManager {
         if self.is_dirty() {
             self.confirm_discard = true;
             self.discard_action = Some(DiscardAction::Close);
+            self.focus_discard_keep_requested = true;
         } else {
             self.open = false;
         }
@@ -580,8 +758,10 @@ impl ProfileManager {
         self.saved_name = None;
         self.saved_draft = None;
         self.draft = RemoteProfile::default();
+        self.focus_field_requested = true;
         self.notice = None;
         self.confirm_delete = false;
+        self.focus_delete_cancel_requested = false;
     }
 
     fn save(&mut self) {
@@ -625,10 +805,16 @@ impl ProfileManager {
                     ui.label(format!("Delete the profile ‘{}’?", self.draft.name));
                     ui.add_enabled_ui(actions_enabled, |ui| {
                         ui.horizontal(|ui| {
-                            if ui.button("Delete").clicked() {
+                            let (delete, cancel) =
+                                ca_ui::widgets::dialog_button_pair(ui, "Delete", "Cancel");
+                            if self.focus_delete_cancel_requested {
+                                cancel.request_focus();
+                                self.focus_delete_cancel_requested = false;
+                            }
+                            if delete.clicked() {
                                 answer = Some(true);
                             }
-                            if ui.button("Cancel").clicked() {
+                            if cancel.clicked() {
                                 answer = Some(false);
                             }
                         });
@@ -639,6 +825,7 @@ impl ProfileManager {
                 });
             if let Some(yes) = answer {
                 self.confirm_delete = false;
+                self.focus_delete_cancel_requested = false;
                 if yes {
                     self.delete_selected();
                 }
@@ -658,10 +845,19 @@ impl ProfileManager {
                     );
                     ui.add_enabled_ui(actions_enabled, |ui| {
                         ui.horizontal(|ui| {
-                            if ui.button("Discard and close").clicked() {
+                            let (discard, keep) = ca_ui::widgets::dialog_button_pair(
+                                ui,
+                                "Discard and close",
+                                "Keep editing",
+                            );
+                            if self.focus_discard_keep_requested {
+                                keep.request_focus();
+                                self.focus_discard_keep_requested = false;
+                            }
+                            if discard.clicked() {
                                 answer = Some(true);
                             }
-                            if ui.button("Keep editing").clicked() {
+                            if keep.clicked() {
                                 answer = Some(false);
                             }
                         });
@@ -804,16 +1000,41 @@ enum DiscardAction {
     Exit,
 }
 
-fn text_field(ui: &mut egui::Ui, label: &str, value: &mut String) {
-    ui.label(label);
-    ui.text_edit_singleline(value);
+fn profile_label(ui: &mut egui::Ui, label: &str) {
+    ca_ui::widgets::sized(ui, TOKENS.forms.dialog_label_width, |ui| {
+        ui.add(egui::Label::new(label).truncate());
+    });
+}
+
+fn remember_focused_text(response: &egui::Response, focused_text: &mut Option<egui::Id>) {
+    if response.has_focus() || response.clicked() {
+        *focused_text = Some(response.id);
+    }
+}
+
+fn text_field(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut String,
+    focused_text: &mut Option<egui::Id>,
+) {
+    profile_label(ui, label);
+    let response = ui.text_edit_singleline(value);
+    remember_focused_text(&response, focused_text);
     ui.end_row();
 }
 
-fn text_field_ref(ui: &mut egui::Ui, label: &str, value: &mut SecretRef) {
-    ui.label(label);
+fn text_field_ref(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut SecretRef,
+    focused_text: &mut Option<egui::Id>,
+) {
+    profile_label(ui, label);
     let mut reference = value.id().to_owned();
-    if ui.text_edit_singleline(&mut reference).changed() {
+    let response = ui.text_edit_singleline(&mut reference);
+    remember_focused_text(&response, focused_text);
+    if response.changed() {
         *value = SecretRef::new(reference);
     }
     ui.end_row();
@@ -1099,6 +1320,19 @@ mod tests {
         assert!(manager.job.is_none(), "the profile job did not finish");
     }
 
+    fn key_input(key: egui::Key) -> egui::RawInput {
+        egui::RawInput {
+            events: vec![egui::Event::Key {
+                key,
+                physical_key: Some(key),
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..ca_ui::testing::sized_input(800.0, 600.0)
+        }
+    }
+
     #[test]
     fn plaintext_authentication_compatibility_checkbox_toggles_by_accessible_label() {
         let mut manager =
@@ -1136,6 +1370,62 @@ mod tests {
             &manager.borrow().draft.service,
             ServiceProfile::WebDav(profile) if !profile.allow_plaintext_credentials
         ));
+    }
+
+    #[test]
+    fn enter_keeps_the_safe_default_on_a_profile_delete_question() {
+        let mut manager =
+            ProfileManager::open_with_loader(std::path::Path::new("."), Arc::new(|| {}), |_| {
+                (Vec::new(), None)
+            });
+        wait_for_job(&mut manager);
+        manager.confirm_delete = true;
+
+        let ctx = egui::Context::default();
+        let _ = ctx.run(key_input(egui::Key::Enter), |ctx| {
+            manager.handle_dialog_keys(ctx);
+        });
+
+        assert!(!manager.confirm_delete);
+    }
+
+    #[test]
+    fn enter_closes_profiles_from_the_initially_focused_name_field() {
+        let mut manager =
+            ProfileManager::open_with_loader(std::path::Path::new("."), Arc::new(|| {}), |_| {
+                (Vec::new(), None)
+            });
+        wait_for_job(&mut manager);
+        let ctx = egui::Context::default();
+        let _ = ctx.run(ca_ui::testing::sized_input(800.0, 600.0), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| manager.body(ui));
+        });
+        let _ = ctx.run(key_input(egui::Key::Enter), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| manager.body(ui));
+        });
+        assert!(!manager.is_open());
+    }
+
+    #[test]
+    fn the_service_selector_keeps_its_accessible_name() {
+        let mut manager =
+            ProfileManager::open_with_loader(std::path::Path::new("."), Arc::new(|| {}), |_| {
+                (Vec::new(), None)
+            });
+        wait_for_job(&mut manager);
+        let manager = std::cell::RefCell::new(manager);
+        let mut probe = ca_ui::testing::probe::Probe::new(1_200.0, 800.0);
+        let mut draw = |ctx: &egui::Context| {
+            egui::CentralPanel::default().show(ctx, |_| {
+                manager.borrow_mut().show(ctx);
+            });
+        };
+        probe.idle(&mut draw);
+        probe.idle(&mut draw);
+
+        assert!(probe.controls().iter().any(|control| {
+            control.label == "Service" && control.role == egui::accesskit::Role::ComboBox
+        }));
     }
 
     #[test]
