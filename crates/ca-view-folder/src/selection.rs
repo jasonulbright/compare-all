@@ -313,17 +313,34 @@ impl Selection {
 
     /// Select every visible row a rule takes, on the sides a scope covers.
     pub fn select_rule(&mut self, rule: SelectRule, scope: Scope, rows: &[FlatRow], arena: &Arena) {
+        self.select_rule_with_statuses(rule, scope, rows, arena, &[]);
+    }
+
+    /// Select every visible row a rule takes, using `statuses` in place of
+    /// the arena's comparison statuses.
+    pub fn select_rule_with_statuses(
+        &mut self,
+        rule: SelectRule,
+        scope: Scope,
+        rows: &[FlatRow],
+        arena: &Arena,
+        statuses: &[NodeStatus],
+    ) {
         self.clear();
         for row in rows {
             let Some(node) = arena.node(row.node) else {
                 continue;
             };
+            let status = statuses
+                .get(row.node as usize)
+                .copied()
+                .unwrap_or(node.status);
             for side in scope.sides() {
                 let present = match side {
                     Side::Left => node.left.is_some(),
                     Side::Right => node.right.is_some(),
                 };
-                if rule.takes(*side, node.is_dir, node.status, present) {
+                if rule.takes(*side, node.is_dir, status, present) {
                     self.side_mut(*side).insert(node.rel.clone());
                 }
             }

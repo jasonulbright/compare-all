@@ -687,7 +687,7 @@ const FOLDER_MENUS: &[(&str, &[Entry])] = &[
             Entry::Run(Command::Exclude, ACTIONABLE),
             Entry::Run(Command::NewFolder, ACTIONABLE),
             Entry::Run(Command::CopyFilename, ACTIONABLE),
-            Entry::Soon(Command::ToggleIgnored),
+            Entry::Run(Command::ToggleRowIgnored, ACTIONABLE),
             Entry::Run(Command::RefreshSelection, ACTIONABLE),
             Entry::Rule,
             Entry::Run(Command::Synchronize, "Nothing is waiting to be reconciled"),
@@ -7701,9 +7701,9 @@ mod tests {
             .all(|state| state.command.menu() == Menu::Actions));
     }
 
+    /// The Actions menu toggles Ignored and starts Refresh Selection by label.
     #[test]
-    /// The Actions menu exposes refresh by its accessible label and starts it.
-    fn refresh_selection_runs_from_its_accessible_actions_menu_label() {
+    fn ignored_and_refresh_selection_run_from_accessible_actions_labels() {
         use ca_ui::testing::probe::Probe;
         use std::cell::RefCell;
 
@@ -7750,6 +7750,14 @@ mod tests {
             });
         };
         probe.idle(&mut draw_actions);
+        probe.click(ACTIONS_MENU, &mut draw_actions).unwrap();
+        assert!(probe.find("Ignored").unwrap().enabled);
+        probe.click("Ignored", &mut draw_actions).unwrap();
+        assert_eq!(
+            app.borrow().tabs[0].checked(Command::ToggleRowIgnored),
+            Some(true)
+        );
+
         probe.click(ACTIONS_MENU, &mut draw_actions).unwrap();
         let refresh_label = "Refresh Selection\tShift+F5";
         assert!(probe.find(refresh_label).unwrap().enabled);

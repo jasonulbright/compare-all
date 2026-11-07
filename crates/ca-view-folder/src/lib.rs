@@ -44,11 +44,12 @@ use opjobs::{
     ProgressState, RecoverMessage, RecoveryNotice, RescanMessage, SelectionRefreshMessage,
 };
 use selection::{ClickKind, Scope, SelectRule, Selection};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use sync_mode::SyncMode;
-use tree::{Arena, ArenaNode, Expanded, FlatRow, Sort, SortColumn};
+use tree::{Arena, ArenaNode, Expanded, FlatRow, Sort, SortColumn, Totals};
 
 /// Row height as a multiple of the folder listing font size.
 ///
@@ -106,6 +107,10 @@ const SCAN_FAILED: &str = "The folder scan failed. Use Refresh to try again";
 const SCAN_STOPPED: &str = "The folder scan was stopped. Use Refresh to try again";
 /// Why an operation needs selected rows.
 const NOTHING_SELECTED_FOR_ACTION: &str = "Select the items to act on first";
+/// Why ignored state cannot be changed in a synchronization view.
+const IGNORE_ONLY_IN_COMPARE: &str = "Ignored is available only in Folder Compare";
+/// Why ignored state cannot be changed without a selected comparison row.
+const NOTHING_SELECTED_TO_IGNORE: &str = "Select comparison rows to ignore first";
 /// Why the refresh selection command has no rows to read.
 const NOTHING_SELECTED_TO_REFRESH: &str = "Select the items to refresh first";
 /// Why a selected action cannot export a path.
@@ -157,6 +162,7 @@ const HANDLED: &[Command] = &[
     Command::Attributes,
     Command::NewFolder,
     Command::CopyFilename,
+    Command::ToggleRowIgnored,
     Command::Exchange,
     Command::Exclude,
 ];
@@ -361,6 +367,15 @@ pub struct FolderView {
     arena: Arena,
     compared_tree: Option<Box<Node>>,
     expanded: Expanded,
+    /// Explicit session overrides; a folder override also applies to its
+    /// descendants unless a child has its own override.
+    ignored_overrides: HashMap<PathBuf, bool>,
+    /// Statuses after the ignored overrides, indexed like `arena.nodes()`.
+    effective_statuses: Vec<NodeStatus>,
+    /// Inherited ignored state, indexed like `arena.nodes()`.
+    ignored_rows: Vec<bool>,
+    /// Cached totals for the effective row statuses.
+    effective_totals: Option<Totals>,
     visible: Vec<bool>,
     order: navigate::DisplayOrder,
     rows: Vec<FlatRow>,
@@ -552,6 +567,10 @@ impl FolderView {
             arena: Arena::default(),
             compared_tree: None,
             expanded: Expanded::new(),
+            ignored_overrides: HashMap::new(),
+            effective_statuses: Vec::new(),
+            ignored_rows: Vec::new(),
+            effective_totals: None,
             visible: Vec::new(),
             order: navigate::DisplayOrder::default(),
             rows: Vec::new(),
@@ -750,7 +769,13 @@ impl FolderView {
     /// Select every visible row a rule takes, on the sides a scope covers.
     pub fn select(&mut self, rule: SelectRule, scope: Scope) {
         let rows = std::mem::take(&mut self.rows);
-        self.selection.select_rule(rule, scope, &rows, &self.arena);
+        self.selection.select_rule_with_statuses(
+            rule,
+            scope,
+            &rows,
+            &self.arena,
+            &self.effective_statuses,
+        );
         self.rows = rows;
     }
 
@@ -1486,6 +1511,7 @@ impl FolderView {
         };
         let messages = job.drain();
         let finished = job.is_finished();
+        let mut terminal_status = None;
         for message in messages {
             match message {
                 ContentMessage::Update(update) => {
@@ -1495,21 +1521,30 @@ impl FolderView {
                     if let Some(tree) = tree {
                         self.compared_tree = Some(tree);
                     }
-                    self.status = if complete {
+                    terminal_status = Some(if complete {
                         Status::Ready
                     } else {
                         Status::Cancelled
-                    };
+                    });
                     self.rebuild_pending = true;
                 }
-                ContentMessage::Failed(reason) => self.status = Status::Failed(reason),
+                ContentMessage::Failed(reason) => {
+                    terminal_status = Some(Status::Failed(reason));
+                }
             }
         }
         if finished {
             self.content_job = None;
-            if self.status.is_running() {
-                self.status = Status::Cancelled;
+            if terminal_status.is_none() && self.status.is_running() {
+                terminal_status = Some(Status::Cancelled);
             }
+        }
+        if let Some(status) = terminal_status {
+            if self.rebuild_pending {
+                self.arena.roll_up();
+                self.rebuild();
+            }
+            self.status = status;
         }
     }
 
@@ -1937,8 +1972,22 @@ impl FolderView {
         self.font.row_height(ROW_HEIGHT_RATIO, self.line_spacing)
     }
 
+    /// Recompute effective statuses, totals, filters, navigation order, and rows.
     fn rebuild(&mut self) {
-        self.visible = self.arena.visibility(self.filter, self.folder_filter);
+        if self.ignored_overrides.is_empty() {
+            self.effective_statuses.clear();
+            self.ignored_rows.clear();
+            self.effective_totals = Some(self.arena.totals());
+        } else {
+            (self.effective_statuses, self.ignored_rows) =
+                self.arena.statuses_with_ignored(&self.ignored_overrides);
+            self.effective_totals = Some(self.arena.totals_with_statuses(&self.effective_statuses));
+        }
+        self.visible = self.arena.visibility_with_statuses(
+            self.filter,
+            self.folder_filter,
+            &self.effective_statuses,
+        );
         self.rows = self.arena.flatten(&self.expanded, &self.visible);
         self.order = navigate::DisplayOrder::of(&self.arena, &self.visible);
         if let Some(drag) = &mut self.selection_drag {
@@ -1949,6 +1998,94 @@ impl FolderView {
         self.rebuild_pending = false;
         self.last_rebuild = Instant::now();
         self.rebuilds = self.rebuilds.saturating_add(1);
+    }
+
+    /// The status the current view exposes for an arena row.
+    pub(crate) fn effective_status_at(&self, index: u32, node: &ArenaNode) -> NodeStatus {
+        if self.effective_statuses.is_empty() {
+            return node.status;
+        }
+        self.effective_statuses
+            .get(index as usize)
+            .copied()
+            .unwrap_or(node.status)
+    }
+
+    /// Whether either side has a selected path that still names an arena row.
+    fn has_selected_rows(&self) -> bool {
+        self.selection
+            .side(Side::Left)
+            .iter()
+            .chain(self.selection.side(Side::Right))
+            .any(|rel| self.arena.index_of(rel).is_some())
+    }
+
+    /// Whether every selected path still in the arena has an ignored override.
+    fn selected_rows_are_ignored(&self) -> bool {
+        let mut found = false;
+        for rel in self
+            .selection
+            .side(Side::Left)
+            .iter()
+            .chain(self.selection.side(Side::Right))
+        {
+            let Some(index) = self.arena.index_of(rel) else {
+                continue;
+            };
+            found = true;
+            if !self
+                .ignored_rows
+                .get(index as usize)
+                .copied()
+                .unwrap_or(false)
+            {
+                return false;
+            }
+        }
+        found
+    }
+
+    /// Toggle ignored state on selected rows that still belong to the arena.
+    fn toggle_selected_ignored(&mut self) {
+        if !self.has_selected_rows() {
+            return;
+        }
+        let ignored = !self.selected_rows_are_ignored();
+        let selection = &self.selection;
+        let arena = &self.arena;
+        let overrides = &mut self.ignored_overrides;
+        for rel in selection
+            .side(Side::Left)
+            .iter()
+            .chain(selection.side(Side::Right))
+        {
+            if arena.index_of(rel).is_some() {
+                overrides.insert(rel.clone(), ignored);
+            }
+        }
+        self.rebuild();
+    }
+
+    /// Explain why the ignored action is unavailable in the current view.
+    fn ignored_refusal(&self) -> &'static str {
+        if self.mode != Mode::Compare {
+            return IGNORE_ONLY_IN_COMPARE;
+        }
+        if self.stage.blocks_input() {
+            return OPERATION_OPEN;
+        }
+        if !matches!(self.stage, Stage::Idle) {
+            return READ_BUSY;
+        }
+        match self.status {
+            Status::Running(_) => SCAN_NOT_READY,
+            Status::Failed(_) => SCAN_FAILED,
+            Status::Cancelled => SCAN_STOPPED,
+            Status::Ready if self.selection.is_empty() || !self.has_selected_rows() => {
+                NOTHING_SELECTED_TO_IGNORE
+            }
+            Status::Ready => READ_BUSY,
+        }
     }
 
     fn apply_fields(&mut self) {
@@ -2036,8 +2173,13 @@ impl FolderView {
         });
         if let Some((select, scope)) = rule {
             let rows = std::mem::take(&mut self.rows);
-            self.selection
-                .select_rule(select, scope, &rows, &self.arena);
+            self.selection.select_rule_with_statuses(
+                select,
+                scope,
+                &rows,
+                &self.arena,
+                &self.effective_statuses,
+            );
             self.rows = rows;
         }
     }
@@ -2293,8 +2435,13 @@ impl FolderView {
             None => {}
         }
         if let Some((select, scope)) = rule {
-            self.selection
-                .select_rule(select, scope, &self.rows, &self.arena);
+            self.selection.select_rule_with_statuses(
+                select,
+                scope,
+                &self.rows,
+                &self.arena,
+                &self.effective_statuses,
+            );
         }
         if rescan {
             self.restart();
@@ -2334,7 +2481,12 @@ impl FolderView {
                 name: node.name.clone(),
                 relative_path: node.rel.to_string_lossy().replace('\\', "/"),
                 is_dir: node.is_dir,
-                status: ca_ui::report::EntryStatus::from(node.status),
+                status: ca_ui::report::EntryStatus::from(
+                    self.effective_statuses
+                        .get(flat.node as usize)
+                        .copied()
+                        .unwrap_or(node.status),
+                ),
                 left: side_facts(node.left.as_ref()),
                 right: side_facts(node.right.as_ref()),
                 link: None,
@@ -2581,7 +2733,7 @@ impl FolderView {
                     );
                 }
                 Status::Ready => {
-                    let totals = self.arena.totals();
+                    let totals = self.effective_totals.unwrap_or_else(|| self.arena.totals());
                     ui.label(format!(
                         "{} folders, {} files: {} same, {} differ, {} orphans, {} not compared",
                         totals.folders,
@@ -2609,7 +2761,10 @@ impl FolderView {
                     toggle_errors = true;
                 }
             }
-            let mismatches = self.arena.totals().kind_mismatches;
+            let mismatches = self
+                .effective_totals
+                .unwrap_or_else(|| self.arena.totals())
+                .kind_mismatches;
             if mismatches > 0 {
                 ui.separator();
                 ui.label(format!("{mismatches} file and folder clashes"));
@@ -2887,7 +3042,22 @@ impl FolderView {
             if position % 2 == 1 {
                 clip.rect_filled(row_rect, 0.0, palette.stripe);
             }
-            let color = palette.folder_row(theme::folder_class(node.status));
+            let effective_status = self
+                .effective_statuses
+                .get(row.node as usize)
+                .copied()
+                .unwrap_or(node.status);
+            let ignored = self
+                .ignored_rows
+                .get(row.node as usize)
+                .copied()
+                .unwrap_or(false)
+                && effective_status == NodeStatus::Same;
+            let color = palette.folder_row(if ignored {
+                theme::FolderClass::Unknown
+            } else {
+                theme::folder_class(effective_status)
+            });
             let expanded = node.is_dir && self.expanded.is_expanded(row.node);
             for (side, pane, info) in [
                 (Side::Left, layout.left, node.left.as_ref()),
@@ -2912,6 +3082,8 @@ impl FolderView {
                     y,
                     pane,
                     node,
+                    effective_status,
+                    ignored,
                     row.depth,
                     expanded,
                     info,
@@ -2925,7 +3097,7 @@ impl FolderView {
             if !row_rect.contains(cursor) {
                 continue;
             }
-            if let Some(tip) = node_tooltip(node) {
+            if let Some(tip) = node_tooltip_with_ignored(node, ignored) {
                 egui::show_tooltip_at(
                     ui.ctx(),
                     ui.layer_id(),
@@ -3399,6 +3571,8 @@ fn paint_pane(
     y: f32,
     pane: Pane,
     node: &ArenaNode,
+    status: NodeStatus,
+    ignored: bool,
     depth: u16,
     expanded: bool,
     side: Option<&tree::SideInfo>,
@@ -3427,12 +3601,22 @@ fn paint_pane(
             color,
         );
     }
-    ca_ui::icons::node_status_icon(node.status, node.content, node.incomplete).paint_in_row(
-        &clip,
-        egui::pos2(pane.name.start + indent + 26.0, middle),
-        row_height,
-        color,
-    );
+    if ignored {
+        clip.text(
+            egui::pos2(pane.name.start + indent + 26.0, middle),
+            egui::Align2::CENTER_CENTER,
+            "I",
+            font.clone(),
+            color,
+        );
+    } else {
+        ca_ui::icons::node_status_icon(status, node.content, node.incomplete).paint_in_row(
+            &clip,
+            egui::pos2(pane.name.start + indent + 26.0, middle),
+            row_height,
+            color,
+        );
+    }
     let item_icon = if node.is_dir {
         if expanded {
             ca_ui::icons::Icon::FolderOpen
@@ -3506,6 +3690,11 @@ pub fn node_tooltip(node: &ArenaNode) -> Option<&'static str> {
         return Some("Contents were not read: the file is not stored locally");
     }
     None
+}
+
+/// The explanation shown for a row whose differences are ignored.
+fn node_tooltip_with_ignored(node: &ArenaNode, ignored: bool) -> Option<&'static str> {
+    node_tooltip(node).or_else(|| ignored.then_some("Differences in this item are ignored"))
 }
 
 /// The glyph shown in front of a name for a status.
@@ -3957,6 +4146,7 @@ impl SessionView for FolderView {
             Command::OnlyCompareFiles => {
                 self.folder_filter == FolderDisplayFilter::OnlyCompareFiles
             }
+            Command::ToggleRowIgnored => self.selected_rows_are_ignored(),
             _ => return None,
         })
     }
@@ -3964,6 +4154,7 @@ impl SessionView for FolderView {
     /// A ready, idle filename copy with a selection but no local path has a distinct refusal.
     fn refusal(&self, command: Command) -> Option<&'static str> {
         match command {
+            Command::ToggleRowIgnored if !self.accepts(command) => Some(self.ignored_refusal()),
             Command::NextDifference | Command::PreviousDifference if !self.accepts(command) => {
                 Some(navigate::NO_DIFFERENCE)
             }
@@ -4028,6 +4219,13 @@ impl SessionView for FolderView {
                     && self.selection_refresh_job.is_none()
                     && self.preview_job.is_none()
             }
+            Command::ToggleRowIgnored => {
+                self.mode == Mode::Compare
+                    && self.status == Status::Ready
+                    && idle
+                    && !self.selection.is_empty()
+                    && self.has_selected_rows()
+            }
             Command::NextDifference => self.has_difference(true),
             Command::PreviousDifference => self.has_difference(false),
             Command::FindNext | Command::FindPrevious => self.has_name_match(),
@@ -4077,6 +4275,7 @@ impl SessionView for FolderView {
             Command::ClearSelection => self.selection.clear(),
             Command::InvertSelection => self.selection.invert_visible(&self.rows, &self.arena),
             Command::CopyFilename => self.copy_filenames(),
+            Command::ToggleRowIgnored => self.toggle_selected_ignored(),
             Command::CopyToRight => self.copy_to(Side::Right),
             Command::CopyToLeft => self.copy_to(Side::Left),
             Command::SwapSides => {
@@ -4088,8 +4287,13 @@ impl SessionView for FolderView {
             other => {
                 if let Some(rule) = select_rule_of(other) {
                     let rows = std::mem::take(&mut self.rows);
-                    self.selection
-                        .select_rule(rule, Scope::Both, &rows, &self.arena);
+                    self.selection.select_rule_with_statuses(
+                        rule,
+                        Scope::Both,
+                        &rows,
+                        &self.arena,
+                        &self.effective_statuses,
+                    );
                     self.rows = rows;
                 } else if let Some(operation) = operation_of(other) {
                     self.start_operation(operation);
@@ -4714,6 +4918,59 @@ mod stale_results {
         control
     }
 
+    /// Folder Sync explains why Ignored stays disabled even with a selection.
+    #[test]
+    fn ignored_is_disabled_with_a_specific_reason_on_the_sync_tab() {
+        use crate::selection::{Scope, SelectRule};
+        use crate::{Command, FolderSyncView, IGNORE_ONLY_IN_COMPARE};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut view = sync_view(dir.path());
+        view.select(SelectRule::All, Scope::Both);
+        assert!(!view.selection().is_empty());
+
+        let sync = FolderSyncView::from(view);
+        assert!(!sync.accepts(Command::ToggleRowIgnored));
+        assert_eq!(
+            sync.refusal(Command::ToggleRowIgnored),
+            Some(IGNORE_ONLY_IN_COMPARE)
+        );
+    }
+
+    /// Folder Compare names empty selection, scan, and operation refusal states.
+    #[test]
+    fn ignored_refusal_names_the_compare_scan_and_operation_blockers() {
+        use crate::{
+            Command, OperationPlan, Stage, Status, NOTHING_SELECTED_TO_IGNORE, OPERATION_OPEN,
+            SCAN_NOT_READY,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut view = ready_view(dir.path());
+        assert_eq!(
+            view.refusal(Command::ToggleRowIgnored),
+            Some(NOTHING_SELECTED_TO_IGNORE)
+        );
+
+        view.run(Command::SelectAll);
+        view.status = Status::Running("Scanning");
+        assert_eq!(
+            view.refusal(Command::ToggleRowIgnored),
+            Some(SCAN_NOT_READY)
+        );
+
+        view.status = Status::Ready;
+        view.stage = Stage::Running(Box::new(OperationPlan::new(
+            ca_fs::OperationKind::Copy,
+            Vec::new(),
+            ca_fs::OperationOptions::default(),
+        )));
+        assert_eq!(
+            view.refusal(Command::ToggleRowIgnored),
+            Some(OPERATION_OPEN)
+        );
+    }
+
     /// A compared tree that holds `stale.txt`, which no scan of the view's
     /// folders produces.
     fn stale_tree(dir: &Path) -> Box<Node> {
@@ -4754,6 +5011,91 @@ mod stale_results {
 
     fn shows_stale(view: &FolderView) -> bool {
         view.arena().index_of(Path::new("stale.txt")).is_some()
+    }
+
+    /// Complete a content comparison inside the rebuild interval and refresh an ignored row.
+    #[test]
+    fn content_completion_rebuilds_ignored_read_errors_before_ready() {
+        use crate::jobs::ContentMessage;
+        use ca_fs::{ContentFailure, ContentUpdate, PairFacts, StatusFlags};
+
+        let dir = tempfile::tempdir().unwrap();
+        let rel = PathBuf::from("different.txt");
+        let file = Node {
+            name: "different.txt".to_owned(),
+            rel: rel.clone(),
+            is_dir: false,
+            left: None,
+            right: None,
+            facts: PairFacts::default(),
+            status: NodeStatus::Different,
+            flags: StatusFlags::default(),
+            quick: None,
+            content: None,
+            error: None,
+            incomplete: false,
+            scan_cancelled: false,
+            children: Vec::new(),
+        };
+        let root = Node {
+            name: String::new(),
+            rel: PathBuf::new(),
+            is_dir: true,
+            left: None,
+            right: None,
+            facts: PairFacts::default(),
+            status: NodeStatus::NotCompared,
+            flags: StatusFlags::default(),
+            quick: None,
+            content: None,
+            error: None,
+            incomplete: false,
+            scan_cancelled: false,
+            children: vec![file],
+        };
+        let mut view = FolderView::from_arena(
+            dir.path().join("left"),
+            dir.path().join("right"),
+            &ca_ui::testing::context(),
+            1,
+            Arena::from_root(&root),
+        );
+        view.ignored_overrides.insert(rel.clone(), true);
+        view.rebuild();
+        // Keep the periodic rebuild deferred so completion must refresh the rows.
+        view.last_rebuild = Instant::now() + Duration::from_secs(1);
+        let index = view.arena.index_of(&rel).unwrap();
+        assert_eq!(
+            view.effective_status_at(index, view.arena.node(index).unwrap()),
+            NodeStatus::Same
+        );
+
+        view.content_job = Some(Job::spawn(move |emitter, _cancel| {
+            emitter.send(ContentMessage::Update(Box::new(ContentUpdate {
+                rel,
+                outcome: Err(ContentFailure::Io {
+                    path: "different.txt".to_owned(),
+                    message: "read failed".to_owned(),
+                }),
+            })));
+            emitter.send(ContentMessage::Done {
+                tree: None,
+                complete: true,
+            });
+        }));
+        let deadline = Instant::now() + PATIENCE;
+        while view.content_job.is_some() && Instant::now() < deadline {
+            view.tick();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(view.content_job.is_none(), "the content job did not finish");
+        assert!(view.is_ready());
+
+        assert_eq!(
+            view.effective_status_at(index, view.arena.node(index).unwrap()),
+            NodeStatus::Error
+        );
+        assert_eq!(view.effective_totals.unwrap().errors, 1);
     }
 
     #[test]

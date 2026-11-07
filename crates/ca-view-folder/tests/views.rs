@@ -8,7 +8,7 @@ use ca_ui::command::Command;
 use ca_ui::testing::{context, sized_input};
 use ca_ui::view::SessionView;
 use ca_view_folder::operations::Operation;
-use ca_view_folder::selection::ClickKind;
+use ca_view_folder::selection::{ClickKind, Scope, SelectRule};
 use ca_view_folder::FolderView;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -74,6 +74,55 @@ fn a_content_comparison_that_runs_to_the_end_leaves_the_view_ready() {
     assert!(tick_until(&mut view, |view| SessionView::is_ready(view)
         && view.accepts(Command::CompareContents)));
     assert!(view.arena().totals().files > 0);
+}
+
+/// Ignored rows act as matches in navigation, selection, and reports.
+#[test]
+fn ignored_folder_rows_count_as_matching_and_leave_difference_selection() {
+    let dir = fixture();
+    let mut view = view_over(dir.path());
+    assert!(tick_until(&mut view, SessionView::is_ready));
+    view.run(Command::ExpandAll);
+    view.select(SelectRule::Differences, Scope::Both);
+    assert!(!view.selection().is_empty());
+    assert!(view.accepts(Command::ToggleRowIgnored));
+
+    view.run(Command::ToggleRowIgnored);
+    assert_eq!(view.checked(Command::ToggleRowIgnored), Some(true));
+    assert!(!view.accepts(Command::NextDifference));
+
+    let (_, payload) = view.report_payload();
+    let ca_ui::report::Payload::Folder(rows) = payload else {
+        panic!("the folder view must create folder report rows");
+    };
+    let row_status = |path: &str| {
+        rows.iter()
+            .find(|row| row.relative_path == path)
+            .map(|row| format!("{:?}", row.status))
+    };
+    assert_eq!(row_status("sub"), Some("Same".to_string()));
+    assert_eq!(row_status("sub/differs.txt"), Some("Same".to_string()));
+    assert_eq!(row_status("orphan.txt"), Some("Same".to_string()));
+
+    let selected = view.selection().clone();
+    view.select(SelectRule::Differences, Scope::Both);
+    assert!(view.selection().is_empty());
+    *view.selection_mut() = selected;
+
+    view.run(Command::ToggleRowIgnored);
+    assert_eq!(view.checked(Command::ToggleRowIgnored), Some(false));
+    let (_, payload) = view.report_payload();
+    let ca_ui::report::Payload::Folder(rows) = payload else {
+        panic!("the folder view must create folder report rows");
+    };
+    let difference = rows
+        .iter()
+        .find(|row| row.relative_path == "sub/differs.txt")
+        .map(|row| format!("{:?}", row.status));
+    assert_eq!(difference.as_deref(), Some("Different"));
+
+    view.select(SelectRule::Differences, Scope::Both);
+    assert!(!view.selection().is_empty());
 }
 
 /// The engine marks a folder whose listing did not come back whole. The view
