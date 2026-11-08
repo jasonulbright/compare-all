@@ -1106,6 +1106,7 @@ impl FolderView {
             ));
             return;
         };
+        self.form.options.include_hidden = self.confirmations.include_hidden_items;
         let parent = self.new_folder_parent();
         let request = Request::build(
             operation,
@@ -1256,6 +1257,7 @@ impl FolderView {
         let Some(tree) = self.compared_tree.take() else {
             return;
         };
+        self.form.options.include_hidden = self.confirmations.include_hidden_items;
         let basis = SyncBasis {
             preset: self.sync.method.preset(),
             preview,

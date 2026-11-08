@@ -536,6 +536,11 @@ fn a_synchronisation_previews_every_operation_and_honours_an_override() {
         fixture.journals(),
     );
     view.form_mut().options.use_recycle_bin = false;
+    view.set_confirmations(ca_session::options::FileOperationOptions {
+        include_hidden_items: false,
+        ..ca_session::options::FileOperationOptions::default()
+    });
+    view.form_mut().options.include_hidden = true;
     assert!(poll_until(&mut view, |view| view.sync().preview.is_some()));
     view.set_sync_method(ca_view_folder::sync_mode::Method::UpdateRight);
     assert!(poll_until(&mut view, |view| {
@@ -558,6 +563,7 @@ fn a_synchronisation_previews_every_operation_and_honours_an_override() {
     view.start_synchronisation();
     assert!(poll_until(&mut view, FolderView::is_confirming));
     let plan = view.pending_plan().expect("a plan is on screen");
+    assert!(!plan.options.include_hidden);
     assert!(
         !plan
             .steps
@@ -1013,6 +1019,41 @@ fn an_operation_whose_confirmation_is_cleared_runs_without_asking() {
         view.has_summary()
     });
     assert!(finished, "the batch never reported a result");
+    assert!(fixture.right().join("one.txt").exists());
+}
+
+#[test]
+fn operation_confirmation_starts_with_the_saved_hidden_items_default_and_can_override_it() {
+    let fixture = Fixture::new();
+    fixture.write("left", "one.txt", b"alpha");
+    let mut view = fixture.view();
+    view.set_confirmations(ca_session::options::FileOperationOptions {
+        include_hidden_items: false,
+        ..ca_session::options::FileOperationOptions::default()
+    });
+    view.form_mut().options.include_hidden = true;
+
+    plan_for(&mut view, Operation::CopyToOtherSide, Scope::Left);
+    assert!(
+        !view
+            .pending_plan()
+            .expect("a plan is on screen")
+            .options
+            .include_hidden
+    );
+
+    view.form_mut().options.include_hidden = true;
+    view.confirm_pending();
+    assert!(poll_until(&mut view, |view| {
+        view.is_confirming() || view.has_summary()
+    }));
+    assert!(
+        view.pending_plan()
+            .expect("the updated plan is retained")
+            .options
+            .include_hidden
+    );
+    assert!(view.has_summary());
     assert!(fixture.right().join("one.txt").exists());
 }
 

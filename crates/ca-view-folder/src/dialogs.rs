@@ -136,6 +136,9 @@ const fn confirm_label(operation: Operation) -> &'static str {
 /// The controls one operation offers.
 #[allow(clippy::too_many_lines)]
 fn options_for(ui: &mut egui::Ui, operation: Operation, form: &mut Form, offset_seconds: i32) {
+    if operation.needs_selection() && operation.writes_files() {
+        ui.checkbox(&mut form.options.include_hidden, "Include hidden items");
+    }
     match operation {
         Operation::Delete => {
             ui.checkbox(
@@ -663,6 +666,34 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn file_operation_dialog_changes_the_hidden_items_option_by_accessible_label() {
+        let mut probe = ca_ui::testing::probe::Probe::new(800.0, 500.0);
+        let mut form = crate::operations::Form::default();
+        form.options.include_hidden = false;
+        let mut run = |ctx: &egui::Context| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                super::options_for(
+                    ui,
+                    crate::operations::Operation::CopyToOtherSide,
+                    &mut form,
+                    0,
+                );
+            });
+        };
+
+        probe.idle(&mut run);
+        probe.idle(&mut run);
+        assert_eq!(
+            probe.find("Include hidden items").unwrap().toggled,
+            Some(false)
+        );
+        probe.click("Include hidden items", &mut run).unwrap();
+        assert!(form.options.include_hidden);
+    }
+
     use super::{describe, fraction, outcome_text};
     use ca_fs::{StepAction, StepOutcome};
     use std::path::PathBuf;
