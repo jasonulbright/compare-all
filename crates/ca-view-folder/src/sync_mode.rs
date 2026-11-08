@@ -202,6 +202,7 @@ mod tests {
                 },
             ],
             overrides: std::collections::BTreeMap::new(),
+            blocked_overrides: std::collections::BTreeMap::new(),
         }
     }
 

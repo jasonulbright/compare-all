@@ -43,6 +43,8 @@ pub enum PlanMessage {
         tree: Option<Box<Node>>,
         /// What the run produced.
         outcome: PlanOutcome,
+        /// The preview used by a sync plan, and its hidden-item setting.
+        sync_preview: Option<(Box<SyncPreview>, bool)>,
     },
     /// The run could not proceed.
     Failed(String),
@@ -57,6 +59,7 @@ impl Terminal for PlanMessage {
         Self::Done {
             tree: None,
             outcome: PlanOutcome::Stopped,
+            sync_preview: None,
         }
     }
 
@@ -83,6 +86,7 @@ pub fn spawn_plan(
             emitter.send(PlanMessage::Done {
                 tree: Some(tree),
                 outcome,
+                sync_preview: None,
             });
         },
         notify,
@@ -341,6 +345,10 @@ pub fn spawn_sync_plan(
                 left: &left_base,
                 right: &right_base,
             };
+            let include_hidden = options.include_hidden;
+            let overrides = preview.overrides;
+            let mut preview = ca_fs::preview_with_options(&tree, &preset, include_hidden);
+            preview.overrides = overrides;
             let outcome = unless_stopped(cancel, || {
                 match plan_sync(&tree, &preset, bases, &options, &preview) {
                     Ok(plan) => PlanOutcome::Plan(Box::new(plan)),
@@ -350,6 +358,7 @@ pub fn spawn_sync_plan(
             emitter.send(PlanMessage::Done {
                 tree: Some(tree),
                 outcome,
+                sync_preview: Some((Box::new(preview), include_hidden)),
             });
         },
         notify,
@@ -393,12 +402,13 @@ pub fn spawn_preview(
     tree: Box<Node>,
     preset: SyncPreset,
     overrides: std::collections::BTreeMap<PathBuf, ca_fs::SyncAction>,
+    include_hidden: bool,
     notify: Arc<dyn Fn() + Send + Sync>,
 ) -> Job<PreviewMessage> {
     Job::spawn_notifying(
         move |emitter, _cancel| {
             let tree = tree;
-            let mut preview = ca_fs::preview(&tree, &preset);
+            let mut preview = ca_fs::preview_with_options(&tree, &preset, include_hidden);
             preview.overrides = overrides;
             emitter.send(PreviewMessage::Done {
                 tree: Some(tree),

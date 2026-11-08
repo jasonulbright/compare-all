@@ -82,8 +82,8 @@ pub use source::{
     SourceKind, TimeFidelity,
 };
 pub use sync::{
-    plan_sync, preview, PreviewRow, StatusKey, SyncAction, SyncPreset, SyncPreview, SyncRefused,
-    SyncRules,
+    plan_sync, preview, preview_with_options, PreviewRow, StatusKey, SyncAction, SyncPreset,
+    SyncPreview, SyncRefused, SyncRules,
 };
 pub use zone::{local_offset_seconds, probed_offset};
 

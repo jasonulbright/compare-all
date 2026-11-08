@@ -726,17 +726,72 @@ pub fn resolve_selection_with<'a>(
     out
 }
 
-/// True when a descendant reached through a selected folder is left out because
-/// it is hidden.
-fn skips_hidden(options: &OperationOptions, node: &Node) -> bool {
-    !options.include_hidden && is_hidden(node)
+/// Whether the operation options omit this node on one side because it is hidden.
+fn skips_hidden_on(options: &OperationOptions, node: &Node, side: Side) -> bool {
+    !options.include_hidden && is_hidden_on(node, side)
 }
 
-/// True when the pair exists and every side of it carries the hidden flag.
-fn is_hidden(node: &Node) -> bool {
+/// True when every present side of a pair is marked hidden.
+pub(crate) fn is_hidden(node: &Node) -> bool {
     let sides = [node.left.as_ref(), node.right.as_ref()];
     let mut present = sides.iter().flatten().peekable();
     present.peek().is_some() && present.all(|entry| entry.attributes.hidden)
+}
+
+/// True when the selected side of a pair is marked hidden.
+pub(crate) fn is_hidden_on(node: &Node, side: Side) -> bool {
+    entry_of(node, side).is_some_and(|entry| entry.attributes.hidden)
+}
+
+/// True when a hidden descendant on one side will be excluded by these options.
+pub(crate) fn has_excluded_hidden_descendant(
+    options: &OperationOptions,
+    node: &Node,
+    side: Side,
+) -> bool {
+    !options.include_hidden
+        && node.children.iter().any(|child| {
+            is_hidden_on(child, side) || has_excluded_hidden_descendant(options, child, side)
+        })
+}
+
+/// True when at least one child on this side will participate in a copy.
+pub(crate) fn has_included_children(options: &OperationOptions, node: &Node, side: Side) -> bool {
+    node.children.iter().any(|child| {
+        if skips_hidden_on(options, child, side) {
+            return false;
+        }
+        let Some(entry) = entry_of(child, side) else {
+            return false;
+        };
+        if entry.is_dir {
+            !entry.is_link()
+                && (options.create_empty_folders || has_included_children(options, child, side))
+        } else {
+            true
+        }
+    })
+}
+
+/// Record why a folder stays after its hidden descendants are excluded.
+fn note_excluded_hidden_descendants(plan: &mut OperationPlan, node: &Node) {
+    plan.skipped.push(PlanSkip::noted(
+        node.rel.clone(),
+        "the folder is kept because it contains hidden items excluded from this operation",
+    ));
+}
+
+/// Record that hidden descendants prevent removing this folder from a side.
+fn keep_folder_for_excluded_hidden_descendants(
+    plan: &mut OperationPlan,
+    node: &Node,
+    side: Side,
+) -> bool {
+    if !has_excluded_hidden_descendant(&plan.options, node, side) {
+        return false;
+    }
+    note_excluded_hidden_descendants(plan, node);
+    true
 }
 
 fn collect_selected<'a>(
@@ -966,8 +1021,7 @@ pub(crate) fn removal_expectation(node: &Node, side: Side, recursive: bool) -> S
     }
 }
 
-/// Append the steps that put `node`'s subtree from `from` onto `to` under
-/// `target_root`, with the destination path built from `rel_for`.
+/// Shared roots and direction for subtree copy and move planning.
 pub(crate) struct Transfer<'a> {
     pub from: Side,
     pub to: Side,
@@ -976,6 +1030,10 @@ pub(crate) struct Transfer<'a> {
     pub moving: bool,
 }
 
+/// Append the steps that put `node`'s included subtree on the destination side.
+///
+/// Hidden descendants excluded by the operation options are left in place when
+/// moving, and their containing source folders are retained.
 pub(crate) fn plan_copy_subtree(
     plan: &mut OperationPlan,
     node: &Node,
@@ -1013,7 +1071,10 @@ pub(crate) fn plan_copy_subtree(
             ));
             return;
         }
-        if node.children.is_empty() && !plan.options.create_empty_folders {
+        if !has_included_children(&plan.options, node, from) && !plan.options.create_empty_folders {
+            if moving {
+                keep_folder_for_excluded_hidden_descendants(plan, node, from);
+            }
             return;
         }
         let mut dir_step = step(
@@ -1030,7 +1091,7 @@ pub(crate) fn plan_copy_subtree(
         dir_step.expected = expectation(node, Some(from), Some(to));
         plan.push(dir_step);
         for child in &node.children {
-            if skips_hidden(&plan.options, child) {
+            if skips_hidden_on(&plan.options, child, from) {
                 continue;
             }
             plan_copy_subtree(plan, child, transfer, &dest_rel.join(&child.name));
@@ -1042,6 +1103,9 @@ pub(crate) fn plan_copy_subtree(
                     Conflict::CounterpartUnreadable,
                     "the source folder's listing is partial, so it is not removed",
                 ));
+                return;
+            }
+            if keep_folder_for_excluded_hidden_descendants(plan, node, from) {
                 return;
             }
             let mut remove = step(
@@ -1118,7 +1182,9 @@ pub(crate) fn plan_delete_subtree(plan: &mut OperationPlan, node: &Node, side: S
         return;
     }
 
-    if plan.options.use_recycle_bin {
+    let excluded_hidden_descendants =
+        entry.is_dir && has_excluded_hidden_descendant(&plan.options, node, side);
+    if plan.options.use_recycle_bin && !excluded_hidden_descendants {
         let mut trash_step = step(StepAction::Trash { path }, node.rel.clone(), Some(side));
         trash_step.conflicts = delete_conflicts(entry);
         trash_step.bytes = entry.size;
@@ -1129,10 +1195,14 @@ pub(crate) fn plan_delete_subtree(plan: &mut OperationPlan, node: &Node, side: S
 
     if entry.is_dir {
         for child in &node.children {
-            if skips_hidden(&plan.options, child) {
+            if skips_hidden_on(&plan.options, child, side) {
                 continue;
             }
             plan_delete_subtree(plan, child, side, root);
+        }
+        if excluded_hidden_descendants {
+            note_excluded_hidden_descendants(plan, node);
+            return;
         }
         let mut dir_step = step(StepAction::DeleteDir { path }, node.rel.clone(), Some(side));
         dir_step.conflicts = delete_conflicts(entry);
@@ -1431,6 +1501,14 @@ struct ToFolder<'a> {
     fs: &'a dyn FileOps,
 }
 
+struct DirectoryTarget<'a> {
+    dest_rel: &'a Path,
+    source_path: PathBuf,
+    target_path: PathBuf,
+    target_state: PathState,
+    target_is_file: bool,
+}
+
 /// What a probe of one destination found.
 enum Destination {
     /// No item holds the name.
@@ -1506,45 +1584,19 @@ fn plan_copy_subtree_to(
         .map_or_else(PathState::absent, PathState::found);
 
     if source.is_dir {
-        if source.is_link() {
-            plan.skipped.push(PlanSkip::refused(
-                node.rel.clone(),
-                Conflict::RemovesLinkOnly,
-                "a directory link is not descended into",
-            ));
-            return;
-        }
-        let mut dir_step = step(
-            StepAction::CreateDir { path: target_path },
-            dest_rel.to_path_buf(),
-            None,
+        plan_copy_directory_to(
+            plan,
+            node,
+            to,
+            source,
+            DirectoryTarget {
+                dest_rel,
+                source_path,
+                target_path,
+                target_state,
+                target_is_file: found.as_ref().is_some_and(|found| !found.is_dir),
+            },
         );
-        if found.as_ref().is_some_and(|found| !found.is_dir) {
-            dir_step.conflicts.push(Conflict::KindMismatch);
-        }
-        dir_step.expected = expectation(node, Some(from), None);
-        dir_step.expected.target = Some(target_state);
-        plan.push(dir_step);
-        for child in &node.children {
-            plan_copy_subtree_to(plan, child, to, &dest_rel.join(&child.name), None);
-        }
-        if moving {
-            if node.incomplete {
-                plan.skipped.push(PlanSkip::refused(
-                    node.rel.clone(),
-                    Conflict::CounterpartUnreadable,
-                    "the source folder's listing is partial, so it is not removed",
-                ));
-                return;
-            }
-            let mut remove = step(
-                StepAction::DeleteDir { path: source_path },
-                node.rel.clone(),
-                Some(from),
-            );
-            remove.expected = removal_expectation(node, from, false);
-            plan.push(remove);
-        }
         return;
     }
 
@@ -1574,6 +1626,72 @@ fn plan_copy_subtree_to(
         .filter(|_| found.is_some())
         .map(|backup| backup.path_for(&target_path));
     plan.push(file_step);
+}
+
+/// Copy included children, retaining the source when excluded hidden items remain.
+fn plan_copy_directory_to(
+    plan: &mut OperationPlan,
+    node: &Node,
+    to: &ToFolder<'_>,
+    source: &crate::scan::Entry,
+    target: DirectoryTarget<'_>,
+) {
+    let ToFolder { from, moving, .. } = *to;
+    if source.is_link() {
+        plan.skipped.push(PlanSkip::refused(
+            node.rel.clone(),
+            Conflict::RemovesLinkOnly,
+            "a directory link is not descended into",
+        ));
+        return;
+    }
+    if !has_included_children(&plan.options, node, from) && !plan.options.create_empty_folders {
+        if moving {
+            keep_folder_for_excluded_hidden_descendants(plan, node, from);
+        }
+        return;
+    }
+    let mut dir_step = step(
+        StepAction::CreateDir {
+            path: target.target_path,
+        },
+        target.dest_rel.to_path_buf(),
+        None,
+    );
+    if target.target_is_file {
+        dir_step.conflicts.push(Conflict::KindMismatch);
+    }
+    dir_step.expected = expectation(node, Some(from), None);
+    dir_step.expected.target = Some(target.target_state);
+    plan.push(dir_step);
+    for child in &node.children {
+        if skips_hidden_on(&plan.options, child, from) {
+            continue;
+        }
+        plan_copy_subtree_to(plan, child, to, &target.dest_rel.join(&child.name), None);
+    }
+    if moving {
+        if node.incomplete {
+            plan.skipped.push(PlanSkip::refused(
+                node.rel.clone(),
+                Conflict::CounterpartUnreadable,
+                "the source folder's listing is partial, so it is not removed",
+            ));
+            return;
+        }
+        if keep_folder_for_excluded_hidden_descendants(plan, node, from) {
+            return;
+        }
+        let mut remove = step(
+            StepAction::DeleteDir {
+                path: target.source_path,
+            },
+            node.rel.clone(),
+            Some(from),
+        );
+        remove.expected = removal_expectation(node, from, false);
+        plan.push(remove);
+    }
 }
 
 /// Plan a delete of the selected items from one or both sides.

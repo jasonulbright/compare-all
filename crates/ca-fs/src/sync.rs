@@ -13,8 +13,8 @@ use serde::{Deserialize, Serialize};
 use crate::compare::{Node, NodeStatus};
 use crate::criteria::Side;
 use crate::ops::plan::{
-    entry_of, path_is_within, step, Bases, Conflict, OperationKind, OperationOptions,
-    OperationPlan, PlanStep, StepAction,
+    entry_of, has_excluded_hidden_descendant, has_included_children, is_hidden_on, path_is_within,
+    step, Bases, Conflict, OperationKind, OperationOptions, OperationPlan, PlanStep, StepAction,
 };
 
 /// What a sync does to one pair.
@@ -34,6 +34,15 @@ pub enum SyncAction {
 }
 
 impl SyncAction {
+    /// The side whose attributes control hidden filtering for this action.
+    const fn affected_side(self) -> Option<Side> {
+        match self {
+            Self::CopyLeftToRight | Self::DeleteLeft => Some(Side::Left),
+            Self::CopyRightToLeft | Self::DeleteRight => Some(Side::Right),
+            Self::LeaveAlone => None,
+        }
+    }
+
     /// True when the action removes something.
     #[must_use]
     pub fn is_delete(self) -> bool {
@@ -200,17 +209,61 @@ pub struct SyncPreview {
     pub rows: Vec<PreviewRow>,
     /// Rows the caller has overridden, keyed by relative path.
     pub overrides: BTreeMap<PathBuf, SyncAction>,
+    /// Overrides that cannot produce the advertised action with these options.
+    pub blocked_overrides: BTreeMap<PathBuf, Vec<SyncAction>>,
+}
+
+/// Hidden flags inherited independently from each side's ancestor chain.
+#[derive(Debug, Clone, Copy, Default)]
+struct HiddenAbove {
+    left: bool,
+    right: bool,
+}
+
+impl HiddenAbove {
+    /// Carry this node's hidden flags into its descendants.
+    fn includes(self, node: &Node) -> Self {
+        Self {
+            left: self.left || is_hidden_on(node, Side::Left),
+            right: self.right || is_hidden_on(node, Side::Right),
+        }
+    }
+
+    /// Whether an ancestor is hidden on one side.
+    const fn on(self, side: Side) -> bool {
+        match side {
+            Side::Left => self.left,
+            Side::Right => self.right,
+        }
+    }
+
+    /// Whether this node or an ancestor is hidden on one side.
+    fn hides(self, node: &Node, side: Side) -> bool {
+        self.on(side) || is_hidden_on(node, side)
+    }
 }
 
 impl SyncPreview {
-    /// The action one row will actually receive, after overrides.
+    /// The action one row will receive, after applicable overrides.
     #[must_use]
     pub fn effective(&self, rel: &std::path::Path, planned: SyncAction) -> SyncAction {
-        self.overrides.get(rel).copied().unwrap_or(planned)
+        let Some(override_action) = self.overrides.get(rel).copied() else {
+            return planned;
+        };
+        if self
+            .blocked_overrides
+            .get(rel)
+            .is_some_and(|blocked| blocked.contains(&override_action))
+        {
+            planned
+        } else {
+            override_action
+        }
     }
 
     /// Override one row's action, which is how a preview excludes an operation
-    /// or forces one the rules did not choose.
+    /// or forces one the rules did not choose. An override that cannot run with
+    /// the current hidden-item setting has no effect until that setting allows it.
     pub fn set_override(&mut self, rel: PathBuf, action: SyncAction) {
         self.overrides.insert(rel, action);
     }
@@ -231,30 +284,130 @@ impl SyncPreview {
 /// no row and is never acted on.
 #[must_use]
 pub fn preview(root: &Node, preset: &SyncPreset) -> SyncPreview {
+    preview_with_options(root, preset, true)
+}
+
+/// Build the preview for the hidden-item setting used by the next operation.
+#[must_use]
+pub fn preview_with_options(root: &Node, preset: &SyncPreset, include_hidden: bool) -> SyncPreview {
     let rules = preset.rules();
+    let options = OperationOptions {
+        include_hidden,
+        ..OperationOptions::default()
+    };
     let mut preview = SyncPreview::default();
-    collect_rows(root, &rules, true, &mut preview.rows);
+    collect_rows(
+        root,
+        &rules,
+        true,
+        &options,
+        &mut preview,
+        HiddenAbove::default(),
+    );
     preview
 }
 
-fn collect_rows(node: &Node, rules: &SyncRules, is_root: bool, rows: &mut Vec<PreviewRow>) {
+/// Add runnable rows and block overrides excluded by hidden-item filtering.
+///
+/// Hidden state is tracked per side so recursion through an idle folder cannot
+/// expose actions on that side's hidden descendants.
+fn collect_rows(
+    node: &Node,
+    rules: &SyncRules,
+    is_root: bool,
+    options: &OperationOptions,
+    preview: &mut SyncPreview,
+    hidden_above: HiddenAbove,
+) {
+    let action = if is_root {
+        SyncAction::LeaveAlone
+    } else {
+        preview_action(node, rules, options)
+    };
+    if is_hidden_action(node, action, is_root, options, hidden_above) {
+        return;
+    }
     if !is_root {
-        rows.push(PreviewRow {
+        preview.rows.push(PreviewRow {
             rel: node.rel.clone(),
             name: node.name.clone(),
             is_dir: node.is_dir,
             status: node.status,
-            action: rules.action_for(node.status),
+            action,
         });
+        let hidden_left = !options.include_hidden && hidden_above.hides(node, Side::Left);
+        let hidden_right = !options.include_hidden && hidden_above.hides(node, Side::Right);
+        let mut blocked = Vec::new();
+        if hidden_left || (node.is_dir && !has_included_children(options, node, Side::Left)) {
+            blocked.push(SyncAction::CopyLeftToRight);
+        }
+        if hidden_right || (node.is_dir && !has_included_children(options, node, Side::Right)) {
+            blocked.push(SyncAction::CopyRightToLeft);
+        }
+        if hidden_left || (node.is_dir && has_excluded_hidden_descendant(options, node, Side::Left))
+        {
+            blocked.push(SyncAction::DeleteLeft);
+        }
+        if hidden_right
+            || (node.is_dir && has_excluded_hidden_descendant(options, node, Side::Right))
+        {
+            blocked.push(SyncAction::DeleteRight);
+        }
+        if !blocked.is_empty() {
+            preview.blocked_overrides.insert(node.rel.clone(), blocked);
+        }
     }
     // Execution treats a linked folder as one item and never walks its target.
     // Offering child overrides here would promise steps that cannot run.
     if is_link_node(node) {
         return;
     }
+    let hidden_for_children = if is_root {
+        hidden_above
+    } else {
+        hidden_above.includes(node)
+    };
     for child in &node.children {
-        collect_rows(child, rules, false, rows);
+        collect_rows(child, rules, false, options, preview, hidden_for_children);
     }
+}
+
+/// Keep folder actions idle when filtering removes every child they would use.
+fn preview_action(node: &Node, rules: &SyncRules, options: &OperationOptions) -> SyncAction {
+    let action = rules.action_for(node.status);
+    if !node.is_dir {
+        return action;
+    }
+    match action {
+        SyncAction::CopyLeftToRight if !has_included_children(options, node, Side::Left) => {
+            SyncAction::LeaveAlone
+        }
+        SyncAction::CopyRightToLeft if !has_included_children(options, node, Side::Right) => {
+            SyncAction::LeaveAlone
+        }
+        SyncAction::DeleteLeft if has_excluded_hidden_descendant(options, node, Side::Left) => {
+            SyncAction::LeaveAlone
+        }
+        SyncAction::DeleteRight if has_excluded_hidden_descendant(options, node, Side::Right) => {
+            SyncAction::LeaveAlone
+        }
+        _ => action,
+    }
+}
+
+/// Whether an action's affected side is hidden on the row or an ancestor.
+fn is_hidden_action(
+    node: &Node,
+    action: SyncAction,
+    is_root: bool,
+    options: &OperationOptions,
+    hidden_above: HiddenAbove,
+) -> bool {
+    !is_root
+        && !options.include_hidden
+        && action
+            .affected_side()
+            .is_some_and(|side| hidden_above.hides(node, side))
 }
 
 /// Why a sync produced no plan at all.
@@ -300,6 +453,7 @@ pub fn plan_sync(
         &mut plan,
         &mut deletions,
         true,
+        HiddenAbove::default(),
     );
     // The walk queues children before parents for directory removal.
     for removal in deletions {
@@ -322,6 +476,9 @@ fn plan_roots_contain(bases: Bases<'_>, step: &PlanStep) -> bool {
         .all(|written| path_is_within(bases.left, written) || path_is_within(bases.right, written))
 }
 
+/// Add the steps for a row, then remove its folder only when all children go.
+///
+/// The per-side hidden ancestor state mirrors preview filtering during planning.
 #[allow(clippy::too_many_arguments)]
 fn walk(
     node: &Node,
@@ -331,11 +488,29 @@ fn walk(
     plan: &mut OperationPlan,
     deletions: &mut Vec<PlanStep>,
     is_root: bool,
+    hidden_above: HiddenAbove,
 ) -> Option<SyncAction> {
+    let planned_action = if is_root {
+        SyncAction::LeaveAlone
+    } else {
+        rules.action_for(node.status)
+    };
+    let filtered_action = if is_root {
+        SyncAction::LeaveAlone
+    } else {
+        preview_action(node, rules, &plan.options)
+    };
+
+    // Filter by the rules action before applying overrides. A stale override
+    // must not revive a row that the matching preview omitted as hidden.
+    if is_hidden_action(node, filtered_action, is_root, &plan.options, hidden_above) {
+        return None;
+    }
+
     let action = if is_root {
         SyncAction::LeaveAlone
     } else {
-        preview.effective(&node.rel, rules.action_for(node.status))
+        preview.effective(&node.rel, planned_action)
     };
 
     if !is_root
@@ -352,8 +527,22 @@ fn walk(
     // Each child's preview controls its action. A parent's removal must never
     // turn a preserved child into an implicit deletion, including via trash.
     if !is_link_node(node) {
+        let hidden_for_children = if is_root {
+            hidden_above
+        } else {
+            hidden_above.includes(node)
+        };
         for child in &node.children {
-            let removed = walk(child, rules, preview, bases, plan, deletions, false);
+            let removed = walk(
+                child,
+                rules,
+                preview,
+                bases,
+                plan,
+                deletions,
+                false,
+                hidden_for_children,
+            );
             all_deleted &= removed == Some(action);
         }
     }
@@ -445,7 +634,7 @@ fn emit(
         if source.is_link() {
             return;
         }
-        if node.children.is_empty() && !plan.options.create_empty_folders {
+        if !has_included_children(&plan.options, node, from) && !plan.options.create_empty_folders {
             return;
         }
         let mut create = step(
