@@ -324,12 +324,7 @@ fn collect_rows(
     } else {
         preview_action(node, rules, options)
     };
-    if !is_root
-        && !options.include_hidden
-        && action
-            .affected_side()
-            .is_some_and(|side| hidden_above.hides(node, side))
-    {
+    if is_hidden_action(node, action, is_root, options, hidden_above) {
         return;
     }
     if !is_root {
@@ -398,6 +393,21 @@ fn preview_action(node: &Node, rules: &SyncRules, options: &OperationOptions) ->
         }
         _ => action,
     }
+}
+
+/// Whether an action's affected side is hidden on the row or an ancestor.
+fn is_hidden_action(
+    node: &Node,
+    action: SyncAction,
+    is_root: bool,
+    options: &OperationOptions,
+    hidden_above: HiddenAbove,
+) -> bool {
+    !is_root
+        && !options.include_hidden
+        && action
+            .affected_side()
+            .is_some_and(|side| hidden_above.hides(node, side))
 }
 
 /// Why a sync produced no plan at all.
@@ -480,20 +490,28 @@ fn walk(
     is_root: bool,
     hidden_above: HiddenAbove,
 ) -> Option<SyncAction> {
+    let planned_action = if is_root {
+        SyncAction::LeaveAlone
+    } else {
+        rules.action_for(node.status)
+    };
+    let filtered_action = if is_root {
+        SyncAction::LeaveAlone
+    } else {
+        preview_action(node, rules, &plan.options)
+    };
+
+    // Filter by the rules action before applying overrides. A stale override
+    // must not revive a row that the matching preview omitted as hidden.
+    if is_hidden_action(node, filtered_action, is_root, &plan.options, hidden_above) {
+        return None;
+    }
+
     let action = if is_root {
         SyncAction::LeaveAlone
     } else {
-        preview.effective(&node.rel, rules.action_for(node.status))
+        preview.effective(&node.rel, planned_action)
     };
-
-    if !is_root
-        && !plan.options.include_hidden
-        && action
-            .affected_side()
-            .is_some_and(|side| hidden_above.hides(node, side))
-    {
-        return None;
-    }
 
     if !is_root
         && !action.is_idle()

@@ -3032,6 +3032,55 @@ fn a_hidden_file_row_cannot_be_overridden_to_act_on_its_hidden_side() {
 }
 
 #[test]
+fn sync_does_not_apply_an_override_to_a_hidden_row_omitted_from_preview() {
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    std::fs::write(left.path().join("different.txt"), b"left").unwrap();
+    std::fs::write(right.path().join("different.txt"), b"right").unwrap();
+    std::fs::write(left.path().join("visible.txt"), b"visible").unwrap();
+
+    let mut root = compared(left.path(), right.path());
+    root.children
+        .iter_mut()
+        .find(|node| node.rel == Path::new("different.txt"))
+        .unwrap()
+        .left
+        .as_mut()
+        .unwrap()
+        .attributes
+        .hidden = true;
+
+    let preset = SyncPreset::MirrorToRight;
+    let mut shown = preview_with_options(&root, &preset, false);
+    assert!(!shown
+        .rows
+        .iter()
+        .any(|row| row.rel == Path::new("different.txt")));
+    shown.set_override(PathBuf::from("different.txt"), SyncAction::DeleteRight);
+
+    let bases = Bases {
+        left: left.path(),
+        right: right.path(),
+    };
+    let mut opts = options();
+    opts.include_hidden = false;
+    let plan = plan_sync(&root, &preset, bases, &opts, &shown).unwrap();
+
+    assert!(shown
+        .pending()
+        .iter()
+        .any(|row| row.rel == Path::new("visible.txt")));
+    assert!(plan
+        .steps
+        .iter()
+        .any(|step| step.rel == Path::new("visible.txt")));
+    assert!(!plan
+        .steps
+        .iter()
+        .any(|step| step.rel == Path::new("different.txt")));
+}
+
+#[test]
 fn sync_excludes_actions_below_a_hidden_ancestor() {
     let left = tempfile::tempdir().unwrap();
     let right = tempfile::tempdir().unwrap();
