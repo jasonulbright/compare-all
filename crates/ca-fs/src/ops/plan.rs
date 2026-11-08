@@ -726,23 +726,24 @@ pub fn resolve_selection_with<'a>(
     out
 }
 
-/// True when a descendant reached through a selected folder is left out because
-/// it is hidden.
+/// Whether the operation options omit this node on one side because it is hidden.
 fn skips_hidden_on(options: &OperationOptions, node: &Node, side: Side) -> bool {
     !options.include_hidden && is_hidden_on(node, side)
 }
 
-/// True when the pair exists and every side of it carries the hidden flag.
+/// True when every present side of a pair is marked hidden.
 pub(crate) fn is_hidden(node: &Node) -> bool {
     let sides = [node.left.as_ref(), node.right.as_ref()];
     let mut present = sides.iter().flatten().peekable();
     present.peek().is_some() && present.all(|entry| entry.attributes.hidden)
 }
 
+/// True when the selected side of a pair is marked hidden.
 pub(crate) fn is_hidden_on(node: &Node, side: Side) -> bool {
     entry_of(node, side).is_some_and(|entry| entry.attributes.hidden)
 }
 
+/// True when a hidden descendant on one side will be excluded by these options.
 pub(crate) fn has_excluded_hidden_descendant(
     options: &OperationOptions,
     node: &Node,
@@ -754,6 +755,7 @@ pub(crate) fn has_excluded_hidden_descendant(
         })
 }
 
+/// True when at least one child on this side will participate in a copy.
 pub(crate) fn has_included_children(options: &OperationOptions, node: &Node, side: Side) -> bool {
     node.children.iter().any(|child| {
         if skips_hidden_on(options, child, side) {
@@ -771,6 +773,7 @@ pub(crate) fn has_included_children(options: &OperationOptions, node: &Node, sid
     })
 }
 
+/// Record why a folder stays after its hidden descendants are excluded.
 fn note_excluded_hidden_descendants(plan: &mut OperationPlan, node: &Node) {
     plan.skipped.push(PlanSkip::noted(
         node.rel.clone(),
@@ -778,6 +781,7 @@ fn note_excluded_hidden_descendants(plan: &mut OperationPlan, node: &Node) {
     ));
 }
 
+/// Record that hidden descendants prevent removing this folder from a side.
 fn keep_folder_for_excluded_hidden_descendants(
     plan: &mut OperationPlan,
     node: &Node,
@@ -1017,8 +1021,7 @@ pub(crate) fn removal_expectation(node: &Node, side: Side, recursive: bool) -> S
     }
 }
 
-/// Append the steps that put `node`'s subtree from `from` onto `to` under
-/// `target_root`, with the destination path built from `rel_for`.
+/// Shared roots and direction for subtree copy and move planning.
 pub(crate) struct Transfer<'a> {
     pub from: Side,
     pub to: Side,
@@ -1027,6 +1030,10 @@ pub(crate) struct Transfer<'a> {
     pub moving: bool,
 }
 
+/// Append the steps that put `node`'s included subtree on the destination side.
+///
+/// Hidden descendants excluded by the operation options are left in place when
+/// moving, and their containing source folders are retained.
 pub(crate) fn plan_copy_subtree(
     plan: &mut OperationPlan,
     node: &Node,
@@ -1204,12 +1211,11 @@ pub(crate) fn plan_delete_subtree(plan: &mut OperationPlan, node: &Node, side: S
         return;
     }
 
-    let action = if plan.options.use_recycle_bin {
-        StepAction::Trash { path }
-    } else {
-        StepAction::DeleteFile { path }
-    };
-    let mut file_step = step(action, node.rel.clone(), Some(side));
+    let mut file_step = step(
+        StepAction::DeleteFile { path },
+        node.rel.clone(),
+        Some(side),
+    );
     file_step.bytes = entry.size;
     file_step.conflicts = delete_conflicts(entry);
     file_step.expected = removal_expectation(node, side, false);
@@ -1622,6 +1628,7 @@ fn plan_copy_subtree_to(
     plan.push(file_step);
 }
 
+/// Copy included children, retaining the source when excluded hidden items remain.
 fn plan_copy_directory_to(
     plan: &mut OperationPlan,
     node: &Node,

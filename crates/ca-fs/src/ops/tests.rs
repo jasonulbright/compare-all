@@ -2992,6 +2992,118 @@ fn an_override_cannot_promise_to_delete_a_folder_kept_for_hidden_items() {
 }
 
 #[test]
+fn a_hidden_file_row_cannot_be_overridden_to_act_on_its_hidden_side() {
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    std::fs::write(left.path().join("different.txt"), b"left").unwrap();
+    std::fs::write(right.path().join("different.txt"), b"right").unwrap();
+
+    let mut root = compared(left.path(), right.path());
+    root.children[0].right.as_mut().unwrap().attributes.hidden = true;
+    let preset = SyncPreset::MirrorToRight;
+    let base_preview = preview_with_options(&root, &preset, false);
+    let row = base_preview.rows.first().unwrap();
+    assert_eq!(row.action, SyncAction::CopyLeftToRight);
+    let rel = row.rel.clone();
+    let included_preview = preview_with_options(&root, &preset, true);
+    assert!(!included_preview.blocked_overrides.contains_key(&rel));
+    let bases = Bases {
+        left: left.path(),
+        right: right.path(),
+    };
+    let mut opts = options();
+    opts.include_hidden = false;
+
+    for action in [SyncAction::CopyRightToLeft, SyncAction::DeleteRight] {
+        let mut shown = base_preview.clone();
+        shown.set_override(rel.clone(), action);
+        assert_eq!(shown.effective(&rel, row.action), row.action);
+        let plan = plan_sync(&root, &preset, bases, &opts, &shown).unwrap();
+
+        assert!(plan.steps.iter().any(|step| {
+            step.rel == rel && matches!(&step.action, StepAction::CopyFile { .. })
+        }));
+        assert!(!plan.steps.iter().any(|step| {
+            step.rel == rel
+                && (matches!(&step.action, StepAction::DeleteFile { .. })
+                    || matches!(&step.action, StepAction::Trash { .. }))
+        }));
+    }
+}
+
+#[test]
+fn sync_excludes_actions_below_a_hidden_ancestor() {
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    let left_folder = left.path().join("folder");
+    let right_folder = right.path().join("folder");
+    std::fs::create_dir(&left_folder).unwrap();
+    std::fs::create_dir(&right_folder).unwrap();
+    let left_newer_left = left_folder.join("left_newer.txt");
+    let left_newer_right = right_folder.join("left_newer.txt");
+    let right_newer_left = left_folder.join("right_newer.txt");
+    let right_newer_right = right_folder.join("right_newer.txt");
+    for file in [
+        &left_newer_left,
+        &left_newer_right,
+        &right_newer_left,
+        &right_newer_right,
+    ] {
+        std::fs::write(file, b"value").unwrap();
+    }
+    let base_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    RealFs
+        .set_modified(&left_newer_left, base_time + Duration::from_secs(2_000))
+        .unwrap();
+    RealFs.set_modified(&left_newer_right, base_time).unwrap();
+    RealFs.set_modified(&right_newer_left, base_time).unwrap();
+    RealFs
+        .set_modified(&right_newer_right, base_time + Duration::from_secs(2_000))
+        .unwrap();
+
+    let mut root = compared(left.path(), right.path());
+    let folder = root
+        .children
+        .iter_mut()
+        .find(|node| node.rel == Path::new("folder"))
+        .unwrap();
+    folder.right.as_mut().unwrap().attributes.hidden = true;
+    assert_eq!(folder.status, NodeStatus::Different);
+    assert_eq!(
+        folder
+            .children
+            .iter()
+            .find(|node| node.rel == Path::new("folder/right_newer.txt"))
+            .unwrap()
+            .status,
+        NodeStatus::RightNewer
+    );
+
+    let preset = SyncPreset::UpdateBoth;
+    let mut preview = preview_with_options(&root, &preset, false);
+    let visible = Path::new("folder/left_newer.txt");
+    let visible_action = preview
+        .rows
+        .iter()
+        .find(|row| row.rel == visible)
+        .unwrap()
+        .action;
+    assert_eq!(visible_action, SyncAction::CopyLeftToRight);
+    preview.set_override(visible.to_path_buf(), SyncAction::CopyRightToLeft);
+    assert_eq!(preview.effective(visible, visible_action), visible_action);
+    let target = Path::new("folder/right_newer.txt");
+    assert!(!preview.rows.iter().any(|row| row.rel == target));
+    let bases = Bases {
+        left: left.path(),
+        right: right.path(),
+    };
+    let mut opts = options();
+    opts.include_hidden = false;
+    let plan = plan_sync(&root, &preset, bases, &opts, &preview).unwrap();
+    assert!(!plan.steps.iter().any(|step| step.rel == target));
+}
+
+#[test]
 fn sync_preview_omits_hidden_items_when_the_option_is_clear() {
     let left = tempfile::tempdir().unwrap();
     let right = tempfile::tempdir().unwrap();

@@ -721,6 +721,7 @@ impl FolderView {
         }
     }
 
+    /// Restore the saved preview after a pending confirmation is cancelled.
     fn cancel_confirmation(&mut self, shown: &Shown) {
         if matches!(&shown.basis, Basis::Sync(sync)
             if sync.options.include_hidden != self.confirmations.include_hidden_items)
@@ -1696,6 +1697,7 @@ impl FolderView {
         }
     }
 
+    /// Store a completed plan with the sync preview that produced it.
     fn accept_plan(&mut self, outcome: PlanOutcome, sync_preview: Option<SyncPreview>) {
         let (operation, mut basis, shown) = match std::mem::replace(&mut self.stage, Stage::Idle) {
             Stage::Planning(operation, basis) => (operation, basis, None),
@@ -4731,7 +4733,9 @@ mod stale_results {
     use super::FolderView;
     use crate::opjobs::{PreviewMessage, RescanMessage};
     use crate::tree::Arena;
-    use ca_fs::{FileOps, Node, NodeStatus};
+    #[cfg(windows)]
+    use ca_fs::FileOps;
+    use ca_fs::{Node, NodeStatus};
     use ca_ui::view::SessionView;
     use ca_ui::worker::{Job, Terminal};
     use std::path::{Path, PathBuf};
@@ -4911,24 +4915,9 @@ mod stale_results {
         for folder in [&left, &right, &journals] {
             std::fs::create_dir_all(folder).unwrap();
         }
-        let hidden = if cfg!(windows) {
-            "hidden.txt"
-        } else {
-            ".hidden.txt"
-        };
-        std::fs::write(left.join(hidden), b"left").unwrap();
-        let hidden_right = right.join(hidden);
-        std::fs::write(&hidden_right, b"right").unwrap();
-        #[cfg(windows)]
-        ca_fs::RealFs
-            .set_attributes(
-                &hidden_right,
-                &ca_fs::AttributeChange {
-                    hidden: Some(true),
-                    ..ca_fs::AttributeChange::default()
-                },
-            )
-            .unwrap();
+        let differing = "differs.txt";
+        std::fs::write(left.join(differing), b"left").unwrap();
+        std::fs::write(right.join(differing), b"right").unwrap();
 
         let mut view = FolderView::with_journal_directory(
             left.clone(),
@@ -4939,19 +4928,18 @@ mod stale_results {
         );
         assert!(poll_until(&mut view, FolderView::is_ready));
         view.mode = super::Mode::Sync;
-        view.confirmations.include_hidden_items = false;
+        view.confirmations.include_hidden_items = true;
         view.sync.method = super::sync_mode::Method::MirrorToLeft;
         let old_method = super::sync_mode::Method::MirrorToLeft;
         let tree = view.compared_tree.take().unwrap();
-        let old_preview = ca_fs::preview_with_options(&tree, &old_method.preset(), false);
-        assert!(!old_preview
-            .rows
-            .iter()
-            .any(|row| row.rel == Path::new(hidden)));
+        let old_preview = ca_fs::preview_with_options(&tree, &old_method.preset(), true);
+        assert!(old_preview.rows.iter().any(|row| {
+            row.rel == Path::new(differing) && row.action == ca_fs::SyncAction::CopyRightToLeft
+        }));
         let (open, gate) = mpsc::channel();
         let sent = Arc::new(AtomicBool::new(false));
         view.preview_comparison = view.comparisons.current();
-        view.preview_include_hidden = Some(false);
+        view.preview_include_hidden = Some(true);
         view.preview_method = Some(old_method);
         view.preview_job = Some(gated(
             PreviewMessage::Done {
@@ -4970,7 +4958,7 @@ mod stale_results {
                 || view.preview_job.is_some()
                 || view.sync.preview.as_ref().is_some_and(|preview| {
                     preview.rows.iter().any(|row| {
-                        row.rel == Path::new(hidden)
+                        row.rel == Path::new(differing)
                             && row.action == ca_fs::SyncAction::CopyLeftToRight
                     })
                 }),
@@ -4980,8 +4968,11 @@ mod stale_results {
             !view.sync.stale
                 && view.sync.preview.as_ref().is_some_and(|preview| {
                     preview.rows.iter().any(|row| {
-                        row.rel == Path::new(hidden)
+                        row.rel == Path::new(differing)
                             && row.action == ca_fs::SyncAction::CopyLeftToRight
+                    }) && !preview.rows.iter().any(|row| {
+                        row.rel == Path::new(differing)
+                            && row.action == ca_fs::SyncAction::CopyRightToLeft
                     })
                 })
         }));
