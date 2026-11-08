@@ -13,8 +13,8 @@ use serde::{Deserialize, Serialize};
 use crate::compare::{Node, NodeStatus};
 use crate::criteria::Side;
 use crate::ops::plan::{
-    entry_of, path_is_within, step, Bases, Conflict, OperationKind, OperationOptions,
-    OperationPlan, PlanStep, StepAction,
+    entry_of, has_excluded_hidden_descendant, has_included_children, is_hidden_on, path_is_within,
+    step, Bases, Conflict, OperationKind, OperationOptions, OperationPlan, PlanStep, StepAction,
 };
 
 /// What a sync does to one pair.
@@ -34,6 +34,14 @@ pub enum SyncAction {
 }
 
 impl SyncAction {
+    const fn affected_side(self) -> Option<Side> {
+        match self {
+            Self::CopyLeftToRight | Self::DeleteLeft => Some(Side::Left),
+            Self::CopyRightToLeft | Self::DeleteRight => Some(Side::Right),
+            Self::LeaveAlone => None,
+        }
+    }
+
     /// True when the action removes something.
     #[must_use]
     pub fn is_delete(self) -> bool {
@@ -200,17 +208,31 @@ pub struct SyncPreview {
     pub rows: Vec<PreviewRow>,
     /// Rows the caller has overridden, keyed by relative path.
     pub overrides: BTreeMap<PathBuf, SyncAction>,
+    /// Overrides that cannot produce the advertised action with these options.
+    pub blocked_overrides: BTreeMap<PathBuf, Vec<SyncAction>>,
 }
 
 impl SyncPreview {
-    /// The action one row will actually receive, after overrides.
+    /// The action one row will receive, after applicable overrides.
     #[must_use]
     pub fn effective(&self, rel: &std::path::Path, planned: SyncAction) -> SyncAction {
-        self.overrides.get(rel).copied().unwrap_or(planned)
+        let Some(override_action) = self.overrides.get(rel).copied() else {
+            return planned;
+        };
+        if self
+            .blocked_overrides
+            .get(rel)
+            .is_some_and(|blocked| blocked.contains(&override_action))
+        {
+            planned
+        } else {
+            override_action
+        }
     }
 
     /// Override one row's action, which is how a preview excludes an operation
-    /// or forces one the rules did not choose.
+    /// or forces one the rules did not choose. An override that cannot run with
+    /// the current hidden-item setting has no effect until that setting allows it.
     pub fn set_override(&mut self, rel: PathBuf, action: SyncAction) {
         self.overrides.insert(rel, action);
     }
@@ -231,21 +253,68 @@ impl SyncPreview {
 /// no row and is never acted on.
 #[must_use]
 pub fn preview(root: &Node, preset: &SyncPreset) -> SyncPreview {
+    preview_with_options(root, preset, true)
+}
+
+/// Build the preview for the hidden-item setting used by the next operation.
+#[must_use]
+pub fn preview_with_options(root: &Node, preset: &SyncPreset, include_hidden: bool) -> SyncPreview {
     let rules = preset.rules();
+    let options = OperationOptions {
+        include_hidden,
+        ..OperationOptions::default()
+    };
     let mut preview = SyncPreview::default();
-    collect_rows(root, &rules, true, &mut preview.rows);
+    collect_rows(root, &rules, true, &options, &mut preview);
     preview
 }
 
-fn collect_rows(node: &Node, rules: &SyncRules, is_root: bool, rows: &mut Vec<PreviewRow>) {
+fn collect_rows(
+    node: &Node,
+    rules: &SyncRules,
+    is_root: bool,
+    options: &OperationOptions,
+    preview: &mut SyncPreview,
+) {
+    let action = if is_root {
+        SyncAction::LeaveAlone
+    } else {
+        preview_action(node, rules, options)
+    };
+    if !is_root
+        && !options.include_hidden
+        && action
+            .affected_side()
+            .is_some_and(|side| is_hidden_on(node, side))
+    {
+        return;
+    }
     if !is_root {
-        rows.push(PreviewRow {
+        preview.rows.push(PreviewRow {
             rel: node.rel.clone(),
             name: node.name.clone(),
             is_dir: node.is_dir,
             status: node.status,
-            action: rules.action_for(node.status),
+            action,
         });
+        if node.is_dir {
+            let mut blocked = Vec::new();
+            if !has_included_children(options, node, Side::Left) {
+                blocked.push(SyncAction::CopyLeftToRight);
+            }
+            if !has_included_children(options, node, Side::Right) {
+                blocked.push(SyncAction::CopyRightToLeft);
+            }
+            if has_excluded_hidden_descendant(options, node, Side::Left) {
+                blocked.push(SyncAction::DeleteLeft);
+            }
+            if has_excluded_hidden_descendant(options, node, Side::Right) {
+                blocked.push(SyncAction::DeleteRight);
+            }
+            if !blocked.is_empty() {
+                preview.blocked_overrides.insert(node.rel.clone(), blocked);
+            }
+        }
     }
     // Execution treats a linked folder as one item and never walks its target.
     // Offering child overrides here would promise steps that cannot run.
@@ -253,7 +322,29 @@ fn collect_rows(node: &Node, rules: &SyncRules, is_root: bool, rows: &mut Vec<Pr
         return;
     }
     for child in &node.children {
-        collect_rows(child, rules, false, rows);
+        collect_rows(child, rules, false, options, preview);
+    }
+}
+
+fn preview_action(node: &Node, rules: &SyncRules, options: &OperationOptions) -> SyncAction {
+    let action = rules.action_for(node.status);
+    if !node.is_dir {
+        return action;
+    }
+    match action {
+        SyncAction::CopyLeftToRight if !has_included_children(options, node, Side::Left) => {
+            SyncAction::LeaveAlone
+        }
+        SyncAction::CopyRightToLeft if !has_included_children(options, node, Side::Right) => {
+            SyncAction::LeaveAlone
+        }
+        SyncAction::DeleteLeft if has_excluded_hidden_descendant(options, node, Side::Left) => {
+            SyncAction::LeaveAlone
+        }
+        SyncAction::DeleteRight if has_excluded_hidden_descendant(options, node, Side::Right) => {
+            SyncAction::LeaveAlone
+        }
+        _ => action,
     }
 }
 
@@ -337,6 +428,15 @@ fn walk(
     } else {
         preview.effective(&node.rel, rules.action_for(node.status))
     };
+
+    if !is_root
+        && !plan.options.include_hidden
+        && action
+            .affected_side()
+            .is_some_and(|side| is_hidden_on(node, side))
+    {
+        return None;
+    }
 
     if !is_root
         && !action.is_idle()
@@ -445,7 +545,7 @@ fn emit(
         if source.is_link() {
             return;
         }
-        if node.children.is_empty() && !plan.options.create_empty_folders {
+        if !has_included_children(&plan.options, node, from) && !plan.options.create_empty_folders {
             return;
         }
         let mut create = step(

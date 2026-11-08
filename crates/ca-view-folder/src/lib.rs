@@ -24,7 +24,7 @@ pub use opjobs::MISSING_FILES;
 
 use ca_fs::{
     ContentMethod, ContentOutcome, DisplayFilter, ExecutionReport, FolderDisplayFilter, Node,
-    NodeStatus, OperationPlan, Side, SyncAction,
+    NodeStatus, OperationPlan, Side, SyncAction, SyncPreview,
 };
 use ca_session::SessionKind;
 use ca_ui::command::Command;
@@ -334,6 +334,10 @@ pub struct FolderView {
     recover_job: Option<Job<RecoverMessage>>,
     cleanup_job: Option<Job<CleanupMessage>>,
     preview_job: Option<Job<PreviewMessage>>,
+    /// Hidden-item setting captured by the active preview job.
+    preview_include_hidden: Option<bool>,
+    /// Synchronization method captured by the active preview job.
+    preview_method: Option<sync_mode::Method>,
     /// The comparison the rows and the compared tree belong to. Every restart
     /// starts a new one.
     comparisons: ca_ui::schedule::Generations,
@@ -537,6 +541,8 @@ impl FolderView {
             recover_job: None,
             cleanup_job: None,
             preview_job: None,
+            preview_include_hidden: None,
+            preview_method: None,
             comparisons: ca_ui::schedule::Generations::new(),
             plan_comparison: 0,
             rescan_comparison: 0,
@@ -674,6 +680,10 @@ impl FolderView {
     }
 
     fn confirm(&mut self, shown: Shown) {
+        if matches!(&shown.basis, Basis::Sync(_)) && self.sync.stale {
+            self.refresh_preview();
+            return;
+        }
         let Some(basis) = shown.basis.revised(&self.form) else {
             self.execute_plan(shown.plan);
             return;
@@ -705,8 +715,18 @@ impl FolderView {
 
     /// Drop the plan that is waiting for a confirmation, touching nothing.
     pub fn cancel_pending(&mut self) {
-        if matches!(self.stage, Stage::Confirming(_)) {
-            self.stage = Stage::Idle;
+        match std::mem::replace(&mut self.stage, Stage::Idle) {
+            Stage::Confirming(shown) => self.cancel_confirmation(&shown),
+            other => self.stage = other,
+        }
+    }
+
+    fn cancel_confirmation(&mut self, shown: &Shown) {
+        if matches!(&shown.basis, Basis::Sync(sync)
+            if sync.options.include_hidden != self.confirmations.include_hidden_items)
+        {
+            self.sync.stale = true;
+            self.refresh_preview();
         }
     }
 
@@ -1233,10 +1253,15 @@ impl FolderView {
         };
         self.sync.refusal = None;
         self.preview_comparison = self.comparisons.current();
+        let include_hidden = self.confirmations.include_hidden_items;
+        let method = self.sync.method;
+        self.preview_include_hidden = Some(include_hidden);
+        self.preview_method = Some(method);
         self.preview_job = Some(opjobs::spawn_preview(
             tree,
-            self.sync.method.preset(),
+            method.preset(),
             self.sync.overrides(),
+            include_hidden,
             self.notify.clone(),
         ));
     }
@@ -1244,6 +1269,10 @@ impl FolderView {
     /// Plan the synchronisation the preview shows.
     fn start_sync(&mut self) {
         if self.stage.blocks_input() {
+            return;
+        }
+        if self.sync.stale {
+            self.refresh_preview();
             return;
         }
         if let Some(reason) = self.archive_refusal() {
@@ -1601,15 +1630,28 @@ impl FolderView {
                 continue;
             }
             match message {
-                PlanMessage::Done { tree, outcome } => {
+                PlanMessage::Done {
+                    tree,
+                    outcome,
+                    sync_preview,
+                } => {
                     if let Some(tree) = tree {
                         self.compared_tree = Some(tree);
                     }
-                    self.accept_plan(if stopped {
-                        PlanOutcome::Stopped
-                    } else {
-                        outcome
+                    let sync_preview = sync_preview.map(|(preview, include_hidden)| {
+                        self.preview_include_hidden = Some(include_hidden);
+                        let preview = *preview;
+                        self.sync.preview = Some(preview.clone());
+                        preview
                     });
+                    self.accept_plan(
+                        if stopped {
+                            PlanOutcome::Stopped
+                        } else {
+                            outcome
+                        },
+                        sync_preview,
+                    );
                 }
                 PlanMessage::Failed(reason) => {
                     self.stage = Stage::Idle;
@@ -1645,11 +1687,17 @@ impl FolderView {
 
     /// Take the confirmations the application options state.
     pub fn set_confirmations(&mut self, options: ca_session::options::FileOperationOptions) {
+        let hidden_setting_changed =
+            self.confirmations.include_hidden_items != options.include_hidden_items;
         self.confirmations = options;
+        if hidden_setting_changed && self.mode == Mode::Sync {
+            self.sync.stale = true;
+            self.refresh_preview();
+        }
     }
 
-    fn accept_plan(&mut self, outcome: PlanOutcome) {
-        let (operation, basis, shown) = match std::mem::replace(&mut self.stage, Stage::Idle) {
+    fn accept_plan(&mut self, outcome: PlanOutcome, sync_preview: Option<SyncPreview>) {
+        let (operation, mut basis, shown) = match std::mem::replace(&mut self.stage, Stage::Idle) {
             Stage::Planning(operation, basis) => (operation, basis, None),
             Stage::Replanning(held) => {
                 let Shown {
@@ -1665,6 +1713,13 @@ impl FolderView {
                 return;
             }
         };
+        if let (Basis::Sync(sync), Some(preview)) = (&mut basis, sync_preview) {
+            sync.preview = preview;
+        }
+        if matches!(&basis, Basis::Sync(_)) && self.sync.stale {
+            self.refresh_preview();
+            return;
+        }
         match outcome {
             PlanOutcome::Plan(plan) => match shown {
                 // The dialog showed these steps and was confirmed; only the
@@ -1919,7 +1974,7 @@ impl FolderView {
     }
 
     fn poll_preview(&mut self) {
-        let Some(job) = self.preview_job.as_mut() else {
+        let Some(mut job) = self.preview_job.take() else {
             return;
         };
         let messages = job.drain();
@@ -1934,14 +1989,26 @@ impl FolderView {
                     if let Some(tree) = tree {
                         self.compared_tree = Some(tree);
                     }
-                    self.sync.preview = Some(*preview);
-                    self.sync.stale = false;
+                    if self.preview_include_hidden == Some(self.confirmations.include_hidden_items)
+                        && self.preview_method == Some(self.sync.method)
+                    {
+                        self.sync.preview = Some(*preview);
+                        self.sync.stale = false;
+                    } else {
+                        self.sync.stale = true;
+                    }
                 }
                 PreviewMessage::Failed(reason) => self.sync.refusal = Some(reason),
             }
         }
-        if finished {
-            self.preview_job = None;
+        if !finished {
+            self.preview_job = Some(job);
+        } else if self.sync.stale
+            && (self.preview_include_hidden != Some(self.confirmations.include_hidden_items)
+                || self.preview_method != Some(self.sync.method))
+            && !self.stage.blocks_input()
+        {
+            self.refresh_preview();
         }
     }
 
@@ -3420,7 +3487,10 @@ impl FolderView {
                         self.confirm(*shown);
                         return;
                     }
-                    ConfirmChoice::Cancel => Stage::Idle,
+                    ConfirmChoice::Cancel => {
+                        self.cancel_confirmation(&shown);
+                        Stage::Idle
+                    }
                 }
             }
             Stage::Running(plan) => {
@@ -4066,7 +4136,7 @@ impl SessionView for FolderView {
     /// writes as frame output.
     fn ui(&mut self, ui: &mut egui::Ui, context: &ViewContext) -> Vec<ViewAction> {
         let options = ca_ui::options::current(ui.ctx());
-        self.confirmations = options.stored.file_operations.clone();
+        self.set_confirmations(options.stored.file_operations.clone());
         if self.backups.as_ref() != Some(&options.stored.backups) {
             self.form.follow_backups(&options.stored.backups);
             self.backups = Some(options.stored.backups.clone());
@@ -4661,7 +4731,7 @@ mod stale_results {
     use super::FolderView;
     use crate::opjobs::{PreviewMessage, RescanMessage};
     use crate::tree::Arena;
-    use ca_fs::{Node, NodeStatus};
+    use ca_fs::{FileOps, Node, NodeStatus};
     use ca_ui::view::SessionView;
     use ca_ui::worker::{Job, Terminal};
     use std::path::{Path, PathBuf};
@@ -4702,6 +4772,219 @@ mod stale_results {
         );
         assert!(poll_until(&mut view, FolderView::is_ready));
         view
+    }
+
+    #[test]
+    fn a_stale_sync_preview_is_refreshed_before_starting_a_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let left = dir.path().join("left");
+        let right = dir.path().join("right");
+        let journals = dir.path().join("journals");
+        for folder in [&left, &right, &journals] {
+            std::fs::create_dir_all(folder).unwrap();
+        }
+        let hidden = if cfg!(windows) {
+            "hidden.txt"
+        } else {
+            ".hidden.txt"
+        };
+        let hidden_path = left.join(hidden);
+        std::fs::write(&hidden_path, b"hidden").unwrap();
+        #[cfg(windows)]
+        ca_fs::RealFs
+            .set_attributes(
+                &hidden_path,
+                &ca_fs::AttributeChange {
+                    hidden: Some(true),
+                    ..ca_fs::AttributeChange::default()
+                },
+            )
+            .unwrap();
+
+        let mut view = ready_view(dir.path());
+        view.mode = super::Mode::Sync;
+        let preset = view.sync.method.preset();
+        let tree = view.compared_tree.as_deref().unwrap();
+        let preview = ca_fs::preview_with_options(tree, &preset, false);
+        assert!(!preview.rows.iter().any(|row| row.rel == Path::new(hidden)));
+        view.sync.preview = Some(preview.clone());
+        view.sync.stale = false;
+        let plan = ca_fs::OperationPlan::new(
+            ca_fs::OperationKind::Sync,
+            vec![left.clone(), right.clone()],
+            ca_fs::OperationOptions::default(),
+        );
+        view.stage = super::Stage::Confirming(Box::new(super::Shown {
+            operation: super::Operation::CopyToOtherSide,
+            plan: Box::new(plan),
+            basis: super::Basis::Sync(Box::new(super::SyncBasis {
+                preset,
+                preview,
+                options: ca_fs::OperationOptions::default(),
+            })),
+            revised: false,
+        }));
+
+        view.set_confirmations(ca_session::options::FileOperationOptions {
+            include_hidden_items: true,
+            ..ca_session::options::FileOperationOptions::default()
+        });
+        assert!(view.sync.stale);
+        view.cancel_pending();
+        view.start_synchronisation();
+
+        assert!(matches!(view.stage, super::Stage::Idle));
+        assert!(view.preview_job.is_some());
+        assert!(poll_until(&mut view, |view| {
+            !view.sync.stale
+                && view.sync.preview.as_ref().is_some_and(|preview| {
+                    preview.rows.iter().any(|row| row.rel == Path::new(hidden))
+                })
+        }));
+    }
+
+    #[test]
+    fn a_preview_job_restarts_when_hidden_setting_changes_while_it_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let left = dir.path().join("left");
+        for folder in [&left, &dir.path().join("right")] {
+            std::fs::create_dir_all(folder).unwrap();
+        }
+        std::fs::create_dir_all(dir.path().join("journals")).unwrap();
+        let hidden = if cfg!(windows) {
+            "hidden.txt"
+        } else {
+            ".hidden.txt"
+        };
+        let hidden_path = left.join(hidden);
+        std::fs::write(&hidden_path, b"hidden").unwrap();
+        #[cfg(windows)]
+        ca_fs::RealFs
+            .set_attributes(
+                &hidden_path,
+                &ca_fs::AttributeChange {
+                    hidden: Some(true),
+                    ..ca_fs::AttributeChange::default()
+                },
+            )
+            .unwrap();
+
+        let mut view = ready_view(dir.path());
+        view.mode = super::Mode::Sync;
+        let preset = view.sync.method.preset();
+        let tree = view.compared_tree.take().unwrap();
+        let preview = ca_fs::preview_with_options(&tree, &preset, false);
+        let (open, gate) = mpsc::channel();
+        let sent = Arc::new(AtomicBool::new(false));
+        view.preview_comparison = view.comparisons.current();
+        view.preview_include_hidden = Some(false);
+        view.preview_method = Some(view.sync.method);
+        view.preview_job = Some(gated(
+            PreviewMessage::Done {
+                tree: Some(tree),
+                preview: Box::new(preview),
+            },
+            gate,
+            Arc::clone(&sent),
+        ));
+        view.sync.stale = true;
+        view.set_confirmations(ca_session::options::FileOperationOptions {
+            include_hidden_items: true,
+            ..ca_session::options::FileOperationOptions::default()
+        });
+
+        release(&mut view, &open, &sent);
+        assert!(poll_until(&mut view, |view| !view.sync.stale));
+        assert!(view
+            .sync
+            .preview
+            .as_ref()
+            .is_some_and(|preview| preview.rows.iter().any(|row| row.rel == Path::new(hidden))));
+    }
+
+    #[test]
+    fn a_preview_job_restarts_when_the_sync_method_changes_while_it_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let left = dir.path().join("left");
+        let right = dir.path().join("right");
+        let journals = dir.path().join("journals");
+        for folder in [&left, &right, &journals] {
+            std::fs::create_dir_all(folder).unwrap();
+        }
+        let hidden = if cfg!(windows) {
+            "hidden.txt"
+        } else {
+            ".hidden.txt"
+        };
+        std::fs::write(left.join(hidden), b"left").unwrap();
+        let hidden_right = right.join(hidden);
+        std::fs::write(&hidden_right, b"right").unwrap();
+        #[cfg(windows)]
+        ca_fs::RealFs
+            .set_attributes(
+                &hidden_right,
+                &ca_fs::AttributeChange {
+                    hidden: Some(true),
+                    ..ca_fs::AttributeChange::default()
+                },
+            )
+            .unwrap();
+
+        let mut view = FolderView::with_journal_directory(
+            left.clone(),
+            right.clone(),
+            &ca_ui::testing::context(),
+            1,
+            journals,
+        );
+        assert!(poll_until(&mut view, FolderView::is_ready));
+        view.mode = super::Mode::Sync;
+        view.confirmations.include_hidden_items = false;
+        view.sync.method = super::sync_mode::Method::MirrorToLeft;
+        let old_method = super::sync_mode::Method::MirrorToLeft;
+        let tree = view.compared_tree.take().unwrap();
+        let old_preview = ca_fs::preview_with_options(&tree, &old_method.preset(), false);
+        assert!(!old_preview
+            .rows
+            .iter()
+            .any(|row| row.rel == Path::new(hidden)));
+        let (open, gate) = mpsc::channel();
+        let sent = Arc::new(AtomicBool::new(false));
+        view.preview_comparison = view.comparisons.current();
+        view.preview_include_hidden = Some(false);
+        view.preview_method = Some(old_method);
+        view.preview_job = Some(gated(
+            PreviewMessage::Done {
+                tree: Some(tree),
+                preview: Box::new(old_preview),
+            },
+            gate,
+            Arc::clone(&sent),
+        ));
+
+        view.set_sync_method(super::sync_mode::Method::MirrorToRight);
+        release(&mut view, &open, &sent);
+
+        assert!(
+            view.sync.stale
+                || view.preview_job.is_some()
+                || view.sync.preview.as_ref().is_some_and(|preview| {
+                    preview.rows.iter().any(|row| {
+                        row.rel == Path::new(hidden)
+                            && row.action == ca_fs::SyncAction::CopyLeftToRight
+                    })
+                }),
+            "the old method's result must be rejected"
+        );
+        assert!(poll_until(&mut view, |view| {
+            !view.sync.stale
+                && view.sync.preview.as_ref().is_some_and(|preview| {
+                    preview.rows.iter().any(|row| {
+                        row.rel == Path::new(hidden)
+                            && row.action == ca_fs::SyncAction::CopyLeftToRight
+                    })
+                })
+        }));
     }
 
     /// Capture platform output because the test process has no native clipboard.
@@ -4895,6 +5178,7 @@ mod stale_results {
                 action: ca_fs::SyncAction::CopyLeftToRight,
             }],
             overrides: std::collections::BTreeMap::default(),
+            blocked_overrides: std::collections::BTreeMap::default(),
         });
         view.sync.stale = false;
         view
@@ -5325,6 +5609,7 @@ mod stale_results {
                 action: ca_fs::SyncAction::CopyLeftToRight,
             }],
             overrides: std::collections::BTreeMap::default(),
+            blocked_overrides: std::collections::BTreeMap::default(),
         });
 
         let sync = FolderSyncView::from(view);

@@ -6,7 +6,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use ca_fs::{Conflict, Node, NodeStatus, Side, StepAction};
+use ca_fs::{AttributeChange, Conflict, FileOps, Node, NodeStatus, RealFs, Side, StepAction};
 use ca_ui::testing::{context, sized_input};
 use ca_ui::view::SessionView;
 use ca_view_folder::operations::{conflicts_by_kind, Operation};
@@ -77,6 +77,18 @@ impl Fixture {
         assert!(poll_until(&mut view, SessionView::is_ready));
         // A test never reaches the real recycle bin: on some platforms that
         // call asks the desktop shell for permission and blocks on a dialog.
+        view.form_mut().options.use_recycle_bin = false;
+        view
+    }
+
+    fn sync_view(&self) -> FolderView {
+        let mut view = FolderView::sync_with_journal_directory(
+            self.left(),
+            self.right(),
+            &context(),
+            1,
+            self.journals(),
+        );
         view.form_mut().options.use_recycle_bin = false;
         view
     }
@@ -571,6 +583,152 @@ fn a_synchronisation_previews_every_operation_and_honours_an_override() {
             .any(|step| step.rel == Path::new("only-left.txt")),
         "an excluded row reached the plan"
     );
+}
+
+#[test]
+fn a_sync_preview_tracks_the_saved_hidden_items_setting() {
+    let fixture = Fixture::new();
+    let hidden = if cfg!(windows) {
+        "secret.txt"
+    } else {
+        ".secret.txt"
+    };
+    fixture.write("left", hidden, b"secret");
+    if cfg!(windows) {
+        RealFs
+            .set_attributes(
+                &fixture.left().join(hidden),
+                &AttributeChange {
+                    hidden: Some(true),
+                    ..AttributeChange::default()
+                },
+            )
+            .unwrap();
+    }
+
+    let mut view = fixture.sync_view();
+    view.set_confirmations(ca_session::options::FileOperationOptions {
+        include_hidden_items: true,
+        ..ca_session::options::FileOperationOptions::default()
+    });
+    assert!(poll_until(&mut view, |view| {
+        !view.sync().stale
+            && view
+                .sync()
+                .preview
+                .as_ref()
+                .is_some_and(|preview| preview.rows.iter().any(|row| row.rel == Path::new(hidden)))
+    }));
+
+    view.set_confirmations(ca_session::options::FileOperationOptions {
+        include_hidden_items: false,
+        ..ca_session::options::FileOperationOptions::default()
+    });
+    assert!(poll_until(&mut view, |view| {
+        !view.sync().stale
+            && view
+                .sync()
+                .preview
+                .as_ref()
+                .is_some_and(|preview| preview.rows.iter().all(|row| row.rel != Path::new(hidden)))
+    }));
+}
+
+#[test]
+fn a_sync_confirmation_override_refreshes_the_preview_and_plan() {
+    let fixture = Fixture::new();
+    let hidden = if cfg!(windows) {
+        "secret.txt"
+    } else {
+        ".secret.txt"
+    };
+    fixture.write("left", hidden, b"secret");
+    if cfg!(windows) {
+        RealFs
+            .set_attributes(
+                &fixture.left().join(hidden),
+                &AttributeChange {
+                    hidden: Some(true),
+                    ..AttributeChange::default()
+                },
+            )
+            .unwrap();
+    }
+
+    let mut view = fixture.sync_view();
+    assert!(poll_until(&mut view, |view| {
+        !view.sync().stale && view.sync().preview.is_some()
+    }));
+    assert!(view
+        .sync()
+        .preview
+        .as_ref()
+        .is_some_and(|preview| preview.rows.iter().all(|row| row.rel != Path::new(hidden))));
+
+    view.start_synchronisation();
+    assert!(poll_until(&mut view, FolderView::is_confirming));
+    view.form_mut().options.include_hidden = true;
+    view.confirm_pending();
+    assert!(poll_until(&mut view, FolderView::is_confirming));
+    assert!(view
+        .sync()
+        .preview
+        .as_ref()
+        .is_some_and(|preview| preview.rows.iter().any(|row| row.rel == Path::new(hidden))));
+    assert!(view
+        .pending_plan()
+        .is_some_and(|plan| plan.steps.iter().any(|step| step.rel == Path::new(hidden))));
+
+    confirm_and_run(&mut view);
+    assert!(fixture.right().join(hidden).exists());
+}
+
+#[test]
+fn cancelling_a_sync_override_restores_the_saved_hidden_items_preview() {
+    let fixture = Fixture::new();
+    let hidden = if cfg!(windows) {
+        "secret.txt"
+    } else {
+        ".secret.txt"
+    };
+    fixture.write("left", hidden, b"secret");
+    if cfg!(windows) {
+        RealFs
+            .set_attributes(
+                &fixture.left().join(hidden),
+                &AttributeChange {
+                    hidden: Some(true),
+                    ..AttributeChange::default()
+                },
+            )
+            .unwrap();
+    }
+
+    let mut view = fixture.sync_view();
+    assert!(poll_until(&mut view, |view| {
+        !view.sync().stale && view.sync().preview.is_some()
+    }));
+    view.start_synchronisation();
+    assert!(poll_until(&mut view, FolderView::is_confirming));
+    view.form_mut().options.include_hidden = true;
+    view.confirm_pending();
+    assert!(poll_until(&mut view, FolderView::is_confirming));
+    assert!(view
+        .sync()
+        .preview
+        .as_ref()
+        .is_some_and(|preview| preview.rows.iter().any(|row| row.rel == Path::new(hidden))));
+
+    view.cancel_pending();
+    assert!(view.sync().stale);
+    assert!(poll_until(&mut view, |view| {
+        !view.sync().stale
+            && view
+                .sync()
+                .preview
+                .as_ref()
+                .is_some_and(|preview| preview.rows.iter().all(|row| row.rel != Path::new(hidden)))
+    }));
 }
 
 #[test]

@@ -33,7 +33,9 @@ use crate::ops::plan::{
     RenameError, Sides, StepAction, TouchSpec, Verify,
 };
 use crate::scan::{scan_with, ScanOptions, ScanResult};
-use crate::sync::{plan_sync, preview, SyncAction, SyncPreset};
+use crate::sync::{
+    plan_sync, preview, preview_with_options, StatusKey, SyncAction, SyncPreset, SyncRules,
+};
 
 // ---------------------------------------------------------------- fixtures
 
@@ -2486,12 +2488,16 @@ fn delete_removes_contents_before_their_folder() {
 /// Creates a file the platform reports as hidden, and returns its name. Off
 /// Windows the leading period is what the scan reads as hidden.
 fn hidden_file(dir: &Path) -> String {
+    hidden_file_named(dir, "secret.txt")
+}
+
+fn hidden_file_named(dir: &Path, name: &str) -> String {
     let name = if cfg!(windows) {
-        "secret.txt"
+        name.to_string()
     } else {
-        ".secret"
+        format!(".{name}")
     };
-    let path = dir.join(name);
+    let path = dir.join(&name);
     std::fs::write(&path, b"h").unwrap();
     if cfg!(windows) {
         RealFs
@@ -2504,7 +2510,7 @@ fn hidden_file(dir: &Path) -> String {
             )
             .unwrap();
     }
-    name.to_owned()
+    name
 }
 
 #[test]
@@ -2538,6 +2544,90 @@ fn a_copy_of_a_selected_folder_carries_its_hidden_items_only_when_the_option_is_
     }
 }
 
+#[cfg(windows)]
+#[test]
+fn a_copy_excludes_a_hidden_source_when_its_counterpart_is_visible() {
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    let left_folder = left.path().join("sub");
+    let right_folder = right.path().join("sub");
+    std::fs::create_dir(&left_folder).unwrap();
+    std::fs::create_dir(&right_folder).unwrap();
+    let source = left_folder.join("item.txt");
+    std::fs::write(&source, b"hidden source").unwrap();
+    std::fs::write(right_folder.join("item.txt"), b"visible target").unwrap();
+    RealFs
+        .set_attributes(
+            &source,
+            &AttributeChange {
+                hidden: Some(true),
+                ..AttributeChange::default()
+            },
+        )
+        .unwrap();
+
+    let root = compared(left.path(), right.path());
+    let bases = Bases {
+        left: left.path(),
+        right: right.path(),
+    };
+    let mut opts = options();
+    opts.include_hidden = false;
+    let plan = plan_copy(&selection(&root, &["sub"]), Side::Left, bases, &opts);
+
+    assert!(!plan
+        .steps
+        .iter()
+        .any(|step| step.rel == Path::new("sub/item.txt")));
+}
+
+#[cfg(windows)]
+#[test]
+fn move_and_delete_use_the_hidden_attribute_on_the_side_they_change() {
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    let left_folder = left.path().join("sub");
+    let right_folder = right.path().join("sub");
+    std::fs::create_dir(&left_folder).unwrap();
+    std::fs::create_dir(&right_folder).unwrap();
+    std::fs::write(left_folder.join("item.txt"), b"visible left").unwrap();
+    let hidden_source = right_folder.join("item.txt");
+    std::fs::write(&hidden_source, b"hidden right").unwrap();
+    RealFs
+        .set_attributes(
+            &hidden_source,
+            &AttributeChange {
+                hidden: Some(true),
+                ..AttributeChange::default()
+            },
+        )
+        .unwrap();
+
+    let root = compared(left.path(), right.path());
+    let bases = Bases {
+        left: left.path(),
+        right: right.path(),
+    };
+    let mut opts = options();
+    opts.include_hidden = false;
+    let selected = selection(&root, &["sub"]);
+    let delete = plan_delete(&selected, Sides::Right, bases, &opts);
+    let moving = plan_move(&selected, Side::Right, bases, &opts);
+
+    for plan in [&delete, &moving] {
+        assert!(!plan
+            .steps
+            .iter()
+            .any(|step| step.rel == Path::new("sub/item.txt")));
+        assert!(!plan.steps.iter().any(|step| {
+            step.rel == Path::new("sub")
+                && matches!(&step.action, StepAction::DeleteDir { path } if path.starts_with(right.path()))
+        }));
+    }
+    assert!(hidden_source.exists());
+    assert!(left_folder.join("item.txt").exists());
+}
+
 #[test]
 fn a_hidden_item_the_selection_names_is_acted_on_whatever_the_option_says() {
     let left = tempfile::tempdir().unwrap();
@@ -2556,6 +2646,418 @@ fn a_hidden_item_the_selection_names_is_acted_on_whatever_the_option_says() {
     let plan = plan_copy(&selection(&root, &[&hidden]), Side::Left, bases, &opts);
     assert!(run(&plan).is_clean());
     assert!(right.path().join(&hidden).exists());
+}
+
+#[test]
+fn delete_does_not_remove_a_folder_that_contains_excluded_hidden_items() {
+    for use_recycle_bin in [false, true] {
+        let left = tempfile::tempdir().unwrap();
+        let right = tempfile::tempdir().unwrap();
+        let folder = left.path().join("sub");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join("visible.txt"), b"visible").unwrap();
+        let hidden = hidden_file(&folder);
+
+        let root = compared(left.path(), right.path());
+        let bases = Bases {
+            left: left.path(),
+            right: right.path(),
+        };
+        let mut opts = options();
+        opts.include_hidden = false;
+        opts.use_recycle_bin = use_recycle_bin;
+        let plan = plan_delete(&selection(&root, &["sub"]), Sides::Left, bases, &opts);
+
+        assert!(plan
+            .steps
+            .iter()
+            .any(|step| step.rel == Path::new("sub/visible.txt")));
+        assert!(!plan.steps.iter().any(|step| {
+            step.rel == Path::new("sub")
+                && matches!(
+                    &step.action,
+                    StepAction::DeleteDir { .. } | StepAction::Trash { .. }
+                )
+        }));
+        assert!(!plan
+            .steps
+            .iter()
+            .any(|step| step.rel == Path::new("sub").join(&hidden)));
+        assert!(plan
+            .skipped
+            .iter()
+            .any(|skip| skip.path == Path::new("sub")));
+        if !use_recycle_bin {
+            assert!(run(&plan).is_clean());
+            assert!(!folder.join("visible.txt").exists());
+            assert!(folder.join(hidden).exists());
+            assert!(folder.is_dir());
+        }
+    }
+}
+
+#[test]
+fn move_does_not_remove_a_source_folder_that_contains_excluded_hidden_items() {
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    let folder = left.path().join("sub");
+    std::fs::create_dir(&folder).unwrap();
+    std::fs::write(folder.join("visible.txt"), b"visible").unwrap();
+    let hidden = hidden_file(&folder);
+
+    let root = compared(left.path(), right.path());
+    let bases = Bases {
+        left: left.path(),
+        right: right.path(),
+    };
+    let mut opts = options();
+    opts.include_hidden = false;
+    let plan = plan_move(&selection(&root, &["sub"]), Side::Left, bases, &opts);
+
+    assert!(plan
+        .steps
+        .iter()
+        .any(|step| step.rel == Path::new("sub/visible.txt")));
+    assert!(!plan.steps.iter().any(|step| {
+        step.rel == Path::new("sub") && matches!(&step.action, StepAction::DeleteDir { .. })
+    }));
+    assert!(!plan
+        .steps
+        .iter()
+        .any(|step| step.rel == Path::new("sub").join(&hidden)));
+    assert!(plan
+        .skipped
+        .iter()
+        .any(|skip| skip.path == Path::new("sub")));
+    assert!(run(&plan).is_clean());
+    assert!(left.path().join("sub").is_dir());
+    assert!(left.path().join("sub").join(&hidden).exists());
+    assert!(!left.path().join("sub/visible.txt").exists());
+    assert!(right.path().join("sub/visible.txt").exists());
+}
+
+#[test]
+fn move_to_folder_does_not_copy_excluded_hidden_items_or_remove_their_parent() {
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    let target = tempfile::tempdir().unwrap();
+    let folder = left.path().join("sub");
+    std::fs::create_dir(&folder).unwrap();
+    std::fs::write(folder.join("visible.txt"), b"visible").unwrap();
+    let hidden = hidden_file(&folder);
+
+    let root = compared(left.path(), right.path());
+    let bases = Bases {
+        left: left.path(),
+        right: right.path(),
+    };
+    let mut opts = options();
+    opts.include_hidden = false;
+    let plan = plan_to_folder(
+        &selection(&root, &["sub"]),
+        Side::Left,
+        bases,
+        target.path(),
+        PathOption::KeepBase,
+        &opts,
+        true,
+        &RealFs,
+    );
+
+    assert!(plan
+        .steps
+        .iter()
+        .any(|step| step.rel == Path::new("sub/visible.txt")));
+    assert!(!plan
+        .steps
+        .iter()
+        .any(|step| step.rel == Path::new("sub").join(&hidden)));
+    assert!(!plan.steps.iter().any(|step| {
+        step.rel == Path::new("sub") && matches!(&step.action, StepAction::DeleteDir { .. })
+    }));
+    assert!(plan
+        .skipped
+        .iter()
+        .any(|skip| skip.path == Path::new("sub")));
+    assert!(run(&plan).is_clean());
+    assert!(left.path().join("sub").is_dir());
+    assert!(left.path().join("sub").join(&hidden).exists());
+    assert!(!left.path().join("sub/visible.txt").exists());
+    assert!(target.path().join("sub/visible.txt").exists());
+}
+
+#[test]
+fn a_move_does_not_create_empty_folders_for_excluded_hidden_descendants() {
+    for to_folder in [false, true] {
+        let left = tempfile::tempdir().unwrap();
+        let right = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let child = left.path().join("sub/visible-child");
+        std::fs::create_dir_all(&child).unwrap();
+        let hidden = hidden_file(&child);
+
+        let root = compared(left.path(), right.path());
+        let bases = Bases {
+            left: left.path(),
+            right: right.path(),
+        };
+        let mut opts = options();
+        opts.include_hidden = false;
+        let plan = if to_folder {
+            plan_to_folder(
+                &selection(&root, &["sub"]),
+                Side::Left,
+                bases,
+                target.path(),
+                PathOption::KeepBase,
+                &opts,
+                true,
+                &RealFs,
+            )
+        } else {
+            plan_move(&selection(&root, &["sub"]), Side::Left, bases, &opts)
+        };
+
+        assert!(plan.steps.iter().all(|step| !matches!(
+            &step.action,
+            StepAction::CreateDir { .. } | StepAction::CopyFile { .. }
+        )));
+        assert!(run(&plan).is_clean());
+        assert!(child.join(&hidden).exists());
+        assert!(!right.path().join("sub").exists());
+        assert!(!target.path().join("sub").exists());
+    }
+}
+
+#[test]
+fn delete_and_move_only_keep_folders_for_hidden_items_on_the_affected_side() {
+    for moving in [false, true] {
+        let left = tempfile::tempdir().unwrap();
+        let right = tempfile::tempdir().unwrap();
+        let left_folder = left.path().join("sub");
+        let right_folder = right.path().join("sub");
+        std::fs::create_dir(&left_folder).unwrap();
+        std::fs::create_dir(&right_folder).unwrap();
+        let hidden = hidden_file(&left_folder);
+        std::fs::write(right_folder.join("visible.txt"), b"visible").unwrap();
+
+        let root = compared(left.path(), right.path());
+        let bases = Bases {
+            left: left.path(),
+            right: right.path(),
+        };
+        let mut opts = options();
+        opts.include_hidden = false;
+        let plan = if moving {
+            plan_move(&selection(&root, &["sub"]), Side::Right, bases, &opts)
+        } else {
+            plan_delete(&selection(&root, &["sub"]), Sides::Right, bases, &opts)
+        };
+
+        assert!(plan.steps.iter().any(|step| {
+            step.rel == Path::new("sub") && matches!(&step.action, StepAction::DeleteDir { path } if path.starts_with(right.path()))
+        }));
+        assert!(run(&plan).is_clean());
+        assert!(left_folder.join(hidden).exists());
+        assert!(!right_folder.exists());
+        if moving {
+            assert!(left_folder.join("visible.txt").exists());
+        }
+    }
+}
+
+#[test]
+fn sync_does_not_copy_or_delete_hidden_orphans_when_the_option_is_clear() {
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    let copied = hidden_file_named(left.path(), "copy.txt");
+    let deleted = hidden_file_named(right.path(), "delete.txt");
+
+    let root = compared(left.path(), right.path());
+    let bases = Bases {
+        left: left.path(),
+        right: right.path(),
+    };
+    let preset = SyncPreset::MirrorToRight;
+    let view = preview(&root, &preset);
+    for (include_hidden, expected) in [(false, false), (true, true)] {
+        let mut opts = options();
+        opts.include_hidden = include_hidden;
+        let plan = plan_sync(&root, &preset, bases, &opts, &view).unwrap();
+
+        for path in [&copied, &deleted] {
+            assert_eq!(
+                plan.steps.iter().any(|step| step.rel == Path::new(path)),
+                expected,
+                "include_hidden = {include_hidden}; item {path:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn sync_preview_does_not_show_folder_actions_it_cannot_run() {
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    let copied_folder = left.path().join("copy");
+    let deleted_folder = right.path().join("delete");
+    std::fs::create_dir(&copied_folder).unwrap();
+    std::fs::create_dir(&deleted_folder).unwrap();
+    hidden_file(&copied_folder);
+    hidden_file(&deleted_folder);
+
+    let root = compared(left.path(), right.path());
+    let preset = SyncPreset::MirrorToRight;
+    let preview = preview_with_options(&root, &preset, false);
+    let bases = Bases {
+        left: left.path(),
+        right: right.path(),
+    };
+    let mut opts = options();
+    opts.include_hidden = false;
+    let plan = plan_sync(&root, &preset, bases, &opts, &preview).unwrap();
+
+    assert!(plan.steps.is_empty());
+    assert!(preview.pending().is_empty());
+}
+
+#[test]
+fn sync_deletion_keeps_a_folder_only_for_hidden_items_on_the_deleted_side() {
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    let left_folder = left.path().join("sub");
+    let right_folder = right.path().join("sub");
+    std::fs::create_dir(&left_folder).unwrap();
+    std::fs::create_dir(&right_folder).unwrap();
+    let hidden = hidden_file(&left_folder);
+    std::fs::write(right_folder.join("visible.txt"), b"visible").unwrap();
+
+    let root = compared(left.path(), right.path());
+    let preset = SyncPreset::Custom(SyncRules {
+        actions: [
+            (StatusKey::Same, SyncAction::DeleteRight),
+            (StatusKey::Different, SyncAction::DeleteRight),
+            (StatusKey::LeftNewer, SyncAction::DeleteRight),
+            (StatusKey::RightNewer, SyncAction::DeleteRight),
+            (StatusKey::LeftOrphan, SyncAction::DeleteRight),
+            (StatusKey::RightOrphan, SyncAction::DeleteRight),
+            (StatusKey::KindMismatch, SyncAction::DeleteRight),
+            (StatusKey::Error, SyncAction::DeleteRight),
+            (StatusKey::NotCompared, SyncAction::DeleteRight),
+        ]
+        .into_iter()
+        .collect(),
+    });
+    let preview = preview_with_options(&root, &preset, false);
+    let bases = Bases {
+        left: left.path(),
+        right: right.path(),
+    };
+    let mut opts = options();
+    opts.include_hidden = false;
+    let plan = plan_sync(&root, &preset, bases, &opts, &preview).unwrap();
+
+    assert!(plan.steps.iter().any(|step| {
+        step.rel == Path::new("sub")
+            && matches!(&step.action, StepAction::DeleteDir { path } if path.starts_with(right.path()))
+    }));
+    assert!(run(&plan).is_clean());
+    assert!(left_folder.join(hidden).exists());
+    assert!(!right_folder.exists());
+}
+
+#[test]
+fn an_override_cannot_promise_to_delete_a_folder_kept_for_hidden_items() {
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    let folder = right.path().join("orphan");
+    std::fs::create_dir(&folder).unwrap();
+    hidden_file(&folder);
+
+    let root = compared(left.path(), right.path());
+    let preset = SyncPreset::MirrorToRight;
+    let mut shown = preview_with_options(&root, &preset, false);
+    shown.set_override(PathBuf::from("orphan"), SyncAction::DeleteRight);
+    let bases = Bases {
+        left: left.path(),
+        right: right.path(),
+    };
+    let mut opts = options();
+    opts.include_hidden = false;
+    let plan = plan_sync(&root, &preset, bases, &opts, &shown).unwrap();
+
+    assert!(shown.pending().is_empty());
+    assert!(plan.steps.is_empty());
+    assert!(folder.is_dir());
+}
+
+#[test]
+fn sync_preview_omits_hidden_items_when_the_option_is_clear() {
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    std::fs::write(left.path().join("visible.txt"), b"visible").unwrap();
+    let hidden = hidden_file_named(left.path(), "hidden.txt");
+
+    let root = compared(left.path(), right.path());
+    let preset = SyncPreset::MirrorToRight;
+    let excluded = preview_with_options(&root, &preset, false);
+    let included = preview_with_options(&root, &preset, true);
+
+    assert!(excluded
+        .rows
+        .iter()
+        .any(|row| row.rel == Path::new("visible.txt")));
+    assert!(!excluded
+        .rows
+        .iter()
+        .any(|row| row.rel == Path::new(&hidden)));
+    assert!(included
+        .rows
+        .iter()
+        .any(|row| row.rel == Path::new(&hidden)));
+}
+
+#[test]
+fn sync_keeps_an_orphan_folder_that_contains_excluded_hidden_items() {
+    for use_recycle_bin in [false, true] {
+        let left = tempfile::tempdir().unwrap();
+        let right = tempfile::tempdir().unwrap();
+        let folder = right.path().join("orphan");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join("visible.txt"), b"visible").unwrap();
+        let hidden = hidden_file(&folder);
+
+        let root = compared(left.path(), right.path());
+        let bases = Bases {
+            left: left.path(),
+            right: right.path(),
+        };
+        let preset = SyncPreset::MirrorToRight;
+        let view = preview_with_options(&root, &preset, false);
+        let mut opts = options();
+        opts.include_hidden = false;
+        opts.use_recycle_bin = use_recycle_bin;
+        let plan = plan_sync(&root, &preset, bases, &opts, &view).unwrap();
+
+        assert!(plan
+            .steps
+            .iter()
+            .any(|step| step.rel == Path::new("orphan/visible.txt")));
+        assert!(plan
+            .steps
+            .iter()
+            .all(|step| step.rel != Path::new("orphan")));
+        assert!(plan
+            .steps
+            .iter()
+            .all(|step| step.rel != Path::new("orphan").join(&hidden)));
+        if !use_recycle_bin {
+            assert!(run(&plan).is_clean());
+            assert!(folder.is_dir());
+            assert!(folder.join(hidden).exists());
+            assert!(!folder.join("visible.txt").exists());
+        }
+    }
 }
 
 #[test]
