@@ -269,11 +269,13 @@ impl ProfileManager {
                 self.request_new();
             }
             if ui
-                .add_enabled(self.selected.is_some(), egui::Button::new("Delete"))
+                .add_enabled(
+                    self.job.is_none() && self.selected.is_some() && self.saved_name.is_some(),
+                    egui::Button::new("Delete"),
+                )
                 .clicked()
             {
-                self.confirm_delete = true;
-                self.focus_delete_cancel_requested = true;
+                self.request_delete();
             }
         });
     }
@@ -792,6 +794,12 @@ impl ProfileManager {
         let actions_enabled = self.job.is_none();
         if self.confirm_delete {
             let mut answer = None;
+            let delete_will_discard_draft = self.is_dirty();
+            let delete_button = if delete_will_discard_draft {
+                "Delete and discard"
+            } else {
+                "Delete"
+            };
             egui::Window::new("Delete profile?")
                 .collapsible(false)
                 .resizable(false)
@@ -802,11 +810,15 @@ impl ProfileManager {
                         24.0,
                         "Delete profile?",
                     );
-                    ui.label(format!("Delete the profile ‘{}’?", self.draft.name));
+                    let name = self.saved_name.as_deref().unwrap_or(&self.draft.name);
+                    ui.label(format!("Delete the saved profile ‘{name}’?"));
+                    if delete_will_discard_draft {
+                        ui.label("This also discards the unsaved changes in the editor.");
+                    }
                     ui.add_enabled_ui(actions_enabled, |ui| {
                         ui.horizontal(|ui| {
                             let (delete, cancel) =
-                                ca_ui::widgets::dialog_button_pair(ui, "Delete", "Cancel");
+                                ca_ui::widgets::dialog_button_pair(ui, delete_button, "Cancel");
                             if self.focus_delete_cancel_requested {
                                 cancel.request_focus();
                                 self.focus_delete_cancel_requested = false;
@@ -845,9 +857,13 @@ impl ProfileManager {
                     );
                     ui.add_enabled_ui(actions_enabled, |ui| {
                         ui.horizontal(|ui| {
+                            let discard_label = self
+                                .discard_action
+                                .as_ref()
+                                .map_or("Discard", DiscardAction::affirmative_label);
                             let (discard, keep) = ca_ui::widgets::dialog_button_pair(
                                 ui,
-                                "Discard and close",
+                                discard_label,
                                 "Keep editing",
                             );
                             if self.focus_discard_keep_requested {
@@ -897,6 +913,14 @@ impl ProfileManager {
             },
             notify,
         ));
+    }
+
+    fn request_delete(&mut self) {
+        if self.job.is_some() || self.selected.is_none() || self.saved_name.is_none() {
+            return;
+        }
+        self.confirm_delete = true;
+        self.focus_delete_cancel_requested = true;
     }
 
     fn poll_job(&mut self) {
@@ -998,6 +1022,17 @@ enum DiscardAction {
     New,
     Select(String),
     Exit,
+}
+
+impl DiscardAction {
+    fn affirmative_label(&self) -> &'static str {
+        match self {
+            Self::Close => "Discard and close",
+            Self::New => "Discard and create new",
+            Self::Select(_) => "Discard and switch profile",
+            Self::Exit => "Discard and exit",
+        }
+    }
 }
 
 fn profile_label(ui: &mut egui::Ui, label: &str) {
