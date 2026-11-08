@@ -5,9 +5,11 @@
 use crate::settings::EngineOptions;
 use crate::tree::{Arena, Sort};
 use ca_fs::{
-    align_trees, apply_filters, compare_quick, compare_source_contents_parallel, scan_source,
-    scan_with, ArchiveTypes, CompareOptions, ContentMethod, ContentUpdate, FilterContext, Limits,
-    NameFilters, Node, RulesEngine, ScanOptions, ScanProgress, Source,
+    align_trees, apply_filters, compare_quick, compare_source_contents_parallel,
+    compare_source_contents_with, scan_source, scan_with, ArchiveTypes, CompareOptions,
+    ContentError, ContentMethod, ContentOutcome, ContentSide, ContentTests, ContentUpdate,
+    EntryFacts, FilterContext, Limits, NameFilters, Node, RulesEngine, ScanOptions, ScanProgress,
+    Source,
 };
 use ca_ui::worker::{Cancel, Emitter, Job, Terminal};
 use std::path::{Path, PathBuf};
@@ -67,6 +69,112 @@ pub struct Sides {
     pub left: Source,
     /// The right side.
     pub right: Source,
+}
+
+/// The selected file pair and the method the summary runs.
+#[derive(Debug, Clone)]
+pub struct QuickCompareRequest {
+    /// Source holding the left file.
+    pub left: Source,
+    /// Path of the left file inside its source.
+    pub left_rel: PathBuf,
+    /// What the left listing proved about size and time.
+    pub left_facts: EntryFacts,
+    /// Source holding the right file.
+    pub right: Source,
+    /// Path of the right file inside its source.
+    pub right_rel: PathBuf,
+    /// What the right listing proved about size and time.
+    pub right_facts: EntryFacts,
+    /// Content method selected in program options.
+    pub method: ContentMethod,
+    /// Formats enabled for this folder session.
+    pub enabled_formats: Vec<String>,
+    /// Formats disabled for this folder session.
+    pub disabled_formats: Vec<String>,
+}
+
+/// What the Quick Compare worker posts back.
+#[derive(Debug)]
+pub enum QuickCompareMessage {
+    /// The content comparison finished.
+    Done(Result<ContentOutcome, String>),
+    /// The user closed the dialog while the comparison ran.
+    Cancelled,
+}
+
+impl Terminal for QuickCompareMessage {
+    fn is_terminal(&self) -> bool {
+        true
+    }
+
+    fn cancelled() -> Self {
+        Self::Cancelled
+    }
+
+    fn panicked(detail: String) -> Self {
+        Self::Done(Err(detail))
+    }
+}
+
+/// Compare one selected pair on a worker, through the source abstraction.
+#[must_use]
+pub fn spawn_quick_compare(
+    request: QuickCompareRequest,
+    notify: Arc<dyn Fn() + Send + Sync>,
+) -> Job<QuickCompareMessage> {
+    Job::spawn_notifying(
+        move |emitter, cancel| {
+            let result = (|| {
+                let left_path = request
+                    .left
+                    .entry_path(&request.left_rel)
+                    .map_err(|error| error.to_string())?;
+                let right_path = request
+                    .right
+                    .entry_path(&request.right_rel)
+                    .map_err(|error| error.to_string())?;
+                let rules = (request.method == ContentMethod::Rules).then(|| {
+                    RulesEngine::with_builtin_formats().with_format_lists(
+                        request.enabled_formats.clone(),
+                        request.disabled_formats.clone(),
+                    )
+                });
+                let tests = ContentTests {
+                    enabled: true,
+                    method: request.method,
+                    ..ContentTests::default()
+                };
+                compare_source_contents_with(
+                    ContentSide {
+                        source: &request.left,
+                        path: &left_path,
+                        facts: request.left_facts,
+                    },
+                    ContentSide {
+                        source: &request.right,
+                        path: &right_path,
+                        facts: request.right_facts,
+                    },
+                    &tests,
+                    rules
+                        .as_ref()
+                        .map(|engine| engine as &dyn ca_fs::RulesComparer),
+                    cancel.as_fs(),
+                )
+                .map_err(|error| match error {
+                    ContentError::Cancelled => "comparison cancelled".to_owned(),
+                    other => other.to_string(),
+                })
+            })();
+            if cancel.is_cancelled() {
+                emitter.send(QuickCompareMessage::Cancelled);
+            } else {
+                emitter.send(QuickCompareMessage::Done(result));
+            }
+        },
+        notify,
+    )
 }
 
 impl Sides {
@@ -891,12 +999,30 @@ pub fn extract_pair(
     request: ca_ui::view::OpenRequest,
     cancel: &Cancel,
 ) -> Result<ca_ui::view::OpenRequest, String> {
+    extract_selected_pair(sides, rel, rel, directory, request, cancel)
+}
+
+/// Copy two selected entries out of their sources when either source is not a
+/// local folder. The two paths can be different when the user selected two
+/// unaligned files.
+///
+/// # Errors
+/// Returns the message to show when a side cannot be read or a copy cannot be
+/// written. The copies already made are deleted first.
+pub fn extract_selected_pair(
+    sides: &Sides,
+    left_rel: &Path,
+    right_rel: &Path,
+    directory: &Path,
+    request: ca_ui::view::OpenRequest,
+    cancel: &Cancel,
+) -> Result<ca_ui::view::OpenRequest, String> {
     let mut copies = Vec::new();
     let mut paths = Vec::new();
     let mut titles = request.titles.clone();
-    for (source, shown, title) in [
-        (&sides.left, &request.left, &mut titles.left),
-        (&sides.right, &request.right, &mut titles.right),
+    for (source, rel, shown, title) in [
+        (&sides.left, left_rel, &request.left, &mut titles.left),
+        (&sides.right, right_rel, &request.right, &mut titles.right),
     ] {
         if source.is_local_folder() {
             paths.push(source.origin().join(rel));
@@ -994,16 +1120,36 @@ pub fn spawn_extract(
     request: ca_ui::view::OpenRequest,
     notify: Arc<dyn Fn() + Send + Sync>,
 ) -> Job<ExtractMessage> {
+    spawn_extract_selected_pair(sides, rel.clone(), rel, request, notify)
+}
+
+/// Start copying two selected entries out of their sources on a worker.
+#[must_use]
+pub fn spawn_extract_selected_pair(
+    sides: Sides,
+    left_rel: PathBuf,
+    right_rel: PathBuf,
+    request: ca_ui::view::OpenRequest,
+    notify: Arc<dyn Fn() + Send + Sync>,
+) -> Job<ExtractMessage> {
     Job::spawn_notifying(
         move |emitter, cancel| {
             let message = match ca_ui::paths::prepared_temporary_directory() {
-                Ok(directory) => match extract_pair(&sides, &rel, &directory, request, cancel) {
+                Ok(directory) => match extract_selected_pair(
+                    &sides,
+                    &left_rel,
+                    &right_rel,
+                    &directory,
+                    request,
+                    cancel,
+                ) {
                     Ok(request) => ExtractMessage::Ready(Box::new(request)),
                     Err(reason) => ExtractMessage::Failed(reason),
                 },
                 Err(error) => ExtractMessage::Failed(format!(
-                    "{} could not be copied out: the folder for copies {} cannot be used: {error}",
-                    rel.display(),
+                    "{} and {} could not be copied out: the folder for copies {} cannot be used: {error}",
+                    left_rel.display(),
+                    right_rel.display(),
                     ca_ui::paths::temporary_directory().display()
                 )),
             };

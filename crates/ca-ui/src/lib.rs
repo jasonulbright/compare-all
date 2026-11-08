@@ -24,6 +24,7 @@ pub mod launch;
 pub mod options;
 pub mod pack;
 pub mod paths;
+pub mod quick_compare;
 pub mod rediff;
 pub mod report;
 pub mod save;

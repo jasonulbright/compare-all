@@ -871,6 +871,7 @@ dependencies = [
 name = "ca-app"
 version = "0.0.0"
 dependencies = [
+ "ca-fs",
  "ca-io",
  "ca-session",
  "ca-ui",

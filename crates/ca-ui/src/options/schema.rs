@@ -16,8 +16,6 @@ mod reason {
     pub const NO_SHELL: &str = "The file manager menu exists on Windows only.";
     /// No clipboard helper exists in this build.
     pub const NO_CLIPBOARD_HELPER: &str = "The clipboard helper program is not built.";
-    /// The command line opens the full view.
-    pub const NO_QUICK_COMPARE: &str = "The quick compare summary dialog is not built.";
     /// The command this field narrows is not built.
     pub const NO_NEXT_DIFFERENCE_FILES: &str =
         "The Next Difference Files command is not built, so nothing reads this.";
@@ -504,20 +502,17 @@ const PRIORITY_CHOICES: &[Choice] = &[
 const STARTUP_FIELDS: &[OptionField] = &[
     text!(startup.load_workspace, "On start, load workspace"),
     text!(startup.save_workspace_on_exit, "On exit, save workspace as"),
-    flag!(startup.show_quick_compare, "Show quick compare dialog")
-        .unavailable(reason::NO_QUICK_COMPARE),
+    flag!(startup.show_quick_compare, "Show quick compare dialog"),
     choice!(
         startup.quick_compare_method,
         QuickCompareMethod,
         "Quick compare method"
     )
-    .with_choices(QUICK_COMPARE_CHOICES)
-    .unavailable(reason::NO_QUICK_COMPARE),
+    .with_choices(QUICK_COMPARE_CHOICES),
     flag!(
         startup.open_view_if_different,
         "Open the view when the files differ"
-    )
-    .unavailable(reason::NO_QUICK_COMPARE),
+    ),
     flag!(
         startup.run_clipboard_compare_at_startup,
         "Run the clipboard helper at system start"

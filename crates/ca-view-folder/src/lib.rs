@@ -24,7 +24,7 @@ pub use opjobs::MISSING_FILES;
 
 use ca_fs::{
     ContentMethod, ContentOutcome, DisplayFilter, ExecutionReport, FolderDisplayFilter, Node,
-    NodeStatus, OperationPlan, Side, SyncAction, SyncPreview,
+    NodeStatus, OperationPlan, Side, Source, SyncAction, SyncPreview,
 };
 use ca_session::SessionKind;
 use ca_ui::command::Command;
@@ -110,6 +110,10 @@ const SYNC_PREVIEW_FAILED: &str = "The synchronization preview could not be buil
 /// Why a copy waits while a file operation is planned, asks, runs or shows
 /// its result.
 const OPERATION_OPEN: &str = "Available once the open file operation is closed";
+/// Why Quick Compare needs one or two selected files.
+const QUICK_COMPARE_SELECTION: &str = "Select one or two files to compare";
+/// Why a selected file cannot be compared with its counterpart.
+const QUICK_COMPARE_COUNTERPART: &str = "The selected file has no file on the other side";
 /// How often streamed content results are folded into the rows on screen.
 const REBUILD_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -120,6 +124,7 @@ const HANDLED: &[Command] = &[
     Command::CollapseAll,
     Command::RefreshSelection,
     Command::CompareContents,
+    Command::QuickCompare,
     Command::SwapSides,
     Command::Reload,
     Command::Recompare,
@@ -310,6 +315,64 @@ struct DragSelection {
     last_end: Option<(Side, usize)>,
 }
 
+/// One file a Quick Compare will read.
+struct QuickCompareFile {
+    rel: PathBuf,
+    source: Source,
+    facts: ca_fs::EntryFacts,
+}
+
+/// The ordered pair a Quick Compare will read and later open in a view.
+struct QuickComparePair {
+    first: QuickCompareFile,
+    second: QuickCompareFile,
+}
+
+/// The summary window, its worker, and the pair it can open next.
+struct QuickCompareState {
+    dialog: ca_ui::quick_compare::QuickCompareDialog,
+    job: Option<Job<jobs::QuickCompareMessage>>,
+    sources: jobs::Sides,
+    first_rel: PathBuf,
+    second_rel: PathBuf,
+    first_path: PathBuf,
+    second_path: PathBuf,
+}
+
+impl QuickCompareState {
+    fn new(pair: QuickComparePair, method: ContentMethod, view: &FolderView) -> Self {
+        let first_path = display_source_path(&pair.first.source, &pair.first.rel);
+        let second_path = display_source_path(&pair.second.source, &pair.second.rel);
+        let sources = jobs::Sides {
+            left: pair.first.source.clone(),
+            right: pair.second.source.clone(),
+        };
+        let request = jobs::QuickCompareRequest {
+            left: pair.first.source,
+            left_rel: pair.first.rel.clone(),
+            left_facts: pair.first.facts,
+            right: pair.second.source,
+            right_rel: pair.second.rel.clone(),
+            right_facts: pair.second.facts,
+            method,
+            enabled_formats: view.session_settings.misc.enabled_formats.clone(),
+            disabled_formats: view.session_settings.misc.disabled_formats.clone(),
+        };
+        Self {
+            dialog: ca_ui::quick_compare::QuickCompareDialog::new(
+                first_path.display().to_string(),
+                second_path.display().to_string(),
+            ),
+            job: Some(jobs::spawn_quick_compare(request, view.notify.clone())),
+            sources,
+            first_rel: pair.first.rel,
+            second_rel: pair.second.rel,
+            first_path,
+            second_path,
+        }
+    }
+}
+
 /// A folder comparison tab.
 #[allow(clippy::struct_excessive_bools)]
 pub struct FolderView {
@@ -349,6 +412,7 @@ pub struct FolderView {
     selection_refresh_comparison: u64,
     preview_comparison: u64,
     extract_job: Option<Job<jobs::ExtractMessage>>,
+    quick_compare: Option<QuickCompareState>,
     /// Tabs to open on the next frame, from work that finished off the frame.
     pending_opens: Vec<OpenRequest>,
     /// The report command of this view.
@@ -394,6 +458,7 @@ pub struct FolderView {
     root_incomplete: bool,
     show_errors: bool,
     content_method: ContentMethod,
+    quick_compare_method: ContentMethod,
     content_done: usize,
     selection: Selection,
     selection_drag: Option<DragSelection>,
@@ -549,6 +614,7 @@ impl FolderView {
             selection_refresh_comparison: 0,
             preview_comparison: 0,
             extract_job: None,
+            quick_compare: None,
             pending_opens: Vec::new(),
             report: ViewReport::new(
                 ReportKind::Folder,
@@ -583,6 +649,7 @@ impl FolderView {
             root_incomplete: false,
             show_errors: false,
             content_method: ContentMethod::Binary,
+            quick_compare_method: ContentMethod::Binary,
             content_done: 0,
             selection: Selection::new(),
             selection_drag: None,
@@ -1464,6 +1531,7 @@ impl FolderView {
         self.poll_cleanup();
         self.poll_preview();
         self.poll_extract();
+        self.poll_quick_compare();
         self.poll_automatic_refresh();
         self.flush_rebuild();
     }
@@ -1970,6 +2038,35 @@ impl FolderView {
         }
     }
 
+    fn poll_quick_compare(&mut self) {
+        let Some(state) = self.quick_compare.as_mut() else {
+            return;
+        };
+        let Some(job) = state.job.as_mut() else {
+            return;
+        };
+        let messages = job.drain();
+        let finished = job.is_finished();
+        for message in messages {
+            match message {
+                jobs::QuickCompareMessage::Done(Ok(outcome)) => {
+                    state.dialog.set_result(quick_compare_result(outcome));
+                }
+                jobs::QuickCompareMessage::Done(Err(reason)) => {
+                    state
+                        .dialog
+                        .set_result(format!("Could not compare: {reason}"));
+                }
+                jobs::QuickCompareMessage::Cancelled => {
+                    state.dialog.set_result("Comparison cancelled");
+                }
+            }
+        }
+        if finished {
+            state.job = None;
+        }
+    }
+
     /// The tabs the view asks for next frame, taken so each opens once.
     pub fn take_pending_opens(&mut self) -> Vec<OpenRequest> {
         std::mem::take(&mut self.pending_opens)
@@ -2196,6 +2293,104 @@ impl FolderView {
             Box::new(self.engine_options()),
             self.notify.clone(),
         ));
+    }
+
+    /// Start the selected file pair's summary comparison.
+    fn start_quick_compare(&mut self) {
+        let Ok(pair) = self.quick_compare_pair() else {
+            return;
+        };
+        self.quick_compare = Some(QuickCompareState::new(
+            pair,
+            self.quick_compare_method,
+            self,
+        ));
+    }
+
+    /// Resolve one selected file and its counterpart, or two selected files.
+    fn quick_compare_pair(&self) -> Result<QuickComparePair, &'static str> {
+        let mut selected = Vec::with_capacity(2);
+        for side in [Side::Left, Side::Right] {
+            selected.extend(
+                self.selection
+                    .side(side)
+                    .iter()
+                    .map(|rel| (side, rel.clone())),
+            );
+        }
+        match selected.as_slice() {
+            [(side, rel)] => {
+                let file = self.quick_compare_file(*side, rel)?;
+                let counterpart = self
+                    .quick_compare_file(opposite(*side), rel)
+                    .map_err(|_| QUICK_COMPARE_COUNTERPART)?;
+                Ok(match side {
+                    Side::Left => QuickComparePair {
+                        first: file,
+                        second: counterpart,
+                    },
+                    Side::Right => QuickComparePair {
+                        first: counterpart,
+                        second: file,
+                    },
+                })
+            }
+            [(first_side, first_rel), (second_side, second_rel)] => Ok(QuickComparePair {
+                first: self.quick_compare_file(*first_side, first_rel)?,
+                second: self.quick_compare_file(*second_side, second_rel)?,
+            }),
+            _ => Err(QUICK_COMPARE_SELECTION),
+        }
+    }
+
+    fn quick_compare_file(&self, side: Side, rel: &Path) -> Result<QuickCompareFile, &'static str> {
+        let tree = self
+            .compared_tree
+            .as_deref()
+            .ok_or(QUICK_COMPARE_SELECTION)?;
+        let node = find_node(tree, rel).ok_or(QUICK_COMPARE_SELECTION)?;
+        if node.is_dir {
+            return Err(QUICK_COMPARE_SELECTION);
+        }
+        let facts = match side {
+            Side::Left if node.left.is_some() => node.facts.left,
+            Side::Right if node.right.is_some() => node.facts.right,
+            _ => return Err(QUICK_COMPARE_SELECTION),
+        };
+        let source = self.sides.as_ref().ok_or(QUICK_COMPARE_SELECTION)?;
+        let source = match side {
+            Side::Left => &source.left,
+            Side::Right => &source.right,
+        };
+        Ok(QuickCompareFile {
+            rel: rel.to_path_buf(),
+            source: source.clone(),
+            facts,
+        })
+    }
+
+    fn finish_quick_compare(&mut self, action: ca_ui::quick_compare::QuickCompareAction) {
+        let Some(state) = self.quick_compare.take() else {
+            return;
+        };
+        let ca_ui::quick_compare::QuickCompareAction::OpenView(kind) = action else {
+            return;
+        };
+        let mut request =
+            OpenRequest::new(kind, state.first_path.clone(), state.second_path.clone());
+        if state.sources.are_local() {
+            self.pending_opens.push(request);
+        } else {
+            request.titles.left = Some(state.first_path.display().to_string());
+            request.titles.right = Some(state.second_path.display().to_string());
+            self.extract_job = Some(jobs::spawn_extract_selected_pair(
+                state.sources,
+                state.first_rel,
+                state.second_rel,
+                request,
+                self.notify.clone(),
+            ));
+        }
     }
 
     fn path_bar(&mut self, ui: &mut egui::Ui) {
@@ -3336,7 +3531,10 @@ impl FolderView {
 
     fn tree_takes_input(&self) -> bool {
         let recovery_shown = self.show_recovery && !self.notices.is_empty();
-        !self.stage.blocks_input() && self.message.is_none() && !recovery_shown
+        !self.stage.blocks_input()
+            && self.message.is_none()
+            && !recovery_shown
+            && self.quick_compare.is_none()
     }
 
     /// Register the tree as a widget that holds the keyboard.
@@ -3377,7 +3575,10 @@ impl FolderView {
         // without consuming them, so an arrow typed into the name filter
         // would also move the tree cursor.
         let focused = ui.ctx().memory(egui::Memory::focused);
-        if self.stage.blocks_input() || focused.is_some_and(|id| id != self.tree_widget()) {
+        if self.stage.blocks_input()
+            || self.quick_compare.is_some()
+            || focused.is_some_and(|id| id != self.tree_widget())
+        {
             return;
         }
         let (pressed, modifiers) = ui.input(|input| {
@@ -3447,6 +3648,13 @@ impl FolderView {
     /// The windows that stand between a command and the disk.
     #[allow(clippy::too_many_lines)]
     fn overlays(&mut self, ui: &mut egui::Ui) {
+        let quick_action = self
+            .quick_compare
+            .as_mut()
+            .and_then(|state| state.dialog.show(ui.ctx(), self.id.with("quick-compare")));
+        if let Some(action) = quick_action {
+            self.finish_quick_compare(action);
+        }
         if let Some((title, body)) = self.message.clone() {
             if dialogs::notice(ui, self.id.with("notice"), &title, &body) {
                 self.message = None;
@@ -3543,6 +3751,34 @@ const fn opposite(side: Side) -> Side {
     match side {
         Side::Left => Side::Right,
         Side::Right => Side::Left,
+    }
+}
+
+/// Find one compared entry by its path below the root.
+fn find_node<'a>(node: &'a Node, rel: &Path) -> Option<&'a Node> {
+    if node.rel == rel {
+        return Some(node);
+    }
+    node.children.iter().find_map(|child| find_node(child, rel))
+}
+
+/// The path shown in the summary for an entry from any source.
+fn display_source_path(source: &Source, rel: &Path) -> PathBuf {
+    if source.origin().as_os_str().is_empty() {
+        PathBuf::from(format!("{}\\{}", source.label(), rel.display()))
+    } else {
+        source.origin().join(rel)
+    }
+}
+
+/// The wording the summary uses for a content result.
+const fn quick_compare_result(outcome: ContentOutcome) -> &'static str {
+    match outcome {
+        ContentOutcome::BinarySame | ContentOutcome::RulesSame => "Files are identical",
+        ContentOutcome::UnimportantDifferences => "Unimportant differences",
+        ContentOutcome::ImportantDifferences => "Important differences",
+        ContentOutcome::BinaryDifferences => "Differences",
+        ContentOutcome::NotComparedCloudPlaceholder => "Not compared",
     }
 }
 
@@ -4138,6 +4374,11 @@ impl SessionView for FolderView {
     /// writes as frame output.
     fn ui(&mut self, ui: &mut egui::Ui, context: &ViewContext) -> Vec<ViewAction> {
         let options = ca_ui::options::current(ui.ctx());
+        self.quick_compare_method = if options.stored.startup.quick_compare_method.id() == "rules" {
+            ContentMethod::Rules
+        } else {
+            ContentMethod::Binary
+        };
         self.set_confirmations(options.stored.file_operations.clone());
         if self.backups.as_ref() != Some(&options.stored.backups) {
             self.form.follow_backups(&options.stored.backups);
@@ -4235,6 +4476,9 @@ impl SessionView for FolderView {
     /// A ready, idle filename copy with a selection but no local path has a distinct refusal.
     fn refusal(&self, command: Command) -> Option<&'static str> {
         match command {
+            Command::QuickCompare if !self.accepts(command) => {
+                self.quick_compare_pair().err().or(Some(READ_BUSY))
+            }
             Command::ToggleRowIgnored if !self.accepts(command) => Some(self.ignored_refusal()),
             Command::NextDifference | Command::PreviousDifference if !self.accepts(command) => {
                 Some(navigate::NO_DIFFERENCE)
@@ -4281,10 +4525,21 @@ impl SessionView for FolderView {
 
     /// Keeps declared command states from advertising actions the active view will refuse.
     fn accepts(&self, command: Command) -> bool {
+        if self.quick_compare.is_some() {
+            return command == Command::Cancel;
+        }
         let idle = matches!(self.stage, Stage::Idle);
         match command {
             Command::ExpandAll | Command::CollapseAll | Command::Find => !self.arena.is_empty(),
             Command::CompareContents | Command::CompareReport => self.compared_tree.is_some(),
+            Command::QuickCompare => {
+                self.quick_compare_pair().is_ok()
+                    && self.status == Status::Ready
+                    && idle
+                    && self.extract_job.is_none()
+                    && self.message.is_none()
+                    && (!self.show_recovery || self.notices.is_empty())
+            }
             Command::SwapSides => self.status == Status::Ready && idle,
             Command::Reload | Command::Recompare => !self.status.is_running() && idle,
             Command::RefreshSelection => {
@@ -4344,7 +4599,9 @@ impl SessionView for FolderView {
                 self.rebuild();
             }
             Command::CompareContents => self.start_content_comparison(),
+            Command::QuickCompare => self.start_quick_compare(),
             Command::CompareReport => self.report.request(),
+            Command::Cancel if self.quick_compare.is_some() => self.quick_compare = None,
             Command::Cancel => self.request_stop(),
             Command::RefreshSelection => self.refresh_selection(),
             Command::Reload | Command::Recompare => self.restart(),
@@ -4390,6 +4647,7 @@ impl SessionView for FolderView {
     fn on_close(&mut self) {
         self.drop_jobs();
         self.request_stop();
+        self.quick_compare = None;
         if let Some(job) = self.picker.take() {
             job.cancel();
         }
@@ -4724,6 +4982,181 @@ mod tests {
             let shown = opened.titles.left.clone().unwrap_or_default();
             assert!(shown.ends_with("NUL"), "{shown}");
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod quick_compare_tests {
+    use super::FolderView;
+    use crate::selection::ClickKind;
+    use ca_fs::Side;
+    use ca_ui::view::SessionView;
+    use std::path::Path;
+    use std::time::{Duration, Instant};
+
+    const PATIENCE: Duration = Duration::from_secs(30);
+
+    fn view(dir: &Path) -> FolderView {
+        let left = dir.join("left");
+        let right = dir.join("right");
+        let journals = dir.join("journals");
+        for folder in [&left, &right, &journals] {
+            std::fs::create_dir_all(folder).unwrap();
+        }
+        let mut view = FolderView::with_journal_directory(
+            left,
+            right,
+            &ca_ui::testing::context(),
+            91,
+            journals,
+        );
+        let deadline = Instant::now() + PATIENCE;
+        while !view.is_ready() && Instant::now() < deadline {
+            view.tick();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(view.is_ready(), "folder comparison did not become ready");
+        view
+    }
+
+    fn select(view: &mut FolderView, side: Side, rel: &Path, kind: ClickKind) {
+        let node = view.arena.index_of(rel).unwrap();
+        let row = view.rows.iter().position(|row| row.node == node).unwrap();
+        view.selection
+            .click(side, row, &view.rows, &view.arena, kind);
+    }
+
+    fn wait_for_result(view: &mut FolderView) -> String {
+        let deadline = Instant::now() + PATIENCE;
+        loop {
+            view.tick();
+            if let Some(result) = view
+                .quick_compare
+                .as_ref()
+                .and_then(|state| state.dialog.result())
+            {
+                return result.to_owned();
+            }
+            assert!(Instant::now() < deadline, "quick comparison did not finish");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn one_selected_file_compares_with_its_counterpart_and_opens_the_pair() {
+        let dir = tempfile::tempdir().unwrap();
+        let left = dir.path().join("left");
+        let right = dir.path().join("right");
+        std::fs::create_dir_all(&left).unwrap();
+        std::fs::create_dir_all(&right).unwrap();
+        std::fs::write(left.join("same.txt"), b"same").unwrap();
+        std::fs::write(right.join("same.txt"), b"same").unwrap();
+        let mut view = view(dir.path());
+        select(
+            &mut view,
+            Side::Left,
+            Path::new("same.txt"),
+            ClickKind::Replace,
+        );
+
+        assert!(view.accepts(ca_ui::Command::QuickCompare));
+        view.start_quick_compare();
+        assert_eq!(wait_for_result(&mut view), "Files are identical");
+        view.finish_quick_compare(ca_ui::quick_compare::QuickCompareAction::OpenView(
+            ca_session::SessionKind::HexCompare,
+        ));
+
+        let opened = view.take_pending_opens();
+        assert_eq!(opened.len(), 1);
+        assert_eq!(opened[0].kind, ca_session::SessionKind::HexCompare);
+        assert_eq!(opened[0].left, left.join("same.txt"));
+        assert_eq!(opened[0].right, right.join("same.txt"));
+    }
+
+    #[test]
+    fn two_unaligned_files_on_one_side_compare_directly() {
+        let dir = tempfile::tempdir().unwrap();
+        let left = dir.path().join("left");
+        std::fs::create_dir_all(&left).unwrap();
+        std::fs::create_dir_all(dir.path().join("right")).unwrap();
+        std::fs::write(left.join("alpha.txt"), b"left").unwrap();
+        std::fs::write(left.join("beta.txt"), b"right").unwrap();
+        let mut view = view(dir.path());
+        select(
+            &mut view,
+            Side::Left,
+            Path::new("alpha.txt"),
+            ClickKind::Replace,
+        );
+        select(
+            &mut view,
+            Side::Left,
+            Path::new("beta.txt"),
+            ClickKind::Toggle,
+        );
+
+        assert!(view.accepts(ca_ui::Command::QuickCompare));
+        view.start_quick_compare();
+        assert_eq!(wait_for_result(&mut view), "Differences");
+        view.finish_quick_compare(ca_ui::quick_compare::QuickCompareAction::OpenView(
+            ca_session::SessionKind::TableCompare,
+        ));
+
+        let opened = view.take_pending_opens();
+        assert_eq!(opened.len(), 1);
+        assert_eq!(opened[0].kind, ca_session::SessionKind::TableCompare);
+        assert_eq!(opened[0].left, left.join("alpha.txt"));
+        assert_eq!(opened[0].right, left.join("beta.txt"));
+    }
+
+    #[test]
+    fn two_unaligned_archive_files_open_from_separate_copies() {
+        const EMPTY_ZIP: &[u8] = &[
+            0x50, 0x4b, 0x05, 0x06, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("bundle.zip");
+        std::fs::write(&archive, EMPTY_ZIP).unwrap();
+        let source = ca_fs::Source::archive(&archive, ca_vfs::ArchiveOptions::default()).unwrap();
+        for (name, contents) in [("alpha.txt", b"alpha".as_slice()), ("beta.txt", b"beta")] {
+            let mut reader = contents;
+            source
+                .file_system()
+                .write_file(
+                    &ca_vfs::VfsPath::parse(name).unwrap(),
+                    &mut reader,
+                    &ca_vfs::Cancel::new(),
+                )
+                .unwrap();
+        }
+        let sides = crate::jobs::Sides {
+            left: source.clone(),
+            right: source,
+        };
+        let mut request = ca_ui::view::OpenRequest::new(
+            ca_session::SessionKind::TextCompare,
+            Path::new("bundle.zip\\alpha.txt").to_path_buf(),
+            Path::new("bundle.zip\\beta.txt").to_path_buf(),
+        );
+        request.titles.left = Some("bundle.zip\\alpha.txt".to_owned());
+        request.titles.right = Some("bundle.zip\\beta.txt".to_owned());
+        let opened = crate::jobs::extract_selected_pair(
+            &sides,
+            Path::new("alpha.txt"),
+            Path::new("beta.txt"),
+            &dir.path().join("copies"),
+            request,
+            &ca_ui::worker::Cancel::new(),
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read(&opened.left).unwrap(), b"alpha");
+        assert_eq!(std::fs::read(&opened.right).unwrap(), b"beta");
+        assert_eq!(opened.temporaries.len(), 2);
+        assert_eq!(opened.titles.left.as_deref(), Some("bundle.zip\\alpha.txt"));
+        assert_eq!(opened.titles.right.as_deref(), Some("bundle.zip\\beta.txt"));
+        assert!(opened.read_only);
     }
 }
 

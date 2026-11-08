@@ -17,6 +17,7 @@ name = "compare-all"
 path = "src/main.rs"
 
 [dependencies]
+ca-fs.workspace = true
 ca-session.workspace = true
 ca-io.workspace = true
 ca-update.workspace = true
