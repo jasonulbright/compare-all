@@ -3,7 +3,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, missing_docs)]
 
 use ca_session::SessionKind;
-use ca_ui::quick_compare::{QuickCompareAction, QuickCompareDialog};
+use ca_ui::quick_compare::{supports_view, QuickCompareAction, QuickCompareDialog};
 use ca_ui::testing::probe::Probe;
 
 fn draw<'a>(
@@ -80,4 +80,12 @@ fn the_window_close_control_returns_close() {
     drop(run);
 
     assert_eq!(action, Some(QuickCompareAction::Close));
+}
+
+#[test]
+fn the_view_selector_accepts_only_the_kinds_it_offers() {
+    assert!(supports_view(&SessionKind::TextCompare));
+    assert!(supports_view(&SessionKind::HexCompare));
+    assert!(!supports_view(&SessionKind::TextMerge));
+    assert!(!supports_view(&SessionKind::FolderCompare));
 }

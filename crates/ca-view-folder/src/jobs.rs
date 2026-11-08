@@ -86,8 +86,8 @@ pub struct QuickCompareRequest {
     pub right_rel: PathBuf,
     /// What the right listing proved about size and time.
     pub right_facts: EntryFacts,
-    /// Content method selected in program options.
-    pub method: ContentMethod,
+    /// The folder session's content settings with Quick Compare's method.
+    pub content: ContentTests,
     /// Formats enabled for this folder session.
     pub enabled_formats: Vec<String>,
     /// Formats disabled for this folder session.
@@ -134,17 +134,13 @@ pub fn spawn_quick_compare(
                     .right
                     .entry_path(&request.right_rel)
                     .map_err(|error| error.to_string())?;
-                let rules = (request.method == ContentMethod::Rules).then(|| {
+                let rules = (request.content.method == ContentMethod::Rules).then(|| {
                     RulesEngine::with_builtin_formats().with_format_lists(
                         request.enabled_formats.clone(),
                         request.disabled_formats.clone(),
                     )
                 });
-                let tests = ContentTests {
-                    enabled: true,
-                    method: request.method,
-                    ..ContentTests::default()
-                };
+                let tests = request.content;
                 compare_source_contents_with(
                     ContentSide {
                         source: &request.left,
@@ -528,7 +524,7 @@ pub fn spawn_contents(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
-    use super::{spawn_contents, spawn_scan, ContentMessage, ScanMessage};
+    use super::{selected_pair_label, spawn_contents, spawn_scan, ContentMessage, ScanMessage};
     use ca_fs::ContentMethod;
     use std::path::Path;
     use std::sync::Arc;
@@ -559,6 +555,20 @@ mod tests {
         std::fs::write(right.join("sub/differs.txt"), b"two").unwrap();
         std::fs::write(left.join("orphan.txt"), b"only here").unwrap();
         dir
+    }
+
+    #[test]
+    fn an_aligned_extraction_failure_names_the_path_once() {
+        let path = Path::new("sub/notes.txt");
+        assert_eq!(selected_pair_label(path, path), "sub/notes.txt");
+    }
+
+    #[test]
+    fn an_unaligned_extraction_failure_names_both_paths() {
+        assert_eq!(
+            selected_pair_label(Path::new("alpha.txt"), Path::new("beta.txt")),
+            "alpha.txt and beta.txt"
+        );
     }
 
     /// Options with the two-phase scan off, so a test sees one result only.
@@ -1136,20 +1146,14 @@ pub fn spawn_extract_selected_pair(
         move |emitter, cancel| {
             let message = match ca_ui::paths::prepared_temporary_directory() {
                 Ok(directory) => match extract_selected_pair(
-                    &sides,
-                    &left_rel,
-                    &right_rel,
-                    &directory,
-                    request,
-                    cancel,
+                    &sides, &left_rel, &right_rel, &directory, request, cancel,
                 ) {
                     Ok(request) => ExtractMessage::Ready(Box::new(request)),
                     Err(reason) => ExtractMessage::Failed(reason),
                 },
                 Err(error) => ExtractMessage::Failed(format!(
-                    "{} and {} could not be copied out: the folder for copies {} cannot be used: {error}",
-                    left_rel.display(),
-                    right_rel.display(),
+                    "{} could not be copied out: the folder for copies {} cannot be used: {error}",
+                    selected_pair_label(&left_rel, &right_rel),
                     ca_ui::paths::temporary_directory().display()
                 )),
             };
@@ -1157,4 +1161,13 @@ pub fn spawn_extract_selected_pair(
         },
         notify,
     )
+}
+
+/// The selected paths named in an extraction failure.
+fn selected_pair_label(left: &Path, right: &Path) -> String {
+    if left == right {
+        left.display().to_string()
+    } else {
+        format!("{} and {}", left.display(), right.display())
+    }
 }

@@ -343,6 +343,10 @@ impl QuickCompareState {
     fn new(pair: QuickComparePair, method: ContentMethod, view: &FolderView) -> Self {
         let first_path = display_source_path(&pair.first.source, &pair.first.rel);
         let second_path = display_source_path(&pair.second.source, &pair.second.rel);
+        let options = view.engine_options();
+        let mut content = options.compare.content;
+        content.enabled = true;
+        content.method = method;
         let sources = jobs::Sides {
             left: pair.first.source.clone(),
             right: pair.second.source.clone(),
@@ -354,9 +358,9 @@ impl QuickCompareState {
             right: pair.second.source,
             right_rel: pair.second.rel.clone(),
             right_facts: pair.second.facts,
-            method,
-            enabled_formats: view.session_settings.misc.enabled_formats.clone(),
-            disabled_formats: view.session_settings.misc.disabled_formats.clone(),
+            content,
+            enabled_formats: options.enabled_formats,
+            disabled_formats: options.disabled_formats,
         };
         Self {
             dialog: ca_ui::quick_compare::QuickCompareDialog::new(
@@ -2309,6 +2313,9 @@ impl FolderView {
 
     /// Resolve one selected file and its counterpart, or two selected files.
     fn quick_compare_pair(&self) -> Result<QuickComparePair, &'static str> {
+        if !(1..=2).contains(&self.selection.len()) {
+            return Err(QUICK_COMPARE_SELECTION);
+        }
         let mut selected = Vec::with_capacity(2);
         for side in [Side::Left, Side::Right] {
             selected.extend(
@@ -3756,10 +3763,16 @@ const fn opposite(side: Side) -> Side {
 
 /// Find one compared entry by its path below the root.
 fn find_node<'a>(node: &'a Node, rel: &Path) -> Option<&'a Node> {
-    if node.rel == rel {
+    if rel.as_os_str().is_empty() {
         return Some(node);
     }
-    node.children.iter().find_map(|child| find_node(child, rel))
+    let mut current = node;
+    let mut prefix = PathBuf::new();
+    for component in rel.components() {
+        prefix.push(component.as_os_str());
+        current = current.children.iter().find(|child| child.rel == prefix)?;
+    }
+    Some(current)
 }
 
 /// The path shown in the summary for an entry from any source.
@@ -4374,7 +4387,7 @@ impl SessionView for FolderView {
     /// writes as frame output.
     fn ui(&mut self, ui: &mut egui::Ui, context: &ViewContext) -> Vec<ViewAction> {
         let options = ca_ui::options::current(ui.ctx());
-        self.quick_compare_method = if options.stored.startup.quick_compare_method.id() == "rules" {
+        self.quick_compare_method = if options.stored.startup.quick_compare_method.uses_rules() {
             ContentMethod::Rules
         } else {
             ContentMethod::Binary
@@ -4990,7 +5003,7 @@ mod tests {
 mod quick_compare_tests {
     use super::FolderView;
     use crate::selection::ClickKind;
-    use ca_fs::Side;
+    use ca_fs::{ContentMethod, Side};
     use ca_ui::view::SessionView;
     use std::path::Path;
     use std::time::{Duration, Instant};
@@ -5050,15 +5063,25 @@ mod quick_compare_tests {
         let right = dir.path().join("right");
         std::fs::create_dir_all(&left).unwrap();
         std::fs::create_dir_all(&right).unwrap();
-        std::fs::write(left.join("same.txt"), b"same").unwrap();
-        std::fs::write(right.join("same.txt"), b"same").unwrap();
+        std::fs::create_dir_all(left.join("nested")).unwrap();
+        std::fs::create_dir_all(right.join("nested")).unwrap();
+        std::fs::write(left.join("nested/same.txt"), b"same").unwrap();
+        std::fs::write(right.join("nested/same.txt"), b"same").unwrap();
         let mut view = view(dir.path());
-        select(
-            &mut view,
-            Side::Left,
-            Path::new("same.txt"),
-            ClickKind::Replace,
+        let rel = Path::new("nested/same.txt");
+        let deadline = Instant::now() + PATIENCE;
+        while view.arena.index_of(rel).is_none() && Instant::now() < deadline {
+            view.tick();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(
+            view.arena.index_of(rel).is_some(),
+            "nested file was not scanned"
         );
+        let nested = view.arena.index_of(Path::new("nested")).unwrap();
+        view.expanded.expand(nested);
+        view.rebuild();
+        select(&mut view, Side::Left, rel, ClickKind::Replace);
 
         assert!(view.accepts(ca_ui::Command::QuickCompare));
         view.start_quick_compare();
@@ -5070,8 +5093,8 @@ mod quick_compare_tests {
         let opened = view.take_pending_opens();
         assert_eq!(opened.len(), 1);
         assert_eq!(opened[0].kind, ca_session::SessionKind::HexCompare);
-        assert_eq!(opened[0].left, left.join("same.txt"));
-        assert_eq!(opened[0].right, right.join("same.txt"));
+        assert_eq!(opened[0].left, left.join("nested/same.txt"));
+        assert_eq!(opened[0].right, right.join("nested/same.txt"));
     }
 
     #[test]
@@ -5108,6 +5131,59 @@ mod quick_compare_tests {
         assert_eq!(opened[0].kind, ca_session::SessionKind::TableCompare);
         assert_eq!(opened[0].left, left.join("alpha.txt"));
         assert_eq!(opened[0].right, left.join("beta.txt"));
+    }
+
+    #[test]
+    fn quick_compare_keeps_the_folder_rules_threshold() {
+        let dir = tempfile::tempdir().unwrap();
+        let left = dir.path().join("left");
+        let right = dir.path().join("right");
+        std::fs::create_dir_all(&left).unwrap();
+        std::fs::create_dir_all(&right).unwrap();
+        std::fs::write(left.join("item.rs"), b"let item = 1;\n").unwrap();
+        std::fs::write(right.join("item.rs"), b"let    item = 1;\n").unwrap();
+        let mut view = view(dir.path());
+        view.quick_compare_method = ContentMethod::Rules;
+        view.session_settings.comparison.binary_size_threshold_bytes = 1;
+        select(
+            &mut view,
+            Side::Left,
+            Path::new("item.rs"),
+            ClickKind::Replace,
+        );
+
+        view.start_quick_compare();
+
+        assert_eq!(wait_for_result(&mut view), "Differences");
+    }
+
+    #[test]
+    fn more_than_two_selected_files_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let left = dir.path().join("left");
+        std::fs::create_dir_all(&left).unwrap();
+        std::fs::create_dir_all(dir.path().join("right")).unwrap();
+        for name in ["alpha.txt", "beta.txt", "gamma.txt"] {
+            std::fs::write(left.join(name), name.as_bytes()).unwrap();
+        }
+        let mut view = view(dir.path());
+        for (index, name) in ["alpha.txt", "beta.txt", "gamma.txt"]
+            .into_iter()
+            .enumerate()
+        {
+            select(
+                &mut view,
+                Side::Left,
+                Path::new(name),
+                if index == 0 {
+                    ClickKind::Replace
+                } else {
+                    ClickKind::Toggle
+                },
+            );
+        }
+
+        assert!(view.quick_compare_pair().is_err());
     }
 
     #[test]

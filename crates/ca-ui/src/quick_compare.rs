@@ -2,6 +2,22 @@
 
 use ca_session::SessionKind;
 
+const VIEWS: &[SessionKind] = &[
+    SessionKind::TextCompare,
+    SessionKind::HexCompare,
+    SessionKind::MediaCompare,
+    SessionKind::PictureCompare,
+    SessionKind::RegistryCompare,
+    SessionKind::TableCompare,
+    SessionKind::VersionCompare,
+];
+
+/// True when the summary offers `kind` in its view selector.
+#[must_use]
+pub fn supports_view(kind: &SessionKind) -> bool {
+    VIEWS.contains(kind)
+}
+
 /// What the quick comparison window asks the caller to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QuickCompareAction {
@@ -30,6 +46,15 @@ impl QuickCompareDialog {
             result: None,
             selected: SessionKind::TextCompare,
         }
+    }
+
+    /// Set the initially selected view when the kind is offered.
+    #[must_use]
+    pub fn with_selected_view(mut self, kind: SessionKind) -> Self {
+        if supports_view(&kind) {
+            self.selected = kind;
+        }
+        self
     }
 
     /// The result text to show after the comparison finishes.
@@ -80,15 +105,7 @@ impl QuickCompareDialog {
                 egui::ComboBox::new(id.with("view"), "View")
                     .selected_text(self.selected.title())
                     .show_ui(ui, |ui| {
-                        for kind in [
-                            SessionKind::TextCompare,
-                            SessionKind::HexCompare,
-                            SessionKind::MediaCompare,
-                            SessionKind::PictureCompare,
-                            SessionKind::RegistryCompare,
-                            SessionKind::TableCompare,
-                            SessionKind::VersionCompare,
-                        ] {
+                        for kind in VIEWS {
                             ui.selectable_value(&mut self.selected, kind.clone(), kind.title());
                         }
                     });
