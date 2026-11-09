@@ -7354,6 +7354,7 @@ mod tests {
         assert!(app.is_closing());
     }
 
+    /// The overflow menu selects hidden tabs and exposes their close actions.
     #[test]
     fn tab_overflow_menu_selects_and_closes_hidden_tabs() {
         use ca_ui::testing::probe::Probe;
@@ -7431,9 +7432,11 @@ mod tests {
         assert_eq!(app.active, 1);
     }
 
+    /// Closing an earlier tab keeps the selected session fully in view.
     #[test]
     fn closing_an_earlier_tab_keeps_the_active_tab_visible() {
         use ca_ui::testing::probe::Probe;
+        use std::cell::Cell;
 
         let (_settings, mut app) = empty_app();
         app.open_home(&context());
@@ -7443,18 +7446,74 @@ mod tests {
         app.active = 8;
 
         let mut probe = Probe::new(360.0, 900.0);
+        let viewport = Cell::new(egui::Rect::NOTHING);
+        {
+            let mut draw = |ctx: &egui::Context| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let available = ui.available_rect_before_wrap();
+                    let overflow_width = ui.spacing().interact_size.x.max(72.0);
+                    let scroll_width =
+                        (ui.available_width() - overflow_width - ui.spacing().item_spacing.x)
+                            .max(16.0);
+                    viewport.set(egui::Rect::from_min_size(
+                        available.min,
+                        egui::vec2(scroll_width, 32.0),
+                    ));
+                    app.tab_strip(ui);
+                });
+            };
+            probe.idle(&mut draw);
+            probe.idle(&mut draw);
+            let select = probe.find("Code 8").unwrap();
+            let close = probe.find("Close Code 8").unwrap();
+            let bounds = viewport.get();
+            assert!(select.rect.min.x >= bounds.left());
+            assert!(close.rect.max.x <= bounds.right());
+        }
+
+        assert_eq!(app.active_title().as_deref(), Some("Code 8"));
+        let bounds = viewport.get();
+        let select = probe.find("Code 8").unwrap();
+        let close = probe.find("Close Code 8").unwrap();
+        let tab_left_distance = select.rect.min.x - bounds.left();
+        assert!(tab_left_distance > 0.0);
+        let full_tab_width;
         {
             let mut draw = |ctx: &egui::Context| {
                 egui::CentralPanel::default().show(ctx, |ui| app.tab_strip(ui));
             };
+            let scroll_point = close.rect.center();
+            let mut scroll_left = tab_left_distance - 8.0;
+            while scroll_left > 0.0 {
+                let step = scroll_left.min(7.0);
+                let _ = probe.frame(
+                    vec![
+                        egui::Event::PointerMoved(scroll_point),
+                        egui::Event::MouseWheel {
+                            unit: egui::MouseWheelUnit::Point,
+                            delta: egui::vec2(-step, 0.0),
+                            modifiers: egui::Modifiers::default(),
+                        },
+                    ],
+                    &mut draw,
+                );
+                scroll_left -= step;
+            }
             probe.idle(&mut draw);
-            probe.idle(&mut draw);
+            let select = probe.find("Code 8").unwrap();
             let close = probe.find("Close Code 8").unwrap();
-            assert!(close.rect.min.x >= 0.0);
-            assert!(close.rect.max.x <= 360.0);
+            let bounds = viewport.get();
+            full_tab_width = close.rect.right() - select.rect.left();
+            assert!(select.rect.min.x >= bounds.left());
+            assert!(
+                select.rect.min.x <= bounds.left() + 12.0,
+                "Code 8 {:?} was not near the viewport's left edge {:?}",
+                select.rect,
+                bounds
+            );
+            assert!(close.rect.max.x <= bounds.right());
         }
 
-        assert_eq!(app.active_title().as_deref(), Some("Code 8"));
         app.close_tab(1);
         assert_eq!(app.active_title().as_deref(), Some("Code 8"));
         {
@@ -7463,9 +7522,16 @@ mod tests {
             };
             probe.idle(&mut draw);
             probe.idle(&mut draw);
+            let select = probe.find("Code 8").unwrap();
             let close = probe.find("Close Code 8").unwrap();
-            assert!(close.rect.min.x >= 0.0);
-            assert!(close.rect.max.x <= 360.0);
+            let bounds = viewport.get();
+            assert!(select.rect.min.x >= bounds.left());
+            assert!(close.rect.max.x <= bounds.right());
+            let visible_tab_width = close.rect.right() - select.rect.left();
+            assert!(
+                (visible_tab_width - full_tab_width).abs() < 0.5,
+                "Code 8 width changed from {full_tab_width} to {visible_tab_width}"
+            );
         }
     }
 
