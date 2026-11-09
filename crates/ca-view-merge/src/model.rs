@@ -532,13 +532,15 @@ fn best_row_for_output_anchor(
     anchor: OutputAnchor,
     last_output_row: Option<usize>,
 ) -> Option<usize> {
+    let first_row = last_output_row.map_or(0, |last| last.saturating_add(1));
     if let Some((pane, line)) = anchor.source {
-        let source_row = rows.iter().enumerate().find_map(|(index, row)| {
-            (row.output.is_none()
-                && last_output_row.is_none_or(|last| index > last)
-                && row.line(pane, None) == Some(line))
-            .then_some(index)
-        });
+        let source_row = rows
+            .iter()
+            .enumerate()
+            .skip(first_row)
+            .find_map(|(index, row)| {
+                (row.output.is_none() && row.line(pane, None) == Some(line)).then_some(index)
+            });
         if source_row.is_some() {
             return source_row;
         }
@@ -551,9 +553,10 @@ fn best_row_for_input_lines(
     input_lines: InputLineTriple,
     last_output_row: Option<usize>,
 ) -> Option<usize> {
+    let first_row = last_output_row.map_or(0, |last| last.saturating_add(1));
     let mut best: Option<(usize, bool, usize)> = None;
-    for (index, row) in rows.iter().enumerate() {
-        if row.output.is_some() || last_output_row.is_some_and(|last| index <= last) {
+    for (index, row) in rows.iter().enumerate().skip(first_row) {
+        if row.output.is_some() {
             continue;
         }
         let matching_lines = [row.left, row.center, row.right]
