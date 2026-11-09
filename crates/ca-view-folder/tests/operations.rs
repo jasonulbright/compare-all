@@ -175,6 +175,52 @@ fn a_recycle_bin_choice_made_in_the_dialog_is_shown_before_it_runs() {
     assert!(fixture.left().join("one.txt").exists());
 }
 
+#[test]
+fn delete_side_choices_follow_the_option_and_rebuild_the_shown_plan() {
+    let fixture = Fixture::new();
+    fixture.write("left", "one.txt", b"left");
+    fixture.write("right", "one.txt", b"right");
+    let left_target = fixture.left().join("one.txt");
+    let right_target = fixture.right().join("one.txt");
+    let mut view = fixture.view();
+    view.select(SelectRule::All, Scope::Both);
+
+    view.start_operation(Operation::Delete);
+    assert!(poll_until(&mut view, FolderView::is_confirming));
+    assert_eq!(view.form_mut().delete_scope, Some(Scope::Both));
+    let plan = view.pending_plan().expect("the two-side plan is shown");
+    assert!(plan.steps.iter().any(
+        |step| matches!(&step.action, StepAction::DeleteFile { path } if path == &left_target)
+    ));
+    assert!(plan.steps.iter().any(
+        |step| matches!(&step.action, StepAction::DeleteFile { path } if path == &right_target)
+    ));
+    view.cancel_pending();
+
+    view.set_confirmations(ca_session::options::FileOperationOptions {
+        require_explicit_delete_side: true,
+        ..ca_session::options::FileOperationOptions::default()
+    });
+    view.select(SelectRule::All, Scope::Both);
+    view.start_operation(Operation::Delete);
+    assert!(poll_until(&mut view, FolderView::is_confirming));
+    assert_eq!(view.form_mut().delete_scope, None);
+    assert!(view.pending_plan().unwrap().steps.is_empty());
+
+    view.form_mut().delete_scope = Some(Scope::Left);
+    view.confirm_pending();
+    assert!(poll_until(&mut view, FolderView::is_confirming));
+    let plan = view.pending_plan().expect("the left-only plan is shown");
+    assert_eq!(plan.steps.len(), 1);
+    assert!(matches!(
+        &plan.steps[0].action,
+        StepAction::DeleteFile { path } if path == &left_target
+    ));
+    view.cancel_pending();
+    assert!(left_target.exists());
+    assert!(right_target.exists());
+}
+
 /// A change that leaves the steps as shown runs at once, under the settings
 /// the dialog now holds.
 #[test]
@@ -684,6 +730,53 @@ fn a_sync_confirmation_override_refreshes_the_preview_and_plan() {
 }
 
 #[test]
+fn a_sync_confirmation_limits_just_selection_to_selected_paths() {
+    let fixture = Fixture::new();
+    fixture.write("left", "selected.txt", b"selected");
+    fixture.write("left", "other.txt", b"other");
+
+    let mut view = fixture.sync_view();
+    assert!(poll_until(&mut view, |view| {
+        !view.sync().stale && view.sync().preview.is_some()
+    }));
+    view.set_sync_method(ca_view_folder::sync_mode::Method::UpdateRight);
+    assert!(poll_until(&mut view, |view| !view.sync().stale));
+    let node = view.arena().index_of(Path::new("selected.txt")).unwrap();
+    let row = view.rows().iter().position(|row| row.node == node).unwrap();
+    let rows = view.rows().to_vec();
+    let arena = view.arena().clone();
+    view.selection_mut().click(
+        Side::Left,
+        row,
+        &rows,
+        &arena,
+        ca_view_folder::selection::ClickKind::Replace,
+    );
+
+    view.start_synchronisation();
+    assert!(poll_until(&mut view, FolderView::is_confirming));
+    view.form_mut().sync_just_selection = true;
+    view.confirm_pending();
+    assert!(poll_until(&mut view, FolderView::is_confirming));
+
+    let plan = view.pending_plan().expect("the scoped plan is on screen");
+    assert!(plan
+        .steps
+        .iter()
+        .any(|step| step.rel == Path::new("selected.txt")));
+    assert!(!plan
+        .steps
+        .iter()
+        .any(|step| step.rel == Path::new("other.txt")));
+    assert!(view
+        .sync()
+        .preview
+        .as_ref()
+        .is_some_and(|preview| preview.overrides.get(Path::new("other.txt"))
+            != Some(&ca_fs::SyncAction::LeaveAlone)));
+}
+
+#[test]
 fn cancelling_a_sync_override_restores_the_saved_hidden_items_preview() {
     let fixture = Fixture::new();
     let hidden = if cfg!(windows) {
@@ -737,12 +830,15 @@ fn a_cancelled_scan_refuses_to_synchronise() {
     let mut tree = folder_tree();
     tree.scan_cancelled = true;
     let mut job = ca_view_folder::opjobs::spawn_sync_plan(
-        tree,
-        ca_fs::SyncPreset::MirrorToRight,
-        ca_fs::SyncPreview::default(),
-        fixture.left(),
-        fixture.right(),
-        ca_fs::OperationOptions::default(),
+        ca_view_folder::opjobs::SyncPlanRequest {
+            tree,
+            preset: ca_fs::SyncPreset::MirrorToRight,
+            preview: ca_fs::SyncPreview::default(),
+            left_base: fixture.left(),
+            right_base: fixture.right(),
+            options: ca_fs::OperationOptions::default(),
+            selection: None,
+        },
         std::sync::Arc::new(|| {}),
     );
     let deadline = Instant::now() + PATIENCE;

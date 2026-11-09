@@ -373,6 +373,66 @@ pub enum CloseChoice {
     Cancel,
 }
 
+/// Which modified files the save question will write.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SaveSelection {
+    /// The left file is checked.
+    pub left: bool,
+    /// The right file is checked.
+    pub right: bool,
+    /// The center file is checked.
+    pub center: bool,
+}
+
+impl SaveSelection {
+    /// Check the files that currently hold edits.
+    pub fn reset(&mut self, dirty: [bool; 3]) {
+        self.left = dirty[0];
+        self.right = dirty[1];
+        self.center = dirty[2];
+    }
+
+    /// Draw side choices and return the action the user chose.
+    pub fn show(&mut self, ui: &mut egui::Ui, dirty: [bool; 3]) -> Option<UnsavedAnswer> {
+        ui.horizontal_wrapped(|ui| {
+            ui.add_enabled(dirty[0], egui::Checkbox::new(&mut self.left, "Left file"));
+            ui.add_enabled(dirty[1], egui::Checkbox::new(&mut self.right, "Right file"));
+            ui.add_enabled(
+                dirty[2],
+                egui::Checkbox::new(&mut self.center, "Center file"),
+            );
+        });
+        let mut answer = None;
+        ui.horizontal_wrapped(|ui| {
+            let save = ui.add_enabled(
+                (dirty[0] && self.left) || (dirty[1] && self.right) || (dirty[2] && self.center),
+                egui::Button::new("Save Checked"),
+            );
+            if save.clicked() {
+                answer = Some(UnsavedAnswer::SaveChecked);
+            }
+            if ui.button("Discard All").clicked() {
+                answer = Some(UnsavedAnswer::DiscardAll);
+            }
+            if ui.button("Cancel").clicked() {
+                answer = Some(UnsavedAnswer::Cancel);
+            }
+        });
+        answer
+    }
+}
+
+/// An answer to the per-file save question.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnsavedAnswer {
+    /// Write checked files and discard unchecked edits.
+    SaveChecked,
+    /// Discard every edit.
+    DiscardAll,
+    /// Keep the tab open with its edits.
+    Cancel,
+}
+
 /// A command that reads both files again, which replaces every edit the panes
 /// hold.
 ///
@@ -392,6 +452,17 @@ pub enum Reread {
 }
 
 impl Reread {
+    /// Describe the action that follows a save or discard answer.
+    #[must_use]
+    pub const fn action_description(self) -> &'static str {
+        match self {
+            Self::Reload => "reload the files",
+            Self::Open => "open the selected paths",
+            Self::SwapSides => "swap the files",
+            Self::Settings => "apply the changed comparison settings",
+        }
+    }
+
     /// The label of the button that writes the edits first.
     #[must_use]
     pub const fn save_label(self) -> &'static str {
@@ -514,11 +585,52 @@ pub fn spawn_with(
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::{needs_close_prompt, save, Baseline, CloseChoice, FileSystem, SaveOutcome, Stamp};
+    use super::{
+        needs_close_prompt, save, Baseline, CloseChoice, FileSystem, Reread, SaveOutcome,
+        SaveSelection, Stamp, UnsavedAnswer,
+    };
     use std::collections::HashMap;
     use std::io;
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
+
+    #[test]
+    fn save_question_choices_are_accessible_and_apply_to_the_checked_file() {
+        let mut probe = crate::testing::probe::Probe::new(800.0, 300.0);
+        let mut selection = SaveSelection {
+            left: true,
+            right: true,
+            center: false,
+        };
+        let mut answer = None;
+        let mut run = |ctx: &egui::Context| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                if let Some(chosen) = selection.show(ui, [true, true, false]) {
+                    answer = Some(chosen);
+                }
+            });
+        };
+
+        probe.idle(&mut run);
+        probe.idle(&mut run);
+        assert_eq!(probe.find("Left file").unwrap().toggled, Some(true));
+        assert!(!probe.find("Center file").unwrap().enabled);
+        probe.click("Left file", &mut run).unwrap();
+        assert_eq!(probe.find("Left file").unwrap().toggled, Some(false));
+        probe.click("Save Checked", &mut run).unwrap();
+        assert_eq!(answer, Some(UnsavedAnswer::SaveChecked));
+    }
+
+    #[test]
+    fn reread_actions_name_the_follow_up() {
+        assert_eq!(Reread::Reload.action_description(), "reload the files");
+        assert_eq!(Reread::Open.action_description(), "open the selected paths");
+        assert_eq!(Reread::SwapSides.action_description(), "swap the files");
+        assert_eq!(
+            Reread::Settings.action_description(),
+            "apply the changed comparison settings"
+        );
+    }
 
     #[derive(Default)]
     pub struct FakeFiles {

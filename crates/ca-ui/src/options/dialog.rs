@@ -1632,6 +1632,37 @@ mod tests {
     }
 
     #[test]
+    fn explicit_delete_side_option_is_clickable_by_accessible_label() {
+        use crate::testing::probe::Probe;
+
+        let mut dialog = dialog();
+        dialog.select_page_named("File Operations");
+        let mut probe = Probe::new(1_280.0, 900.0);
+        let mut draw = |ctx: &egui::Context| {
+            let _ = dialog.show(ctx, &crate::theme::LIGHT);
+        };
+        probe.idle(&mut draw);
+        probe.idle(&mut draw);
+        assert_eq!(
+            probe
+                .find("Require explicit side selection in Delete dialog")
+                .unwrap()
+                .toggled,
+            Some(false)
+        );
+        probe
+            .click(
+                "Require explicit side selection in Delete dialog",
+                &mut draw,
+            )
+            .unwrap();
+        assert_eq!(
+            dialog.value("file_operations.require_explicit_delete_side"),
+            Some(FieldValue::Flag(true))
+        );
+    }
+
+    #[test]
     fn every_page_is_reachable_by_name() {
         let mut dialog = dialog();
         for page in dialog.pages() {

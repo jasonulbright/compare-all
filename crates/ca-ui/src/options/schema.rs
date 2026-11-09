@@ -678,6 +678,10 @@ const FILE_OPERATION_FIELDS: &[OptionField] = &[
     flag!(file_operations.confirm_merge, "Confirm a merge"),
     flag!(file_operations.confirm_delete, "Confirm a delete"),
     flag!(
+        file_operations.require_explicit_delete_side,
+        "Require explicit side selection in Delete dialog"
+    ),
+    flag!(
         file_operations.confirm_content_comparison,
         "Ask before comparing file contents"
     ),

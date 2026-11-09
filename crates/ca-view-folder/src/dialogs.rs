@@ -25,6 +25,8 @@ const BODY_HEIGHT: f32 = 260.0;
 pub enum ConfirmChoice {
     /// Neither button was pressed this frame.
     Pending,
+    /// Rebuild the plan after a destructive scope changed.
+    Replan,
     /// Carry the plan out.
     Confirm,
     /// Leave everything as it is.
@@ -72,7 +74,15 @@ pub fn confirm(
     offset_seconds: i32,
     revised: bool,
 ) -> ConfirmChoice {
-    modal(ui, id, operation.dialog_title(), |ui| {
+    let is_sync = plan.kind == ca_fs::OperationKind::Sync;
+    let title = if is_sync {
+        "Synchronize"
+    } else {
+        operation.dialog_title()
+    };
+    modal(ui, id, title, |ui| {
+        let original_delete_scope = form.delete_scope;
+        let mut delete_scope_changed = false;
         if revised {
             wrapped_text(
                 ui,
@@ -95,22 +105,35 @@ pub fn confirm(
             .id_salt(id.with("body"))
             .max_height(BODY_HEIGHT)
             .show(ui, |ui| {
-                options_for(ui, operation, form, offset_seconds);
+                options_for(ui, operation, form, offset_seconds, is_sync);
+                delete_scope_changed =
+                    operation == Operation::Delete && form.delete_scope != original_delete_scope;
                 conflicts(ui, plan);
                 steps(ui, plan);
             });
         ui.separator();
         let mut choice = ConfirmChoice::Pending;
         ui.horizontal_wrapped(|ui| {
-            let allowed = !plan.steps.is_empty();
-            let confirm = ui.add_enabled(allowed, egui::Button::new(confirm_label(operation)));
+            let allowed = !plan.steps.is_empty() && !delete_scope_changed;
+            let confirm = ui.add_enabled(
+                allowed,
+                egui::Button::new(confirm_label(operation, is_sync)),
+            );
+            let confirm_clicked = confirm.clicked();
             if !allowed {
-                let _ = ca_ui::widgets::disabled_reason(confirm, "There is nothing to carry out");
-            } else if confirm.clicked() {
-                choice = ConfirmChoice::Confirm;
+                let reason = if delete_scope_changed {
+                    "The delete scope changed; the plan is being refreshed"
+                } else {
+                    "There is nothing to carry out"
+                };
+                let _ = ca_ui::widgets::disabled_reason(confirm, reason);
             }
             if ui.button("Cancel").clicked() {
                 choice = ConfirmChoice::Cancel;
+            } else if delete_scope_changed {
+                choice = ConfirmChoice::Replan;
+            } else if confirm_clicked {
+                choice = ConfirmChoice::Confirm;
             }
         });
         choice
@@ -119,7 +142,10 @@ pub fn confirm(
 }
 
 /// The label the button that starts the operation carries.
-const fn confirm_label(operation: Operation) -> &'static str {
+const fn confirm_label(operation: Operation, is_sync: bool) -> &'static str {
+    if is_sync {
+        return "Sync";
+    }
     match operation {
         Operation::Delete => "Delete",
         Operation::CopyToOtherSide | Operation::CopyToFolder => "Copy",
@@ -135,12 +161,41 @@ const fn confirm_label(operation: Operation) -> &'static str {
 
 /// The controls one operation offers.
 #[allow(clippy::too_many_lines)]
-fn options_for(ui: &mut egui::Ui, operation: Operation, form: &mut Form, offset_seconds: i32) {
+fn options_for(
+    ui: &mut egui::Ui,
+    operation: Operation,
+    form: &mut Form,
+    offset_seconds: i32,
+    is_sync: bool,
+) {
     if operation.needs_selection() && operation.writes_files() {
         ui.checkbox(&mut form.options.include_hidden, "Include hidden items");
     }
+    if is_sync {
+        ui.checkbox(&mut form.sync_just_selection, "Just selection");
+        ui.checkbox(
+            &mut form.options.use_recycle_bin,
+            "Use recycle bin if possible",
+        );
+        ui.label("Network locations, remote services and archives ignore the recycle bin.");
+        return;
+    }
     match operation {
         Operation::Delete => {
+            ui.horizontal_wrapped(|ui| {
+                let mut left = form.delete_scope.is_some_and(|scope| scope != Scope::Right);
+                let mut right = form.delete_scope.is_some_and(|scope| scope != Scope::Left);
+                let left_changed = ui.checkbox(&mut left, "Left side").changed();
+                let right_changed = ui.checkbox(&mut right, "Right side").changed();
+                if left_changed || right_changed {
+                    form.delete_scope = match (left, right) {
+                        (true, true) => Some(Scope::Both),
+                        (true, false) => Some(Scope::Left),
+                        (false, true) => Some(Scope::Right),
+                        (false, false) => None,
+                    };
+                }
+            });
             ui.checkbox(
                 &mut form.options.use_recycle_bin,
                 "Use recycle bin if possible",
@@ -651,6 +706,7 @@ mod tests {
                             crate::operations::Operation::Attributes,
                             &mut form,
                             0,
+                            false,
                         );
                     });
                 };
@@ -680,6 +736,7 @@ mod tests {
                     crate::operations::Operation::CopyToOtherSide,
                     &mut form,
                     0,
+                    false,
                 );
             });
         };
@@ -692,6 +749,104 @@ mod tests {
         );
         probe.click("Include hidden items", &mut run).unwrap();
         assert!(form.options.include_hidden);
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn delete_side_checkboxes_change_the_form_by_accessible_label() {
+        let mut probe = ca_ui::testing::probe::Probe::new(800.0, 500.0);
+        let mut form = crate::operations::Form::default();
+        let mut run = |ctx: &egui::Context| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                super::options_for(
+                    ui,
+                    crate::operations::Operation::Delete,
+                    &mut form,
+                    0,
+                    false,
+                );
+            });
+        };
+
+        probe.idle(&mut run);
+        probe.idle(&mut run);
+        assert_eq!(probe.find("Left side").unwrap().toggled, Some(true));
+        assert_eq!(probe.find("Right side").unwrap().toggled, Some(true));
+        probe.click("Left side", &mut run).unwrap();
+        probe.click("Right side", &mut run).unwrap();
+        assert_eq!(form.delete_scope, None);
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn an_empty_delete_plan_replans_when_a_side_is_checked() {
+        use super::ConfirmChoice;
+        use crate::operations::{Form, Operation};
+        use crate::selection::Scope;
+
+        let mut probe = ca_ui::testing::probe::Probe::new(800.0, 500.0);
+        let plan = ca_fs::OperationPlan::new(
+            ca_fs::OperationKind::Delete,
+            Vec::new(),
+            ca_fs::OperationOptions::default(),
+        );
+        let mut form = Form {
+            delete_scope: None,
+            ..Form::default()
+        };
+        let mut replan_requested = false;
+        let mut run = |ctx: &egui::Context| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                replan_requested |= super::confirm(
+                    ui,
+                    egui::Id::new("delete-confirm"),
+                    Operation::Delete,
+                    &plan,
+                    &mut form,
+                    0,
+                    false,
+                ) == ConfirmChoice::Replan;
+            });
+        };
+
+        probe.idle(&mut run);
+        probe.idle(&mut run);
+        probe.click("Left side", &mut run).unwrap();
+
+        assert_eq!(form.delete_scope, Some(Scope::Left));
+        assert!(replan_requested);
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn sync_confirmation_controls_change_the_form_by_accessible_label() {
+        let mut probe = ca_ui::testing::probe::Probe::new(800.0, 500.0);
+        let mut form = crate::operations::Form::default();
+        let mut run = |ctx: &egui::Context| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                super::options_for(
+                    ui,
+                    crate::operations::Operation::CopyToOtherSide,
+                    &mut form,
+                    0,
+                    true,
+                );
+            });
+        };
+
+        probe.idle(&mut run);
+        probe.idle(&mut run);
+        assert_eq!(probe.find("Just selection").unwrap().toggled, Some(false));
+        assert_eq!(
+            probe.find("Use recycle bin if possible").unwrap().toggled,
+            Some(true)
+        );
+        probe.click("Just selection", &mut run).unwrap();
+        probe
+            .click("Use recycle bin if possible", &mut run)
+            .unwrap();
+        assert!(form.sync_just_selection);
+        assert!(!form.options.use_recycle_bin);
     }
 
     use super::{describe, fraction, outcome_text};

@@ -331,7 +331,7 @@ fn reload_with_an_edit_asks_before_it_reads_the_files_again() {
     harness.frame(Vec::new());
     assert_eq!(
         harness.view.prompt_text().as_deref(),
-        Some("This tab has edits that are not written.")
+        Some("This tab has edits that are not written. Saving checked files or discarding all edits will reload the files.")
     );
     assert_eq!(harness.left(), "XYalpha\nbeta\n");
     assert!(harness.view.pane(Side::Left).is_modified());
@@ -364,7 +364,7 @@ fn swap_sides_with_an_edit_saves_first_when_asked_to() {
     harness.frame(Vec::new());
     assert_eq!(
         harness.view.prompt_text().as_deref(),
-        Some("This tab has edits that are not written.")
+        Some("This tab has edits that are not written. Saving checked files or discarding all edits will swap the files.")
     );
     assert_eq!(
         harness.view.title(),
@@ -407,7 +407,7 @@ fn a_format_change_with_an_edit_asks_before_it_reads_the_files_again() {
     harness.frame(Vec::new());
     assert_eq!(
         harness.view.prompt_text().as_deref(),
-        Some("This tab has edits that are not written.")
+        Some("This tab has edits that are not written. Saving checked files or discarding all edits will apply the changed comparison settings.")
     );
     assert_eq!(harness.left(), "XYalpha\nbeta\n");
     assert_eq!(harness.view.session_settings(), &before);

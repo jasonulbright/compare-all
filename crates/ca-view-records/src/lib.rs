@@ -1104,6 +1104,52 @@ mod tests {
     }
 
     #[test]
+    fn save_checked_writes_only_the_checked_registry_file() {
+        use ca_ui::testing::probe::Probe;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut view = registry(dir.path());
+        assert!(settle(&mut view, RegistryView::view));
+        let left_before = std::fs::read(view.view().left()).unwrap();
+
+        point(&mut view, "LeftOnly", Side::Left);
+        run_and_finish(&mut view, Command::CopyToRight);
+        point(&mut view, "Blob", Side::Right);
+        run_and_finish(&mut view, Command::CopyToLeft);
+        assert!(view.view().is_modified(Side::Left));
+        assert!(view.view().is_modified(Side::Right));
+        assert!(!view.may_close());
+
+        let view_context = context();
+        let mut probe = Probe::new(1_280.0, 800.0);
+        {
+            let mut draw = |ctx: &egui::Context| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    view.ui(ui, &view_context);
+                });
+            };
+            probe.idle(&mut draw);
+            probe.idle(&mut draw);
+            assert_eq!(probe.find("Left file").unwrap().toggled, Some(true));
+            assert_eq!(probe.find("Right file").unwrap().toggled, Some(true));
+            probe.click("Left file", &mut draw).unwrap();
+            probe.click("Save Checked", &mut draw).unwrap();
+        }
+        finish(&mut view);
+
+        assert!(view.wants_close());
+        assert_eq!(std::fs::read(view.view().left()).unwrap(), left_before);
+        let right = RegFile::parse(
+            &std::fs::read(view.view().right()).unwrap(),
+            &Limits::default(),
+        )
+        .unwrap();
+        assert!(right
+            .key("HKEY_CURRENT_USER\\Software\\Sample\\LeftOnly")
+            .is_some());
+    }
+
+    #[test]
     fn a_new_value_whose_name_is_taken_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let mut view = registry(dir.path());

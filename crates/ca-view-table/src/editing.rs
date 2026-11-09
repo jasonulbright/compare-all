@@ -611,7 +611,7 @@ impl TableView {
         }
         if let Some(reason) = self.write_block(side) {
             self.message = Some(reason.to_owned());
-            self.save_both_pending = false;
+            self.abandon_save_sequence();
             return;
         }
         let Some(template) = self
@@ -657,13 +657,44 @@ impl TableView {
 
     pub(crate) fn save_next_modified(&mut self) {
         self.save_both_pending = true;
-        if self.left_text.is_modified() {
+        if self.left_text.is_modified() && self.discard_after_save[0].is_none() {
             self.save_side(Side::Left, SaveConsent::default());
-        } else if self.right_text.is_modified() {
+        } else if self.right_text.is_modified() && self.discard_after_save[1].is_none() {
             self.save_side(Side::Right, SaveConsent::default());
         } else {
-            self.save_both_pending = false;
+            self.finish_save_sequence();
         }
+    }
+
+    fn finish_save_sequence(&mut self) {
+        if let Some(revision) = self.discard_after_save[0].take() {
+            self.left_text.mark_saved_revision(revision);
+        }
+        if let Some(revision) = self.discard_after_save[1].take() {
+            self.right_text.mark_saved_revision(revision);
+        }
+        if self.left_text.is_modified() || self.right_text.is_modified() {
+            self.abandon_save_sequence();
+            return;
+        }
+        self.save_both_pending = false;
+        self.reread_when_saved();
+    }
+
+    fn abandon_save_sequence(&mut self) {
+        self.save_both_pending = false;
+        self.close_requested = false;
+        self.discard_after_save = [None, None];
+        self.forget_reread();
+    }
+
+    fn mark_unchecked_for_discard(&mut self) {
+        self.discard_after_save = [
+            (!self.save_selection.left && self.left_text.is_modified())
+                .then(|| self.left_text.revision()),
+            (!self.save_selection.right && self.right_text.is_modified())
+                .then(|| self.right_text.revision()),
+        ];
     }
 
     /// Write the active side under a new name.
@@ -701,8 +732,7 @@ impl TableView {
                     self.message = Some("The save stopped.".to_owned());
                     self.saving = None;
                     self.saving_as = None;
-                    self.save_both_pending = false;
-                    self.forget_reread();
+                    self.abandon_save_sequence();
                 }
             }
         }
@@ -743,9 +773,7 @@ impl TableView {
                         "Saved, but another version was kept at {backup}. Review it."
                     ));
                     self.prompt = Some(Prompt::KeptCopy(backup));
-                    self.save_both_pending = false;
-                    self.close_requested = false;
-                    self.forget_reread();
+                    self.abandon_save_sequence();
                 } else {
                     self.message = Some(format!("{} written.", side.label()));
                     if self.save_both_pending {
@@ -760,13 +788,11 @@ impl TableView {
             }
             SaveOutcome::NotWritable => {
                 self.message = Some(format!("{} cannot be written.", side.label()));
-                self.save_both_pending = false;
-                self.forget_reread();
+                self.abandon_save_sequence();
             }
             SaveOutcome::Failed(reason) => {
                 self.message = Some(format!("Save failed: {reason}"));
-                self.save_both_pending = false;
-                self.forget_reread();
+                self.abandon_save_sequence();
             }
         }
     }
@@ -784,9 +810,11 @@ impl TableView {
             Prompt::WouldLose(_, reason, _) => {
                 format!("{reason} Save anyway and lose those characters?")
             }
-            Prompt::Closing | Prompt::Reread(_) => {
-                "This tab has changes that are not written.".to_owned()
-            }
+            Prompt::Closing => "This tab has changes that are not written.".to_owned(),
+            Prompt::Reread(action) => format!(
+                "This tab has changes that are not written. Saving checked files or discarding all changes will {}.",
+                action.action_description()
+            ),
         })
     }
 
@@ -808,9 +836,7 @@ impl TableView {
             _ if !proceed => {
                 self.prompt = None;
                 self.saving = None;
-                self.save_both_pending = false;
-                self.close_requested = false;
-                self.forget_reread();
+                self.abandon_save_sequence();
             }
             Prompt::DiskChanged(side) => {
                 let consent = SaveConsent {
@@ -840,11 +866,16 @@ impl TableView {
         self.prompt = None;
         match (choice, action) {
             (CloseChoice::Cancel, _) => {
-                self.close_requested = false;
-                self.forget_reread();
+                self.abandon_save_sequence();
             }
-            (CloseChoice::Discard, None) => self.discard_and_close(),
-            (CloseChoice::Discard, Some(action)) => self.reread(action),
+            (CloseChoice::Discard, None) => {
+                self.discard_after_save = [None, None];
+                self.discard_and_close();
+            }
+            (CloseChoice::Discard, Some(action)) => {
+                self.discard_after_save = [None, None];
+                self.reread(action);
+            }
             (CloseChoice::Save, None) => {
                 self.close_requested = true;
                 self.save_next_modified();
@@ -874,6 +905,11 @@ impl TableView {
             return;
         }
         if self.is_modified(Side::Left) || self.is_modified(Side::Right) {
+            self.save_selection.reset([
+                self.is_modified(Side::Left),
+                self.is_modified(Side::Right),
+                false,
+            ]);
             self.prompt = Some(Prompt::Reread(action));
             return;
         }
@@ -928,6 +964,20 @@ impl TableView {
         let Some(text) = self.prompt_text() else {
             return;
         };
+        if matches!(prompt, Prompt::Closing | Prompt::Reread(_)) {
+            ui.vertical(|ui| {
+                ui.label(text);
+                let dirty = [
+                    self.is_modified(Side::Left),
+                    self.is_modified(Side::Right),
+                    false,
+                ];
+                if let Some(answer) = self.save_selection.show(ui, dirty) {
+                    self.answer_save_selection(answer);
+                }
+            });
+            return;
+        }
         ui.horizontal_wrapped(|ui| {
             ui.label(text);
             match prompt {
@@ -944,23 +994,26 @@ impl TableView {
                         self.answer_prompt(false);
                     }
                 }
-                Prompt::Closing | Prompt::Reread(_) => {
-                    let (save, discard) = match prompt {
-                        Prompt::Reread(action) => (action.save_label(), action.discard_label()),
-                        _ => ("Save and close", "Discard and close"),
-                    };
-                    for (label, choice) in [
-                        (save, CloseChoice::Save),
-                        (discard, CloseChoice::Discard),
-                        ("Cancel", CloseChoice::Cancel),
-                    ] {
-                        if ui.button(label).clicked() {
-                            self.answer_unsaved(choice);
-                        }
-                    }
-                }
+                Prompt::Closing | Prompt::Reread(_) => {}
             }
         });
+    }
+
+    fn answer_save_selection(&mut self, answer: ca_ui::save::UnsavedAnswer) {
+        match answer {
+            ca_ui::save::UnsavedAnswer::SaveChecked => {
+                self.mark_unchecked_for_discard();
+                self.answer_unsaved(CloseChoice::Save);
+            }
+            ca_ui::save::UnsavedAnswer::DiscardAll => {
+                self.discard_after_save = [None, None];
+                self.answer_unsaved(CloseChoice::Discard);
+            }
+            ca_ui::save::UnsavedAnswer::Cancel => {
+                self.discard_after_save = [None, None];
+                self.answer_unsaved(CloseChoice::Cancel);
+            }
+        }
     }
 
     // --- find and replace -------------------------------------------------
@@ -1221,6 +1274,7 @@ impl TableView {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    use super::Prompt;
     use crate::model::{Cursor, Side};
     use crate::TableView;
     use ca_table::parse::ParseOptions;
@@ -1455,6 +1509,103 @@ mod tests {
         assert_eq!(std::fs::read(&left).unwrap(), CSV);
     }
 
+    #[test]
+    fn saving_checked_table_sides_discards_unchecked_edits() {
+        let (_dir, left, right) = files(CSV, CSV);
+        let mut view = open(&left, &right);
+        at(&mut view, 0, 1);
+        view.edit_current_cell("Left edit").unwrap();
+        settle(&mut view);
+        view.active = Side::Right;
+        at(&mut view, 0, 1);
+        view.edit_current_cell("Right edit").unwrap();
+        settle(&mut view);
+
+        assert!(!view.may_close());
+        assert!(view.save_selection.left && view.save_selection.right);
+        view.save_selection.left = false;
+        view.answer_save_selection(ca_ui::save::UnsavedAnswer::SaveChecked);
+        settle(&mut view);
+
+        assert!(view.wants_close());
+        assert_eq!(std::fs::read(&left).unwrap(), CSV);
+        assert_eq!(
+            std::fs::read(&right).unwrap(),
+            b"id,name\r\n1,Right edit\r\n2,Bob\r\n"
+        );
+        assert!(!view.is_modified(Side::Left));
+    }
+
+    #[test]
+    fn a_refused_checked_table_save_keeps_unchecked_edits_modified() {
+        let (_dir, left, right) = files(CSV, CSV);
+        let mut view = open(&left, &right);
+        at(&mut view, 0, 1);
+        view.edit_current_cell("Left edit").unwrap();
+        settle(&mut view);
+        view.set_active_side(Side::Right);
+        view.edit_current_cell("Right edit").unwrap();
+        settle(&mut view);
+
+        view.specs.disable_editing = true;
+        view.prompt = Some(Prompt::Closing);
+        view.save_selection.left = true;
+        view.save_selection.right = false;
+        view.answer_save_selection(ca_ui::save::UnsavedAnswer::SaveChecked);
+
+        assert!(view.is_modified(Side::Left));
+        assert!(view.is_modified(Side::Right));
+        assert!(!view.close_requested);
+        assert_eq!(view.discard_after_save, [None, None]);
+        assert!(view.save_job.is_none());
+    }
+
+    #[test]
+    fn edits_to_an_unchecked_table_side_during_save_stay_unwritten() {
+        let (_dir, left, right) = files(CSV, CSV);
+        let mut view = open(&left, &right);
+        at(&mut view, 0, 1);
+        view.edit_current_cell("Left edit").unwrap();
+        settle(&mut view);
+        view.set_active_side(Side::Right);
+        view.edit_current_cell("Right edit").unwrap();
+        settle(&mut view);
+
+        view.prompt = Some(Prompt::Closing);
+        view.save_selection.left = false;
+        view.save_selection.right = true;
+        view.answer_save_selection(ca_ui::save::UnsavedAnswer::SaveChecked);
+        view.left_text.replace(vec![(0..0, "Later ".to_owned())]);
+        settle(&mut view);
+
+        assert_eq!(std::fs::read(&left).unwrap(), CSV);
+        assert_eq!(
+            std::fs::read(&right).unwrap(),
+            b"id,name\r\n1,Right edit\r\n2,Bob\r\n"
+        );
+        assert!(view.is_modified(Side::Left));
+        assert!(!view.close_requested);
+    }
+
+    #[test]
+    fn a_later_unchecked_table_edit_abandons_the_deferred_reread() {
+        let (_dir, left, right) = files(CSV, CSV);
+        let mut view = open(&left, &right);
+        view.left_text.replace(vec![(0..0, "before".to_owned())]);
+        let discarded_revision = view.left_text.revision();
+        view.left_text.replace(vec![(0..0, "later ".to_owned())]);
+        view.discard_after_save[0] = Some(discarded_revision);
+        view.reread_after_save = Some(ca_ui::save::Reread::Reload);
+        view.pending_settings = Some(Box::new(super::jobs::TableSettings::default()));
+
+        view.finish_save_sequence();
+
+        assert!(view.is_modified(Side::Left));
+        assert!(view.reread_after_save.is_none());
+        assert!(view.pending_settings.is_none());
+        assert!(!view.close_requested);
+    }
+
     /// Reload and Swap Sides read both files again, so an edit that is not
     /// written raises the question a close raises instead of a refusal, and
     /// the edit stays until it is answered.
@@ -1469,10 +1620,15 @@ mod tests {
             assert!(view.accepts(command), "{command:?} is refused");
             view.run(command);
             settle(&mut view);
-            assert_eq!(
-                view.prompt_text().as_deref(),
-                Some("This tab has changes that are not written.")
+            let pending_action = if command == Command::Reload {
+                "reload the files"
+            } else {
+                "swap the files"
+            };
+            let expected = format!(
+                "This tab has changes that are not written. Saving checked files or discarding all changes will {pending_action}."
             );
+            assert_eq!(view.prompt_text().as_deref(), Some(expected.as_str()));
             assert!(view.is_modified(Side::Left));
             view.answer_unsaved(ca_ui::save::CloseChoice::Cancel);
             assert_eq!(view.prompt_text(), None);
@@ -1511,7 +1667,7 @@ mod tests {
         settle(&mut view);
         assert_eq!(
             view.prompt_text().as_deref(),
-            Some("This tab has changes that are not written.")
+            Some("This tab has changes that are not written. Saving checked files or discarding all changes will apply the changed comparison settings.")
         );
         assert!(view.is_modified(Side::Left));
         assert!(view.accepts(Command::Undo));

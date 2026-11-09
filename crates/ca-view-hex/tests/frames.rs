@@ -670,7 +670,7 @@ fn reload_with_a_change_asks_before_it_reads_the_files_again() {
     harness.frames(1);
     assert_eq!(
         harness.view.prompt_text().as_deref(),
-        Some("This tab has changes that are not written.")
+        Some("This tab has changes that are not written. Saving checked files or discarding all changes will reload the files.")
     );
     assert_eq!(harness.view.buffer(Side::Left).byte(3), Some(0xAB));
     assert!(harness.view.accepts(Command::Undo));
@@ -699,7 +699,7 @@ fn swap_sides_with_a_change_saves_first_when_asked_to() {
     harness.frames(1);
     assert_eq!(
         harness.view.prompt_text().as_deref(),
-        Some("This tab has changes that are not written.")
+        Some("This tab has changes that are not written. Saving checked files or discarding all changes will swap the files.")
     );
     assert_eq!(
         harness.view.title(),

@@ -1034,6 +1034,13 @@ impl StartupQuickCompare {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExitChoice {
+    CloseAll,
+    CloseCurrent,
+    Cancel,
+}
+
 /// The window and everything in it.
 ///
 /// The window carries one flag per thing it is in the middle of, so the count
@@ -1136,6 +1143,8 @@ pub struct App {
     exit_question: bool,
     /// Focus the safe action when the tab-close question opens.
     exit_question_focus_requested: bool,
+    /// Remember an accepted request to always close every tab.
+    exit_question_always_close_all: bool,
     /// The workspace a load waits to open while a tab asks about edits that
     /// are not written, or while the work of a tab runs. The load runs again
     /// once a tab closes after its answer, or once that work ends, and is
@@ -1344,6 +1353,7 @@ impl App {
             startup_wait_since: None,
             exit_question: false,
             exit_question_focus_requested: false,
+            exit_question_always_close_all: false,
             pending_workspace: None,
             pending_busy_tab: None,
             workspace_notice: None,
@@ -1972,6 +1982,7 @@ impl App {
         self.active = 0;
         self.exit_question = false;
         self.exit_question_focus_requested = false;
+        self.exit_question_always_close_all = false;
         self.closing = true;
     }
 
@@ -2027,6 +2038,7 @@ impl App {
         if self.tabs.len() > 1 && self.resolved.stored.tabs.confirm_closing_several_tabs {
             self.exit_question = true;
             self.exit_question_focus_requested = true;
+            self.exit_question_always_close_all = false;
         } else {
             self.try_leave();
         }
@@ -2040,15 +2052,37 @@ impl App {
 
     /// Answer the question raised before several tabs are closed.
     pub fn answer_exit(&mut self, leave: bool) {
+        self.answer_exit_choice(if leave {
+            ExitChoice::CloseAll
+        } else {
+            ExitChoice::Cancel
+        });
+    }
+
+    fn answer_exit_choice(&mut self, choice: ExitChoice) {
         if !self.exit_question {
             return;
         }
+        let always_close_all = self.exit_question_always_close_all;
         self.exit_question = false;
         self.exit_question_focus_requested = false;
-        if leave {
-            self.try_leave();
-        } else {
-            self.update.restart_on_leave = false;
+        self.exit_question_always_close_all = false;
+        match choice {
+            ExitChoice::CloseAll => {
+                if always_close_all {
+                    let mut options = self.options.options_or_default();
+                    options.tabs.confirm_closing_several_tabs = false;
+                    self.apply_options(options);
+                }
+                self.try_leave();
+            }
+            ExitChoice::CloseCurrent => {
+                self.update.restart_on_leave = false;
+                self.close_tab(self.active);
+            }
+            ExitChoice::Cancel => {
+                self.update.restart_on_leave = false;
+            }
         }
     }
 
@@ -4568,11 +4602,11 @@ impl App {
             return;
         }
         if ca_ui::widgets::dialog_key_action(ctx).is_some() {
-            self.answer_exit(false);
+            self.answer_exit_choice(ExitChoice::Cancel);
             return;
         }
         let mut answer = None;
-        egui::Window::new("Close every tab?")
+        egui::Window::new("Close tabs?")
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
@@ -4583,23 +4617,31 @@ impl App {
                     24.0,
                     &format!("{} tabs are open.", self.tabs.len()),
                 );
-                ui.horizontal(|ui| {
-                    let (close, keep) =
-                        widgets::dialog_button_pair(ui, "Close them", "Keep them open");
+                ui.horizontal_wrapped(|ui| {
+                    let close = ui.button("Close All Tabs");
+                    let current = ui.button("Close Current Tab");
+                    let cancel = ui.button("Cancel");
                     if self.exit_question_focus_requested {
-                        keep.request_focus();
+                        cancel.request_focus();
                         self.exit_question_focus_requested = false;
                     }
                     if close.clicked() {
-                        answer = Some(true);
+                        answer = Some(ExitChoice::CloseAll);
                     }
-                    if keep.clicked() {
-                        answer = Some(false);
+                    if current.clicked() {
+                        answer = Some(ExitChoice::CloseCurrent);
+                    }
+                    if cancel.clicked() {
+                        answer = Some(ExitChoice::Cancel);
                     }
                 });
+                ui.checkbox(
+                    &mut self.exit_question_always_close_all,
+                    "Always close all tabs",
+                );
             });
-        if let Some(leave) = answer {
-            self.answer_exit(leave);
+        if let Some(choice) = answer {
+            self.answer_exit_choice(choice);
         }
     }
 
@@ -6694,6 +6736,93 @@ mod tests {
         assert_eq!(close_checks.get(), 1);
         assert!(!app.is_closing());
         assert_eq!(app.active_title().as_deref(), Some("Unsaved edit"));
+    }
+
+    #[test]
+    fn close_current_tab_and_always_close_all_controls_work_by_accessible_label() {
+        use ca_ui::testing::probe::Probe;
+
+        let (_settings, mut app) = empty_app();
+        app.push(Box::new(TemporaryView));
+        app.push(Box::new(TemporaryView));
+        assert_eq!(app.tab_count(), 2);
+        app.exit_question = true;
+        let mut probe = Probe::new(800.0, 400.0);
+        let mut draw = |ctx: &egui::Context| app.exit_question_panel(ctx);
+        probe.idle(&mut draw);
+        probe.idle(&mut draw);
+        assert!(!probe
+            .find("Always close all tabs")
+            .unwrap()
+            .toggled
+            .unwrap());
+        probe.click("Always close all tabs", &mut draw).unwrap();
+        probe.click("Close Current Tab", &mut draw).unwrap();
+
+        assert_eq!(app.tab_count(), 1);
+        assert!(!app.asks_before_closing());
+        assert!(
+            app.options()
+                .options_or_default()
+                .tabs
+                .confirm_closing_several_tabs
+        );
+    }
+
+    #[test]
+    fn accepting_always_close_all_saves_the_tab_option() {
+        use ca_ui::testing::probe::Probe;
+
+        let (_settings, mut app) = empty_app();
+        frame_until(&mut app, |app| app.options().is_ready());
+        app.push(Box::new(TemporaryView));
+        app.push(Box::new(TemporaryView));
+        assert_eq!(app.tab_count(), 2);
+        app.exit_question = true;
+        let mut probe = Probe::new(800.0, 400.0);
+        let mut draw = |ctx: &egui::Context| app.exit_question_panel(ctx);
+        probe.idle(&mut draw);
+        probe.idle(&mut draw);
+        probe.click("Always close all tabs", &mut draw).unwrap();
+        probe.click("Close All Tabs", &mut draw).unwrap();
+
+        assert!(app.is_closing());
+        assert!(
+            !app.options()
+                .options_or_default()
+                .tabs
+                .confirm_closing_several_tabs
+        );
+    }
+
+    #[test]
+    fn enter_keeps_the_safe_tab_close_choice() {
+        use ca_ui::testing::probe::Probe;
+
+        let (_settings, mut app) = empty_app();
+        app.push(Box::new(TemporaryView));
+        app.push(Box::new(TemporaryView));
+        app.exit_question = true;
+        app.exit_question_focus_requested = true;
+
+        let mut probe = Probe::new(800.0, 400.0);
+        let mut draw = |ctx: &egui::Context| app.exit_question_panel(ctx);
+        probe.idle(&mut draw);
+        probe.idle(&mut draw);
+        probe.frame(
+            vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            &mut draw,
+        );
+
+        assert_eq!(app.tab_count(), 2);
+        assert!(!app.is_closing());
+        assert!(!app.exit_question);
     }
 
     #[test]
@@ -9125,10 +9254,7 @@ mod tests {
 
         app.borrow_mut().exit_question = true;
         probe.idle(&mut run);
-        assert!(probe
-            .labels()
-            .iter()
-            .any(|label| label == "Close every tab?"));
+        assert!(probe.labels().iter().any(|label| label == "Close tabs?"));
         assert!(!probe.labels().iter().any(|label| label == "Session"));
         assert!(!probe.labels().iter().any(|label| label == "View"));
         assert!(!probe
