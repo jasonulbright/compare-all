@@ -3536,6 +3536,9 @@ impl App {
         }
         self.hand_out_saves();
         let mut view = self.tabs.remove(index);
+        if index < self.active {
+            self.active -= 1;
+        }
         self.publish_exit(view.as_ref());
         if index < self.tab_sessions.len() {
             self.tab_sessions.remove(index);
@@ -4354,6 +4357,7 @@ impl App {
         self.tabs.len() >= 2 || self.resolved.stored.tabs.show_tab_strip_with_one_tab
     }
 
+    /// Draw the shared tab strip and apply the selection or close request.
     fn tab_strip(&mut self, ui: &mut egui::Ui) {
         if !self.shows_tab_strip() {
             return;
@@ -4403,6 +4407,7 @@ impl App {
         }
     }
 
+    /// Draw visible tabs and return their selection, close, and reveal actions.
     fn draw_tab_items(
         &self,
         ui: &mut egui::Ui,
@@ -4439,6 +4444,7 @@ impl App {
         (activate, close, target_rect)
     }
 
+    /// Draw the menu that can select any open tab.
     fn draw_tab_overflow(&self, ui: &mut egui::Ui) -> Option<usize> {
         let mut activate = None;
         ui.menu_button("All Tabs", |ui| {
@@ -4462,6 +4468,7 @@ impl App {
         activate
     }
 
+    /// Return the icon for a launcher tab or session kind.
     fn tab_icon(launcher: bool, kind: Option<&SessionKind>) -> Option<ca_ui::icons::Icon> {
         if launcher {
             Some(ca_ui::icons::Icon::Home)
@@ -4470,6 +4477,7 @@ impl App {
         }
     }
 
+    /// Scroll the requested tab into view and clear its one-frame request.
     fn reveal_tab(
         context: &egui::Context,
         scroll: &egui::scroll_area::ScrollAreaOutput<(
@@ -7421,6 +7429,44 @@ mod tests {
             probe.click("Code 2", &mut draw).unwrap();
         }
         assert_eq!(app.active, 1);
+    }
+
+    #[test]
+    fn closing_an_earlier_tab_keeps_the_active_tab_visible() {
+        use ca_ui::testing::probe::Probe;
+
+        let (_settings, mut app) = empty_app();
+        app.open_home(&context());
+        for index in 1..=12 {
+            app.push(Box::new(CodeView(index)));
+        }
+        app.active = 8;
+
+        let mut probe = Probe::new(360.0, 900.0);
+        {
+            let mut draw = |ctx: &egui::Context| {
+                egui::CentralPanel::default().show(ctx, |ui| app.tab_strip(ui));
+            };
+            probe.idle(&mut draw);
+            probe.idle(&mut draw);
+            let close = probe.find("Close Code 8").unwrap();
+            assert!(close.rect.min.x >= 0.0);
+            assert!(close.rect.max.x <= 360.0);
+        }
+
+        assert_eq!(app.active_title().as_deref(), Some("Code 8"));
+        app.close_tab(1);
+        assert_eq!(app.active_title().as_deref(), Some("Code 8"));
+        {
+            let mut draw = |ctx: &egui::Context| {
+                egui::CentralPanel::default().show(ctx, |ui| app.tab_strip(ui));
+            };
+            probe.idle(&mut draw);
+            probe.idle(&mut draw);
+            let close = probe.find("Close Code 8").unwrap();
+            assert!(close.rect.min.x >= 0.0);
+            assert!(close.rect.max.x <= 360.0);
+        }
     }
 
     #[test]
