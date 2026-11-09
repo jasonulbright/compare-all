@@ -31,9 +31,10 @@ use std::path::Path;
 
 pub use cancel::Cancel;
 pub use compare::{
-    align_trees, apply_filters, compare_contents_parallel, compare_quick,
-    compare_source_contents_parallel, folder_status, normalization_key, rollup, AlignmentOptions,
-    AlignmentOverride, ContentFailure, ContentUpdate, Node, NodeStatus, PairFacts, StatusFlags,
+    align_trees, apply_filters, compare_contents_parallel, compare_contents_scoped_parallel,
+    compare_quick, compare_source_contents_parallel, compare_source_contents_scoped_parallel,
+    folder_status, normalization_key, rollup, AlignmentOptions, AlignmentOverride, ContentFailure,
+    ContentUpdate, Node, NodeStatus, PairFacts, StatusFlags,
 };
 pub use criteria::{
     binary_equal, compare_contents, compare_source_contents, compare_source_contents_with, crc32,

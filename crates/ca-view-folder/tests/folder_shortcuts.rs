@@ -238,8 +238,29 @@ fn a_folder_sync_has_no_copy_keys() {
 fn next_and_previous_difference_walk_the_differences_and_open_folders() {
     let fixture = Fixture::new();
     let mut view = fixture.view();
+    let mut options = ca_session::options::ProgramOptions::default();
+    options.file_operations.confirm_content_comparison = false;
+    let resolved = std::sync::Arc::new(ca_ui::options::AppOptions::resolve(
+        options,
+        ca_ui::theme::Variant::Light,
+        ca_session::AdminPolicies::default(),
+    ));
+    let mut probe = Probe::new(WINDOW[0], WINDOW[1]);
+    ca_ui::options::install(probe.context(), resolved);
+    let view_context = context();
+    {
+        let mut frame = |ctx: &egui::Context| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                view.ui(ui, &view_context);
+            });
+        };
+        probe.idle(&mut frame);
+    }
     expect(&mut view, Command::CompareContents);
-    ready(&mut view);
+    assert!(wait(|| {
+        view.tick();
+        view.is_ready()
+    }));
     let closed = view.rows().len();
     let mut seen = Vec::new();
     while view.accepts(Command::NextDifference) && seen.len() < 8 {
@@ -248,7 +269,10 @@ fn next_and_previous_difference_walk_the_differences_and_open_folders() {
     }
     let names: Vec<&str> = seen.iter().map(|rel| rel.to_str().unwrap()).collect();
     assert!(names.contains(&"newer.txt"), "{names:?}");
-    assert!(names.iter().any(|name| name.ends_with("differs.txt")));
+    assert!(
+        names.iter().any(|name| name.ends_with("differs.txt")),
+        "{names:?}"
+    );
     assert!(names.iter().any(|name| name.ends_with("orphan.txt")));
     assert!(!names.contains(&"same.txt") && !names.contains(&"sub"));
     assert!(view.rows().len() > closed, "no folder was opened");

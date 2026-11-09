@@ -1598,6 +1598,40 @@ mod tests {
     }
 
     #[test]
+    fn content_comparison_options_are_clickable_by_accessible_label() {
+        use crate::testing::probe::Probe;
+
+        let mut dialog = dialog();
+        dialog.select_page_named("File Operations");
+        let mut probe = Probe::new(1_280.0, 900.0);
+        {
+            let mut draw = |ctx: &egui::Context| {
+                let _ = dialog.show(ctx, &crate::theme::LIGHT);
+            };
+            for _ in 0..2 {
+                probe.idle(&mut draw);
+            }
+            probe
+                .click("Ask before comparing file contents", &mut draw)
+                .unwrap();
+        }
+        assert_eq!(
+            dialog.value("file_operations.confirm_content_comparison"),
+            Some(FieldValue::Flag(false))
+        );
+        let mut draw = |ctx: &egui::Context| {
+            let _ = dialog.show(ctx, &crate::theme::LIGHT);
+        };
+        probe
+            .click("Show content comparison results", &mut draw)
+            .unwrap();
+        assert_eq!(
+            dialog.value("file_operations.show_content_results"),
+            Some(FieldValue::Flag(true))
+        );
+    }
+
+    #[test]
     fn every_page_is_reachable_by_name() {
         let mut dialog = dialog();
         for page in dialog.pages() {

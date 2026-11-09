@@ -90,6 +90,11 @@ impl NativeWindow {
         self.focus_requested = true;
     }
 
+    /// Change the title used the next time the viewport is drawn.
+    pub fn set_title(&mut self, title: impl Into<String>) {
+        self.title = title.into();
+    }
+
     /// Draw one frame of the dialog through `draw`, which runs exactly once
     /// with the host the platform offers.
     pub fn show<R>(&mut self, ctx: &Context, mut draw: impl FnMut(Host<'_>) -> R) -> Frame<R> {
