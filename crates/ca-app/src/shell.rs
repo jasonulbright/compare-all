@@ -3536,6 +3536,9 @@ impl App {
         }
         self.hand_out_saves();
         let mut view = self.tabs.remove(index);
+        if index < self.active {
+            self.active -= 1;
+        }
         self.publish_exit(view.as_ref());
         if index < self.tab_sessions.len() {
             self.tab_sessions.remove(index);
@@ -4354,45 +4357,153 @@ impl App {
         self.tabs.len() >= 2 || self.resolved.stored.tabs.show_tab_strip_with_one_tab
     }
 
+    /// Draw the shared tab strip and apply the selection or close request.
     fn tab_strip(&mut self, ui: &mut egui::Ui) {
         if !self.shows_tab_strip() {
             return;
         }
-        let mut close: Option<usize> = None;
-        ui.horizontal_wrapped(|ui| {
-            for index in 0..self.tabs.len() {
-                let title = self.tabs[index].title();
-                let selected = index == self.active;
-                let icon = if self.tabs[index].is_launcher() {
-                    Some(ca_ui::icons::Icon::Home)
-                } else {
-                    self.tabs[index]
-                        .kind()
-                        .as_ref()
-                        .map(ca_ui::icons::session_icon)
-                };
-                let mut label = ui.add(
-                    widgets::IconButton::new(&title, icon)
-                        .inline()
-                        .selected(selected),
-                );
-                if let Some(description) = self.tab_description(index) {
-                    label = label.on_hover_text(description);
-                }
-                if label.clicked() {
-                    self.active = index;
-                    self.drop_pending_workspace();
-                }
-                if widgets::icon_only(ui, "Close Tab", ca_ui::icons::Icon::Close, None).clicked() {
-                    close = Some(index);
-                }
-                ui.separator();
+        let mut activate = None;
+        let mut close = None;
+        let tab_scroll_id = ui.id().with("session-tab-scroll-target");
+        let active_tab_id = ui.id().with("session-tab-active");
+        let previous_active = ui.ctx().data(|data| data.get_temp::<usize>(active_tab_id));
+        let pending_scroll = ui
+            .ctx()
+            .data(|data| data.get_temp::<usize>(tab_scroll_id))
+            .or_else(|| {
+                previous_active
+                    .is_none_or(|previous| previous != self.active)
+                    .then_some(self.active)
+            });
+        ui.ctx()
+            .data_mut(|data| data.insert_temp(active_tab_id, self.active));
+        ui.horizontal(|ui| {
+            let overflow_width = ui.spacing().interact_size.x.max(72.0);
+            let scroll_width =
+                (ui.available_width() - overflow_width - ui.spacing().item_spacing.x).max(16.0);
+            let scroll = egui::ScrollArea::horizontal()
+                .id_salt("session-tabs")
+                .max_width(scroll_width)
+                .max_height(32.0)
+                .min_scrolled_width(0.0)
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                .auto_shrink([false, false])
+                .show(ui, |ui| Self::draw_tab_items(self, ui, pending_scroll));
+            let (tab_choice, tab_close, target_rect) = scroll.inner;
+            activate = tab_choice;
+            close = tab_close;
+            Self::reveal_tab(ui.ctx(), &scroll, target_rect, tab_scroll_id);
+            if let Some(index) = self.draw_tab_overflow(ui) {
+                activate = Some(index);
             }
         });
+        if let Some(index) = activate {
+            self.active = index;
+            self.drop_pending_workspace();
+        }
         if let Some(index) = close {
             self.drop_pending_workspace();
             self.close_tab(index);
         }
+    }
+
+    /// Draw visible tabs and return their selection, close, and reveal actions.
+    fn draw_tab_items(
+        &self,
+        ui: &mut egui::Ui,
+        pending_scroll: Option<usize>,
+    ) -> (Option<usize>, Option<usize>, Option<egui::Rect>) {
+        let mut activate = None;
+        let mut close = None;
+        let mut target_rect = None;
+        ui.horizontal(|ui| {
+            for index in 0..self.tabs.len() {
+                let title = self.tabs[index].title();
+                let selected = index == self.active;
+                let icon = Self::tab_icon(
+                    self.tabs[index].is_launcher(),
+                    self.tabs[index].kind().as_ref(),
+                );
+                let (label, close_button) = widgets::session_tab(ui, index, &title, icon, selected);
+                let label = if let Some(description) = self.tab_description(index) {
+                    label.on_hover_text(description)
+                } else {
+                    label
+                };
+                if pending_scroll == Some(index) {
+                    target_rect = Some(label.rect.union(close_button.rect));
+                }
+                if label.clicked() {
+                    activate = Some(index);
+                }
+                if close_button.clicked() {
+                    close = Some(index);
+                }
+            }
+        });
+        (activate, close, target_rect)
+    }
+
+    /// Draw the menu that can select any open tab.
+    fn draw_tab_overflow(&self, ui: &mut egui::Ui) -> Option<usize> {
+        let mut activate = None;
+        ui.menu_button("All Tabs", |ui| {
+            ui.set_min_width(260.0);
+            for index in 0..self.tabs.len() {
+                let title = self.tabs[index].title();
+                let selected = index == self.active;
+                let icon = Self::tab_icon(
+                    self.tabs[index].is_launcher(),
+                    self.tabs[index].kind().as_ref(),
+                );
+                let item = widgets::IconButton::new(&title, icon)
+                    .menu()
+                    .selected(selected);
+                if ui.add(item).clicked() {
+                    activate = Some(index);
+                    ui.close_menu();
+                }
+            }
+        });
+        activate
+    }
+
+    /// Return the icon for a launcher tab or session kind.
+    fn tab_icon(launcher: bool, kind: Option<&SessionKind>) -> Option<ca_ui::icons::Icon> {
+        if launcher {
+            Some(ca_ui::icons::Icon::Home)
+        } else {
+            kind.map(ca_ui::icons::session_icon)
+        }
+    }
+
+    /// Scroll the requested tab into view and clear its one-frame request.
+    fn reveal_tab(
+        context: &egui::Context,
+        scroll: &egui::scroll_area::ScrollAreaOutput<(
+            Option<usize>,
+            Option<usize>,
+            Option<egui::Rect>,
+        )>,
+        target_rect: Option<egui::Rect>,
+        target_id: egui::Id,
+    ) {
+        let Some(rect) = target_rect else {
+            return;
+        };
+        let mut state = scroll.state;
+        if rect.left() < scroll.inner_rect.left() {
+            state.offset.x += rect.left() - scroll.inner_rect.left();
+        } else if rect.right() > scroll.inner_rect.right() {
+            state.offset.x += rect.right() - scroll.inner_rect.right();
+        }
+        state.offset.x = state.offset.x.clamp(
+            0.0,
+            (scroll.content_size.x - scroll.inner_rect.width()).max(0.0),
+        );
+        state.store(context, scroll.id);
+        context.data_mut(|data| data.remove::<usize>(target_id));
+        context.request_repaint();
     }
 
     /// Take what the launcher asked for and act on it.
@@ -7241,6 +7352,187 @@ mod tests {
         app.run(Command::CloseTab, &context);
         assert_eq!(app.tab_count(), 0);
         assert!(app.is_closing());
+    }
+
+    /// The overflow menu selects hidden tabs and exposes their close actions.
+    #[test]
+    fn tab_overflow_menu_selects_and_closes_hidden_tabs() {
+        use ca_ui::testing::probe::Probe;
+
+        let (_settings, mut app) = empty_app();
+        app.open_home(&context());
+        for index in 1..=12 {
+            app.push(Box::new(CodeView(index)));
+        }
+
+        let mut probe = Probe::new(360.0, 900.0);
+        {
+            let mut draw = |ctx: &egui::Context| {
+                egui::CentralPanel::default().show(ctx, |ui| app.tab_strip(ui));
+            };
+            probe.idle(&mut draw);
+            probe.idle(&mut draw);
+            assert!(probe.find("All Tabs").is_ok(), "{:?}", probe.labels());
+            probe.click("All Tabs", &mut draw).unwrap();
+            probe.idle(&mut draw);
+            let mut code_one = probe.find_all("Code 1");
+            assert!(code_one.len() >= 2, "{:?}", probe.labels());
+            let overflow_bottom = probe.find("All Tabs").unwrap().rect.bottom();
+            let selected_item = probe
+                .find_all("Code 12")
+                .into_iter()
+                .find(|item| item.rect.center().y > overflow_bottom)
+                .unwrap();
+            assert_eq!(selected_item.toggled, Some(true));
+            let overflow_item = code_one
+                .drain(..)
+                .find(|item| item.rect.center().y > overflow_bottom)
+                .unwrap();
+            probe.press_at(overflow_item.rect.center(), &mut draw);
+        }
+        assert_eq!(app.active, 1);
+
+        {
+            let mut draw = |ctx: &egui::Context| {
+                egui::CentralPanel::default().show(ctx, |ui| app.tab_strip(ui));
+            };
+            probe.idle(&mut draw);
+            probe.idle(&mut draw);
+            assert_eq!(probe.find("Code 1").unwrap().toggled, Some(true));
+            probe.click("Close Code 1", &mut draw).unwrap();
+        }
+        assert_eq!(app.tab_count(), 12);
+        assert!(app.tabs.iter().all(|tab| tab.title() != "Code 1"));
+
+        app.active = 11;
+        {
+            let mut draw = |ctx: &egui::Context| {
+                egui::CentralPanel::default().show(ctx, |ui| app.tab_strip(ui));
+            };
+            probe.idle(&mut draw);
+            probe.idle(&mut draw);
+            let active_close = probe.find("Close Code 12").unwrap();
+            assert!(active_close.rect.min.x >= 0.0);
+            assert!(active_close.rect.max.x <= 360.0);
+        }
+
+        app.run(Command::TabNext, &context());
+        assert_eq!(app.active, 0);
+        {
+            let mut draw = |ctx: &egui::Context| {
+                egui::CentralPanel::default().show(ctx, |ui| app.tab_strip(ui));
+            };
+            probe.idle(&mut draw);
+            probe.idle(&mut draw);
+            let active_close = probe.find("Close Home").unwrap();
+            assert!(active_close.rect.min.x >= 0.0);
+            assert!(active_close.rect.max.x <= 360.0);
+            probe.click("Code 2", &mut draw).unwrap();
+        }
+        assert_eq!(app.active, 1);
+    }
+
+    /// Closing an earlier tab keeps the selected session fully in view.
+    #[test]
+    fn closing_an_earlier_tab_keeps_the_active_tab_visible() {
+        use ca_ui::testing::probe::Probe;
+        use std::cell::Cell;
+
+        let (_settings, mut app) = empty_app();
+        app.open_home(&context());
+        for index in 1..=12 {
+            app.push(Box::new(CodeView(index)));
+        }
+        app.active = 8;
+
+        let mut probe = Probe::new(360.0, 900.0);
+        let viewport = Cell::new(egui::Rect::NOTHING);
+        {
+            let mut draw = |ctx: &egui::Context| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let available = ui.available_rect_before_wrap();
+                    let overflow_width = ui.spacing().interact_size.x.max(72.0);
+                    let scroll_width =
+                        (ui.available_width() - overflow_width - ui.spacing().item_spacing.x)
+                            .max(16.0);
+                    viewport.set(egui::Rect::from_min_size(
+                        available.min,
+                        egui::vec2(scroll_width, 32.0),
+                    ));
+                    app.tab_strip(ui);
+                });
+            };
+            probe.idle(&mut draw);
+            probe.idle(&mut draw);
+            let select = probe.find("Code 8").unwrap();
+            let close = probe.find("Close Code 8").unwrap();
+            let bounds = viewport.get();
+            assert!(select.rect.min.x >= bounds.left());
+            assert!(close.rect.max.x <= bounds.right());
+        }
+
+        assert_eq!(app.active_title().as_deref(), Some("Code 8"));
+        let bounds = viewport.get();
+        let select = probe.find("Code 8").unwrap();
+        let close = probe.find("Close Code 8").unwrap();
+        let tab_left_distance = select.rect.min.x - bounds.left();
+        assert!(tab_left_distance > 0.0);
+        let full_tab_width;
+        {
+            let mut draw = |ctx: &egui::Context| {
+                egui::CentralPanel::default().show(ctx, |ui| app.tab_strip(ui));
+            };
+            let scroll_point = close.rect.center();
+            let mut scroll_left = tab_left_distance - 8.0;
+            while scroll_left > 0.0 {
+                let step = scroll_left.min(7.0);
+                let _ = probe.frame(
+                    vec![
+                        egui::Event::PointerMoved(scroll_point),
+                        egui::Event::MouseWheel {
+                            unit: egui::MouseWheelUnit::Point,
+                            delta: egui::vec2(-step, 0.0),
+                            modifiers: egui::Modifiers::default(),
+                        },
+                    ],
+                    &mut draw,
+                );
+                scroll_left -= step;
+            }
+            probe.idle(&mut draw);
+            let select = probe.find("Code 8").unwrap();
+            let close = probe.find("Close Code 8").unwrap();
+            let bounds = viewport.get();
+            full_tab_width = close.rect.right() - select.rect.left();
+            assert!(select.rect.min.x >= bounds.left());
+            assert!(
+                select.rect.min.x <= bounds.left() + 12.0,
+                "Code 8 {:?} was not near the viewport's left edge {:?}",
+                select.rect,
+                bounds
+            );
+            assert!(close.rect.max.x <= bounds.right());
+        }
+
+        app.close_tab(1);
+        assert_eq!(app.active_title().as_deref(), Some("Code 8"));
+        {
+            let mut draw = |ctx: &egui::Context| {
+                egui::CentralPanel::default().show(ctx, |ui| app.tab_strip(ui));
+            };
+            probe.idle(&mut draw);
+            probe.idle(&mut draw);
+            let select = probe.find("Code 8").unwrap();
+            let close = probe.find("Close Code 8").unwrap();
+            let bounds = viewport.get();
+            assert!(select.rect.min.x >= bounds.left());
+            assert!(close.rect.max.x <= bounds.right());
+            let visible_tab_width = close.rect.right() - select.rect.left();
+            assert!(
+                (visible_tab_width - full_tab_width).abs() < 0.5,
+                "Code 8 width changed from {full_tab_width} to {visible_tab_width}"
+            );
+        }
     }
 
     #[test]

@@ -272,6 +272,111 @@ pub fn icon_only_with_hover(
     response.on_hover_text(hover)
 }
 
+/// A tab with a distinct close target inside its selected-state shape.
+///
+/// The label response selects the tab; the close response closes it. Long
+/// titles are clipped to keep tab widths bounded and remain available in the
+/// label tooltip and accessibility tree.
+pub fn session_tab(
+    ui: &mut egui::Ui,
+    index: usize,
+    label: &str,
+    icon: Option<Icon>,
+    selected: bool,
+) -> (egui::Response, egui::Response) {
+    const MAX_LABEL_WIDTH: f32 = 180.0;
+
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let galley = ui
+        .painter()
+        .layout_no_wrap(label.to_owned(), font, ui.visuals().text_color());
+    let icon_size = TOKENS.toolbar.icon_inline;
+    let close_size = TOKENS.toolbar.toggle_hit_size.max(20.0);
+    let gap = ui.spacing().icon_spacing;
+    let padding_x = ui.spacing().button_padding.x + 4.0;
+    let padding_y = ui.spacing().button_padding.y + 3.0;
+    let label_width = galley.size().x.clamp(24.0, MAX_LABEL_WIDTH);
+    let icon_width = icon.map_or(0.0, |_| icon_size + gap);
+    let size = egui::vec2(
+        padding_x * 2.0 + icon_width + label_width + gap + close_size,
+        galley.size().y.max(icon_size).max(close_size) + padding_y * 2.0,
+    );
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let tab_id = ui.id().with(("session-tab", index));
+    let close_rect = egui::Rect::from_min_size(
+        egui::pos2(rect.max.x - padding_x - close_size, rect.min.y),
+        egui::vec2(close_size, rect.height()),
+    );
+    let select_rect = egui::Rect::from_min_max(rect.min, egui::pos2(close_rect.min.x, rect.max.y));
+    let select = ui.interact(select_rect, tab_id.with("select"), egui::Sense::click());
+    let close = ui.interact(close_rect, tab_id.with("close"), egui::Sense::click());
+    select.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::SelectableLabel,
+            ui.is_enabled(),
+            selected,
+            label,
+        )
+    });
+    let close_label = format!("Close {label}");
+    close.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), &close_label)
+    });
+
+    if ui.is_rect_visible(rect) {
+        let visuals = ui.style().interact_selectable(&select, selected);
+        ui.painter().rect(
+            rect,
+            visuals.corner_radius,
+            visuals.weak_bg_fill,
+            visuals.bg_stroke,
+            egui::StrokeKind::Inside,
+        );
+
+        let mut text_left = rect.min.x + padding_x;
+        if let Some(icon) = icon {
+            let icon_rect = egui::Rect::from_center_size(
+                egui::pos2(text_left + icon_size / 2.0, rect.center().y),
+                egui::Vec2::splat(icon_size),
+            );
+            icon.paint(ui.painter(), icon_rect, visuals.fg_stroke.color);
+            text_left += icon_size + gap;
+        }
+        let text_rect = egui::Rect::from_min_max(
+            egui::pos2(text_left, rect.min.y),
+            egui::pos2(close_rect.min.x - gap, rect.max.y),
+        );
+        ui.painter()
+            .with_clip_rect(text_rect)
+            .galley_with_override_text_color(
+                egui::pos2(text_left, rect.center().y - galley.size().y / 2.0),
+                galley,
+                visuals.fg_stroke.color,
+            );
+
+        if close.hovered() || close.is_pointer_button_down_on() {
+            let close_visuals = ui.style().interact(&close);
+            ui.painter().rect(
+                close_rect.shrink(2.0),
+                close_visuals.corner_radius,
+                close_visuals.weak_bg_fill,
+                close_visuals.bg_stroke,
+                egui::StrokeKind::Inside,
+            );
+        }
+        Icon::Close.paint(
+            ui.painter(),
+            egui::Rect::from_center_size(close_rect.center(), egui::Vec2::splat(icon_size)),
+            ui.style().interact(&close).fg_stroke.color,
+        );
+    }
+
+    (
+        select.on_hover_text(label.to_owned()),
+        close.on_hover_text(close_label),
+    )
+}
+
 /// An icon beside a message, tinted from the notice palette.
 pub fn notice(
     ui: &mut egui::Ui,
