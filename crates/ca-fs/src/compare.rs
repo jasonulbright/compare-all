@@ -1027,10 +1027,30 @@ pub fn compare_contents_parallel(
     cancel: &Cancel,
     on_update: &(dyn Fn(&ContentUpdate) + Sync),
 ) -> bool {
+    compare_contents_scoped_parallel(
+        root, left_base, right_base, options, None, rules, cancel, on_update,
+    )
+}
+
+/// Run the content tests over the paired files at or below `scope` paths.
+///
+/// An empty scope means that no file is selected. The caller uses `None` to
+/// compare the full tree.
+#[allow(clippy::too_many_arguments)]
+pub fn compare_contents_scoped_parallel(
+    root: &mut Node,
+    left_base: &Path,
+    right_base: &Path,
+    options: &CompareOptions,
+    scope: Option<&[PathBuf]>,
+    rules: Option<&dyn RulesComparer>,
+    cancel: &Cancel,
+    on_update: &(dyn Fn(&ContentUpdate) + Sync),
+) -> bool {
     if !options.content.enabled {
         return true;
     }
-    let pairs = collect_pairs(root, left_base, right_base, options);
+    let pairs = collect_pairs(root, left_base, right_base, options, scope);
     run_pairs(root, &pairs, options, cancel, on_update, &|left, right| {
         compare_contents(left, right, &options.content, rules, cancel)
     })
@@ -1051,12 +1071,33 @@ pub fn compare_source_contents_parallel(
     cancel: &Cancel,
     on_update: &(dyn Fn(&ContentUpdate) + Sync),
 ) -> bool {
+    compare_source_contents_scoped_parallel(
+        root, left, right, options, None, rules, cancel, on_update,
+    )
+}
+
+/// Run the source content tests over the paired files at or below `scope` paths.
+///
+/// An empty scope means that no file is selected. The caller uses `None` to
+/// compare the full tree.
+#[allow(clippy::too_many_arguments)]
+pub fn compare_source_contents_scoped_parallel(
+    root: &mut Node,
+    left: &Source,
+    right: &Source,
+    options: &CompareOptions,
+    scope: Option<&[PathBuf]>,
+    rules: Option<&dyn RulesComparer>,
+    cancel: &Cancel,
+    on_update: &(dyn Fn(&ContentUpdate) + Sync),
+) -> bool {
     if left.is_local_folder() && right.is_local_folder() {
-        return compare_contents_parallel(
+        return compare_contents_scoped_parallel(
             root,
             left.origin(),
             right.origin(),
             options,
+            scope,
             rules,
             cancel,
             on_update,
@@ -1065,7 +1106,7 @@ pub fn compare_source_contents_parallel(
     if !options.content.enabled {
         return true;
     }
-    let pairs = collect_pairs(root, Path::new(""), Path::new(""), options);
+    let pairs = collect_pairs(root, Path::new(""), Path::new(""), options, scope);
     run_pairs(
         root,
         &pairs,
@@ -1170,9 +1211,17 @@ fn collect_pairs(
     left_base: &Path,
     right_base: &Path,
     options: &CompareOptions,
+    scope: Option<&[PathBuf]>,
 ) -> Vec<(PathBuf, PathBuf, PathBuf)> {
     let mut out: Vec<(PathBuf, PathBuf, PathBuf)> = Vec::new();
     root.walk(&mut |node| {
+        if scope.is_some_and(|paths| {
+            !paths
+                .iter()
+                .any(|path| node.rel == *path || node.rel.starts_with(path))
+        }) {
+            return;
+        }
         if node.is_dir || node.status == NodeStatus::KindMismatch {
             return;
         }
@@ -1279,8 +1328,8 @@ fn keep_node(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::{
-        align_trees, apply_filters, compare_contents_parallel, compare_quick, normalization_key,
-        rollup, AlignmentOptions, Node, NodeStatus, StatusFlags,
+        align_trees, apply_filters, compare_contents_parallel, compare_contents_scoped_parallel,
+        compare_quick, normalization_key, rollup, AlignmentOptions, Node, NodeStatus, StatusFlags,
     };
     use crate::cancel::Cancel;
     use crate::criteria::{CompareOptions, ContentMethod, ContentTests, QuickTests};
@@ -1703,6 +1752,48 @@ mod tests {
         assert_eq!(seen.load(Ordering::SeqCst), 8);
         assert_eq!(find(&tree, "f0.bin").status, NodeStatus::Different);
         assert_eq!(find(&tree, "f1.bin").status, NodeStatus::Same);
+    }
+
+    #[test]
+    fn a_scoped_content_pass_compares_the_selected_path_and_descendants_only() {
+        let dirs = pair();
+        for rel in ["keep/child.txt", "outside.txt"] {
+            std::fs::create_dir_all(dirs.left.path().join(rel).parent().unwrap()).unwrap();
+            std::fs::create_dir_all(dirs.right.path().join(rel).parent().unwrap()).unwrap();
+            std::fs::write(dirs.left.path().join(rel), b"left").unwrap();
+            std::fs::write(dirs.right.path().join(rel), b"right").unwrap();
+        }
+        let options = CompareOptions {
+            content: ContentTests {
+                enabled: true,
+                skip_if_quick_same: false,
+                ..ContentTests::default()
+            },
+            ..CompareOptions::default()
+        };
+        let mut tree = align(
+            &scan(dirs.left.path()),
+            &scan(dirs.right.path()),
+            &AlignmentOptions::default(),
+        );
+        let scope = [PathBuf::from("keep")];
+        let compared = std::sync::Mutex::new(Vec::new());
+        assert!(compare_contents_scoped_parallel(
+            &mut tree,
+            dirs.left.path(),
+            dirs.right.path(),
+            &options,
+            Some(&scope),
+            None,
+            &Cancel::new(),
+            &|update| compared.lock().unwrap().push(update.rel.clone()),
+        ));
+        assert_eq!(
+            *compared.lock().unwrap(),
+            vec![PathBuf::from("keep/child.txt")]
+        );
+        assert!(find(&tree, "keep/child.txt").content.is_some());
+        assert!(find(&tree, "outside.txt").content.is_none());
     }
 
     #[test]

@@ -5,12 +5,13 @@
 use crate::settings::EngineOptions;
 use crate::tree::{Arena, Sort};
 use ca_fs::{
-    align_trees, apply_filters, compare_quick, compare_source_contents_parallel,
+    align_trees, apply_filters, compare_quick, compare_source_contents_scoped_parallel,
     compare_source_contents_with, scan_source, scan_with, ArchiveTypes, CompareOptions,
     ContentError, ContentMethod, ContentOutcome, ContentSide, ContentTests, ContentUpdate,
     EntryFacts, FilterContext, Limits, NameFilters, Node, RulesEngine, ScanOptions, ScanProgress,
     Source,
 };
+use ca_ui::contents::{ResultGroup, ResultRow, ResultTarget};
 use ca_ui::worker::{Cancel, Emitter, Job, Terminal};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -239,6 +240,8 @@ pub enum ContentMessage {
         tree: Option<Box<Node>>,
         /// False when the run stopped before finishing.
         complete: bool,
+        /// File rows grouped for the optional results window.
+        results: Vec<ResultRow>,
     },
     /// The run could not proceed.
     Failed(String),
@@ -256,6 +259,7 @@ impl Terminal for ContentMessage {
         ContentMessage::Done {
             tree: None,
             complete: false,
+            results: Vec::new(),
         }
     }
 
@@ -480,6 +484,7 @@ pub fn spawn_contents(
     tree: Box<Node>,
     sides: Sides,
     method: ContentMethod,
+    scope: Option<Vec<PathBuf>>,
     engine: Box<EngineOptions>,
     notify: Arc<dyn Fn() + Send + Sync>,
 ) -> Job<ContentMessage> {
@@ -499,11 +504,12 @@ pub fn spawn_contents(
                     engine.disabled_formats.clone(),
                 )
             });
-            let complete = compare_source_contents_parallel(
+            let complete = compare_source_contents_scoped_parallel(
                 &mut tree,
                 &sides.left,
                 &sides.right,
                 &options,
+                scope.as_deref(),
                 rules
                     .as_ref()
                     .map(|engine| engine as &dyn ca_fs::RulesComparer),
@@ -512,21 +518,78 @@ pub fn spawn_contents(
                     emitter.send(ContentMessage::Update(Box::new(update.clone())));
                 },
             );
+            let results = collect_content_results(&tree, scope.as_deref());
             emitter.send(ContentMessage::Done {
                 tree: Some(tree),
                 complete,
+                results,
             });
         },
         notify,
     )
 }
 
+fn collect_content_results(root: &Node, scope: Option<&[PathBuf]>) -> Vec<ResultRow> {
+    let mut rows = Vec::new();
+    root.walk(&mut |node| {
+        if node.is_dir
+            || scope.is_some_and(|paths| {
+                !paths
+                    .iter()
+                    .any(|path| node.rel == *path || node.rel.starts_with(path))
+            })
+        {
+            return;
+        }
+        let group = if node.error.is_some() {
+            ResultGroup::Error
+        } else {
+            match (&node.left, &node.right) {
+                (Some(_), None) => ResultGroup::LeftOrphan,
+                (None, Some(_)) => ResultGroup::RightOrphan,
+                (Some(_), Some(_)) => match node.content {
+                    Some(ca_fs::ContentOutcome::BinarySame | ca_fs::ContentOutcome::RulesSame) => {
+                        ResultGroup::Same
+                    }
+                    Some(ca_fs::ContentOutcome::UnimportantDifferences) => {
+                        ResultGroup::UnimportantDifferences
+                    }
+                    Some(
+                        ca_fs::ContentOutcome::BinaryDifferences
+                        | ca_fs::ContentOutcome::ImportantDifferences,
+                    ) => ResultGroup::Different,
+                    Some(ca_fs::ContentOutcome::NotComparedCloudPlaceholder) | None => {
+                        ResultGroup::NotCompared
+                    }
+                },
+                (None, None) => return,
+            }
+        };
+        let target = match (&node.left, &node.right) {
+            (Some(_), Some(_)) => ResultTarget::Pair,
+            (Some(_), None) => ResultTarget::Left,
+            (None, Some(_)) => ResultTarget::Right,
+            (None, None) => return,
+        };
+        rows.push(ResultRow {
+            rel: node.rel.clone(),
+            label: node.rel.display().to_string(),
+            group,
+            target,
+        });
+    });
+    rows
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
-    use super::{selected_pair_label, spawn_contents, spawn_scan, ContentMessage, ScanMessage};
+    use super::{
+        selected_pair_label, spawn_contents, spawn_scan, ContentMessage, ResultGroup, ResultTarget,
+        ScanMessage,
+    };
     use ca_fs::ContentMethod;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -654,6 +717,7 @@ mod tests {
                 right: ca_fs::Source::local(dir.path().join("right")),
             },
             ContentMethod::Binary,
+            None,
             Box::new(options()),
             Arc::new(|| {}),
         );
@@ -680,6 +744,43 @@ mod tests {
             arena.node(differs).unwrap().status,
             ca_fs::NodeStatus::Different
         );
+    }
+
+    #[test]
+    fn a_scoped_content_run_returns_only_selected_files_and_orphans() {
+        let dir = fixture();
+        std::fs::write(dir.path().join("left/sub/only-left.txt"), b"left").unwrap();
+        let (_, tree) = scan(dir.path(), "");
+        let mut job = spawn_contents(
+            tree,
+            super::Sides {
+                left: ca_fs::Source::local(dir.path().join("left")),
+                right: ca_fs::Source::local(dir.path().join("right")),
+            },
+            ContentMethod::Binary,
+            Some(vec![PathBuf::from("sub")]),
+            Box::new(options()),
+            Arc::new(|| {}),
+        );
+        let results = drain(&mut job)
+            .into_iter()
+            .find_map(|message| match message {
+                ContentMessage::Done { results, .. } => Some(results),
+                _ => None,
+            })
+            .expect("the content run finished");
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().any(|row| {
+            row.rel == Path::new("sub/differs.txt")
+                && row.group == ResultGroup::Different
+                && row.target == ResultTarget::Pair
+        }));
+        assert!(results.iter().any(|row| {
+            row.rel == Path::new("sub/only-left.txt")
+                && row.group == ResultGroup::LeftOrphan
+                && row.target == ResultTarget::Left
+        }));
+        assert!(!results.iter().any(|row| row.rel == Path::new("same.txt")));
     }
 
     /// The 22 bytes of an end of central directory record: a zip holding
@@ -759,6 +860,7 @@ mod tests {
             tree,
             *sides,
             ContentMethod::Binary,
+            None,
             Box::new(options()),
             Arc::new(|| {}),
         );
@@ -945,6 +1047,7 @@ mod tests {
                 right: ca_fs::Source::local(dir.path().join("right")),
             },
             ContentMethod::Rules,
+            None,
             Box::new(options()),
             Arc::new(|| {}),
         );
@@ -970,8 +1073,8 @@ mod tests {
 /// What the extraction worker posts back.
 #[derive(Debug)]
 pub enum ExtractMessage {
-    /// Both files are on the local disk. The request opens them read-only and
-    /// names the copies its tab deletes.
+    /// The request opens its local file or files and names any copies its tab
+    /// deletes.
     Ready(Box<ca_ui::view::OpenRequest>),
     /// A copy could not be made. Every copy made so far is already gone.
     Failed(String),
@@ -1062,6 +1165,62 @@ pub fn extract_selected_pair(
     Ok(request.over_temporaries(copies))
 }
 
+/// Prepare one file from a folder result for the single-file Text Edit view.
+///
+/// A local side keeps its path. A non-local side is copied to a temporary
+/// folder that the opened tab owns.
+///
+/// # Errors
+/// Returns the message to show when the source cannot be read or the copy
+/// cannot be written.
+pub fn extract_single(
+    source: &Source,
+    rel: &Path,
+    directory: &Path,
+    mut request: ca_ui::view::OpenRequest,
+    side: Side,
+    cancel: &Cancel,
+) -> Result<ca_ui::view::OpenRequest, String> {
+    let shown = match side {
+        Side::Left => request.left.clone(),
+        Side::Right => request.right.clone(),
+    };
+    let (path, copies) = if source.is_local_folder() {
+        (source.origin().join(rel), Vec::new())
+    } else {
+        let (folder, file) = extract_one(source, rel, directory, cancel)?;
+        (file, vec![folder])
+    };
+    let mut titles = request.titles.clone();
+    if !copies.is_empty() && path.file_name() != rel.file_name() {
+        match side {
+            Side::Left if titles.left.is_none() => {
+                titles.left = Some(shown.display().to_string());
+            }
+            Side::Right if titles.right.is_none() => {
+                titles.right = Some(shown.display().to_string());
+            }
+            Side::Left | Side::Right => {}
+        }
+    }
+    match side {
+        Side::Left => {
+            request.left = path;
+            request.right.clear();
+        }
+        Side::Right => {
+            request.left.clear();
+            request.right = path;
+        }
+    }
+    request.titles = titles;
+    if copies.is_empty() {
+        Ok(request)
+    } else {
+        Ok(request.over_temporaries(copies))
+    }
+}
+
 /// One entry copied into a new folder under `directory`: the folder and the
 /// file inside it.
 fn extract_one(
@@ -1131,6 +1290,41 @@ pub fn spawn_extract(
     notify: Arc<dyn Fn() + Send + Sync>,
 ) -> Job<ExtractMessage> {
     spawn_extract_selected_pair(sides, rel.clone(), rel, request, notify)
+}
+
+/// Start preparing one non-local result file on a worker.
+#[must_use]
+pub fn spawn_extract_single(
+    source: Source,
+    rel: PathBuf,
+    request: ca_ui::view::OpenRequest,
+    side: Side,
+    notify: Arc<dyn Fn() + Send + Sync>,
+) -> Job<ExtractMessage> {
+    Job::spawn_notifying(
+        move |emitter, cancel| {
+            let prepared = if source.is_local_folder() {
+                extract_single(&source, &rel, Path::new(""), request, side, cancel)
+            } else {
+                match ca_ui::paths::prepared_temporary_directory() {
+                    Ok(directory) => {
+                        extract_single(&source, &rel, &directory, request, side, cancel)
+                    }
+                    Err(error) => Err(format!(
+                        "{} could not be copied out: the folder for copies {} cannot be used: {error}",
+                        rel.display(),
+                        ca_ui::paths::temporary_directory().display()
+                    )),
+                }
+            };
+            let message = match prepared {
+                Ok(request) => ExtractMessage::Ready(Box::new(request)),
+                Err(reason) => ExtractMessage::Failed(reason),
+            };
+            emitter.send(message);
+        },
+        notify,
+    )
 }
 
 /// Start copying two selected entries out of their sources on a worker.

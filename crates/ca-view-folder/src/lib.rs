@@ -44,7 +44,7 @@ use opjobs::{
     ProgressState, RecoverMessage, RecoveryNotice, RescanMessage, SelectionRefreshMessage,
 };
 use selection::{ClickKind, Scope, SelectRule, Selection};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -59,6 +59,28 @@ const ROW_HEIGHT_RATIO: f32 = 4.0 / 3.0;
 /// Why a comparison with an archive side takes no file operation.
 const ARCHIVE_SIDE_REFUSAL: &str =
     "A side is an archive read as a folder. File operations need two local folders.";
+
+fn content_windows(
+    instance: u64,
+) -> (ca_ui::viewport::NativeWindow, ca_ui::viewport::NativeWindow) {
+    (
+        ca_ui::viewport::NativeWindow::new(
+            "folder-content-dialog",
+            instance,
+            "Compare Contents",
+            [460.0, 260.0],
+            [360.0, 220.0],
+        ),
+        ca_ui::viewport::NativeWindow::new(
+            "folder-content-results",
+            instance,
+            "Content Comparison Results",
+            [640.0, 480.0],
+            [420.0, 320.0],
+        ),
+    )
+}
+
 /// Height of the column header row.
 const HEADER_HEIGHT: f32 = 22.0;
 /// Narrowest share of the width either pane may be dragged to.
@@ -339,6 +361,11 @@ struct QuickCompareState {
     second_path: PathBuf,
 }
 
+/// The method choices shown before a folder content comparison starts.
+struct ContentsDialogState {
+    dialog: ca_ui::contents::ContentsDialog,
+}
+
 impl QuickCompareState {
     fn new(pair: QuickComparePair, method: ContentMethod, view: &FolderView) -> Self {
         let first_path = display_source_path(&pair.first.source, &pair.first.rel);
@@ -417,6 +444,11 @@ pub struct FolderView {
     preview_comparison: u64,
     extract_job: Option<Job<jobs::ExtractMessage>>,
     quick_compare: Option<QuickCompareState>,
+    contents_dialog: Option<ContentsDialogState>,
+    contents_window: ca_ui::viewport::NativeWindow,
+    contents_results: Option<ca_ui::contents::ContentsResultsDialog>,
+    contents_results_window: ca_ui::viewport::NativeWindow,
+    content_show_results: bool,
     /// Tabs to open on the next frame, from work that finished off the frame.
     pending_opens: Vec<OpenRequest>,
     /// The report command of this view.
@@ -590,6 +622,7 @@ impl FolderView {
         instance: u64,
         mode: Mode,
     ) -> Self {
+        let (contents_window, contents_results_window) = content_windows(instance);
         let mut view = Self {
             id: egui::Id::new(("folder-compare", instance)),
             mode,
@@ -619,6 +652,11 @@ impl FolderView {
             preview_comparison: 0,
             extract_job: None,
             quick_compare: None,
+            contents_dialog: None,
+            contents_window,
+            contents_results: None,
+            contents_results_window,
+            content_show_results: false,
             pending_opens: Vec::new(),
             report: ViewReport::new(
                 ReportKind::Folder,
@@ -1607,9 +1645,22 @@ impl FolderView {
                 ContentMessage::Update(update) => {
                     self.apply_content(&update);
                 }
-                ContentMessage::Done { tree, complete } => {
+                ContentMessage::Done {
+                    tree,
+                    complete,
+                    results,
+                } => {
                     if let Some(tree) = tree {
                         self.compared_tree = Some(tree);
+                    }
+                    if self.content_show_results {
+                        let dialog = ca_ui::contents::ContentsResultsDialog::new(
+                            self.content_method,
+                            results,
+                        );
+                        self.contents_results_window.set_title(dialog.title());
+                        self.contents_results = Some(dialog);
+                        self.contents_results_window.request_focus();
                     }
                     terminal_status = Some(if complete {
                         Status::Ready
@@ -2281,22 +2332,73 @@ impl FolderView {
     }
 
     fn start_content_comparison(&mut self) {
+        if self.confirmations.confirm_content_comparison {
+            if self.contents_dialog.is_none() {
+                self.contents_dialog = Some(ContentsDialogState {
+                    dialog: ca_ui::contents::ContentsDialog::new(
+                        self.content_method,
+                        self.confirmations.show_content_results,
+                    ),
+                });
+            }
+            self.contents_window.request_focus();
+            return;
+        }
+        self.start_content_comparison_run(
+            self.content_method,
+            self.confirmations.show_content_results,
+        );
+    }
+
+    fn start_content_comparison_run(&mut self, method: ContentMethod, show_results: bool) {
         let Some(tree) = self.compared_tree.take() else {
             return;
         };
+        self.content_method = method;
+        self.content_show_results = show_results;
         self.content_done = 0;
         self.status = Status::Running("Comparing contents");
         let sides = self.sides.clone().unwrap_or_else(|| jobs::Sides {
             left: ca_fs::Source::local(&self.left_path),
             right: ca_fs::Source::local(&self.right_path),
         });
+        let mut selected = BTreeSet::new();
+        selected.extend(self.selection.side(Side::Left).iter().cloned());
+        selected.extend(self.selection.side(Side::Right).iter().cloned());
+        let scope = (!selected.is_empty()).then(|| selected.into_iter().collect());
         self.content_job = Some(jobs::spawn_contents(
             tree,
             sides,
-            self.content_method,
+            method,
+            scope,
             Box::new(self.engine_options()),
             self.notify.clone(),
         ));
+    }
+
+    fn finish_contents_dialog(
+        &mut self,
+        choice: ca_ui::contents::ContentsAction,
+    ) -> Option<ViewAction> {
+        self.contents_dialog = None;
+        let ca_ui::contents::ContentsAction::Start {
+            method,
+            show_results,
+            dont_show_again,
+        } = choice
+        else {
+            return None;
+        };
+        let confirm_dialog = self.confirmations.confirm_content_comparison && !dont_show_again;
+        let options_changed = confirm_dialog != self.confirmations.confirm_content_comparison
+            || show_results != self.confirmations.show_content_results;
+        self.confirmations.confirm_content_comparison = confirm_dialog;
+        self.confirmations.show_content_results = show_results;
+        self.start_content_comparison_run(method, show_results);
+        options_changed.then_some(ViewAction::ContentComparisonOptions {
+            confirm_dialog,
+            show_results,
+        })
     }
 
     /// Start the selected file pair's summary comparison.
@@ -2646,7 +2748,11 @@ impl FolderView {
                         .width(ca_ui::spacing::TOKENS.toolbar.folder_items.method)
                         .selected_text(method_label(method))
                         .show_ui(ui, |ui| {
-                            for option in [ContentMethod::Binary, ContentMethod::Crc32] {
+                            for option in [
+                                ContentMethod::Binary,
+                                ContentMethod::Crc32,
+                                ContentMethod::Rules,
+                            ] {
                                 ui.selectable_value(&mut method, option, method_label(option));
                             }
                         });
@@ -3654,7 +3760,56 @@ impl FolderView {
 
     /// The windows that stand between a command and the disk.
     #[allow(clippy::too_many_lines)]
-    fn overlays(&mut self, ui: &mut egui::Ui) {
+    fn overlays(&mut self, ui: &mut egui::Ui) -> Vec<ViewAction> {
+        let mut actions = Vec::new();
+        let id = self.id;
+        let content_frame = self.contents_dialog.as_mut().map(|state| {
+            self.contents_window.show(ui.ctx(), |host| match host {
+                ca_ui::viewport::Host::Embedded(ctx) => {
+                    state.dialog.show(ctx, id.with("contents-dialog"))
+                }
+                ca_ui::viewport::Host::Native(ui) => state.dialog.body(ui),
+            })
+        });
+        if let Some(frame) = content_frame {
+            let choice = if frame.close_requested {
+                Some(ca_ui::contents::ContentsAction::Cancel)
+            } else {
+                frame.produced
+            };
+            if let Some(choice) = choice {
+                self.contents_window.close(ui.ctx(), frame.native);
+                if let Some(action) = self.finish_contents_dialog(choice) {
+                    actions.push(action);
+                }
+            }
+        }
+        let results_frame = self.contents_results.as_mut().map(|results| {
+            self.contents_results_window
+                .show(ui.ctx(), |host| match host {
+                    ca_ui::viewport::Host::Embedded(ctx) => {
+                        results.show(ctx, id.with("contents-results"))
+                    }
+                    ca_ui::viewport::Host::Native(ui) => results.body(ui),
+                })
+        });
+        if let Some(frame) = results_frame {
+            let action = if frame.close_requested {
+                Some(ca_ui::contents::ResultsAction::Close)
+            } else {
+                frame.produced
+            };
+            match action {
+                Some(ca_ui::contents::ResultsAction::Open { rel, target }) => {
+                    self.open_content_result(&rel, target);
+                }
+                Some(ca_ui::contents::ResultsAction::Close) => {
+                    self.contents_results_window.close(ui.ctx(), frame.native);
+                    self.contents_results = None;
+                }
+                None => {}
+            }
+        }
         let quick_action = self
             .quick_compare
             .as_mut()
@@ -3702,7 +3857,7 @@ impl FolderView {
                     ConfirmChoice::Pending => Stage::Confirming(shown),
                     ConfirmChoice::Confirm => {
                         self.confirm(*shown);
-                        return;
+                        return actions;
                     }
                     ConfirmChoice::Cancel => {
                         self.cancel_confirmation(&shown);
@@ -3732,6 +3887,92 @@ impl FolderView {
             }
             other => other,
         };
+        actions
+    }
+
+    fn open_content_result(&mut self, rel: &Path, target: ca_ui::contents::ResultTarget) {
+        let node = self
+            .compared_tree
+            .as_deref()
+            .and_then(|tree| find_node(tree, rel));
+        let Some(node) = node.filter(|node| !node.is_dir) else {
+            return;
+        };
+        match target {
+            ca_ui::contents::ResultTarget::Pair => {
+                if node.left.is_none() || node.right.is_none() {
+                    return;
+                }
+                let request = pair_request(
+                    &self.left_path,
+                    &self.right_path,
+                    rel,
+                    &self.engine_options().archives,
+                );
+                match self.sides.as_ref().filter(|sides| !sides.are_local()) {
+                    Some(sides) => {
+                        self.extract_job = Some(jobs::spawn_extract(
+                            sides.clone(),
+                            rel.to_path_buf(),
+                            request,
+                            self.notify.clone(),
+                        ));
+                    }
+                    None => self.pending_opens.push(request),
+                }
+            }
+            ca_ui::contents::ResultTarget::Left | ca_ui::contents::ResultTarget::Right => {
+                let (side, source, shown_path, exists) = match target {
+                    ca_ui::contents::ResultTarget::Left => (
+                        jobs::Side::Left,
+                        self.sides.as_ref().map_or_else(
+                            || Source::local(&self.left_path),
+                            |sides| sides.left.clone(),
+                        ),
+                        self.left_path.join(rel),
+                        node.left.is_some(),
+                    ),
+                    ca_ui::contents::ResultTarget::Right => (
+                        jobs::Side::Right,
+                        self.sides.as_ref().map_or_else(
+                            || Source::local(&self.right_path),
+                            |sides| sides.right.clone(),
+                        ),
+                        self.right_path.join(rel),
+                        node.right.is_some(),
+                    ),
+                    ca_ui::contents::ResultTarget::Pair => return,
+                };
+                if !exists {
+                    return;
+                }
+                let request = match side {
+                    jobs::Side::Left => {
+                        OpenRequest::new(SessionKind::TextEdit, shown_path, PathBuf::new())
+                    }
+                    jobs::Side::Right => {
+                        OpenRequest::new(SessionKind::TextEdit, PathBuf::new(), shown_path)
+                    }
+                };
+                if source.is_local_folder() {
+                    let mut request = request;
+                    let path = source.origin().join(rel);
+                    match side {
+                        jobs::Side::Left => request.left = path,
+                        jobs::Side::Right => request.right = path,
+                    }
+                    self.pending_opens.push(request);
+                } else {
+                    self.extract_job = Some(jobs::spawn_extract_single(
+                        source,
+                        rel.to_path_buf(),
+                        request,
+                        side,
+                        self.notify.clone(),
+                    ));
+                }
+            }
+        }
     }
 }
 
@@ -4443,7 +4684,7 @@ impl SessionView for FolderView {
         });
         actions.extend(self.take_pending_opens().into_iter().map(ViewAction::Open));
         self.keyboard(ui);
-        self.overlays(ui);
+        actions.extend(self.overlays(ui));
         actions
     }
 
@@ -4950,6 +5191,62 @@ mod tests {
         assert!(opened.temporaries[0].starts_with(&copies));
     }
 
+    #[test]
+    fn an_orphan_inside_an_archive_opens_in_text_edit_over_one_copy() {
+        const EMPTY_ZIP: &[u8] = &[
+            0x50, 0x4b, 0x05, 0x06, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let zip = dir.path().join("left.zip");
+        std::fs::write(&zip, EMPTY_ZIP).unwrap();
+        let source = ca_fs::Source::archive(&zip, ca_vfs::ArchiveOptions::default()).unwrap();
+        let mut reader: &[u8] = b"orphan bytes";
+        source
+            .file_system()
+            .write_file(
+                &ca_vfs::VfsPath::parse("sub/orphan.txt").unwrap(),
+                &mut reader,
+                &ca_vfs::Cancel::new(),
+            )
+            .unwrap();
+        let rel = Path::new("sub/orphan.txt");
+        let copies = dir.path().join("copies");
+
+        for side in [ca_fs::Side::Left, ca_fs::Side::Right] {
+            let (left, right) = match side {
+                ca_fs::Side::Left => (zip.join(rel), PathBuf::new()),
+                ca_fs::Side::Right => (PathBuf::new(), zip.join(rel)),
+            };
+            let request =
+                ca_ui::view::OpenRequest::new(ca_session::SessionKind::TextEdit, left, right);
+            let opened = crate::jobs::extract_single(
+                &source,
+                rel,
+                &copies,
+                request,
+                match side {
+                    ca_fs::Side::Left => crate::jobs::Side::Left,
+                    ca_fs::Side::Right => crate::jobs::Side::Right,
+                },
+                &ca_ui::worker::Cancel::new(),
+            )
+            .unwrap();
+            assert_eq!(opened.kind, ca_session::SessionKind::TextEdit);
+            assert!(opened.read_only);
+            assert_eq!(opened.temporaries.len(), 1);
+            match side {
+                ca_fs::Side::Left => {
+                    assert!(opened.right.as_os_str().is_empty());
+                    assert_eq!(std::fs::read(&opened.left).unwrap(), b"orphan bytes");
+                }
+                ca_fs::Side::Right => {
+                    assert!(opened.left.as_os_str().is_empty());
+                    assert_eq!(std::fs::read(&opened.right).unwrap(), b"orphan bytes");
+                }
+            }
+        }
+    }
+
     /// Windows reads a path whose last name is `NUL` as the null device.
     #[test]
     fn an_archive_entry_with_a_device_name_is_copied_out_with_its_bytes() {
@@ -5001,7 +5298,7 @@ mod tests {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod quick_compare_tests {
-    use super::FolderView;
+    use super::{find_node, FolderView};
     use crate::selection::ClickKind;
     use ca_fs::{ContentMethod, Side};
     use ca_ui::view::SessionView;
@@ -5054,6 +5351,114 @@ mod quick_compare_tests {
             assert!(Instant::now() < deadline, "quick comparison did not finish");
             std::thread::sleep(Duration::from_millis(2));
         }
+    }
+
+    #[test]
+    fn compare_contents_dialog_runs_selected_scope_and_opens_grouped_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let left = dir.path().join("left");
+        let right = dir.path().join("right");
+        for folder in [
+            left.join("sub"),
+            right.join("sub"),
+            left.join("outside"),
+            right.join("outside"),
+        ] {
+            std::fs::create_dir_all(folder).unwrap();
+        }
+        std::fs::write(left.join("sub/differs.txt"), b"left").unwrap();
+        std::fs::write(right.join("sub/differs.txt"), b"right").unwrap();
+        std::fs::write(left.join("sub/only-left.txt"), b"orphan").unwrap();
+        std::fs::write(right.join("sub/only-right.txt"), b"orphan").unwrap();
+        std::fs::write(left.join("outside/same.txt"), b"same").unwrap();
+        std::fs::write(right.join("outside/same.txt"), b"same").unwrap();
+
+        let mut view = view(dir.path());
+        select(&mut view, Side::Left, Path::new("sub"), ClickKind::Replace);
+        assert!(view.accepts(ca_ui::Command::CompareContents));
+        view.run(ca_ui::Command::CompareContents);
+        assert_eq!(
+            view.contents_dialog
+                .as_ref()
+                .map(|state| state.dialog.method()),
+            Some(ContentMethod::Binary)
+        );
+        assert!(view.content_job.is_none());
+
+        let action = view.finish_contents_dialog(ca_ui::contents::ContentsAction::Start {
+            method: ContentMethod::Binary,
+            show_results: true,
+            dont_show_again: true,
+        });
+        assert_eq!(
+            action,
+            Some(ca_ui::view::ViewAction::ContentComparisonOptions {
+                confirm_dialog: false,
+                show_results: true,
+            })
+        );
+
+        let deadline = Instant::now() + PATIENCE;
+        while view.content_job.is_some() && Instant::now() < deadline {
+            view.tick();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(
+            view.content_job.is_none(),
+            "content comparison did not finish"
+        );
+        assert_eq!(view.content_done, 1);
+        let results = view.contents_results.as_ref().unwrap().rows();
+        assert_eq!(results.len(), 3);
+        assert!(results.iter().any(|row| {
+            row.rel == Path::new("sub/differs.txt")
+                && row.group == ca_ui::contents::ResultGroup::Different
+                && row.target == ca_ui::contents::ResultTarget::Pair
+        }));
+        assert!(results.iter().any(|row| {
+            row.rel == Path::new("sub/only-left.txt")
+                && row.group == ca_ui::contents::ResultGroup::LeftOrphan
+                && row.target == ca_ui::contents::ResultTarget::Left
+        }));
+        assert!(results.iter().any(|row| {
+            row.rel == Path::new("sub/only-right.txt")
+                && row.group == ca_ui::contents::ResultGroup::RightOrphan
+                && row.target == ca_ui::contents::ResultTarget::Right
+        }));
+        let tree = view.compared_tree.as_deref().unwrap();
+        assert!(find_node(tree, Path::new("outside/same.txt"))
+            .unwrap()
+            .content
+            .is_none());
+
+        view.open_content_result(
+            Path::new("sub/differs.txt"),
+            ca_ui::contents::ResultTarget::Pair,
+        );
+        let opened = view.take_pending_opens();
+        assert_eq!(opened.len(), 1);
+        assert_eq!(opened[0].left, left.join("sub/differs.txt"));
+        assert_eq!(opened[0].right, right.join("sub/differs.txt"));
+
+        view.open_content_result(
+            Path::new("sub/only-left.txt"),
+            ca_ui::contents::ResultTarget::Left,
+        );
+        let opened = view.take_pending_opens();
+        assert_eq!(opened.len(), 1);
+        assert_eq!(opened[0].kind, ca_session::SessionKind::TextEdit);
+        assert_eq!(opened[0].left, left.join("sub/only-left.txt"));
+        assert!(opened[0].right.as_os_str().is_empty());
+
+        view.open_content_result(
+            Path::new("sub/only-right.txt"),
+            ca_ui::contents::ResultTarget::Right,
+        );
+        let opened = view.take_pending_opens();
+        assert_eq!(opened.len(), 1);
+        assert_eq!(opened[0].kind, ca_session::SessionKind::TextEdit);
+        assert!(opened[0].left.as_os_str().is_empty());
+        assert_eq!(opened[0].right, right.join("sub/only-right.txt"));
     }
 
     #[test]
@@ -5874,6 +6279,7 @@ mod stale_results {
             emitter.send(ContentMessage::Done {
                 tree: None,
                 complete: true,
+                results: Vec::new(),
             });
         }));
         let deadline = Instant::now() + PATIENCE;

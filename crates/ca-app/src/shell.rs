@@ -3894,6 +3894,16 @@ impl App {
             match action {
                 ViewAction::Open(request) => self.open(&request, context),
                 ViewAction::OpenHome => self.open_home(context),
+                ViewAction::ContentComparisonOptions {
+                    confirm_dialog,
+                    show_results,
+                } => {
+                    if let Some(options) = self.options.options_mut() {
+                        options.file_operations.confirm_content_comparison = confirm_dialog;
+                        options.file_operations.show_content_results = show_results;
+                        self.options.save();
+                    }
+                }
                 ViewAction::Close => {
                     self.drop_pending_workspace();
                     self.close_tab(self.active);
@@ -5461,6 +5471,26 @@ mod tests {
         let dir = settings();
         let app = App::in_directories(dir.path().to_path_buf(), dir.path().join("journals"));
         (dir, app)
+    }
+
+    #[test]
+    fn content_comparison_choices_are_saved_as_program_options() {
+        let (_settings, mut app) = empty_app();
+        frame_until(&mut app, |app| app.options().is_ready());
+        app.apply(
+            vec![ViewAction::ContentComparisonOptions {
+                confirm_dialog: false,
+                show_results: true,
+            }],
+            &context(),
+        );
+        frame_until(&mut app, |app| {
+            app.options().state() == ca_ui::options::OptionsState::Ready
+        });
+        let saved = std::fs::read_to_string(app.options().path()).unwrap();
+        let options: ca_session::options::ProgramOptions = serde_json::from_str(&saved).unwrap();
+        assert!(!options.file_operations.confirm_content_comparison);
+        assert!(options.file_operations.show_content_results);
     }
 
     /// A window built from `startup`, over a settings directory of its own.

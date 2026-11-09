@@ -12,6 +12,7 @@
 
 pub mod clipboard;
 pub mod command;
+pub mod contents;
 pub mod dialog;
 pub mod editor;
 pub mod filter;

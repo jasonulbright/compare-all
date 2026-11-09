@@ -461,6 +461,10 @@ pub struct FileOperationOptions {
     pub confirm_merge: bool,
     /// Ask before a delete.
     pub confirm_delete: bool,
+    /// Ask before starting a folder content comparison.
+    pub confirm_content_comparison: bool,
+    /// Open a results window after a folder content comparison.
+    pub show_content_results: bool,
     /// What a confirmation raised during a synchronize answers.
     pub synchronize_confirmations: SynchronizeConfirmations,
     /// Hidden items take part in file operations.
@@ -477,6 +481,8 @@ impl Default for FileOperationOptions {
             confirm_move: true,
             confirm_merge: true,
             confirm_delete: true,
+            confirm_content_comparison: true,
+            show_content_results: false,
             synchronize_confirmations: SynchronizeConfirmations::default(),
             include_hidden_items: false,
             unknown: BTreeMap::new(),

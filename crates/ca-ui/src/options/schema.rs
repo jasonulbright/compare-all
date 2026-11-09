@@ -677,6 +677,14 @@ const FILE_OPERATION_FIELDS: &[OptionField] = &[
     flag!(file_operations.confirm_move, "Confirm a move"),
     flag!(file_operations.confirm_merge, "Confirm a merge"),
     flag!(file_operations.confirm_delete, "Confirm a delete"),
+    flag!(
+        file_operations.confirm_content_comparison,
+        "Ask before comparing file contents"
+    ),
+    flag!(
+        file_operations.show_content_results,
+        "Show content comparison results"
+    ),
     choice!(
         file_operations.synchronize_confirmations,
         SynchronizeConfirmations,

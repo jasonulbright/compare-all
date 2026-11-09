@@ -108,6 +108,13 @@ pub enum ViewAction {
     Open(OpenRequest),
     /// Open a tab showing the launcher.
     OpenHome,
+    /// Store the folder content-comparison dialog choices.
+    ContentComparisonOptions {
+        /// Ask before the next content comparison.
+        confirm_dialog: bool,
+        /// Open a results window after the comparison.
+        show_results: bool,
+    },
     /// Close the tab this view occupies.
     Close,
 }
