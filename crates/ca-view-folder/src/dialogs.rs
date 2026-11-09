@@ -25,6 +25,8 @@ const BODY_HEIGHT: f32 = 260.0;
 pub enum ConfirmChoice {
     /// Neither button was pressed this frame.
     Pending,
+    /// Rebuild the plan after a destructive scope changed.
+    Replan,
     /// Carry the plan out.
     Confirm,
     /// Leave everything as it is.
@@ -79,6 +81,8 @@ pub fn confirm(
         operation.dialog_title()
     };
     modal(ui, id, title, |ui| {
+        let original_delete_scope = form.delete_scope;
+        let mut delete_scope_changed = false;
         if revised {
             wrapped_text(
                 ui,
@@ -102,24 +106,34 @@ pub fn confirm(
             .max_height(BODY_HEIGHT)
             .show(ui, |ui| {
                 options_for(ui, operation, form, offset_seconds, is_sync);
+                delete_scope_changed =
+                    operation == Operation::Delete && form.delete_scope != original_delete_scope;
                 conflicts(ui, plan);
                 steps(ui, plan);
             });
         ui.separator();
         let mut choice = ConfirmChoice::Pending;
         ui.horizontal_wrapped(|ui| {
-            let allowed = !plan.steps.is_empty();
+            let allowed = !plan.steps.is_empty() && !delete_scope_changed;
             let confirm = ui.add_enabled(
                 allowed,
                 egui::Button::new(confirm_label(operation, is_sync)),
             );
+            let confirm_clicked = confirm.clicked();
             if !allowed {
-                let _ = ca_ui::widgets::disabled_reason(confirm, "There is nothing to carry out");
-            } else if confirm.clicked() {
-                choice = ConfirmChoice::Confirm;
+                let reason = if delete_scope_changed {
+                    "The delete scope changed; the plan is being refreshed"
+                } else {
+                    "There is nothing to carry out"
+                };
+                let _ = ca_ui::widgets::disabled_reason(confirm, reason);
             }
             if ui.button("Cancel").clicked() {
                 choice = ConfirmChoice::Cancel;
+            } else if delete_scope_changed {
+                choice = ConfirmChoice::Replan;
+            } else if confirm_clicked {
+                choice = ConfirmChoice::Confirm;
             }
         });
         choice
@@ -761,6 +775,46 @@ mod tests {
         probe.click("Left side", &mut run).unwrap();
         probe.click("Right side", &mut run).unwrap();
         assert_eq!(form.delete_scope, None);
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn an_empty_delete_plan_replans_when_a_side_is_checked() {
+        use super::ConfirmChoice;
+        use crate::operations::{Form, Operation};
+        use crate::selection::Scope;
+
+        let mut probe = ca_ui::testing::probe::Probe::new(800.0, 500.0);
+        let plan = ca_fs::OperationPlan::new(
+            ca_fs::OperationKind::Delete,
+            Vec::new(),
+            ca_fs::OperationOptions::default(),
+        );
+        let mut form = Form {
+            delete_scope: None,
+            ..Form::default()
+        };
+        let mut replan_requested = false;
+        let mut run = |ctx: &egui::Context| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                replan_requested |= super::confirm(
+                    ui,
+                    egui::Id::new("delete-confirm"),
+                    Operation::Delete,
+                    &plan,
+                    &mut form,
+                    0,
+                    false,
+                ) == ConfirmChoice::Replan;
+            });
+        };
+
+        probe.idle(&mut run);
+        probe.idle(&mut run);
+        probe.click("Left side", &mut run).unwrap();
+
+        assert_eq!(form.delete_scope, Some(Scope::Left));
+        assert!(replan_requested);
     }
 
     #[test]

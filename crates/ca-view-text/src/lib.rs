@@ -4056,6 +4056,10 @@ impl TextView {
         if let Some(revision) = self.discard_after_save[1].take() {
             self.right_pane.buffer_mut().mark_saved_revision(revision);
         }
+        if self.left_pane.is_modified() || self.right_pane.is_modified() {
+            self.abandon_save_sequence();
+            return;
+        }
         self.save_both_pending = false;
         self.reread_when_saved();
     }
@@ -7605,6 +7609,33 @@ mod tests {
         assert_eq!(std::fs::read(&left).unwrap(), b"left");
         assert_eq!(std::fs::read(&right).unwrap(), b"saved right");
         assert!(view.pane(Side::Left).is_modified());
+        assert!(!view.close_requested);
+    }
+
+    #[test]
+    fn a_later_unchecked_text_edit_abandons_the_deferred_reread() {
+        use super::{Reread, Side, TextView};
+
+        let mut view = TextView::from_data(
+            PathBuf::from("left.txt"),
+            PathBuf::from("right.txt"),
+            &ca_ui::testing::context(),
+            1,
+            crate::jobs::TextData::default(),
+        );
+        view.left_pane.buffer_mut().insert(0, "before");
+        let discarded_revision = view.left_pane.buffer().revision();
+        view.left_pane.buffer_mut().insert(0, "later ");
+        view.discard_after_save[0] = Some(discarded_revision);
+        view.reread_after_save = Some(Reread::Reload);
+        view.pending_settings = Some(Box::default());
+
+        view.finish_save_sequence();
+
+        assert!(view.pane(Side::Left).is_modified());
+        assert!(view.reread_after_save.is_none());
+        assert!(view.pending_settings.is_none());
+        assert!(!view.close_requested);
     }
 
     #[test]

@@ -673,6 +673,10 @@ impl TableView {
         if let Some(revision) = self.discard_after_save[1].take() {
             self.right_text.mark_saved_revision(revision);
         }
+        if self.left_text.is_modified() || self.right_text.is_modified() {
+            self.abandon_save_sequence();
+            return;
+        }
         self.save_both_pending = false;
         self.reread_when_saved();
     }
@@ -1580,6 +1584,26 @@ mod tests {
             b"id,name\r\n1,Right edit\r\n2,Bob\r\n"
         );
         assert!(view.is_modified(Side::Left));
+        assert!(!view.close_requested);
+    }
+
+    #[test]
+    fn a_later_unchecked_table_edit_abandons_the_deferred_reread() {
+        let (_dir, left, right) = files(CSV, CSV);
+        let mut view = open(&left, &right);
+        view.left_text.replace(vec![(0..0, "before".to_owned())]);
+        let discarded_revision = view.left_text.revision();
+        view.left_text.replace(vec![(0..0, "later ".to_owned())]);
+        view.discard_after_save[0] = Some(discarded_revision);
+        view.reread_after_save = Some(ca_ui::save::Reread::Reload);
+        view.pending_settings = Some(Box::new(super::jobs::TableSettings::default()));
+
+        view.finish_save_sequence();
+
+        assert!(view.is_modified(Side::Left));
+        assert!(view.reread_after_save.is_none());
+        assert!(view.pending_settings.is_none());
+        assert!(!view.close_requested);
     }
 
     /// Reload and Swap Sides read both files again, so an edit that is not

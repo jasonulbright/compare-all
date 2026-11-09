@@ -1124,6 +1124,10 @@ impl HexView {
         if let Some(revision) = self.discard_after_save[1].take() {
             self.right_bytes.mark_saved_revision(revision);
         }
+        if self.left_bytes.is_modified() || self.right_bytes.is_modified() {
+            self.abandon_save_sequence();
+            return;
+        }
         self.save_both_pending = false;
         self.reread_when_saved();
     }
@@ -3562,6 +3566,29 @@ mod tests {
         assert!(!left.exists());
         assert_eq!(std::fs::read(&right).unwrap(), [2]);
         assert!(view.left_bytes.is_modified());
+        assert!(!view.close_requested);
+    }
+
+    #[test]
+    fn a_later_unchecked_hex_edit_abandons_the_deferred_reread() {
+        let mut view = HexView::from_data(
+            PathBuf::from("left.bin"),
+            PathBuf::from("right.bin"),
+            &context(),
+            1,
+            crate::jobs::HexData::default(),
+        );
+        view.left_bytes.replace(0, 0, &[1]);
+        let discarded_revision = view.left_bytes.revision();
+        view.left_bytes.replace(0, 0, &[2]);
+        view.discard_after_save[0] = Some(discarded_revision);
+        view.reread_after_save = Some(super::Reread::Reload);
+
+        view.finish_save_sequence();
+
+        assert!(view.left_bytes.is_modified());
+        assert!(view.reread_after_save.is_none());
+        assert!(!view.close_requested);
     }
 
     #[test]

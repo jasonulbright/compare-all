@@ -3894,7 +3894,7 @@ impl FolderView {
                 );
                 match choice {
                     ConfirmChoice::Pending => Stage::Confirming(shown),
-                    ConfirmChoice::Confirm => {
+                    ConfirmChoice::Replan | ConfirmChoice::Confirm => {
                         self.confirm(*shown);
                         return actions;
                     }
