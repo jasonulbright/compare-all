@@ -302,16 +302,19 @@ pub struct TableView {
     clipboard_asked: Option<Side>,
 }
 
+fn workbook_read_only_reason(left: &Path, right: &Path) -> Option<&'static str> {
+    (jobs::is_workbook_path(left) || jobs::is_workbook_path(right))
+        .then_some("Spreadsheet files are read-only in Table Compare.")
+}
+
 impl TableView {
     /// A tab over the two sides, with the comparison already started.
     #[must_use]
     pub fn new(left: PathBuf, right: PathBuf, context: &ViewContext, instance: u64) -> Self {
         let read_only = jobs::is_workbook_path(&left) || jobs::is_workbook_path(&right);
-        let read_only_reason = if read_only {
-            "Spreadsheet files are read-only in Table Compare."
-        } else {
-            "The file is a copy taken out of an archive, so it cannot be edited or saved."
-        };
+        let read_only_reason = workbook_read_only_reason(&left, &right).unwrap_or(
+            "The file is a copy taken out of an archive, so it cannot be edited or saved.",
+        );
         let mut view = Self {
             id: egui::Id::new(("table-compare", instance)),
             specs: ca_session::settings::SpecsSettings::default(),
