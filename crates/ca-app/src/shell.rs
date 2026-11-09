@@ -4622,7 +4622,7 @@ impl App {
                     let current = ui.button("Close Current Tab");
                     let cancel = ui.button("Cancel");
                     if self.exit_question_focus_requested {
-                        close.request_focus();
+                        cancel.request_focus();
                         self.exit_question_focus_requested = false;
                     }
                     if close.clicked() {
@@ -6793,6 +6793,36 @@ mod tests {
                 .tabs
                 .confirm_closing_several_tabs
         );
+    }
+
+    #[test]
+    fn enter_keeps_the_safe_tab_close_choice() {
+        use ca_ui::testing::probe::Probe;
+
+        let (_settings, mut app) = empty_app();
+        app.push(Box::new(TemporaryView));
+        app.push(Box::new(TemporaryView));
+        app.exit_question = true;
+        app.exit_question_focus_requested = true;
+
+        let mut probe = Probe::new(800.0, 400.0);
+        let mut draw = |ctx: &egui::Context| app.exit_question_panel(ctx);
+        probe.idle(&mut draw);
+        probe.idle(&mut draw);
+        probe.frame(
+            vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            &mut draw,
+        );
+
+        assert_eq!(app.tab_count(), 2);
+        assert!(!app.is_closing());
+        assert!(!app.exit_question);
     }
 
     #[test]

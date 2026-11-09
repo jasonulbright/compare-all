@@ -1841,7 +1841,7 @@ impl FolderView {
             Operation::MoveToOtherSide | Operation::MoveToFolder | Operation::Exchange => {
                 options.confirm_move
             }
-            Operation::Delete => options.confirm_delete,
+            Operation::Delete => options.confirm_delete || options.require_explicit_delete_side,
             _ => true,
         }
     }
@@ -5784,6 +5784,16 @@ mod stale_results {
         );
         assert!(poll_until(&mut view, FolderView::is_ready));
         view
+    }
+
+    #[test]
+    fn explicit_delete_side_selection_keeps_the_confirmation_dialog() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut view = ready_view(dir.path());
+        view.confirmations.confirm_delete = false;
+        view.confirmations.require_explicit_delete_side = true;
+
+        assert!(view.asks_before(super::Operation::Delete));
     }
 
     #[test]

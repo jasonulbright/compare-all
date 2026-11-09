@@ -1144,7 +1144,11 @@ impl MergeView {
                     self.close_after_save = false;
                 } else if self.close_after_save {
                     self.close_after_save = false;
-                    self.closing = true;
+                    if self.is_modified() {
+                        self.question = Some(Question::CloseModified);
+                    } else {
+                        self.closing = true;
+                    }
                 }
             }
             SaveOutcome::ChangedOnDisk => self.question = Some(Question::OverwriteChanged),
@@ -5007,6 +5011,32 @@ mod tests {
 
         assert!(view.closing);
         assert_eq!(std::fs::read(dir.path().join("out.txt")).unwrap(), b"xa\n");
+    }
+
+    #[test]
+    fn an_edit_during_checked_close_save_keeps_the_merge_tab_open() {
+        let (mut view, _dir) = open("a\n", None, "a\n");
+        run_until_ready(&mut view);
+        view.output_pane.buffer_mut().insert(0, "first ");
+        let saved_output = view.output_pane.buffer().text().clone();
+        view.saving_revision = Some(view.output_pane.buffer().revision());
+        view.close_after_save = true;
+        view.output_pane.buffer_mut().insert(0, "later ");
+
+        view.finish_save(
+            ca_ui::save::SaveOutcome::Saved(ca_ui::save::Stamp {
+                size: 0,
+                modified: None,
+                identity: None,
+            }),
+            saved_output,
+            Vec::new(),
+        );
+
+        assert!(view.is_modified());
+        assert!(!view.closing);
+        assert!(!view.close_after_save);
+        assert_eq!(view.question(), Some(&Question::CloseModified));
     }
 
     #[test]

@@ -246,6 +246,7 @@ pub struct TableView {
     /// own consent to these and never grants another.
     saving_consent: ca_ui::save::text::SaveConsent,
     save_both_pending: bool,
+    discard_after_save: [Option<u64>; 2],
     save_selection: ca_ui::save::SaveSelection,
     prompt: Option<editing::Prompt>,
     close_requested: bool,
@@ -348,6 +349,7 @@ impl TableView {
             saving_as: None,
             saving_consent: ca_ui::save::text::SaveConsent::default(),
             save_both_pending: false,
+            discard_after_save: [None, None],
             save_selection: ca_ui::save::SaveSelection::default(),
             prompt: None,
             close_requested: false,

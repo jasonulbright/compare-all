@@ -452,6 +452,17 @@ pub enum Reread {
 }
 
 impl Reread {
+    /// Describe the action that follows a save or discard answer.
+    #[must_use]
+    pub const fn action_description(self) -> &'static str {
+        match self {
+            Self::Reload => "reload the files",
+            Self::Open => "open the selected paths",
+            Self::SwapSides => "swap the files",
+            Self::Settings => "apply the changed comparison settings",
+        }
+    }
+
     /// The label of the button that writes the edits first.
     #[must_use]
     pub const fn save_label(self) -> &'static str {
@@ -575,8 +586,8 @@ pub fn spawn_with(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::{
-        needs_close_prompt, save, Baseline, CloseChoice, FileSystem, SaveOutcome, SaveSelection,
-        Stamp, UnsavedAnswer,
+        needs_close_prompt, save, Baseline, CloseChoice, FileSystem, Reread, SaveOutcome,
+        SaveSelection, Stamp, UnsavedAnswer,
     };
     use std::collections::HashMap;
     use std::io;
@@ -608,6 +619,17 @@ mod tests {
         assert_eq!(probe.find("Left file").unwrap().toggled, Some(false));
         probe.click("Save Checked", &mut run).unwrap();
         assert_eq!(answer, Some(UnsavedAnswer::SaveChecked));
+    }
+
+    #[test]
+    fn reread_actions_name_the_follow_up() {
+        assert_eq!(Reread::Reload.action_description(), "reload the files");
+        assert_eq!(Reread::Open.action_description(), "open the selected paths");
+        assert_eq!(Reread::SwapSides.action_description(), "swap the files");
+        assert_eq!(
+            Reread::Settings.action_description(),
+            "apply the changed comparison settings"
+        );
     }
 
     #[derive(Default)]

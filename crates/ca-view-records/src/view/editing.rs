@@ -257,6 +257,7 @@ pub struct EditState {
     pub(super) message: Option<String>,
     pub(super) work: Option<Job<EditMessage>>,
     pub(super) pending_saves: Vec<Side>,
+    pub(super) discard_unchecked: [bool; 2],
     pub(super) save_selection: ca_ui::save::SaveSelection,
     pub(super) journal_directory: PathBuf,
     pub(super) close_requested: bool,
@@ -280,6 +281,7 @@ impl EditState {
             message: None,
             work: None,
             pending_saves: Vec::new(),
+            discard_unchecked: [false, false],
             save_selection: ca_ui::save::SaveSelection::default(),
             journal_directory: ca_ui::paths::journal_directory(),
             close_requested: false,
@@ -1106,26 +1108,45 @@ impl RecordsView {
         }
         if self.editing_off() {
             self.edit.pending_saves.clear();
+            self.abandon_checked_saves();
             self.edit.message = Some(EDITING_OFF.to_owned());
             return;
         }
         let Some(side) = self.edit.pending_saves.first().copied() else {
+            self.finish_checked_saves();
             return;
         };
         self.edit.pending_saves.remove(0);
         self.save_side(side, false);
     }
 
+    fn finish_checked_saves(&mut self) {
+        for side in [Side::Left, Side::Right] {
+            if self.edit.discard_unchecked[index(side)] {
+                self.edit.history.mark_saved(side);
+            }
+        }
+        self.edit.discard_unchecked = [false, false];
+    }
+
+    fn abandon_checked_saves(&mut self) {
+        self.edit.pending_saves.clear();
+        self.edit.discard_unchecked = [false, false];
+        self.edit.close_requested = false;
+    }
+
     /// Start writing `side` to its source.
     fn save_side(&mut self, side: Side, accept_disk_change: bool) {
         let Some(model) = self.model(side).cloned() else {
+            self.abandon_checked_saves();
+            self.edit.message = Some(format!("{} has no saved model to write.", label(side)));
             return;
         };
         let notify = Arc::clone(&self.notify);
         if self.is_live(side) {
             if !live::is_available() {
                 self.edit.message = Some(LIVE_UNAVAILABLE.to_owned());
-                self.edit.pending_saves.clear();
+                self.abandon_checked_saves();
                 return;
             }
             let before = self.edit.written[index(side)]
@@ -1186,6 +1207,8 @@ impl RecordsView {
         }
         self.edit.prompt = None;
         let Some(spec) = self.side_data(side).and_then(|data| data.live.clone()) else {
+            self.abandon_checked_saves();
+            self.edit.message = Some(format!("{} is no longer available to write.", label(side)));
             return;
         };
         let consent = WriteConsent {
@@ -1203,11 +1226,8 @@ impl RecordsView {
 
     /// Answer no to the question the view waits on.
     pub fn cancel_prompt(&mut self) {
-        if matches!(self.edit.prompt, Some(Prompt::Closing)) {
-            self.edit.close_requested = false;
-        }
         self.edit.prompt = None;
-        self.edit.pending_saves.clear();
+        self.abandon_checked_saves();
     }
 
     /// Overwrite a file that changed on disk since it was read.
@@ -1290,8 +1310,7 @@ impl RecordsView {
                 if let Some(now) = now {
                     self.edit.written[index(side)] = Some(now);
                 }
-                self.edit.pending_saves.clear();
-                self.edit.close_requested = false;
+                self.abandon_checked_saves();
                 self.edit.message = Some(match backup {
                     Some(path) => format!(
                         "{}: the live write stopped: {reason}. Restore file: {}",
@@ -1310,7 +1329,7 @@ impl RecordsView {
                 });
             }
             EditMessage::Failed(reason) => {
-                self.edit.pending_saves.clear();
+                self.abandon_checked_saves();
                 self.edit.message = Some(reason);
             }
         }
@@ -1331,8 +1350,7 @@ impl RecordsView {
                         "Saved, but another version was kept at {backup}. Review it."
                     ));
                     self.edit.prompt = Some(Prompt::KeptCopy(backup));
-                    self.edit.pending_saves.clear();
-                    self.edit.close_requested = false;
+                    self.abandon_checked_saves();
                 } else {
                     self.edit.message = Some(format!("{} written.", label(side)));
                     self.save_next();
@@ -1340,8 +1358,7 @@ impl RecordsView {
             }
             SaveOutcome::ChangedOnDisk => self.edit.prompt = Some(Prompt::DiskChanged(side)),
             other => {
-                self.edit.pending_saves.clear();
-                self.edit.close_requested = false;
+                self.abandon_checked_saves();
                 self.edit.message = Some(format!(
                     "{}: save failed: {}",
                     label(side),
@@ -1470,12 +1487,15 @@ impl RecordsView {
 
     /// Write checked files and discard unchecked edits before closing.
     fn save_checked_and_close(&mut self) {
-        if !self.edit.save_selection.left {
-            self.edit.history.mark_saved(Side::Left);
-        }
-        if !self.edit.save_selection.right {
-            self.edit.history.mark_saved(Side::Right);
-        }
+        self.prepare_checked_saves();
+        self.save_next();
+    }
+
+    fn prepare_checked_saves(&mut self) {
+        self.edit.discard_unchecked = [
+            !self.edit.save_selection.left && self.edit.history.is_modified(Side::Left),
+            !self.edit.save_selection.right && self.edit.history.is_modified(Side::Right),
+        ];
         self.edit.pending_saves = [Side::Left, Side::Right]
             .into_iter()
             .filter(|side| {
@@ -1488,7 +1508,6 @@ impl RecordsView {
             .collect();
         self.edit.prompt = None;
         self.edit.close_requested = true;
-        self.save_next();
     }
 
     /// True when a side with unwritten edits is a live key, which a close
@@ -1797,7 +1816,7 @@ mod tests {
     use crate::model::Side;
     use crate::testing;
     use crate::RecordsView;
-    use ca_records::registry::plan::LiveStep;
+    use ca_records::registry::plan::{EditOp, LiveStep, Side as PlanSide, StepCounts};
     use ca_records::registry::{RegFile, RegFileVersion, RegistrySpec};
     use ca_ui::testing::{context, wait_until};
     use ca_ui::{Command, SessionView};
@@ -1842,6 +1861,58 @@ mod tests {
         view.cancel_prompt();
         assert!(view.prompt().is_none());
         assert!(!view.is_writing());
+    }
+
+    #[test]
+    fn a_cancelled_checked_registry_save_keeps_unchecked_edits_modified() {
+        let dir = tempfile::tempdir().unwrap();
+        let (left, right) = testing::registry_pair(dir.path());
+        let mut view = RecordsView::new(Flavor::Registry, left, right, &context(), 32);
+        assert!(wait_until(Duration::from_secs(30), || {
+            view.poll();
+            view.has_comparison()
+        }));
+
+        view.edit.history.push(vec![EditOp::create_key(
+            PlanSide::Left,
+            r"HKEY_CURRENT_USER\Software\compare-all-tests\checked",
+        )]);
+        view.edit.history.push(vec![EditOp::create_key(
+            PlanSide::Right,
+            r"HKEY_CURRENT_USER\Software\compare-all-tests\unchecked",
+        )]);
+        view.edit.save_selection.left = true;
+        view.edit.save_selection.right = false;
+        view.prepare_checked_saves();
+
+        assert_eq!(view.edit.pending_saves, [Side::Left]);
+        assert!(view.edit.discard_unchecked[1]);
+        assert!(view.is_modified(Side::Right));
+
+        let steps = Arc::new(vec![LiveStep::CreateKey {
+            key_path: r"HKEY_CURRENT_USER\Software\compare-all-tests\checked\X".to_owned(),
+        }]);
+        view.edit.prompt = Some(Prompt::ConfirmLive {
+            side: Side::Left,
+            base: r"HKEY_CURRENT_USER\Software\compare-all-tests\checked".to_owned(),
+            hive: "HKEY_CURRENT_USER",
+            counts: StepCounts::of(steps.as_ref()),
+            steps,
+            target: Arc::new(RegFile::empty(RegFileVersion::V5)),
+            protected: false,
+            first_given: false,
+        });
+        view.cancel_prompt();
+
+        assert!(view.is_modified(Side::Right));
+        assert!(!view.edit.close_requested);
+        assert_eq!(view.edit.discard_unchecked, [false, false]);
+
+        view.prepare_checked_saves();
+        view.receive(EditMessage::Failed("write stopped".to_owned()));
+        assert!(view.is_modified(Side::Right));
+        assert!(!view.edit.close_requested);
+        assert_eq!(view.edit.discard_unchecked, [false, false]);
     }
 
     #[test]

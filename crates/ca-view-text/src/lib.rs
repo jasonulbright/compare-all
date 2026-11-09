@@ -465,6 +465,7 @@ pub struct TextView {
     /// own consent to these and never grants another.
     saving_consent: SaveConsent,
     save_both_pending: bool,
+    discard_after_save: [Option<u64>; 2],
     save_selection: ca_ui::save::SaveSelection,
     prompt: Option<Prompt>,
     close_requested: bool,
@@ -783,6 +784,7 @@ impl TextView {
             saving_as: None,
             saving_consent: SaveConsent::default(),
             save_both_pending: false,
+            discard_after_save: [None, None],
             save_selection: ca_ui::save::SaveSelection::default(),
             prompt: None,
             close_requested: false,
@@ -2704,8 +2706,7 @@ impl TextView {
             } else {
                 self.saving = None;
                 self.saving_as = None;
-                self.save_both_pending = false;
-                self.forget_reread();
+                self.abandon_save_sequence();
             }
         }
     }
@@ -2757,9 +2758,7 @@ impl TextView {
                 self.saving = None;
                 if let Some(backup) = conflict_backup {
                     self.prompt = Some(Prompt::KeptCopy(backup));
-                    self.save_both_pending = false;
-                    self.close_requested = false;
-                    self.forget_reread();
+                    self.abandon_save_sequence();
                 } else {
                     if self.save_both_pending {
                         self.save_both();
@@ -2779,14 +2778,12 @@ impl TextView {
                 self.pane_mut(side).set_read_only(true);
                 self.message = Some("The file cannot be written, so the pane is read-only.".into());
                 self.saving = None;
-                self.save_both_pending = false;
-                self.forget_reread();
+                self.abandon_save_sequence();
             }
             SaveOutcome::Failed(reason) => {
                 self.message = Some(format!("The file was not written: {reason}"));
                 self.saving = None;
-                self.save_both_pending = false;
-                self.forget_reread();
+                self.abandon_save_sequence();
             }
         }
     }
@@ -2799,7 +2796,7 @@ impl TextView {
     fn save_side_to(&mut self, side: Side, consent: SaveConsent, save_as: Option<PathBuf>) {
         if self.editing_off() {
             self.message = Some("Editing is turned off for this session".to_owned());
-            self.save_both_pending = false;
+            self.abandon_save_sequence();
             return;
         }
         if matches!(self.prompt, Some(Prompt::KeptCopy(_))) {
@@ -3862,18 +3859,15 @@ impl TextView {
     fn answer_save_selection(&mut self, answer: ca_ui::save::UnsavedAnswer) {
         match answer {
             ca_ui::save::UnsavedAnswer::SaveChecked => {
-                if !self.save_selection.left {
-                    self.left_pane.mark_saved();
-                }
-                if !self.save_selection.right {
-                    self.right_pane.mark_saved();
-                }
+                self.mark_unchecked_for_discard();
                 self.answer_unsaved(CloseChoice::Save);
             }
             ca_ui::save::UnsavedAnswer::DiscardAll => {
+                self.discard_after_save = [None, None];
                 self.answer_unsaved(CloseChoice::Discard);
             }
             ca_ui::save::UnsavedAnswer::Cancel => {
+                self.discard_after_save = [None, None];
                 self.answer_unsaved(CloseChoice::Cancel);
             }
         }
@@ -3890,9 +3884,11 @@ impl TextView {
                 "The file changed on disk since it was read. Overwrite it?".to_owned()
             }
             Prompt::WouldLose(_, reason) => reason.clone(),
-            Prompt::Closing | Prompt::Reread(_) => {
-                "This tab has edits that are not written.".to_owned()
-            }
+            Prompt::Closing => "This tab has edits that are not written.".to_owned(),
+            Prompt::Reread(action) => format!(
+                "This tab has edits that are not written. Saving checked files or discarding all edits will {}.",
+                action.action_description()
+            ),
         })
     }
 
@@ -3915,9 +3911,7 @@ impl TextView {
                 self.prompt = None;
                 self.saving = None;
                 self.saving_as = None;
-                self.save_both_pending = false;
-                self.close_requested = false;
-                self.forget_reread();
+                self.abandon_save_sequence();
             }
             Prompt::DiskChanged(side) => {
                 let save_as = self.saving_as.take();
@@ -3949,15 +3943,18 @@ impl TextView {
         self.prompt = None;
         match (choice, action) {
             (CloseChoice::Cancel, _) => {
-                self.close_requested = false;
-                self.forget_reread();
+                self.abandon_save_sequence();
             }
             (CloseChoice::Discard, None) => {
+                self.discard_after_save = [None, None];
                 self.left_pane.mark_saved();
                 self.right_pane.mark_saved();
                 self.close_requested = true;
             }
-            (CloseChoice::Discard, Some(action)) => self.reread(action),
+            (CloseChoice::Discard, Some(action)) => {
+                self.discard_after_save = [None, None];
+                self.reread(action);
+            }
             (CloseChoice::Save, None) => {
                 self.close_requested = true;
                 self.save_both();
@@ -4043,13 +4040,40 @@ impl TextView {
     /// Write whichever sides are modified, one after the other.
     fn save_both(&mut self) {
         self.save_both_pending = true;
-        if self.left_pane.is_modified() {
+        if self.left_pane.is_modified() && self.discard_after_save[0].is_none() {
             self.save_side(Side::Left, SaveConsent::default());
-        } else if self.right_pane.is_modified() {
+        } else if self.right_pane.is_modified() && self.discard_after_save[1].is_none() {
             self.save_side(Side::Right, SaveConsent::default());
         } else {
-            self.save_both_pending = false;
+            self.finish_save_sequence();
         }
+    }
+
+    fn finish_save_sequence(&mut self) {
+        if let Some(revision) = self.discard_after_save[0].take() {
+            self.left_pane.buffer_mut().mark_saved_revision(revision);
+        }
+        if let Some(revision) = self.discard_after_save[1].take() {
+            self.right_pane.buffer_mut().mark_saved_revision(revision);
+        }
+        self.save_both_pending = false;
+        self.reread_when_saved();
+    }
+
+    fn abandon_save_sequence(&mut self) {
+        self.save_both_pending = false;
+        self.close_requested = false;
+        self.discard_after_save = [None, None];
+        self.forget_reread();
+    }
+
+    fn mark_unchecked_for_discard(&mut self) {
+        self.discard_after_save = [
+            (!self.save_selection.left && self.left_pane.is_modified())
+                .then(|| self.left_pane.buffer().revision()),
+            (!self.save_selection.right && self.right_pane.is_modified())
+                .then(|| self.right_pane.buffer().revision()),
+        ];
     }
 
     /// The line under each path field, naming what the side holds.
@@ -7493,6 +7517,94 @@ mod tests {
         assert_eq!(std::fs::read(&left).unwrap(), b"left");
         assert_eq!(std::fs::read(&right).unwrap(), b"changed right");
         assert!(!view.pane(Side::Left).is_modified());
+    }
+
+    #[test]
+    fn a_refused_checked_text_save_keeps_unchecked_edits_modified() {
+        use super::TextView;
+
+        let mut view = TextView::from_data(
+            PathBuf::from("left.txt"),
+            PathBuf::from("right.txt"),
+            &ca_ui::testing::context(),
+            1,
+            crate::jobs::TextData::default(),
+        );
+        view.left_pane.buffer_mut().insert(0, "left");
+        view.right_pane.buffer_mut().insert(0, "right");
+        view.session_settings.specs.disable_editing = true;
+        view.prompt = Some(super::Prompt::Closing);
+        view.save_selection.left = true;
+        view.save_selection.right = false;
+        view.answer_save_selection(ca_ui::save::UnsavedAnswer::SaveChecked);
+
+        assert!(view.left_pane.is_modified());
+        assert!(view.right_pane.is_modified());
+        assert!(!view.close_requested);
+        assert_eq!(view.discard_after_save, [None, None]);
+        assert!(view.save_job.is_none());
+    }
+
+    #[test]
+    fn reread_text_prompts_name_the_follow_up_action() {
+        use super::TextView;
+
+        let mut view = TextView::from_data(
+            PathBuf::from("left.txt"),
+            PathBuf::from("right.txt"),
+            &ca_ui::testing::context(),
+            1,
+            crate::jobs::TextData::default(),
+        );
+        for (action, description) in [
+            (super::Reread::Reload, "reload the files"),
+            (super::Reread::Open, "open the selected paths"),
+            (super::Reread::SwapSides, "swap the files"),
+            (
+                super::Reread::Settings,
+                "apply the changed comparison settings",
+            ),
+        ] {
+            view.prompt = Some(super::Prompt::Reread(action));
+            assert!(view.prompt_text().unwrap().contains(description));
+        }
+    }
+
+    #[test]
+    fn edits_to_an_unchecked_text_side_during_save_stay_unwritten() {
+        use super::{Side, TextView};
+        use ca_ui::view::SessionView;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let left = dir.path().join("left.txt");
+        let right = dir.path().join("right.txt");
+        std::fs::write(&left, b"left").unwrap();
+        std::fs::write(&right, b"right").unwrap();
+        let mut view = TextView::new(left.clone(), right.clone(), &ca_ui::testing::context(), 1);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !view.is_ready() && Instant::now() < deadline {
+            view.tick();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(view.is_ready());
+        view.pane_mut(Side::Left).buffer_mut().insert(0, "changed ");
+        view.pane_mut(Side::Right).buffer_mut().insert(0, "saved ");
+        view.prompt = Some(super::Prompt::Closing);
+        view.save_selection.left = false;
+        view.save_selection.right = true;
+        view.answer_save_selection(ca_ui::save::UnsavedAnswer::SaveChecked);
+        view.pane_mut(Side::Left).buffer_mut().insert(0, "later ");
+
+        while view.save_job.is_some() && Instant::now() < deadline {
+            view.poll_save();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        assert!(view.save_job.is_none());
+        assert_eq!(std::fs::read(&left).unwrap(), b"left");
+        assert_eq!(std::fs::read(&right).unwrap(), b"saved right");
+        assert!(view.pane(Side::Left).is_modified());
     }
 
     #[test]

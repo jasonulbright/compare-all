@@ -381,9 +381,10 @@ pub fn spawn_sync_plan(
             let mut plan_preview = preview.clone();
             if let Some(selection) = selection {
                 for row in &plan_preview.rows {
-                    let selected = selection.iter().any(|path| {
-                        row.rel.as_path() == path.as_path() || row.rel.starts_with(path)
-                    });
+                    let selected = row
+                        .rel
+                        .ancestors()
+                        .any(|ancestor| selection.contains(ancestor));
                     if !selected {
                         plan_preview
                             .overrides
