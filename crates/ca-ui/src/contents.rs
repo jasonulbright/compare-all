@@ -137,6 +137,18 @@ pub enum ResultGroup {
 }
 
 impl ResultGroup {
+    const fn index(self) -> usize {
+        match self {
+            Self::LeftOrphan => 0,
+            Self::RightOrphan => 1,
+            Self::Different => 2,
+            Self::UnimportantDifferences => 3,
+            Self::Same => 4,
+            Self::NotCompared => 5,
+            Self::Error => 6,
+        }
+    }
+
     fn label(self, count: usize) -> String {
         let name = match self {
             Self::LeftOrphan => "left orphan file(s)",
@@ -238,8 +250,7 @@ impl ContentsResultsDialog {
 
     /// Draw the result list inside a native window.
     pub fn body(&mut self, ui: &mut egui::Ui) -> Option<ResultsAction> {
-        let mut action = None;
-        for group in [
+        const GROUPS: [ResultGroup; 7] = [
             ResultGroup::LeftOrphan,
             ResultGroup::RightOrphan,
             ResultGroup::Different,
@@ -247,25 +258,71 @@ impl ContentsResultsDialog {
             ResultGroup::Same,
             ResultGroup::NotCompared,
             ResultGroup::Error,
-        ] {
-            let rows: Vec<&ResultRow> = self.rows.iter().filter(|row| row.group == group).collect();
-            if rows.is_empty() {
-                continue;
-            }
-            egui::CollapsingHeader::new(group.label(rows.len()))
-                .default_open(true)
-                .show(ui, |ui| {
-                    for row in rows {
-                        if ui.selectable_label(false, &row.label).double_clicked() {
-                            action = Some(ResultsAction::Open {
-                                rel: row.rel.clone(),
-                                target: row.target,
-                            });
-                        }
-                    }
-                });
+        ];
+        let mut grouped: [Vec<&ResultRow>; 7] = std::array::from_fn(|_| Vec::new());
+        for row in &self.rows {
+            grouped[row.group.index()].push(row);
         }
-        ui.label("Double-click a file to open it in the associated view.");
+
+        let mut action = None;
+        let row_height = ui.spacing().interact_size.y;
+        let footer_height = ui.text_style_height(&egui::TextStyle::Body)
+            + ui.spacing().interact_size.y
+            + ui.spacing().item_spacing.y * 2.0;
+        let results_height = (ui.available_height() - footer_height).max(0.0);
+        egui::ScrollArea::vertical()
+            .id_salt("contents-results-groups")
+            .auto_shrink([false, false])
+            .max_height(results_height)
+            .show(ui, |ui| {
+                for group in GROUPS {
+                    let rows = &grouped[group.index()];
+                    if rows.is_empty() {
+                        continue;
+                    }
+                    egui::CollapsingHeader::new(group.label(rows.len()))
+                        .id_salt(("contents-results-group", group.index()))
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            egui::ScrollArea::vertical()
+                                .id_salt(("contents-results-rows", group.index()))
+                                .auto_shrink([false, false])
+                                .max_height(240.0)
+                                .show_rows(ui, row_height, rows.len(), |ui, range| {
+                                    for index in range {
+                                        let Some(row) = rows.get(index) else {
+                                            continue;
+                                        };
+                                        let response = ui
+                                            .push_id(&row.rel, |ui| {
+                                                ui.selectable_label(false, &row.label)
+                                            })
+                                            .inner;
+                                        if response.clicked() {
+                                            response.request_focus();
+                                        }
+                                        let keyboard_open = response.has_focus()
+                                            && ui.input_mut(|input| {
+                                                input.consume_key(
+                                                    egui::Modifiers::NONE,
+                                                    egui::Key::Enter,
+                                                ) || input.consume_key(
+                                                    egui::Modifiers::NONE,
+                                                    egui::Key::Space,
+                                                )
+                                            });
+                                        if response.double_clicked() || keyboard_open {
+                                            action = Some(ResultsAction::Open {
+                                                rel: row.rel.clone(),
+                                                target: row.target,
+                                            });
+                                        }
+                                    }
+                                });
+                        });
+                }
+            });
+        ui.label("Double-click a file or press Enter or Space to open it.");
         if ui.button("Close").clicked() {
             action = Some(ResultsAction::Close);
         }
@@ -443,6 +500,83 @@ mod tests {
             probe.click("Close", &mut run).unwrap();
         }
         assert_eq!(action, Some(ResultsAction::Close));
+    }
+
+    #[test]
+    fn results_rows_open_from_the_keyboard_only_when_focused() {
+        use super::{ContentsResultsDialog, ResultGroup, ResultRow, ResultTarget, ResultsAction};
+        use std::path::PathBuf;
+
+        let mut probe = Probe::new(640.0, 480.0);
+        let mut dialog = ContentsResultsDialog::new(
+            ContentMethod::Binary,
+            vec![
+                ResultRow {
+                    rel: PathBuf::from("first.txt"),
+                    label: "first.txt".to_owned(),
+                    group: ResultGroup::Different,
+                    target: ResultTarget::Pair,
+                },
+                ResultRow {
+                    rel: PathBuf::from("second.txt"),
+                    label: "second.txt".to_owned(),
+                    group: ResultGroup::Different,
+                    target: ResultTarget::Left,
+                },
+            ],
+        );
+        let mut action = None;
+        let mut run = |ctx: &egui::Context| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                action = dialog.body(ui);
+            });
+        };
+        probe.idle(&mut run);
+        let first = probe.find("first.txt").unwrap();
+        probe.press_at(first.rect.center(), &mut run);
+        let enter = egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        probe.frame(vec![enter], &mut run);
+        assert_eq!(
+            action,
+            Some(ResultsAction::Open {
+                rel: PathBuf::from("first.txt"),
+                target: ResultTarget::Pair,
+            })
+        );
+    }
+
+    #[test]
+    fn large_result_groups_scroll_and_keep_close_reachable() {
+        use super::{ContentsResultsDialog, ResultGroup, ResultRow, ResultTarget};
+        use std::path::PathBuf;
+
+        let rows = (0..1_000)
+            .map(|index| ResultRow {
+                rel: PathBuf::from(format!("item-{index:04}.txt")),
+                label: format!("item-{index:04}.txt"),
+                group: ResultGroup::Different,
+                target: ResultTarget::Pair,
+            })
+            .collect();
+        let mut probe = Probe::new(640.0, 320.0);
+        let mut dialog = ContentsResultsDialog::new(ContentMethod::Binary, rows);
+        let mut run = |ctx: &egui::Context| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                dialog.body(ui);
+            });
+        };
+        probe.idle(&mut run);
+
+        let close = probe.find("Close").unwrap();
+        assert!(close.rect.bottom() <= 320.0);
+        assert!(probe.find("item-0000.txt").is_ok());
+        assert!(probe.find("item-0999.txt").is_err());
     }
 
     #[test]

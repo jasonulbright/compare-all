@@ -1081,6 +1081,9 @@ pub struct App {
     session_save: Option<crate::session_save::SessionSave>,
     /// The application options document.
     options: OptionsHandle,
+    /// A content-comparison choice waiting for the options document to be
+    /// available after a load or save.
+    pending_content_options: Option<(bool, bool)>,
     /// What the options resolved to this frame.
     resolved: Arc<AppOptions>,
     /// The theme packs found and the one in force.
@@ -1308,6 +1311,7 @@ impl App {
         Self {
             store,
             options: OptionsHandle::open_in(settings_directory.clone(), Arc::new(|| {})),
+            pending_content_options: None,
             resolved: Arc::new(AppOptions::default()),
             packs: ca_ui::pack::PackHost::new(
                 settings_directory.join("packs"),
@@ -3898,17 +3902,28 @@ impl App {
                     confirm_dialog,
                     show_results,
                 } => {
-                    if let Some(options) = self.options.options_mut() {
-                        options.file_operations.confirm_content_comparison = confirm_dialog;
-                        options.file_operations.show_content_results = show_results;
-                        self.options.save();
-                    }
+                    self.pending_content_options = Some((confirm_dialog, show_results));
                 }
                 ViewAction::Close => {
                     self.drop_pending_workspace();
                     self.close_tab(self.active);
                 }
             }
+        }
+    }
+
+    fn apply_pending_content_options(&mut self) {
+        let Some((confirm_dialog, show_results)) = self.pending_content_options else {
+            return;
+        };
+        let applied = self.options.options_mut().is_some_and(|options| {
+            options.file_operations.confirm_content_comparison = confirm_dialog;
+            options.file_operations.show_content_results = show_results;
+            true
+        });
+        if applied {
+            self.pending_content_options = None;
+            self.options.save();
         }
     }
 
@@ -4765,6 +4780,7 @@ impl App {
         }
         let repaint = ctx.clone();
         self.options.poll();
+        self.apply_pending_content_options();
         let resolved = Arc::new(self.resolve_options(ctx));
         ca_ui::options::install(ctx, Arc::clone(&resolved));
         let context = ViewContext {
@@ -5477,6 +5493,8 @@ mod tests {
     fn content_comparison_choices_are_saved_as_program_options() {
         let (_settings, mut app) = empty_app();
         frame_until(&mut app, |app| app.options().is_ready());
+        app.options.save();
+        assert_eq!(app.options().state(), ca_ui::options::OptionsState::Saving);
         app.apply(
             vec![ViewAction::ContentComparisonOptions {
                 confirm_dialog: false,

@@ -448,6 +448,9 @@ pub struct FolderView {
     contents_window: ca_ui::viewport::NativeWindow,
     contents_results: Option<ca_ui::contents::ContentsResultsDialog>,
     contents_results_window: ca_ui::viewport::NativeWindow,
+    /// Context and host kind of the last frame that drew the results window,
+    /// so restarting or closing the tab can close its native viewport.
+    contents_results_context: Option<(egui::Context, bool)>,
     content_show_results: bool,
     /// Tabs to open on the next frame, from work that finished off the frame.
     pending_opens: Vec<OpenRequest>,
@@ -656,6 +659,7 @@ impl FolderView {
             contents_window,
             contents_results: None,
             contents_results_window,
+            contents_results_context: None,
             content_show_results: false,
             pending_opens: Vec::new(),
             report: ViewReport::new(
@@ -1470,6 +1474,7 @@ impl FolderView {
     }
 
     fn restart(&mut self) {
+        self.clear_contents_results();
         self.comparisons.start();
         self.drop_jobs();
         self.drop_operation_in_wait();
@@ -1496,6 +1501,13 @@ impl FolderView {
             Box::new(self.engine_options()),
             self.notify.clone(),
         ));
+    }
+
+    fn clear_contents_results(&mut self) {
+        self.contents_results = None;
+        if let Some((context, native)) = self.contents_results_context.take() {
+            self.contents_results_window.close(&context, native);
+        }
     }
 
     /// Stop the jobs and let go of them, for a view that is being replaced.
@@ -1653,7 +1665,7 @@ impl FolderView {
                     if let Some(tree) = tree {
                         self.compared_tree = Some(tree);
                     }
-                    if self.content_show_results {
+                    if self.content_show_results && complete {
                         let dialog = ca_ui::contents::ContentsResultsDialog::new(
                             self.content_method,
                             results,
@@ -3793,6 +3805,9 @@ impl FolderView {
                     ca_ui::viewport::Host::Native(ui) => results.body(ui),
                 })
         });
+        if let Some(frame) = &results_frame {
+            self.contents_results_context = Some((ui.ctx().clone(), frame.native));
+        }
         if let Some(frame) = results_frame {
             let action = if frame.close_requested {
                 Some(ca_ui::contents::ResultsAction::Close)
@@ -3804,8 +3819,7 @@ impl FolderView {
                     self.open_content_result(&rel, target);
                 }
                 Some(ca_ui::contents::ResultsAction::Close) => {
-                    self.contents_results_window.close(ui.ctx(), frame.native);
-                    self.contents_results = None;
+                    self.clear_contents_results();
                 }
                 None => {}
             }
@@ -4902,6 +4916,7 @@ impl SessionView for FolderView {
         self.drop_jobs();
         self.request_stop();
         self.quick_compare = None;
+        self.clear_contents_results();
         if let Some(job) = self.picker.take() {
             job.cancel();
         }
@@ -5459,6 +5474,60 @@ mod quick_compare_tests {
         assert_eq!(opened[0].kind, ca_session::SessionKind::TextEdit);
         assert!(opened[0].left.as_os_str().is_empty());
         assert_eq!(opened[0].right, right.join("sub/only-right.txt"));
+    }
+
+    #[test]
+    fn restarting_or_closing_clears_content_results() {
+        use ca_ui::contents::ContentsResultsDialog;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut view = view(dir.path());
+        let results = || ContentsResultsDialog::new(ContentMethod::Binary, Vec::new());
+        view.contents_results = Some(results());
+        view.contents_results_context = Some((egui::Context::default(), false));
+
+        view.restart();
+        assert!(view.contents_results.is_none());
+        assert!(view.contents_results_context.is_none());
+
+        view.contents_results = Some(results());
+        view.on_close();
+        assert!(view.contents_results.is_none());
+        assert!(view.contents_results_context.is_none());
+    }
+
+    #[test]
+    fn cancelled_content_comparison_does_not_open_partial_results() {
+        use crate::jobs::ContentMessage;
+        use ca_ui::contents::{ResultGroup, ResultRow, ResultTarget};
+        use ca_ui::worker::Job;
+        use std::path::PathBuf;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut view = view(dir.path());
+        view.content_show_results = true;
+        view.content_job = Some(Job::spawn(|emitter, _cancel| {
+            emitter.send(ContentMessage::Done {
+                tree: None,
+                complete: false,
+                results: vec![ResultRow {
+                    rel: PathBuf::from("partial.txt"),
+                    label: "partial.txt".to_owned(),
+                    group: ResultGroup::NotCompared,
+                    target: ResultTarget::Pair,
+                }],
+            });
+        }));
+        let deadline = Instant::now() + PATIENCE;
+        while view.content_job.is_some() && Instant::now() < deadline {
+            view.poll_content();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        assert!(view.content_job.is_none());
+        assert!(view.contents_results.is_none());
+        assert_eq!(view.status, super::Status::Cancelled);
+        view.on_close();
     }
 
     #[test]
