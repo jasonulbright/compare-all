@@ -1869,10 +1869,6 @@ impl MergeModel {
         self.manual_output_rows[index] = Some(output_rows);
     }
 
-    fn rebuild_section_rows(&mut self, index: usize) {
-        self.rebuild_section_rows_with_anchors(index, None);
-    }
-
     fn rebuild_section_rows_with_anchors(
         &mut self,
         index: usize,
@@ -2198,6 +2194,11 @@ impl MergeModel {
         if section >= self.sections.len() {
             return;
         }
+        let output_anchors = self
+            .manual_alignments
+            .iter()
+            .any(|alignment| alignment.section == section)
+            .then(|| self.output_anchors(section));
         self.touch(section);
         if let Some(rows) = self.manual_output_rows.get_mut(section) {
             *rows = None;
@@ -2211,7 +2212,7 @@ impl MergeModel {
         entry.conflict = false;
         entry.restore = None;
         entry.restore_from_take = false;
-        self.rebuild_changed_sections(&[section], false);
+        self.rebuild_section_with_anchors(section, output_anchors.as_deref());
     }
 
     /// Replace a section-relative range with output lines already edited in
@@ -3325,16 +3326,33 @@ impl MergeModel {
     }
 
     fn rebuild_section(&mut self, index: usize) {
+        self.rebuild_section_with_anchors(index, None);
+    }
+
+    fn rebuild_section_with_anchors(
+        &mut self,
+        index: usize,
+        output_anchors: Option<&[OutputAnchor]>,
+    ) {
         let Some(section) = self.sections.get(index).cloned() else {
             return;
         };
         let output = self.contribution(index, &section);
-        self.replace_section_lines(index, output);
+        self.replace_section_lines_with_anchors(index, output, output_anchors);
     }
 
     /// Give section `index` exactly `lines`, which a source composition built.
     /// Lines that keep their text keep their place in the output.
     fn replace_section_lines(&mut self, index: usize, lines: Vec<String>) {
+        self.replace_section_lines_with_anchors(index, lines, None);
+    }
+
+    fn replace_section_lines_with_anchors(
+        &mut self,
+        index: usize,
+        lines: Vec<String>,
+        output_anchors: Option<&[OutputAnchor]>,
+    ) {
         let Some(old_output) = self.output_range(index) else {
             return;
         };
@@ -3355,7 +3373,11 @@ impl MergeModel {
             let count = lines.len();
             let repairs = vec![0; count];
             self.splice_output(start..old_output.end as usize, lines, repairs);
-            self.set_output_len(index, u32::try_from(count).unwrap_or(u32::MAX));
+            self.set_output_len_with_anchors(
+                index,
+                u32::try_from(count).unwrap_or(u32::MAX),
+                output_anchors,
+            );
         }
         let section = &mut self.sections[index];
         if matches!(section.resolution, Resolution::Edited) {
@@ -3368,7 +3390,7 @@ impl MergeModel {
                 .iter()
                 .any(|alignment| alignment.section == index)
         {
-            self.rebuild_section_rows(index);
+            self.rebuild_section_rows_with_anchors(index, output_anchors);
         }
         self.refresh_section_totals(index);
     }
@@ -3909,6 +3931,78 @@ mod tests {
 
         assert_eq!(merged.output_text(), "a\nmine\nc\n");
         assert_eq!(merged.output_lines()[0].as_ptr(), unaffected);
+    }
+
+    #[test]
+    fn replacing_manually_aligned_output_preserves_rows_for_later_takes() {
+        fn output_input_rows(
+            merged: &super::MergeModel,
+            section: usize,
+        ) -> Vec<(Option<u32>, Option<u32>, Option<u32>)> {
+            merged
+                .output_range(section)
+                .unwrap()
+                .map(|line| {
+                    let row = merged.row_of_output_line(line).unwrap();
+                    let row = merged.rows()[row];
+                    (row.left, row.center, row.right)
+                })
+                .collect()
+        }
+
+        for extra_line in [false, true] {
+            let mut merged = model(
+                "a\nL0\nL1\nL2\nL3\nL4\nz\n",
+                "a\nC0\nC1\nC2\nC3\nC4\nC5\nz\n",
+                "a\nR0\nR1\nR2\nR3\nR4\nR5\nz\n",
+            );
+            let section = merged
+                .sections()
+                .iter()
+                .position(super::Section::is_unresolved_conflict)
+                .unwrap();
+            let left = merged.sections()[section].left.clone();
+            let center = merged.sections()[section].center.clone();
+            merged
+                .add_manual_alignment(
+                    Pane::Left,
+                    left.start + 1..left.start + 2,
+                    Pane::Center,
+                    center.start + 2..center.start + 3,
+                )
+                .unwrap();
+
+            let original_rows = output_input_rows(&merged, section);
+            let output_count = original_rows.len();
+            let mut edited_lines: Vec<_> = (0..output_count + usize::from(extra_line))
+                .map(|line| format!("edited {line}\n"))
+                .collect();
+            merged.set_edited(section, edited_lines.clone());
+
+            assert_eq!(
+                &output_input_rows(&merged, section)[..output_count],
+                original_rows,
+                "extra line: {extra_line}"
+            );
+
+            let row = merged
+                .row_of_input_line(Pane::Left, left.start + 1)
+                .unwrap();
+            let output_line = merged.output_line_for_row(row).unwrap();
+            let output_range = merged.output_range(section).unwrap();
+            let local_line = (output_line - output_range.start) as usize;
+            let taken_line = merged.inputs().lines(Pane::Left)[(left.start + 1) as usize].clone();
+            assert!(
+                merged.take_line(row, Pane::Left),
+                "extra line: {extra_line}"
+            );
+            edited_lines[local_line] = taken_line.clone();
+            assert_eq!(
+                merged.section_lines(section),
+                edited_lines,
+                "extra line: {extra_line}"
+            );
+        }
     }
 
     #[test]
