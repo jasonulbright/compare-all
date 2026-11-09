@@ -575,7 +575,7 @@ const MERGE_EDIT: &[Entry] = &[
     Entry::Run(Command::Undo, "Nothing to reverse"),
     Entry::Run(Command::Redo, "Nothing to reverse"),
     Entry::Rule,
-    Entry::Soon(Command::AlignWith),
+    Entry::Run(Command::AlignWith, "Select lines in an input pane first"),
     Entry::Soon(Command::Isolate),
     Entry::Run(
         Command::ToggleConflict,
@@ -6834,6 +6834,58 @@ mod tests {
         let open = probe.find(&line(Command::NewSession)).unwrap();
         assert_eq!(open.description, None);
         assert_eq!(painted_texts(&output), unhovered);
+    }
+
+    #[test]
+    fn align_with_menu_starts_after_an_input_line_click() {
+        use ca_ui::testing::probe::Probe;
+        use std::cell::RefCell;
+
+        let context = context();
+        let dir = tempfile::tempdir().unwrap();
+        let left = dir.path().join("left.txt");
+        let center = dir.path().join("center.txt");
+        let right = dir.path().join("right.txt");
+        let output = dir.path().join("output.txt");
+        std::fs::write(&left, "a\nleft\nz\n").unwrap();
+        std::fs::write(&center, "a\nbase\nz\n").unwrap();
+        std::fs::write(&right, "a\nright\nz\n").unwrap();
+        let (_settings, mut app) = empty_app();
+        assert!(ca_ui::testing::wait_until(
+            std::time::Duration::from_secs(10),
+            || {
+                app.poll_store();
+                app.store().borrow().is_ready()
+            }
+        ));
+        let request = OpenRequest::new(SessionKind::TextMerge, left, right)
+            .with_center(Some(center))
+            .with_output(Some(output));
+        app.open(&request, &context);
+        assert!(ca_ui::testing::wait_until(
+            std::time::Duration::from_secs(20),
+            || {
+                app.tabs[0].tick();
+                app.tabs[0].is_ready()
+            }
+        ));
+
+        let app = RefCell::new(app);
+        let mut probe = Probe::new(1600.0, 900.0);
+        let mut run = |ctx: &egui::Context| app.borrow_mut().frame(ctx);
+        probe.idle(&mut run);
+        probe.idle(&mut run);
+        probe.press_at(egui::pos2(200.0, 220.0), &mut run);
+        assert!(
+            app.borrow().tabs[0].accepts(Command::AlignWith),
+            "clicking a line in an input pane enables Align With"
+        );
+
+        probe.click("Edit", &mut run).unwrap();
+        let align = probe.find("Align With...\tF7").unwrap();
+        assert!(align.enabled);
+        probe.click("Align With...\tF7", &mut run).unwrap();
+        assert!(app.borrow().tabs[0].accepts(Command::Cancel));
     }
 
     #[test]

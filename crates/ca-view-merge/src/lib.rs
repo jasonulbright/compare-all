@@ -77,6 +77,8 @@ const PICKING: &str = "A file panel is already open";
 /// What the view says when an edit of the output is asked for while the
 /// editing switch of the session is on.
 const EDITING_OFF: &str = "Editing is turned off for this session";
+/// Why Align With needs a line selection in an input pane.
+const ALIGNMENT_SELECTION_REQUIRED: &str = "Select lines in an input pane first";
 
 const GIVEN_BACK: &str = "The take returned joined text to";
 
@@ -160,6 +162,7 @@ const HANDLED: &[Command] = &[
     Command::NextExistingLine,
     Command::PreviousExistingLine,
     Command::PreviousDifference,
+    Command::AlignWith,
     Command::Undo,
     Command::Redo,
     Command::Cut,
@@ -219,6 +222,27 @@ enum Status {
 impl Status {
     const fn is_running(&self) -> bool {
         matches!(self, Status::Running(_))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InputSelection {
+    anchor: u32,
+    range: Range<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingAlignment {
+    pane: Pane,
+    range: Range<u32>,
+}
+
+fn input_selection_index(pane: Pane) -> Option<usize> {
+    match pane {
+        Pane::Left => Some(0),
+        Pane::Center => Some(1),
+        Pane::Right => Some(2),
+        Pane::Output => None,
     }
 }
 
@@ -343,6 +367,10 @@ pub struct MergeView {
     /// Background of selected output text, read from the theme each frame.
     selection_color: egui::Color32,
     focus: Pane,
+    /// Selected input line ranges, in Left, Center, Right order.
+    input_selections: [Option<InputSelection>; 3],
+    /// The first side of an Align With operation waiting for a target click.
+    pending_alignment: Option<PendingAlignment>,
     show_center: bool,
     show_thumbnail: bool,
     show_line_numbers: bool,
@@ -579,6 +607,8 @@ impl MergeView {
                 ..FindSettings::default()
             }),
             focus: Pane::Output,
+            input_selections: [None, None, None],
+            pending_alignment: None,
             show_center: true,
             show_thumbnail: true,
             show_line_numbers: true,
@@ -1012,6 +1042,8 @@ impl MergeView {
     }
 
     fn start_merge(&mut self) {
+        self.input_selections = [None, None, None];
+        self.pending_alignment = None;
         if let Some(job) = self.job.take() {
             job.cancel();
         }
@@ -1187,6 +1219,8 @@ impl MergeView {
         let marks_were_changed = self.marks_changed;
         self.data = data;
         self.status = Status::Ready;
+        self.input_selections = [None, None, None];
+        self.pending_alignment = None;
         // Before the first write the merge as it loads is the baseline. After
         // a write, section numbers do not survive a new merge run, so a run
         // keeps only whether the marks differed from the written ones.
@@ -1631,7 +1665,17 @@ impl MergeView {
         if let Some(row) = self.data.model.row_of_section(section) {
             self.row = row;
             self.show_row(row);
-            let line = self.data.model.output_line_for_row(row).unwrap_or(0);
+            let line = self
+                .data
+                .model
+                .output_line_for_row(row)
+                .or_else(|| {
+                    self.data
+                        .model
+                        .output_range(section)
+                        .map(|range| range.start)
+                })
+                .unwrap_or(0);
             self.output_pane.place(Caret::new(line, 0), false);
             let _ = self.output_pane.take_changes();
         }
@@ -2384,7 +2428,8 @@ impl MergeView {
         }
         self.paint_pane(ui, bottom, Pane::Output, palette);
         if let Some(position) = clicked {
-            self.click(position);
+            let extend_selection = ui.input(|input| input.modifiers.shift);
+            self.click(position, extend_selection);
         }
     }
 
@@ -2450,6 +2495,7 @@ impl MergeView {
             };
             let (background, text_color) = palette.row(class);
             painter.rect_filled(line_rect, 0.0, background);
+            self.paint_input_selection(&painter, line_rect, pane, line);
             if class == MergeClass::Gap {
                 hatch(&painter, line_rect, palette.gap_pattern);
                 continue;
@@ -2482,6 +2528,24 @@ impl MergeView {
         }
         if pane == Pane::Output {
             self.paint_take_buttons(ui, body, gutter, palette, visible);
+        }
+    }
+
+    fn paint_input_selection(
+        &self,
+        painter: &egui::Painter,
+        rect: egui::Rect,
+        pane: Pane,
+        line: Option<u32>,
+    ) {
+        let Some(line) = line else {
+            return;
+        };
+        if self
+            .input_selection(pane)
+            .is_some_and(|selection| selection.range.contains(&line))
+        {
+            painter.rect_filled(rect, 0.0, self.selection_color);
         }
     }
 
@@ -2632,7 +2696,101 @@ impl MergeView {
         }
     }
 
-    fn click(&mut self, position: egui::Pos2) {
+    fn input_selection(&self, pane: Pane) -> Option<&InputSelection> {
+        self.input_selections
+            .get(input_selection_index(pane)?)?
+            .as_ref()
+    }
+
+    fn select_input_line(&mut self, pane: Pane, line: u32, extend: bool) {
+        let Some(index) = input_selection_index(pane) else {
+            return;
+        };
+        let selected = &mut self.input_selections[index];
+        if extend {
+            if let Some(selection) = selected {
+                selection.range =
+                    selection.anchor.min(line)..selection.anchor.max(line).saturating_add(1);
+            } else {
+                *selected = Some(InputSelection {
+                    anchor: line,
+                    range: line..line.saturating_add(1),
+                });
+            }
+        } else {
+            *selected = Some(InputSelection {
+                anchor: line,
+                range: line..line.saturating_add(1),
+            });
+        }
+    }
+
+    fn begin_alignment(&mut self) {
+        let selected: Vec<_> = [Pane::Left, Pane::Center, Pane::Right]
+            .into_iter()
+            .filter_map(|pane| {
+                self.input_selection(pane)
+                    .map(|selection| (pane, selection.range.clone()))
+            })
+            .collect();
+        match selected.as_slice() {
+            [(first_pane, first), (second_pane, second)] => {
+                self.complete_alignment(*first_pane, first.clone(), *second_pane, second.clone());
+            }
+            [(pane, range)] => {
+                self.pending_alignment = Some(PendingAlignment {
+                    pane: *pane,
+                    range: range.clone(),
+                });
+                self.message = Some("Click a line in another input pane to align it".to_owned());
+            }
+            [] if self.focus != Pane::Output => {
+                let line = self
+                    .data
+                    .model
+                    .rows()
+                    .get(self.row)
+                    .and_then(|row| row.line(self.focus, None));
+                if let Some(line) = line {
+                    self.select_input_line(self.focus, line, false);
+                    self.begin_alignment();
+                } else {
+                    self.message = Some(ALIGNMENT_SELECTION_REQUIRED.to_owned());
+                }
+            }
+            [] => self.message = Some(ALIGNMENT_SELECTION_REQUIRED.to_owned()),
+            _ => self.message = Some("Select lines in exactly two input panes".to_owned()),
+        }
+    }
+
+    fn complete_alignment(
+        &mut self,
+        first_pane: Pane,
+        first: Range<u32>,
+        second_pane: Pane,
+        second: Range<u32>,
+    ) {
+        match self
+            .data
+            .model
+            .add_manual_alignment(first_pane, first.clone(), second_pane, second)
+        {
+            Ok(section) => {
+                self.current = section;
+                if let Some(row) = self.data.model.row_of_input_line(first_pane, first.start) {
+                    self.row = row;
+                }
+                self.navigation_started = true;
+                self.input_selections = [None, None, None];
+                self.pending_alignment = None;
+                self.message = Some("Selected lines are aligned".to_owned());
+                self.touched();
+            }
+            Err(reason) => self.message = Some(reason.to_owned()),
+        }
+    }
+
+    fn click(&mut self, position: egui::Pos2, extend_selection: bool) {
         let Some((pane, rect)) = self
             .panes
             .iter()
@@ -2652,6 +2810,30 @@ impl MergeView {
         if let Some(section) = self.data.model.section_of_row(row) {
             self.current = section;
             self.navigation_started = true;
+        }
+        if let Some(line) = self
+            .data
+            .model
+            .rows()
+            .get(row)
+            .and_then(|entry| entry.line(pane, None))
+        {
+            if pane != Pane::Output && !extend_selection && self.pending_alignment.is_none() {
+                self.input_selections = [None, None, None];
+            }
+            self.select_input_line(pane, line, extend_selection);
+            if let Some(pending) = self.pending_alignment.clone() {
+                if pending.pane != pane && pane != Pane::Output {
+                    if let Some(target) = self.input_selection(pane) {
+                        self.complete_alignment(
+                            pending.pane,
+                            pending.range,
+                            pane,
+                            target.range.clone(),
+                        );
+                    }
+                }
+            }
         }
         if pane == Pane::Output {
             if let Some(line) = self.data.model.output_line_for_row(row) {
@@ -2930,9 +3112,13 @@ impl SessionView for MergeView {
                 | Command::Reload
                 | Command::Recompare
                 | Command::ToggleCenterPane
+                | Command::AlignWith
         );
         if !needs_merge || SessionView::accepts(self, command) {
             return None;
+        }
+        if command == Command::AlignWith && self.status == Status::Ready {
+            return Some(ALIGNMENT_SELECTION_REQUIRED);
         }
         if self.picker.is_some() && matches!(command, Command::OpenFile | Command::SaveFileAs) {
             return Some(PICKING);
@@ -2993,6 +3179,7 @@ impl SessionView for MergeView {
         }
         let ready = self.status == Status::Ready;
         match command {
+            Command::AlignWith => self.accepts_alignment(ready),
             Command::TakeLeft
             | Command::TakeRight
             | Command::TakeLeftThenRight
@@ -3081,6 +3268,7 @@ impl SessionView for MergeView {
                     || self.find_task.is_running()
                     || self.find.is_find_open()
                     || self.find.is_go_to_open()
+                    || self.pending_alignment.is_some()
             }
             _ => false,
         }
@@ -3093,6 +3281,13 @@ impl SessionView for MergeView {
             return;
         }
         match command {
+            Command::AlignWith => {
+                if self.pending_alignment.take().is_some() {
+                    self.message = Some("Alignment canceled".to_owned());
+                } else {
+                    self.begin_alignment();
+                }
+            }
             Command::CompareReport => self.report.request(),
             Command::TakeLeft => self.take(Resolution::Left),
             Command::TakeCenter => self.take(Resolution::Center),
@@ -3156,6 +3351,7 @@ impl SessionView for MergeView {
             Command::ToggleOverwrite => self.output_pane.toggle_overwrite(),
             Command::SwapSides => self.swap_sides(),
             Command::Cancel => {
+                self.pending_alignment = None;
                 self.find_task.cancel();
                 if let Some(job) = self.job.as_ref() {
                     job.cancel();
@@ -3264,6 +3460,13 @@ impl SessionView for MergeView {
 }
 
 impl MergeView {
+    fn accepts_alignment(&self, ready: bool) -> bool {
+        ready
+            && (self.pending_alignment.is_some()
+                || self.focus != Pane::Output
+                || self.input_selections.iter().any(Option::is_some))
+    }
+
     fn navigate_conflict(&mut self, forward: bool) {
         let current_matches = self
             .data
@@ -3715,6 +3918,102 @@ mod tests {
             std::thread::sleep(Duration::from_millis(2));
         }
         panic!("the merge never became ready");
+    }
+
+    #[test]
+    fn align_with_waits_for_the_other_input_pane_and_applies_the_selected_range() {
+        let (mut view, _dir) = open("a\nL1\nL2\nz\n", Some("a\nb1\nb2\nz\n"), "a\nR1\nR2\nz\n");
+        run_until_ready(&mut view);
+        let section = view
+            .model()
+            .sections()
+            .iter()
+            .position(super::model::Section::is_unresolved_conflict)
+            .unwrap();
+        let left = view.model().sections()[section].left.clone();
+        let right = view.model().sections()[section].right.clone();
+
+        view.select_input_line(Pane::Left, left.start, false);
+        view.select_input_line(Pane::Left, left.start + 1, true);
+        assert_eq!(
+            view.input_selection(Pane::Left).unwrap().range,
+            left.start..left.start + 2
+        );
+        view.focus = Pane::Left;
+        view.run(Command::AlignWith);
+        assert_eq!(
+            view.pending_alignment,
+            Some(super::PendingAlignment {
+                pane: Pane::Left,
+                range: left.start..left.start + 2,
+            })
+        );
+        assert!(view.accepts(Command::Cancel));
+
+        let target_row = view
+            .model()
+            .row_of_input_line(Pane::Right, right.start)
+            .unwrap();
+        let visible_row =
+            u16::try_from(view.visible.position_of(target_row).unwrap()).unwrap_or_default();
+        let pane = view.pane_rect(Pane::Right).unwrap();
+        let row_height = view.row_height();
+        let target = egui::pos2(
+            pane.left() + 8.0,
+            pane.top() + row_height * (1.5 + f32::from(visible_row)),
+        );
+        view.click(target, false);
+
+        assert!(view.pending_alignment.is_none());
+        assert!(view.input_selections.iter().all(Option::is_none));
+        assert_eq!(view.message.as_deref(), Some("Selected lines are aligned"));
+        let aligned_start_row = view
+            .model()
+            .row_of_input_line(Pane::Left, left.start)
+            .unwrap();
+        assert_eq!(
+            view.model().rows()[aligned_start_row].right,
+            Some(right.start)
+        );
+        let remaining_row = view
+            .model()
+            .row_of_input_line(Pane::Left, left.start + 1)
+            .unwrap();
+        assert_eq!(view.model().rows()[remaining_row].right, None);
+    }
+
+    #[test]
+    fn a_new_input_click_replaces_selections_from_other_panes() {
+        let (mut view, _dir) = open("a\nL\nz\n", Some("a\nC\nz\n"), "a\nR\nz\n");
+        run_until_ready(&mut view);
+        let section = view
+            .model()
+            .sections()
+            .iter()
+            .position(super::model::Section::is_unresolved_conflict)
+            .unwrap();
+        let left = view.model().sections()[section].left.clone();
+        let center = view.model().sections()[section].center.clone();
+        view.select_input_line(Pane::Left, left.start, false);
+
+        let target_row = view
+            .model()
+            .row_of_input_line(Pane::Center, center.start)
+            .unwrap();
+        let visible_row =
+            u16::try_from(view.visible.position_of(target_row).unwrap()).unwrap_or_default();
+        let pane = view.pane_rect(Pane::Center).unwrap();
+        let target = egui::pos2(
+            pane.left() + 8.0,
+            pane.top() + view.row_height() * (1.5 + f32::from(visible_row)),
+        );
+        view.click(target, false);
+
+        assert!(view.input_selection(Pane::Left).is_none());
+        assert_eq!(
+            view.input_selection(Pane::Center).unwrap().range,
+            center.start..center.start + 1
+        );
     }
 
     fn wait_for_save(view: &mut MergeView) {
@@ -4909,6 +5208,44 @@ mod tests {
     }
 
     #[test]
+    fn navigation_to_a_manual_alignment_gap_uses_the_section_output_start() {
+        let (mut view, _dir) = open(
+            "a\nL0\nL1\nL2\nz\n",
+            Some("a\nC0\nC1\nz\n"),
+            "a\nR0\nR1\nz\n",
+        );
+        run_until_ready(&mut view);
+        let section = view
+            .model()
+            .sections()
+            .iter()
+            .position(crate::model::Section::is_unresolved_conflict)
+            .unwrap();
+        let left = view.model().sections()[section].left.clone();
+        let center = view.model().sections()[section].center.clone();
+        view.data
+            .model
+            .add_manual_alignment(
+                Pane::Left,
+                left.start + 1..left.start + 2,
+                Pane::Center,
+                center.start..center.start + 1,
+            )
+            .unwrap();
+        let output_start = view.model().output_range(section).unwrap().start;
+        assert!(view
+            .model()
+            .output_line_for_row(view.model().row_of_section(section).unwrap())
+            .is_none());
+
+        view.go_to_section(Some(section));
+
+        assert_eq!(view.output_pane.caret().line, output_start);
+        view.follow_caret();
+        assert_eq!(view.current_section(), section);
+    }
+
+    #[test]
     fn saving_with_a_conflict_asks_before_it_writes_markers() {
         let (mut view, _dir) = open("a\nL\nc\n", Some("a\nb\nc\n"), "a\nR\nc\n");
         run_until_ready(&mut view);
@@ -5897,7 +6234,7 @@ mod tests {
         frame(&mut view);
         let pane = view.pane_rect(super::Pane::Left).unwrap();
         let first_body_row = pane.top() + view.row_height() * 1.5;
-        view.click(egui::pos2(pane.center().x, first_body_row));
+        view.click(egui::pos2(pane.center().x, first_body_row), false);
         assert_eq!(view.current_row(), conflict_rows(&view).start);
         assert_eq!(view.focused_pane(), super::Pane::Left);
     }
@@ -5929,7 +6266,10 @@ mod tests {
         assert!(view.scroll.fraction() > 0.0);
         let pane = view.pane_rect(super::Pane::Left).unwrap();
         let body_top = pane.top() + row_height;
-        view.click(egui::pos2(pane.center().x, body_top + row_height * 0.75));
+        view.click(
+            egui::pos2(pane.center().x, body_top + row_height * 0.75),
+            false,
+        );
         assert_eq!(Some(view.current_row()), view.visible_rows().row_at(3));
     }
 
