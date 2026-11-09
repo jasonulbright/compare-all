@@ -4,8 +4,9 @@
 //! panel itself starts no work: it reports that something changed and the view
 //! sends the affected stages to a worker.
 
-use crate::jobs::TableSettings;
+use crate::jobs::{SheetPair, TableSettings};
 use crate::model::ColumnInfo;
+use ca_session::settings::table::TablePairing;
 use ca_table::align::RowAlignmentMode;
 use ca_table::schema::{
     column_letter, ColumnAlignment, ColumnHandling, ColumnType, ManualColumnPair,
@@ -58,6 +59,8 @@ impl SettingsPanel {
         id: egui::Id,
         settings: &mut TableSettings,
         columns: &[ColumnInfo],
+        sheet_pairs: &[SheetPair],
+        sheet_names: (&[String], &[String]),
     ) -> bool {
         let mut changed = false;
         ui.horizontal(|ui| {
@@ -70,6 +73,9 @@ impl SettingsPanel {
         egui::ScrollArea::vertical()
             .id_salt(id.with("settings-scroll"))
             .show(ui, |ui| {
+                changed |=
+                    sheet_section(ui, id, settings, sheet_pairs, sheet_names.0, sheet_names.1);
+                ui.separator();
                 changed |= self.column_section(ui, id, settings, columns);
                 ui.separator();
                 changed |= default_section(ui, id, settings);
@@ -119,6 +125,161 @@ impl SettingsPanel {
         }
         changed
     }
+}
+
+fn sheet_section(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    settings: &mut TableSettings,
+    sheet_pairs: &[SheetPair],
+    left_names: &[String],
+    right_names: &[String],
+) -> bool {
+    ui.label("Sheets");
+    let mut choice = pairing_label(&settings.sheets);
+    let before = choice;
+    egui::ComboBox::from_id_salt(id.with("sheet-alignment"))
+        .width(ALIGN_COMBO_WIDTH)
+        .selected_text(choice)
+        .show_ui(ui, |ui| {
+            for option in [
+                "Unaligned",
+                "By left sheet name",
+                "By right sheet name",
+                "Custom",
+            ] {
+                ui.selectable_value(&mut choice, option, option);
+            }
+        });
+    let mut changed = choice != before;
+    if changed {
+        settings.sheets = match choice {
+            "By left sheet name" => TablePairing::by_left_name(),
+            "By right sheet name" => TablePairing::by_right_name(),
+            "Custom" => TablePairing::Custom {
+                pairs: sheet_pairs
+                    .iter()
+                    .map(|pair| (pair.left_index, pair.right_index))
+                    .collect(),
+                unknown: std::collections::BTreeMap::new(),
+            },
+            _ => TablePairing::unaligned(),
+        };
+    }
+    if matches!(settings.sheets, TablePairing::Custom { .. }) {
+        changed |= custom_sheet_pairs(ui, id, &mut settings.sheets, left_names, right_names);
+    }
+    changed
+}
+
+fn pairing_label(pairing: &TablePairing) -> &'static str {
+    match pairing {
+        TablePairing::ByLeftName { .. } => "By left sheet name",
+        TablePairing::ByRightName { .. } => "By right sheet name",
+        TablePairing::Custom { .. } => "Custom",
+        _ => "Unaligned",
+    }
+}
+
+fn custom_sheet_pairs(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    pairing: &mut TablePairing,
+    left_names: &[String],
+    right_names: &[String],
+) -> bool {
+    let TablePairing::Custom { pairs, .. } = pairing else {
+        return false;
+    };
+    ui.label("Custom sheet pairs");
+    let mut changed = false;
+    let mut move_up = None;
+    let mut move_down = None;
+    let mut remove = None;
+    for (index, pair) in pairs.iter_mut().enumerate() {
+        ui.horizontal(|ui| {
+            changed |= sheet_choice(
+                ui,
+                id.with(("sheet-left", index)),
+                "Left",
+                &mut pair.0,
+                left_names,
+            );
+            changed |= sheet_choice(
+                ui,
+                id.with(("sheet-right", index)),
+                "Right",
+                &mut pair.1,
+                right_names,
+            );
+            if ui.button("Up").clicked() {
+                move_up = Some(index);
+            }
+            if ui.button("Down").clicked() {
+                move_down = Some(index);
+            }
+            if ui.button("Remove").clicked() {
+                remove = Some(index);
+            }
+        });
+    }
+    ui.horizontal(|ui| {
+        if ui.button("Add pair").clicked() {
+            pairs.push((None, None));
+            changed = true;
+        }
+        if ui.button("Tidy").clicked() {
+            pairs.retain(|pair| pair.0.is_some() || pair.1.is_some());
+            changed = true;
+        }
+    });
+    if let Some(index) = move_up {
+        if index > 0 {
+            pairs.swap(index, index - 1);
+            changed = true;
+        }
+    }
+    if let Some(index) = move_down {
+        if index + 1 < pairs.len() {
+            pairs.swap(index, index + 1);
+            changed = true;
+        }
+    }
+    if let Some(index) = remove {
+        if index < pairs.len() {
+            pairs.remove(index);
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn sheet_choice(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    label: &str,
+    value: &mut Option<u32>,
+    names: &[String],
+) -> bool {
+    let selected =
+        match (*value).and_then(|index| Some((index, names.get(usize::try_from(index).ok()?)?))) {
+            Some((index, name)) => format!("{}: {}", index + 1, name),
+            None => "None".to_owned(),
+        };
+    let before = *value;
+    ui.label(label);
+    egui::ComboBox::from_id_salt(id)
+        .width(ALIGN_COMBO_WIDTH)
+        .selected_text(selected)
+        .show_ui(ui, |ui| {
+            ui.selectable_value(value, None, "None");
+            for (index, name) in names.iter().enumerate() {
+                if let Ok(index) = u32::try_from(index) {
+                    ui.selectable_value(value, Some(index), format!("{}: {name}", index + 1));
+                }
+            }
+        });
+    *value != before
 }
 
 fn column_alignment(

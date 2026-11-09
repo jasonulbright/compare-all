@@ -16,7 +16,9 @@ ca-session.workspace = true
 ca-table.workspace = true
 ca-text.workspace = true
 ca-ui.workspace = true
+calamine.workspace = true
 egui.workspace = true
+zip.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

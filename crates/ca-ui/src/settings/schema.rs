@@ -929,12 +929,7 @@ const TABLE_COMPARE: &[Tab] = &[
     },
     Tab {
         name: "Sheets",
-        fields: &[
-            pairing_field!(TableCompare, sheets, "Sheet pairing").unavailable(
-                "The comparison reads one table per side. Sheet pairing waits on \
-             multiple sheets being extracted.",
-            ),
-        ],
+        fields: &[pairing_field!(TableCompare, sheets, "Sheet pairing")],
     },
     Tab {
         name: "Columns",
