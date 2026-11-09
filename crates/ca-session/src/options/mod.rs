@@ -489,6 +489,7 @@ mod tests {
         let mut options = ProgramOptions::default();
         options.text_editing.tab_stop = 4;
         options.file_operations.confirm_delete = false;
+        options.file_operations.require_explicit_delete_side = true;
         options
             .appearance
             .palettes
@@ -500,6 +501,7 @@ mod tests {
         let read = ProgramOptions::load(&file).unwrap().options;
         assert_eq!(read.text_editing.tab_stop, 4);
         assert!(!read.file_operations.confirm_delete);
+        assert!(read.file_operations.require_explicit_delete_side);
         assert_eq!(
             read.appearance
                 .palettes

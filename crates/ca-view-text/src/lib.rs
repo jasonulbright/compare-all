@@ -465,6 +465,7 @@ pub struct TextView {
     /// own consent to these and never grants another.
     saving_consent: SaveConsent,
     save_both_pending: bool,
+    save_selection: ca_ui::save::SaveSelection,
     prompt: Option<Prompt>,
     close_requested: bool,
     /// The command that reads the files again once the save in progress has
@@ -782,6 +783,7 @@ impl TextView {
             saving_as: None,
             saving_consent: SaveConsent::default(),
             save_both_pending: false,
+            save_selection: ca_ui::save::SaveSelection::default(),
             prompt: None,
             close_requested: false,
             reread_after_save: None,
@@ -3816,12 +3818,25 @@ impl TextView {
         let Some(text) = self.prompt_text() else {
             return;
         };
+        if matches!(prompt, Prompt::Closing | Prompt::Reread(_)) {
+            ui.vertical(|ui| {
+                ui.label(text);
+                let dirty = [
+                    self.left_pane.is_modified(),
+                    self.right_pane.is_modified(),
+                    false,
+                ];
+                if let Some(answer) = self.save_selection.show(ui, dirty) {
+                    self.answer_save_selection(answer);
+                }
+            });
+            return;
+        }
         let mut answer: Option<bool> = None;
-        let mut unsaved: Option<CloseChoice> = None;
         ui.horizontal_wrapped(|ui| {
             ui.label(text);
             match &prompt {
-                Prompt::KeptCopy(_) => {}
+                Prompt::KeptCopy(_) | Prompt::Closing | Prompt::Reread(_) => {}
                 Prompt::DiskChanged(_) | Prompt::WouldLose(..) => {
                     let yes = if matches!(prompt, Prompt::DiskChanged(_)) {
                         "Overwrite"
@@ -3837,27 +3852,30 @@ impl TextView {
                         answer = Some(false);
                     }
                 }
-                Prompt::Closing | Prompt::Reread(_) => {
-                    let (save, discard) = match &prompt {
-                        Prompt::Reread(action) => (action.save_label(), action.discard_label()),
-                        _ => ("Save and close", "Discard and close"),
-                    };
-                    for (label, choice) in [
-                        (save, CloseChoice::Save),
-                        (discard, CloseChoice::Discard),
-                        ("Cancel", CloseChoice::Cancel),
-                    ] {
-                        if ui.button(label).clicked() {
-                            unsaved = Some(choice);
-                        }
-                    }
-                }
             }
         });
-        if let Some(choice) = unsaved {
-            self.answer_unsaved(choice);
-        } else if let Some(answer) = answer {
+        if let Some(answer) = answer {
             self.answer_prompt(answer);
+        }
+    }
+
+    fn answer_save_selection(&mut self, answer: ca_ui::save::UnsavedAnswer) {
+        match answer {
+            ca_ui::save::UnsavedAnswer::SaveChecked => {
+                if !self.save_selection.left {
+                    self.left_pane.mark_saved();
+                }
+                if !self.save_selection.right {
+                    self.right_pane.mark_saved();
+                }
+                self.answer_unsaved(CloseChoice::Save);
+            }
+            ca_ui::save::UnsavedAnswer::DiscardAll => {
+                self.answer_unsaved(CloseChoice::Discard);
+            }
+            ca_ui::save::UnsavedAnswer::Cancel => {
+                self.answer_unsaved(CloseChoice::Cancel);
+            }
         }
     }
 
@@ -3964,6 +3982,11 @@ impl TextView {
             return;
         }
         if self.left_pane.is_modified() || self.right_pane.is_modified() {
+            self.save_selection.reset([
+                self.left_pane.is_modified(),
+                self.right_pane.is_modified(),
+                false,
+            ]);
             self.prompt = Some(Prompt::Reread(action));
             return;
         }
@@ -6576,6 +6599,11 @@ impl SessionView for TextView {
         ) {
             return true;
         }
+        self.save_selection.reset([
+            self.left_pane.is_modified(),
+            self.right_pane.is_modified(),
+            false,
+        ]);
         self.prompt = Some(Prompt::Closing);
         false
     }
@@ -7427,6 +7455,44 @@ mod tests {
             assert_eq!(view.wants_close(), closing);
             assert!(view.may_close());
         }
+    }
+
+    #[test]
+    fn saving_checked_text_sides_discards_unchecked_edits() {
+        use super::{Side, TextView};
+        use ca_ui::save::UnsavedAnswer;
+        use ca_ui::view::SessionView;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let left = dir.path().join("left.txt");
+        let right = dir.path().join("right.txt");
+        std::fs::write(&left, b"left").unwrap();
+        std::fs::write(&right, b"right").unwrap();
+        let mut view = TextView::new(left.clone(), right.clone(), &ca_ui::testing::context(), 1);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !view.is_ready() && Instant::now() < deadline {
+            view.tick();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(view.is_ready());
+        view.pane_mut(Side::Left).buffer_mut().insert(0, "changed ");
+        view.pane_mut(Side::Right)
+            .buffer_mut()
+            .insert(0, "changed ");
+        assert!(!view.may_close());
+        assert!(view.save_selection.left && view.save_selection.right);
+        view.save_selection.left = false;
+        view.answer_save_selection(UnsavedAnswer::SaveChecked);
+        while view.save_job.is_some() && Instant::now() < deadline {
+            view.poll_save();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        assert!(view.wants_close());
+        assert_eq!(std::fs::read(&left).unwrap(), b"left");
+        assert_eq!(std::fs::read(&right).unwrap(), b"changed right");
+        assert!(!view.pane(Side::Left).is_modified());
     }
 
     #[test]

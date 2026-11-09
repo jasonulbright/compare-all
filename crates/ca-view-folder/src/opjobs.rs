@@ -18,6 +18,7 @@ use ca_fs::{
 };
 use ca_fs::{ArchiveTypes, FileOps, Mount, SourceOps};
 use ca_ui::worker::{Cancel, Job, Terminal};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 
@@ -167,9 +168,34 @@ fn build(tree: &Node, request: &Request) -> PlanOutcome {
                 &RealFs,
             )))
         }
-        Operation::Delete => per_side(request, &left, &right, |selection, sides| {
-            plan_delete(selection, sides, bases, &request.options)
-        }),
+        Operation::Delete => {
+            let left = if request
+                .delete_scope
+                .is_some_and(|scope| scope != crate::selection::Scope::Right)
+            {
+                left.as_slice()
+            } else {
+                &[]
+            };
+            let right = if request
+                .delete_scope
+                .is_some_and(|scope| scope != crate::selection::Scope::Left)
+            {
+                right.as_slice()
+            } else {
+                &[]
+            };
+            if left.is_empty() && right.is_empty() {
+                return PlanOutcome::Plan(Box::new(OperationPlan::new(
+                    ca_fs::OperationKind::Delete,
+                    vec![request.left_base.clone(), request.right_base.clone()],
+                    request.options.clone(),
+                )));
+            }
+            per_side(request, left, right, |selection, sides| {
+                plan_delete(selection, sides, bases, &request.options)
+            })
+        }
         Operation::Touch => per_side(request, &left, &right, |selection, sides| {
             plan_touch(selection, sides, bases, request.touch, &request.options)
         }),
@@ -330,17 +356,20 @@ pub const fn sides_of(scope: Scope) -> Sides {
 /// Plan a synchronisation on a worker.
 #[must_use]
 pub fn spawn_sync_plan(
-    tree: Box<Node>,
-    preset: SyncPreset,
-    preview: SyncPreview,
-    left_base: PathBuf,
-    right_base: PathBuf,
-    options: ca_fs::OperationOptions,
+    request: SyncPlanRequest,
     notify: Arc<dyn Fn() + Send + Sync>,
 ) -> Job<PlanMessage> {
     Job::spawn_notifying(
         move |emitter, cancel| {
-            let tree = tree;
+            let SyncPlanRequest {
+                tree,
+                preset,
+                preview,
+                left_base,
+                right_base,
+                options,
+                selection,
+            } = request;
             let bases = Bases {
                 left: &left_base,
                 right: &right_base,
@@ -349,8 +378,21 @@ pub fn spawn_sync_plan(
             let overrides = preview.overrides;
             let mut preview = ca_fs::preview_with_options(&tree, &preset, include_hidden);
             preview.overrides = overrides;
+            let mut plan_preview = preview.clone();
+            if let Some(selection) = selection {
+                for row in &plan_preview.rows {
+                    let selected = selection.iter().any(|path| {
+                        row.rel.as_path() == path.as_path() || row.rel.starts_with(path)
+                    });
+                    if !selected {
+                        plan_preview
+                            .overrides
+                            .insert(row.rel.clone(), ca_fs::SyncAction::LeaveAlone);
+                    }
+                }
+            }
             let outcome = unless_stopped(cancel, || {
-                match plan_sync(&tree, &preset, bases, &options, &preview) {
+                match plan_sync(&tree, &preset, bases, &options, &plan_preview) {
                     Ok(plan) => PlanOutcome::Plan(Box::new(plan)),
                     Err(refused) => PlanOutcome::Refused(refused.to_string()),
                 }
@@ -363,6 +405,24 @@ pub fn spawn_sync_plan(
         },
         notify,
     )
+}
+
+/// The complete input captured for one synchronization plan.
+pub struct SyncPlanRequest {
+    /// The compared folder tree.
+    pub tree: Box<Node>,
+    /// Synchronization method used to create the preview.
+    pub preset: SyncPreset,
+    /// Current user choices for preview rows.
+    pub preview: SyncPreview,
+    /// Left comparison root.
+    pub left_base: PathBuf,
+    /// Right comparison root.
+    pub right_base: PathBuf,
+    /// File operation settings for the plan.
+    pub options: ca_fs::OperationOptions,
+    /// Paths to include, or `None` to include all preview rows.
+    pub selection: Option<BTreeSet<PathBuf>>,
 }
 
 /// What the preview worker posts back.

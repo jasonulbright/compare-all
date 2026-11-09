@@ -244,6 +244,10 @@ pub struct Form {
     pub exclude_by_type: bool,
     /// Which sides an operation that can read either one acts on.
     pub scope: Scope,
+    /// The side or sides Delete includes, or `None` when no side is checked.
+    pub delete_scope: Option<Scope>,
+    /// Whether Synchronize limits the run to selected rows.
+    pub sync_just_selection: bool,
     /// The folder and suffix a copy of a replaced file is written with.
     pub backup_names: ca_fs::BackupOptions,
 }
@@ -266,6 +270,8 @@ impl Default for Form {
             new_folder_name: "New Folder".to_string(),
             exclude_by_type: false,
             scope: Scope::Both,
+            delete_scope: Some(Scope::Both),
+            sync_just_selection: false,
             backup_names: ca_fs::BackupOptions::default(),
         }
     }
@@ -367,6 +373,8 @@ pub struct Request {
     pub from: Side,
     /// The sides a two-sided operation acts on.
     pub scope: Scope,
+    /// The side or sides Delete includes, or `None` when no side is checked.
+    pub delete_scope: Option<Scope>,
     /// Left base folder.
     pub left_base: PathBuf,
     /// Right base folder.
@@ -410,6 +418,7 @@ impl Request {
             right: selection.side(Side::Right).clone(),
             from,
             scope: form.scope,
+            delete_scope: form.delete_scope,
             left_base,
             right_base,
             options: OperationOptions::default(),
@@ -446,6 +455,7 @@ impl Request {
             (false, false) => Some(Scope::Both),
         };
         self.scope = occupied.unwrap_or(form.scope);
+        self.delete_scope = form.delete_scope;
         self.options = form.options.clone();
         self.target_folder = (!form.target_folder.trim().is_empty())
             .then(|| PathBuf::from(form.target_folder.trim()));

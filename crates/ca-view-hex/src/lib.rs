@@ -256,6 +256,7 @@ pub struct HexView {
     saving_revision: Option<u64>,
     saving_as: Option<PathBuf>,
     save_both_pending: bool,
+    save_selection: ca_ui::save::SaveSelection,
     prompt: Option<Prompt>,
     close_requested: bool,
     /// The command that reads the files again once the save in progress has
@@ -357,6 +358,7 @@ impl HexView {
             saving_revision: None,
             saving_as: None,
             save_both_pending: false,
+            save_selection: ca_ui::save::SaveSelection::default(),
             prompt: None,
             close_requested: false,
             reread_after_save: None,
@@ -1960,12 +1962,25 @@ impl HexView {
         let Some(text) = self.prompt_text() else {
             return;
         };
+        if matches!(prompt, Prompt::Closing | Prompt::Reread(_)) {
+            ui.vertical(|ui| {
+                ui.label(text);
+                let dirty = [
+                    self.left_bytes.is_modified(),
+                    self.right_bytes.is_modified(),
+                    false,
+                ];
+                if let Some(answer) = self.save_selection.show(ui, dirty) {
+                    self.answer_save_selection(answer);
+                }
+            });
+            return;
+        }
         let mut answer: Option<bool> = None;
-        let mut unsaved: Option<CloseChoice> = None;
         ui.horizontal_wrapped(|ui| {
             ui.label(text);
             match &prompt {
-                Prompt::KeptCopy(_) => {}
+                Prompt::KeptCopy(_) | Prompt::Closing | Prompt::Reread(_) => {}
                 Prompt::DiskChanged(_) => {
                     if ui.button("Overwrite").clicked() {
                         answer = Some(true);
@@ -1976,27 +1991,30 @@ impl HexView {
                         answer = Some(false);
                     }
                 }
-                Prompt::Closing | Prompt::Reread(_) => {
-                    let (save, discard) = match &prompt {
-                        Prompt::Reread(action) => (action.save_label(), action.discard_label()),
-                        _ => ("Save and close", "Discard and close"),
-                    };
-                    for (label, choice) in [
-                        (save, CloseChoice::Save),
-                        (discard, CloseChoice::Discard),
-                        ("Cancel", CloseChoice::Cancel),
-                    ] {
-                        if ui.button(label).clicked() {
-                            unsaved = Some(choice);
-                        }
-                    }
-                }
             }
         });
-        if let Some(choice) = unsaved {
-            self.answer_unsaved(choice);
-        } else if let Some(answer) = answer {
+        if let Some(answer) = answer {
             self.answer_prompt(answer);
+        }
+    }
+
+    fn answer_save_selection(&mut self, answer: ca_ui::save::UnsavedAnswer) {
+        match answer {
+            ca_ui::save::UnsavedAnswer::SaveChecked => {
+                if !self.save_selection.left {
+                    self.left_bytes.mark_saved();
+                }
+                if !self.save_selection.right {
+                    self.right_bytes.mark_saved();
+                }
+                self.answer_unsaved(CloseChoice::Save);
+            }
+            ca_ui::save::UnsavedAnswer::DiscardAll => {
+                self.answer_unsaved(CloseChoice::Discard);
+            }
+            ca_ui::save::UnsavedAnswer::Cancel => {
+                self.answer_unsaved(CloseChoice::Cancel);
+            }
         }
     }
 
@@ -2082,6 +2100,11 @@ impl HexView {
             return;
         }
         if self.left_bytes.is_modified() || self.right_bytes.is_modified() {
+            self.save_selection.reset([
+                self.left_bytes.is_modified(),
+                self.right_bytes.is_modified(),
+                false,
+            ]);
             self.prompt = Some(Prompt::Reread(action));
             return;
         }
@@ -3110,6 +3133,11 @@ impl SessionView for HexView {
         ) {
             return true;
         }
+        self.save_selection.reset([
+            self.left_bytes.is_modified(),
+            self.right_bytes.is_modified(),
+            false,
+        ]);
         self.prompt = Some(Prompt::Closing);
         false
     }
@@ -3401,6 +3429,36 @@ mod tests {
             assert_eq!(view.wants_close(), closing);
             assert!(view.may_close());
         }
+    }
+
+    #[test]
+    fn saving_checked_hex_sides_discards_unchecked_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let left = dir.path().join("left.bin");
+        let right = dir.path().join("right.bin");
+        let mut view = HexView::from_data(
+            left.clone(),
+            right.clone(),
+            &context(),
+            1,
+            crate::jobs::HexData::default(),
+        );
+        view.left_bytes.replace(0, 0, &[1]);
+        view.right_bytes.replace(0, 0, &[2]);
+        assert!(!view.may_close());
+        assert!(view.save_selection.left && view.save_selection.right);
+        view.save_selection.left = false;
+        view.answer_save_selection(ca_ui::save::UnsavedAnswer::SaveChecked);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while view.save_job.is_some() && Instant::now() < deadline {
+            view.poll_save();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        assert!(view.wants_close());
+        assert!(!left.exists());
+        assert_eq!(std::fs::read(&right).unwrap(), [2]);
+        assert!(!view.left_bytes.is_modified());
     }
 
     #[test]

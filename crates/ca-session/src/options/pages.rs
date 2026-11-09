@@ -461,6 +461,8 @@ pub struct FileOperationOptions {
     pub confirm_merge: bool,
     /// Ask before a delete.
     pub confirm_delete: bool,
+    /// Require the user to choose the Delete side or sides.
+    pub require_explicit_delete_side: bool,
     /// Ask before starting a folder content comparison.
     pub confirm_content_comparison: bool,
     /// Open a results window after a folder content comparison.
@@ -481,6 +483,7 @@ impl Default for FileOperationOptions {
             confirm_move: true,
             confirm_merge: true,
             confirm_delete: true,
+            require_explicit_delete_side: false,
             confirm_content_comparison: true,
             show_content_results: false,
             synchronize_confirmations: SynchronizeConfirmations::default(),

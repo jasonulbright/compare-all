@@ -874,6 +874,11 @@ impl TableView {
             return;
         }
         if self.is_modified(Side::Left) || self.is_modified(Side::Right) {
+            self.save_selection.reset([
+                self.is_modified(Side::Left),
+                self.is_modified(Side::Right),
+                false,
+            ]);
             self.prompt = Some(Prompt::Reread(action));
             return;
         }
@@ -928,6 +933,20 @@ impl TableView {
         let Some(text) = self.prompt_text() else {
             return;
         };
+        if matches!(prompt, Prompt::Closing | Prompt::Reread(_)) {
+            ui.vertical(|ui| {
+                ui.label(text);
+                let dirty = [
+                    self.is_modified(Side::Left),
+                    self.is_modified(Side::Right),
+                    false,
+                ];
+                if let Some(answer) = self.save_selection.show(ui, dirty) {
+                    self.answer_save_selection(answer);
+                }
+            });
+            return;
+        }
         ui.horizontal_wrapped(|ui| {
             ui.label(text);
             match prompt {
@@ -944,23 +963,29 @@ impl TableView {
                         self.answer_prompt(false);
                     }
                 }
-                Prompt::Closing | Prompt::Reread(_) => {
-                    let (save, discard) = match prompt {
-                        Prompt::Reread(action) => (action.save_label(), action.discard_label()),
-                        _ => ("Save and close", "Discard and close"),
-                    };
-                    for (label, choice) in [
-                        (save, CloseChoice::Save),
-                        (discard, CloseChoice::Discard),
-                        ("Cancel", CloseChoice::Cancel),
-                    ] {
-                        if ui.button(label).clicked() {
-                            self.answer_unsaved(choice);
-                        }
-                    }
-                }
+                Prompt::Closing | Prompt::Reread(_) => {}
             }
         });
+    }
+
+    fn answer_save_selection(&mut self, answer: ca_ui::save::UnsavedAnswer) {
+        match answer {
+            ca_ui::save::UnsavedAnswer::SaveChecked => {
+                if !self.save_selection.left {
+                    self.left_text.mark_saved();
+                }
+                if !self.save_selection.right {
+                    self.right_text.mark_saved();
+                }
+                self.answer_unsaved(CloseChoice::Save);
+            }
+            ca_ui::save::UnsavedAnswer::DiscardAll => {
+                self.answer_unsaved(CloseChoice::Discard);
+            }
+            ca_ui::save::UnsavedAnswer::Cancel => {
+                self.answer_unsaved(CloseChoice::Cancel);
+            }
+        }
     }
 
     // --- find and replace -------------------------------------------------
@@ -1453,6 +1478,33 @@ mod tests {
         view.discard_and_close();
         assert!(view.wants_close());
         assert_eq!(std::fs::read(&left).unwrap(), CSV);
+    }
+
+    #[test]
+    fn saving_checked_table_sides_discards_unchecked_edits() {
+        let (_dir, left, right) = files(CSV, CSV);
+        let mut view = open(&left, &right);
+        at(&mut view, 0, 1);
+        view.edit_current_cell("Left edit").unwrap();
+        settle(&mut view);
+        view.active = Side::Right;
+        at(&mut view, 0, 1);
+        view.edit_current_cell("Right edit").unwrap();
+        settle(&mut view);
+
+        assert!(!view.may_close());
+        assert!(view.save_selection.left && view.save_selection.right);
+        view.save_selection.left = false;
+        view.answer_save_selection(ca_ui::save::UnsavedAnswer::SaveChecked);
+        settle(&mut view);
+
+        assert!(view.wants_close());
+        assert_eq!(std::fs::read(&left).unwrap(), CSV);
+        assert_eq!(
+            std::fs::read(&right).unwrap(),
+            b"id,name\r\n1,Right edit\r\n2,Bob\r\n"
+        );
+        assert!(!view.is_modified(Side::Left));
     }
 
     /// Reload and Swap Sides read both files again, so an edit that is not

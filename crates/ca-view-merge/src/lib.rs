@@ -352,6 +352,8 @@ pub struct MergeView {
     strip: Strip<MergeClass>,
     strip_stale: bool,
     question: Option<Question>,
+    save_selection: ca_ui::save::SaveSelection,
+    close_after_save: bool,
     consent: SaveConsent,
     accept_markers: bool,
     output_baseline: Baseline,
@@ -585,6 +587,11 @@ impl MergeView {
             strip: Strip::default(),
             strip_stale: true,
             question: None,
+            save_selection: ca_ui::save::SaveSelection {
+                center: true,
+                ..ca_ui::save::SaveSelection::default()
+            },
+            close_after_save: false,
             consent: SaveConsent::default(),
             accept_markers: false,
             output_baseline: Baseline::Unchecked,
@@ -1061,7 +1068,9 @@ impl MergeView {
         let finished = job.is_finished();
         for message in messages {
             match message {
-                MergeSaveMessage::Cancelled => {}
+                MergeSaveMessage::Cancelled => {
+                    self.close_after_save = false;
+                }
                 MergeSaveMessage::NeedsConflictConsent => {
                     self.saving_revision = None;
                     self.saving_conflicts = None;
@@ -1101,6 +1110,7 @@ impl MergeView {
             SaveOutcome::SavedWithConflict { backup, .. } => Some(backup.display().to_string()),
             _ => None,
         };
+        let has_conflict_backup = conflict_backup.is_some();
         match outcome {
             SaveOutcome::Saved(stamp) | SaveOutcome::SavedWithConflict { stamp, .. } => {
                 self.output_baseline = Baseline::Present(stamp);
@@ -1130,15 +1140,23 @@ impl MergeView {
                         )
                     },
                 ));
+                if has_conflict_backup {
+                    self.close_after_save = false;
+                } else if self.close_after_save {
+                    self.close_after_save = false;
+                    self.closing = true;
+                }
             }
             SaveOutcome::ChangedOnDisk => self.question = Some(Question::OverwriteChanged),
             SaveOutcome::WouldLose(reason) => self.question = Some(Question::AcceptLoss(reason)),
             SaveOutcome::NotWritable => {
+                self.close_after_save = false;
                 self.failed = true;
                 self.save_failed = true;
                 self.message = Some("The output file cannot be replaced".to_owned());
             }
             SaveOutcome::Failed(reason) => {
+                self.close_after_save = false;
                 self.failed = true;
                 self.save_failed = true;
                 self.message = Some(format!("The output was not written: {reason}"));
@@ -1840,6 +1858,7 @@ impl MergeView {
             return;
         };
         if !accept {
+            self.close_after_save = false;
             return;
         }
         match question {
@@ -2138,6 +2157,69 @@ impl MergeView {
                         self.question = None;
                     }
                 });
+            return;
+        }
+        if question == Question::CloseModified {
+            let mut answer = None;
+            ui.group(|ui| {
+                ca_ui::widgets::notice_current(
+                    ui,
+                    ca_ui::icons::Icon::Question,
+                    24.0,
+                    &question.prompt(),
+                );
+                ui.checkbox(&mut self.save_selection.center, "Center file");
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .add_enabled(
+                            self.save_selection.center,
+                            egui::Button::new("Save Checked"),
+                        )
+                        .clicked()
+                    {
+                        answer = Some(ca_ui::save::UnsavedAnswer::SaveChecked);
+                    }
+                    if ui.button("Discard All").clicked() {
+                        answer = Some(ca_ui::save::UnsavedAnswer::DiscardAll);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        answer = Some(ca_ui::save::UnsavedAnswer::Cancel);
+                    }
+                });
+            });
+            match answer {
+                Some(ca_ui::save::UnsavedAnswer::SaveChecked) => {
+                    self.question = None;
+                    self.close_after_save = true;
+                    self.save_output();
+                    if self.save_job.is_none()
+                        && !matches!(
+                            self.question,
+                            Some(
+                                Question::SaveWithConflicts
+                                    | Question::OverwriteChanged
+                                    | Question::AcceptLoss(_)
+                            )
+                        )
+                    {
+                        self.close_after_save = false;
+                    }
+                }
+                Some(ca_ui::save::UnsavedAnswer::DiscardAll) => {
+                    self.question = None;
+                    self.close_after_save = false;
+                    self.output_pane.buffer_mut().mark_saved();
+                    self.output_changed_on_load = false;
+                    self.save_failed = false;
+                    self.marks_changed = false;
+                    self.closing = true;
+                }
+                Some(ca_ui::save::UnsavedAnswer::Cancel) => {
+                    self.question = None;
+                    self.close_after_save = false;
+                }
+                _ => {}
+            }
             return;
         }
         let mut answer: Option<bool> = None;
@@ -3163,6 +3245,7 @@ impl SessionView for MergeView {
         if !self.is_modified() || self.closing {
             return true;
         }
+        self.save_selection.reset([false, false, true]);
         self.question = Some(Question::CloseModified);
         false
     }
@@ -4894,6 +4977,36 @@ mod tests {
         assert!(view.is_modified());
         assert!(!view.may_close());
         assert_eq!(view.question(), Some(&Question::CloseModified));
+    }
+
+    #[test]
+    fn save_checked_writes_the_merge_output_before_closing() {
+        use ca_ui::testing::probe::Probe;
+
+        let (mut view, dir) = open("a\n", None, "a\n");
+        run_until_ready(&mut view);
+        view.output_pane.buffer_mut().insert(0, "x");
+        assert!(view.is_modified());
+        assert!(!view.may_close());
+
+        let mut probe = Probe::new(800.0, 400.0);
+        {
+            let mut draw = |ctx: &egui::Context| {
+                egui::CentralPanel::default().show(ctx, |ui| view.question_panel(ui));
+                view.drain_save();
+            };
+            probe.idle(&mut draw);
+            probe.idle(&mut draw);
+            assert_eq!(probe.find("Center file").unwrap().toggled, Some(true));
+            probe.click("Save Checked", &mut draw).unwrap();
+        }
+        assert!(ca_ui::testing::wait_until(Duration::from_secs(20), || {
+            view.drain_save();
+            !view.is_saving()
+        }));
+
+        assert!(view.closing);
+        assert_eq!(std::fs::read(dir.path().join("out.txt")).unwrap(), b"xa\n");
     }
 
     #[test]

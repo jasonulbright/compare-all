@@ -257,6 +257,7 @@ pub struct EditState {
     pub(super) message: Option<String>,
     pub(super) work: Option<Job<EditMessage>>,
     pub(super) pending_saves: Vec<Side>,
+    pub(super) save_selection: ca_ui::save::SaveSelection,
     pub(super) journal_directory: PathBuf,
     pub(super) close_requested: bool,
     pub(super) discard: bool,
@@ -279,6 +280,7 @@ impl EditState {
             message: None,
             work: None,
             pending_saves: Vec::new(),
+            save_selection: ca_ui::save::SaveSelection::default(),
             journal_directory: ca_ui::paths::journal_directory(),
             close_requested: false,
             discard: false,
@@ -1436,6 +1438,11 @@ impl RecordsView {
         if self.edit.discard || !self.edit.history.is_any_modified() {
             return true;
         }
+        self.edit.save_selection.reset([
+            self.edit.history.is_modified(Side::Left),
+            self.edit.history.is_modified(Side::Right),
+            false,
+        ]);
         self.edit.prompt = Some(Prompt::Closing);
         false
     }
@@ -1459,6 +1466,29 @@ impl RecordsView {
         self.edit.prompt = None;
         self.edit.close_requested = true;
         self.run_edit(Command::SaveBoth);
+    }
+
+    /// Write checked files and discard unchecked edits before closing.
+    fn save_checked_and_close(&mut self) {
+        if !self.edit.save_selection.left {
+            self.edit.history.mark_saved(Side::Left);
+        }
+        if !self.edit.save_selection.right {
+            self.edit.history.mark_saved(Side::Right);
+        }
+        self.edit.pending_saves = [Side::Left, Side::Right]
+            .into_iter()
+            .filter(|side| {
+                let checked = match side {
+                    Side::Left => self.edit.save_selection.left,
+                    Side::Right => self.edit.save_selection.right,
+                };
+                checked && self.edit.history.is_modified(*side)
+            })
+            .collect();
+        self.edit.prompt = None;
+        self.edit.close_requested = true;
+        self.save_next();
     }
 
     /// True when a side with unwritten edits is a live key, which a close
@@ -1626,17 +1656,23 @@ impl RecordsView {
                 ui.horizontal_wrapped(|ui| {
                     ui.label("This tab has edits that are not written.");
                     if live_modified {
-                        ui.label("Write the live keys with Save first, or discard the edits.");
-                    } else if ui.button("Save and close").clicked() {
-                        self.save_and_close();
-                    }
-                    if ui.button("Discard and close").clicked() {
-                        self.discard_and_close();
-                    }
-                    if ui.button("Cancel").clicked() {
-                        self.cancel_prompt();
+                        ui.label("Writing live keys asks for a second confirmation.");
                     }
                 });
+                let dirty = [
+                    self.edit.history.is_modified(Side::Left),
+                    self.edit.history.is_modified(Side::Right),
+                    false,
+                ];
+                if let Some(answer) = self.edit.save_selection.show(ui, dirty) {
+                    match answer {
+                        ca_ui::save::UnsavedAnswer::SaveChecked => {
+                            self.save_checked_and_close();
+                        }
+                        ca_ui::save::UnsavedAnswer::DiscardAll => self.discard_and_close(),
+                        ca_ui::save::UnsavedAnswer::Cancel => self.cancel_prompt(),
+                    }
+                }
             }
             Prompt::KeptCopy(_) => {}
         });

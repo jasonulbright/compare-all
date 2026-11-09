@@ -246,6 +246,7 @@ pub struct TableView {
     /// own consent to these and never grants another.
     saving_consent: ca_ui::save::text::SaveConsent,
     save_both_pending: bool,
+    save_selection: ca_ui::save::SaveSelection,
     prompt: Option<editing::Prompt>,
     close_requested: bool,
     /// The command that reads the files again once the save in progress has
@@ -347,6 +348,7 @@ impl TableView {
             saving_as: None,
             saving_consent: ca_ui::save::text::SaveConsent::default(),
             save_both_pending: false,
+            save_selection: ca_ui::save::SaveSelection::default(),
             prompt: None,
             close_requested: false,
             reread_after_save: None,
@@ -2670,6 +2672,11 @@ impl SessionView for TableView {
         ) {
             return true;
         }
+        self.save_selection.reset([
+            self.is_modified(Side::Left),
+            self.is_modified(Side::Right),
+            false,
+        ]);
         self.prompt = Some(editing::Prompt::Closing);
         false
     }

@@ -296,6 +296,8 @@ struct SyncBasis {
     preset: ca_fs::SyncPreset,
     preview: ca_fs::SyncPreview,
     options: ca_fs::OperationOptions,
+    selected: BTreeSet<PathBuf>,
+    just_selection: bool,
 }
 
 impl Basis {
@@ -307,13 +309,17 @@ impl Basis {
                 let current = request.with_form(form);
                 (current != **request).then(|| Self::Request(Box::new(current)))
             }
-            Self::Sync(sync) => (sync.options != form.options).then(|| {
-                Self::Sync(Box::new(SyncBasis {
-                    preset: sync.preset.clone(),
-                    preview: sync.preview.clone(),
-                    options: form.options.clone(),
-                }))
-            }),
+            Self::Sync(sync) => (sync.options != form.options
+                || sync.just_selection != form.sync_just_selection)
+                .then(|| {
+                    Self::Sync(Box::new(SyncBasis {
+                        preset: sync.preset.clone(),
+                        preview: sync.preview.clone(),
+                        options: form.options.clone(),
+                        selected: sync.selected.clone(),
+                        just_selection: form.sync_just_selection,
+                    }))
+                }),
         }
     }
 }
@@ -814,12 +820,15 @@ impl FolderView {
                 opjobs::spawn_plan(tree, (**request).clone(), self.notify.clone())
             }
             Basis::Sync(sync) => opjobs::spawn_sync_plan(
-                tree,
-                sync.preset.clone(),
-                sync.preview.clone(),
-                self.left_path.clone(),
-                self.right_path.clone(),
-                sync.options.clone(),
+                opjobs::SyncPlanRequest {
+                    tree,
+                    preset: sync.preset.clone(),
+                    preview: sync.preview.clone(),
+                    left_base: self.left_path.clone(),
+                    right_base: self.right_path.clone(),
+                    options: sync.options.clone(),
+                    selection: sync.just_selection.then(|| sync.selected.clone()),
+                },
                 self.notify.clone(),
             ),
         });
@@ -1240,6 +1249,11 @@ impl FolderView {
             ));
             return;
         };
+        if operation == Operation::Delete {
+            let scope = self.selection.occupied_scope().unwrap_or(Scope::Both);
+            let require_explicit = self.confirmations.require_explicit_delete_side;
+            self.form.delete_scope = (!require_explicit).then_some(scope);
+        }
         self.form.options.include_hidden = self.confirmations.include_hidden_items;
         let parent = self.new_folder_parent();
         let request = Request::build(
@@ -1401,19 +1415,30 @@ impl FolderView {
             return;
         };
         self.form.options.include_hidden = self.confirmations.include_hidden_items;
+        self.form.sync_just_selection = false;
         let basis = SyncBasis {
             preset: self.sync.method.preset(),
             preview,
             options: self.form.options.clone(),
+            selected: self
+                .selection
+                .side(Side::Left)
+                .union(self.selection.side(Side::Right))
+                .cloned()
+                .collect(),
+            just_selection: self.form.sync_just_selection,
         };
         self.plan_comparison = self.comparisons.current();
         self.plan_job = Some(opjobs::spawn_sync_plan(
-            tree,
-            basis.preset.clone(),
-            basis.preview.clone(),
-            self.left_path.clone(),
-            self.right_path.clone(),
-            basis.options.clone(),
+            opjobs::SyncPlanRequest {
+                tree,
+                preset: basis.preset.clone(),
+                preview: basis.preview.clone(),
+                left_base: self.left_path.clone(),
+                right_base: self.right_path.clone(),
+                options: basis.options.clone(),
+                selection: basis.just_selection.then(|| basis.selected.clone()),
+            },
             self.notify.clone(),
         ));
         self.stage = Stage::Planning(Operation::CopyToOtherSide, Basis::Sync(Box::new(basis)));
@@ -5808,6 +5833,8 @@ mod stale_results {
                 preset,
                 preview,
                 options: ca_fs::OperationOptions::default(),
+                selected: std::collections::BTreeSet::new(),
+                just_selection: false,
             })),
             revised: false,
         }));
