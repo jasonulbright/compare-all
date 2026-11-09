@@ -508,7 +508,7 @@ struct ManualAlignment {
 
 type InputLineTriple = [Option<u32>; 3];
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct OutputAnchor {
     input_lines: InputLineTriple,
     source: Option<(Pane, u32)>,
@@ -2198,10 +2198,10 @@ impl MergeModel {
         if section >= self.sections.len() {
             return;
         }
+        self.touch(section);
         if let Some(rows) = self.manual_output_rows.get_mut(section) {
             *rows = None;
         }
-        self.touch(section);
         let Some(entry) = self.sections.get_mut(section) else {
             return;
         };
@@ -2290,6 +2290,15 @@ impl MergeModel {
     /// Give the output `len` lines in section `index`, with the rows that
     /// count needs. Only the rows past the inputs' longest range change.
     pub(crate) fn set_output_len(&mut self, index: usize, len: u32) {
+        self.set_output_len_with_anchors(index, len, None);
+    }
+
+    fn set_output_len_with_anchors(
+        &mut self,
+        index: usize,
+        len: u32,
+        output_anchors: Option<&[OutputAnchor]>,
+    ) {
         let has_manual_alignment = self
             .manual_alignments
             .iter()
@@ -2307,7 +2316,10 @@ impl MergeModel {
             section.right.clone(),
         );
         let _ = self.section_output.set(index, len as usize);
-        if has_manual_alignment && matches!(section.resolution, Resolution::Edited) {
+        if has_manual_alignment
+            && output_anchors.is_none()
+            && matches!(section.resolution, Resolution::Edited)
+        {
             if let Some(rows) = self
                 .manual_output_rows
                 .get_mut(index)
@@ -2318,7 +2330,7 @@ impl MergeModel {
             }
         }
         if has_manual_alignment {
-            self.rebuild_section_rows(index);
+            self.rebuild_section_rows_with_anchors(index, output_anchors);
         } else {
             let row_count = input_ranges
                 .0
@@ -4352,6 +4364,69 @@ mod tests {
 
         let row = merged.row_of_output_line(output.start + 5).unwrap();
         assert_eq!(merged.rows()[row].center, Some(center.start + 4));
+    }
+
+    #[test]
+    fn undoing_a_length_changing_edit_restores_manual_output_rows() {
+        fn output_input_rows(
+            merged: &super::MergeModel,
+            section: usize,
+        ) -> Vec<(Option<u32>, Option<u32>, Option<u32>)> {
+            merged
+                .output_range(section)
+                .unwrap()
+                .map(|line| {
+                    let row = merged.row_of_output_line(line).unwrap();
+                    let row = merged.rows()[row];
+                    (row.left, row.center, row.right)
+                })
+                .collect()
+        }
+
+        let mut merged = model(
+            "a\nL0\nL1\nL2\nL3\nL4\nz\n",
+            "a\nC0\nC1\nC2\nC3\nC4\nC5\nz\n",
+            "a\nR0\nR1\nR2\nR3\nR4\nR5\nz\n",
+        );
+        let section = merged
+            .sections()
+            .iter()
+            .position(super::Section::is_unresolved_conflict)
+            .unwrap();
+        let left = merged.sections()[section].left.clone();
+        let center = merged.sections()[section].center.clone();
+        merged
+            .add_manual_alignment(
+                Pane::Left,
+                left.start + 1..left.start + 2,
+                Pane::Center,
+                center.start + 2..center.start + 3,
+            )
+            .unwrap();
+
+        merged.begin_journal();
+        assert!(merged.edit_output_range(section, 1..1, vec!["typed\n".to_owned()]));
+        let _first_edit = merged.end_journal().unwrap();
+        let first_edit_lines = merged.section_lines(section);
+        let first_edit_rows = output_input_rows(&merged, section);
+
+        merged.begin_journal();
+        assert!(merged.edit_output_range(section, 3..4, Vec::new()));
+        let second_edit = merged.end_journal().unwrap();
+        let second_edit_lines = merged.section_lines(section);
+        let second_edit_rows = output_input_rows(&merged, section);
+        assert_ne!(second_edit_lines, first_edit_lines);
+        assert_ne!(second_edit_rows, first_edit_rows);
+
+        assert!(merged.step_applies(&second_edit, false));
+        merged.replay(&second_edit, false);
+        assert_eq!(merged.section_lines(section), first_edit_lines);
+        assert_eq!(output_input_rows(&merged, section), first_edit_rows);
+
+        assert!(merged.step_applies(&second_edit, true));
+        merged.replay(&second_edit, true);
+        assert_eq!(merged.section_lines(section), second_edit_lines);
+        assert_eq!(output_input_rows(&merged, section), second_edit_rows);
     }
 
     #[test]

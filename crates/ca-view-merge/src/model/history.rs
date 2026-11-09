@@ -5,7 +5,7 @@
 //! changed. Undo and Redo replay a step without reading the pane or any
 //! input, so the cost of a replay is the lines and sections the step changed.
 
-use super::{MergeModel, Section};
+use super::{MergeModel, OutputAnchor, Section};
 use std::collections::BTreeMap;
 use std::ops::Range;
 
@@ -23,6 +23,8 @@ struct StepSection {
     index: usize,
     before: Section,
     after: Section,
+    before_output_anchors: Vec<OutputAnchor>,
+    after_output_anchors: Vec<OutputAnchor>,
     /// Output lines before this section that sections outside the step
     /// hold; the step leaves them alone, so the count is the same before
     /// and after it.
@@ -40,7 +42,7 @@ pub(crate) struct Step {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Journal {
     replacements: Vec<Replacement>,
-    before: BTreeMap<usize, Section>,
+    before: BTreeMap<usize, (Section, Vec<OutputAnchor>)>,
 }
 
 impl Step {
@@ -131,6 +133,7 @@ impl Step {
                 .find(|known| known.index == section.index)
             {
                 known.after = section.after;
+                known.after_output_anchors = section.after_output_anchors;
             } else {
                 self.sections.push(section);
             }
@@ -179,14 +182,19 @@ impl MergeModel {
         let mut sections: Vec<StepSection> = journal
             .before
             .into_iter()
-            .filter_map(|(index, before)| {
+            .filter_map(|(index, (before, before_output_anchors))| {
                 let after = self.sections.get(index)?.clone();
-                (before != after).then_some(StepSection {
-                    index,
-                    before,
-                    after,
-                    outside: 0,
-                })
+                let after_output_anchors = self.output_anchors(index);
+                (before != after || before_output_anchors != after_output_anchors).then_some(
+                    StepSection {
+                        index,
+                        before,
+                        after,
+                        before_output_anchors,
+                        after_output_anchors,
+                        outside: 0,
+                    },
+                )
             })
             .collect();
         self.count_outside(&mut sections);
@@ -204,8 +212,12 @@ impl MergeModel {
         let Some(section) = self.sections.get(index).cloned() else {
             return;
         };
+        let output_anchors = self.output_anchors(index);
         if let Some(journal) = self.journal.as_mut() {
-            journal.before.entry(index).or_insert(section);
+            journal
+                .before
+                .entry(index)
+                .or_insert((section, output_anchors));
         }
     }
 
@@ -324,7 +336,12 @@ impl MergeModel {
             let len = section.output_len;
             section.refresh(self.rules);
             self.sections[entry.index] = section;
-            self.set_output_len(entry.index, len);
+            let output_anchors = if forward {
+                &entry.after_output_anchors
+            } else {
+                &entry.before_output_anchors
+            };
+            self.set_output_len_with_anchors(entry.index, len, Some(output_anchors));
         }
     }
 
