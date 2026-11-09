@@ -1665,7 +1665,17 @@ impl MergeView {
         if let Some(row) = self.data.model.row_of_section(section) {
             self.row = row;
             self.show_row(row);
-            let line = self.data.model.output_line_for_row(row).unwrap_or(0);
+            let line = self
+                .data
+                .model
+                .output_line_for_row(row)
+                .or_else(|| {
+                    self.data
+                        .model
+                        .output_range(section)
+                        .map(|range| range.start)
+                })
+                .unwrap_or(0);
             self.output_pane.place(Caret::new(line, 0), false);
             let _ = self.output_pane.take_changes();
         }
@@ -5195,6 +5205,44 @@ mod tests {
 
         assert_eq!(view.current_section(), 0);
         assert_ne!(view.notice().as_deref(), Some("No further section"));
+    }
+
+    #[test]
+    fn navigation_to_a_manual_alignment_gap_uses_the_section_output_start() {
+        let (mut view, _dir) = open(
+            "a\nL0\nL1\nL2\nz\n",
+            Some("a\nC0\nC1\nz\n"),
+            "a\nR0\nR1\nz\n",
+        );
+        run_until_ready(&mut view);
+        let section = view
+            .model()
+            .sections()
+            .iter()
+            .position(crate::model::Section::is_unresolved_conflict)
+            .unwrap();
+        let left = view.model().sections()[section].left.clone();
+        let center = view.model().sections()[section].center.clone();
+        view.data
+            .model
+            .add_manual_alignment(
+                Pane::Left,
+                left.start + 1..left.start + 2,
+                Pane::Center,
+                center.start..center.start + 1,
+            )
+            .unwrap();
+        let output_start = view.model().output_range(section).unwrap().start;
+        assert!(view
+            .model()
+            .output_line_for_row(view.model().row_of_section(section).unwrap())
+            .is_none());
+
+        view.go_to_section(Some(section));
+
+        assert_eq!(view.output_pane.caret().line, output_start);
+        view.follow_caret();
+        assert_eq!(view.current_section(), section);
     }
 
     #[test]

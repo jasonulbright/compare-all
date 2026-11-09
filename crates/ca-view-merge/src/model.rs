@@ -1455,7 +1455,16 @@ impl MergeModel {
                 &paired,
                 &third_pairs,
             );
-            self.map_manual_output_rows(section, ordinal, first, &mut rows);
+            if matches!(section.resolution, Resolution::Edited)
+                && self
+                    .manual_output_rows
+                    .get(index)
+                    .is_some_and(Option::is_some)
+            {
+                self.map_edited_output_rows(index, ordinal, section.output_len, &mut rows);
+            } else {
+                self.map_manual_output_rows(section, ordinal, first, &mut rows);
+            }
             rows
         } else {
             let height = section
@@ -1529,6 +1538,114 @@ impl MergeModel {
             rows[row].output = Some(output_line);
             last_output_row = Some(row);
         }
+    }
+
+    fn map_edited_output_rows(
+        &self,
+        index: usize,
+        ordinal: u32,
+        output_len: u32,
+        rows: &mut Vec<Row>,
+    ) {
+        let Some(output_rows) = self.manual_output_rows.get(index).and_then(Option::as_ref) else {
+            return;
+        };
+        let input_row_count = rows.len();
+        let mut current_rows: Vec<_> = (0..input_row_count).collect();
+        let mut last_output_row = None;
+        for output_line in 0..output_len {
+            let old_row = output_rows.get(output_line as usize).copied().flatten();
+            let row = old_row
+                .filter(|row| *row < input_row_count)
+                .and_then(|row| current_rows.get(row).copied())
+                .filter(|row| {
+                    rows.get(*row).is_some_and(|entry| entry.output.is_none())
+                        && last_output_row.is_none_or(|last| *row > last)
+                });
+            let row = row.unwrap_or_else(|| {
+                let insert_at = last_output_row.map_or(0, |last| last + 1);
+                rows.insert(
+                    insert_at,
+                    Row {
+                        section: ordinal,
+                        output: None,
+                        left: None,
+                        center: None,
+                        right: None,
+                    },
+                );
+                for current in &mut current_rows {
+                    if *current >= insert_at {
+                        *current += 1;
+                    }
+                }
+                insert_at
+            });
+            rows[row].output = Some(output_line);
+            last_output_row = Some(row);
+        }
+    }
+
+    fn update_manual_output_rows(
+        &mut self,
+        index: usize,
+        range: Range<u32>,
+        inserted: usize,
+        inserted_row: Option<usize>,
+    ) {
+        let Some(rows) = self
+            .manual_output_rows
+            .get(index)
+            .and_then(Option::as_ref)
+            .cloned()
+        else {
+            return;
+        };
+        let Some(base_rows) = self.base_row_indices(index) else {
+            return;
+        };
+        let rows: Vec<_> = rows
+            .into_iter()
+            .map(|row| row.and_then(|row| base_rows.get(row).copied().flatten()))
+            .collect();
+        let inserted_row = inserted_row.and_then(|row| base_rows.get(row).copied().flatten());
+        let start = (range.start as usize).min(rows.len());
+        let end = (range.end as usize).min(rows.len()).max(start);
+        let replaced = end - start;
+        let mut updated = Vec::with_capacity(rows.len() - replaced + inserted);
+        updated.extend_from_slice(&rows[..start]);
+        for offset in 0..inserted {
+            updated.push(match offset.cmp(&replaced) {
+                std::cmp::Ordering::Less => rows[start + offset],
+                std::cmp::Ordering::Equal => inserted_row,
+                std::cmp::Ordering::Greater => None,
+            });
+        }
+        updated.extend_from_slice(&rows[end..]);
+        if let Some(rows) = self.manual_output_rows.get_mut(index) {
+            *rows = Some(updated);
+        }
+    }
+
+    fn base_row_indices(&self, section: usize) -> Option<Vec<Option<usize>>> {
+        let rows = self.section_row_range(section)?;
+        let mut base = 0;
+        Some(
+            rows.map(|index| {
+                let row = self.rows.get(index)?;
+                if [row.left, row.center, row.right]
+                    .into_iter()
+                    .all(|line| line.is_none())
+                {
+                    None
+                } else {
+                    let current = base;
+                    base += 1;
+                    Some(current)
+                }
+            })
+            .collect(),
+        )
     }
 
     fn output_source_line(
@@ -1933,6 +2050,9 @@ impl MergeModel {
         if section >= self.sections.len() {
             return;
         }
+        if let Some(rows) = self.manual_output_rows.get_mut(section) {
+            *rows = None;
+        }
         self.touch(section);
         let Some(entry) = self.sections.get_mut(section) else {
             return;
@@ -1957,6 +2077,16 @@ impl MergeModel {
         index: usize,
         range: Range<u32>,
         replacement: Vec<String>,
+    ) -> bool {
+        self.edit_output_range_at_row(index, range, replacement, None)
+    }
+
+    fn edit_output_range_at_row(
+        &mut self,
+        index: usize,
+        range: Range<u32>,
+        replacement: Vec<String>,
+        inserted_row: Option<usize>,
     ) -> bool {
         let Some(section) = self.sections.get(index) else {
             return false;
@@ -1989,6 +2119,7 @@ impl MergeModel {
         }
         self.touch(index);
         let inserted = u32::try_from(replacement.len()).unwrap_or(u32::MAX);
+        self.update_manual_output_rows(index, range.clone(), inserted as usize, inserted_row);
         self.shift_held_lines(index, range.clone(), inserted);
         let replaced_length = range.end.saturating_sub(range.start);
         if replaced_length == inserted {
@@ -2028,6 +2159,16 @@ impl MergeModel {
             section.right.clone(),
         );
         let _ = self.section_output.set(index, len as usize);
+        if has_manual_alignment && matches!(section.resolution, Resolution::Edited) {
+            if let Some(rows) = self
+                .manual_output_rows
+                .get_mut(index)
+                .and_then(Option::as_mut)
+            {
+                rows.resize(len as usize, None);
+                rows.truncate(len as usize);
+            }
+        }
         if has_manual_alignment {
             self.rebuild_section_rows(index);
         } else {
@@ -2177,7 +2318,9 @@ impl MergeModel {
         self.touch(section_index);
         self.sections[section_index].restore = None;
         self.sections[section_index].restore_from_take = false;
-        if !self.edit_output_range(section_index, local, replacement) {
+        let inserted_row =
+            (mapped_output.is_none() && !replacement.is_empty()).then_some(row_offset);
+        if !self.edit_output_range_at_row(section_index, local, replacement, inserted_row) {
             return None;
         }
         self.repair_output_seams(new_global.start as usize..new_global.end as usize);
@@ -3952,6 +4095,97 @@ mod tests {
         let left_row = merged.row_of_input_line(Pane::Left, left.start).unwrap();
         assert_eq!(merged.output_line_for_row(left_row), Some(output_start));
         assert_eq!(merged.row_of_output_line(output_start), Some(left_row));
+    }
+
+    #[test]
+    fn manual_alignment_keeps_unedited_output_rows_after_a_take() {
+        let mut merged = model(
+            "a\nL0\nL1\nL2\nz\n",
+            "a\nC0\nC1\nC2\nC3\nz\n",
+            "a\nR0\nR1\nR2\nR3\nz\n",
+        );
+        let section = merged
+            .sections()
+            .iter()
+            .position(super::Section::is_unresolved_conflict)
+            .unwrap();
+        let left = merged.sections()[section].left.clone();
+        let center = merged.sections()[section].center.clone();
+        merged
+            .add_manual_alignment(
+                Pane::Left,
+                left.start + 1..left.start + 2,
+                Pane::Center,
+                center.start + 2..center.start + 3,
+            )
+            .unwrap();
+
+        let output = merged.output_range(section).unwrap();
+        let original_rows: Vec<_> = output
+            .clone()
+            .map(|line| merged.row_of_output_line(line).unwrap())
+            .collect();
+        assert!(merged.take_line(original_rows[0], Pane::Right));
+
+        for line in output.start + 1..output.end {
+            assert_eq!(
+                merged.row_of_output_line(line),
+                Some(original_rows[(line - output.start) as usize]),
+                "output line {line} moved after a line take"
+            );
+        }
+    }
+
+    #[test]
+    fn manual_alignment_splices_preserve_output_rows_for_unaffected_lines() {
+        fn input_row(
+            merged: &super::MergeModel,
+            line: u32,
+        ) -> (Option<u32>, Option<u32>, Option<u32>) {
+            let row = merged.row_of_output_line(line).unwrap();
+            let row = merged.rows()[row];
+            (row.left, row.center, row.right)
+        }
+
+        let mut merged = model(
+            "a\nL0\nL1\nL2\nz\n",
+            "a\nC0\nC1\nC2\nC3\nz\n",
+            "a\nR0\nR1\nR2\nR3\nz\n",
+        );
+        let section = merged
+            .sections()
+            .iter()
+            .position(super::Section::is_unresolved_conflict)
+            .unwrap();
+        let left = merged.sections()[section].left.clone();
+        let center = merged.sections()[section].center.clone();
+        merged
+            .add_manual_alignment(
+                Pane::Left,
+                left.start + 1..left.start + 2,
+                Pane::Center,
+                center.start + 2..center.start + 3,
+            )
+            .unwrap();
+
+        let output = merged.output_range(section).unwrap();
+        let original_rows: Vec<_> = output
+            .clone()
+            .map(|line| input_row(&merged, line))
+            .collect();
+        assert!(merged.edit_output_range(section, 1..1, vec!["typed\n".to_owned()]));
+        assert_eq!(input_row(&merged, output.start + 2), original_rows[1]);
+        assert!(merged.edit_output_range(section, 1..2, Vec::new()));
+        for (offset, row) in original_rows.iter().enumerate() {
+            assert_eq!(
+                input_row(&merged, output.start + u32::try_from(offset).unwrap()),
+                *row
+            );
+        }
+
+        assert!(merged.edit_output_range(section, 1..2, Vec::new()));
+        assert_eq!(input_row(&merged, output.start + 1), original_rows[2]);
+        assert_eq!(input_row(&merged, output.start + 2), original_rows[3]);
     }
 
     #[test]
