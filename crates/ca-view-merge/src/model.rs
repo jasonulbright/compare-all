@@ -506,6 +506,14 @@ struct ManualAlignment {
     second: Range<u32>,
 }
 
+type InputLineTriple = [Option<u32>; 3];
+
+#[derive(Clone, Copy)]
+struct OutputAnchor {
+    input_lines: InputLineTriple,
+    source: Option<(Pane, u32)>,
+}
+
 impl Row {
     /// The line one pane shows on this row.
     #[must_use]
@@ -517,6 +525,54 @@ impl Row {
             Pane::Output => output_line,
         }
     }
+}
+
+fn best_row_for_output_anchor(
+    rows: &[Row],
+    anchor: OutputAnchor,
+    last_output_row: Option<usize>,
+) -> Option<usize> {
+    if let Some((pane, line)) = anchor.source {
+        let source_row = rows.iter().enumerate().find_map(|(index, row)| {
+            (row.output.is_none()
+                && last_output_row.is_none_or(|last| index > last)
+                && row.line(pane, None) == Some(line))
+            .then_some(index)
+        });
+        if source_row.is_some() {
+            return source_row;
+        }
+    }
+    best_row_for_input_lines(rows, anchor.input_lines, last_output_row)
+}
+
+fn best_row_for_input_lines(
+    rows: &[Row],
+    input_lines: InputLineTriple,
+    last_output_row: Option<usize>,
+) -> Option<usize> {
+    let mut best: Option<(usize, bool, usize)> = None;
+    for (index, row) in rows.iter().enumerate() {
+        if row.output.is_some() || last_output_row.is_some_and(|last| index <= last) {
+            continue;
+        }
+        let matching_lines = [row.left, row.center, row.right]
+            .into_iter()
+            .zip(input_lines)
+            .filter(|(current, source)| source.is_some() && current == source)
+            .count();
+        if matching_lines == 0 {
+            continue;
+        }
+        let exact = [row.left, row.center, row.right] == input_lines;
+        let candidate = (index, exact, matching_lines);
+        if best.is_none_or(|(_, best_exact, best_count)| {
+            (exact && !best_exact) || (exact == best_exact && matching_lines > best_count)
+        }) {
+            best = Some(candidate);
+        }
+    }
+    best.map(|(index, _, _)| index)
 }
 
 /// What the status bar counts.
@@ -1349,6 +1405,12 @@ impl MergeModel {
             return Err("Align lines within the same merge section");
         }
 
+        let output_anchors = self
+            .sections
+            .get(first_section)
+            .filter(|section| matches!(section.resolution, Resolution::Edited))
+            .map(|_| self.output_anchors(first_section));
+
         let mut alignments: Vec<_> = self
             .manual_alignments
             .iter()
@@ -1380,8 +1442,43 @@ impl MergeModel {
         self.manual_alignments
             .retain(|alignment| alignment.section != first_section);
         self.manual_alignments.extend(alignments);
-        self.rebuild_section_rows(first_section);
+        self.rebuild_section_rows_with_anchors(first_section, output_anchors.as_deref());
         Ok(first_section)
+    }
+
+    fn output_anchors(&self, section: usize) -> Vec<OutputAnchor> {
+        let Some(output) = self.output_range(section) else {
+            return Vec::new();
+        };
+        output
+            .map(|line| {
+                let Some(row) = self
+                    .row_of_output_line(line)
+                    .and_then(|row| self.rows.get(row))
+                else {
+                    return OutputAnchor {
+                        input_lines: [None; 3],
+                        source: None,
+                    };
+                };
+                let source = [
+                    (Pane::Left, row.left),
+                    (Pane::Center, row.center),
+                    (Pane::Right, row.right),
+                ]
+                .into_iter()
+                .find_map(|(pane, input_line)| {
+                    let input_line = input_line?;
+                    (self.output.get(line as usize)?
+                        == self.inputs.lines(pane).get(input_line as usize)?)
+                    .then_some((pane, input_line))
+                });
+                OutputAnchor {
+                    input_lines: [row.left, row.center, row.right],
+                    source,
+                }
+            })
+            .collect()
     }
 
     /// Find the display row of an input line after manual alignment.
@@ -1427,7 +1524,7 @@ impl MergeModel {
             .or_else(|| (!rows.is_empty()).then(|| fallback.clamp(rows.start, rows.end - 1)))
     }
 
-    fn rows_for_section(&self, index: usize) -> Vec<Row> {
+    fn rows_for_section(&self, index: usize, output_anchors: Option<&[OutputAnchor]>) -> Vec<Row> {
         let Some(section) = self.sections.get(index) else {
             return Vec::new();
         };
@@ -1455,13 +1552,23 @@ impl MergeModel {
                 &paired,
                 &third_pairs,
             );
-            if matches!(section.resolution, Resolution::Edited)
-                && self
+            if matches!(section.resolution, Resolution::Edited) {
+                if let Some(anchors) = output_anchors {
+                    Self::map_edited_output_anchors(
+                        ordinal,
+                        section.output_len,
+                        anchors,
+                        &mut rows,
+                    );
+                } else if self
                     .manual_output_rows
                     .get(index)
                     .is_some_and(Option::is_some)
-            {
-                self.map_edited_output_rows(index, ordinal, section.output_len, &mut rows);
+                {
+                    self.map_edited_output_rows(index, ordinal, section.output_len, &mut rows);
+                } else {
+                    self.map_manual_output_rows(section, ordinal, first, &mut rows);
+                }
             } else {
                 self.map_manual_output_rows(section, ordinal, first, &mut rows);
             }
@@ -1579,6 +1686,36 @@ impl MergeModel {
                         *current += 1;
                     }
                 }
+                insert_at
+            });
+            rows[row].output = Some(output_line);
+            last_output_row = Some(row);
+        }
+    }
+
+    fn map_edited_output_anchors(
+        ordinal: u32,
+        output_len: u32,
+        anchors: &[OutputAnchor],
+        rows: &mut Vec<Row>,
+    ) {
+        let mut last_output_row = None;
+        for output_line in 0..output_len {
+            let row = anchors
+                .get(output_line as usize)
+                .and_then(|anchor| best_row_for_output_anchor(rows, *anchor, last_output_row));
+            let row = row.unwrap_or_else(|| {
+                let insert_at = last_output_row.map_or(0, |last| last + 1);
+                rows.insert(
+                    insert_at,
+                    Row {
+                        section: ordinal,
+                        output: None,
+                        left: None,
+                        center: None,
+                        right: None,
+                    },
+                );
                 insert_at
             });
             rows[row].output = Some(output_line);
@@ -1730,7 +1867,15 @@ impl MergeModel {
     }
 
     fn rebuild_section_rows(&mut self, index: usize) {
-        let rows = self.rows_for_section(index);
+        self.rebuild_section_rows_with_anchors(index, None);
+    }
+
+    fn rebuild_section_rows_with_anchors(
+        &mut self,
+        index: usize,
+        output_anchors: Option<&[OutputAnchor]>,
+    ) {
+        let rows = self.rows_for_section(index, output_anchors);
         self.replace_section_rows(index, rows);
     }
 
@@ -3073,7 +3218,7 @@ impl MergeModel {
             let output_count = lines.len();
             output.extend(lines);
             self.sections[index].output_len = u32::try_from(output_count).unwrap_or(u32::MAX);
-            let section_rows = self.rows_for_section(index);
+            let section_rows = self.rows_for_section(index, None);
             row_counts.push(section_rows.len());
             rows.extend(section_rows);
             output_counts.push(output_count);
@@ -4134,6 +4279,76 @@ mod tests {
                 "output line {line} moved after a line take"
             );
         }
+    }
+
+    #[test]
+    fn first_manual_alignment_after_a_take_keeps_output_on_its_input_lines() {
+        let mut merged = model(
+            "a\nL0\nL1\nL2\nL3\nz\n",
+            "a\nC0\nC1\nC2\nC3\nz\n",
+            "a\nR0\nR1\nR2\nR3\nz\n",
+        );
+        let section = merged
+            .sections()
+            .iter()
+            .position(super::Section::is_unresolved_conflict)
+            .unwrap();
+        let left = merged.sections()[section].left.clone();
+        let center = merged.sections()[section].center.clone();
+        let output = merged.output_range(section).unwrap();
+        let first_row = merged.row_of_output_line(output.start).unwrap();
+        assert!(merged.take_line(first_row, Pane::Right));
+
+        merged
+            .add_manual_alignment(
+                Pane::Left,
+                left.start + 1..left.start + 2,
+                Pane::Center,
+                center.start + 2..center.start + 3,
+            )
+            .unwrap();
+
+        let row = merged.row_of_output_line(output.start + 1).unwrap();
+        assert_eq!(merged.rows()[row].center, Some(center.start + 1));
+    }
+
+    #[test]
+    fn second_manual_alignment_after_a_take_keeps_later_output_on_its_input_lines() {
+        let mut merged = model(
+            "a\nL0\nL1\nL2\nL3\nL4\nz\n",
+            "a\nC0\nC1\nC2\nC3\nC4\nz\n",
+            "a\nR0\nR1\nR2\nR3\nR4\nz\n",
+        );
+        let section = merged
+            .sections()
+            .iter()
+            .position(super::Section::is_unresolved_conflict)
+            .unwrap();
+        let left = merged.sections()[section].left.clone();
+        let center = merged.sections()[section].center.clone();
+        merged
+            .add_manual_alignment(
+                Pane::Left,
+                left.start + 1..left.start + 2,
+                Pane::Center,
+                center.start + 2..center.start + 3,
+            )
+            .unwrap();
+        let output = merged.output_range(section).unwrap();
+        let first_row = merged.row_of_output_line(output.start).unwrap();
+        assert!(merged.take_line(first_row, Pane::Right));
+        assert!(merged.edit_output_range(section, 1..1, vec!["typed\n".to_owned()]));
+        merged
+            .add_manual_alignment(
+                Pane::Left,
+                left.start + 3..left.start + 4,
+                Pane::Center,
+                center.start + 4..center.start + 5,
+            )
+            .unwrap();
+
+        let row = merged.row_of_output_line(output.start + 5).unwrap();
+        assert_eq!(merged.rows()[row].center, Some(center.start + 4));
     }
 
     #[test]
