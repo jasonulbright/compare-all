@@ -59,10 +59,7 @@ fn tab_buttons_activate_and_close_the_tab_they_name() {
     {
         let mut run = |ctx: &egui::Context| app.frame(ctx);
         probe.idle(&mut run);
-        let mut closes = probe.find_all("Close Tab");
-        assert_eq!(closes.len(), 2);
-        closes.sort_by(|a, b| a.rect.min.x.total_cmp(&b.rect.min.x));
-        probe.press_at(closes[0].rect.center(), &mut run);
+        probe.click(&format!("Close {compare}"), &mut run).unwrap();
     }
     assert_eq!(app.tab_count(), 1);
     assert_eq!(app.active_title(), Some(home));
@@ -74,11 +71,12 @@ fn close_icon_closes_the_tab_it_belongs_to() {
     let mut app = App::in_directories(dir.path().to_path_buf(), dir.path().join("journal"));
     app.open_home(&context());
     app.open_home(&context());
+    let home = app.active_title().unwrap();
     let mut probe = Probe::new(1280.0, 800.0);
     let mut run = |ctx: &egui::Context| app.frame(ctx);
     probe.idle(&mut run);
     probe.idle(&mut run);
-    let buttons = probe.find_all("Close Tab");
+    let buttons = probe.find_all(&format!("Close {home}"));
     assert_eq!(buttons.len(), 2);
     probe.press_at(buttons[1].rect.center(), &mut run);
     assert_eq!(app.tab_count(), 1);
