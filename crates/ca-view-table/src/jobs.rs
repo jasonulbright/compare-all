@@ -806,12 +806,6 @@ fn read_xlsx_sheet<R: std::io::Read + std::io::Seek>(
                 reader
                     .next_cell()
                     .map_err(|error| format!("{} — {sheet}: {error}", path.display()))
-                    .map(|cell| {
-                        cell.and_then(|cell| {
-                            (!matches!(cell.get_value(), calamine::DataRef::Empty))
-                                .then_some(cell.get_position())
-                        })
-                    })
             },
             path,
             sheet,
@@ -853,12 +847,6 @@ fn read_xlsb_sheet<R: std::io::Read + std::io::Seek>(
                 reader
                     .next_cell()
                     .map_err(|error| format!("{} — {sheet}: {error}", path.display()))
-                    .map(|cell| {
-                        cell.and_then(|cell| {
-                            (!matches!(cell.get_value(), calamine::DataRef::Empty))
-                                .then_some(cell.get_position())
-                        })
-                    })
             },
             path,
             sheet,
@@ -884,13 +872,17 @@ fn read_xlsb_sheet<R: std::io::Read + std::io::Seek>(
     )
 }
 
-fn scan_sheet_bounds(
-    mut next_cell: impl FnMut() -> Result<Option<(u32, u32)>, String>,
+fn scan_sheet_bounds<'a>(
+    mut next_cell: impl FnMut() -> Result<Option<calamine::Cell<calamine::DataRef<'a>>>, String>,
     path: &Path,
     sheet: &str,
 ) -> Result<Option<SheetBounds>, String> {
     let mut bounds: Option<SheetBounds> = None;
-    while let Some((row, column)) = next_cell()? {
+    while let Some(cell) = next_cell()? {
+        if cell.is_empty() {
+            continue;
+        }
+        let (row, column) = cell.get_position();
         let current = bounds.get_or_insert(SheetBounds {
             first_row: row,
             last_row: row,
@@ -1518,13 +1510,16 @@ mod tests {
         assert_eq!(data.left.facts.encoding, "UTF-8");
     }
 
-    fn sparse_workbook_bytes() -> Vec<u8> {
+    fn workbook_bytes_with_sheet1_rewrite(
+        rewrite_sheet1: impl FnOnce(String) -> String,
+    ) -> Vec<u8> {
         let fixture = include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/multiple-left.xlsx"
         ));
         let mut archive = zip::ZipArchive::new(std::io::Cursor::new(fixture.as_slice())).unwrap();
         let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let mut rewrite_sheet1 = Some(rewrite_sheet1);
         for index in 0..archive.len() {
             let mut entry = archive.by_index(index).unwrap();
             let name = entry.name().unwrap().into_owned();
@@ -1533,10 +1528,7 @@ mod tests {
             entry.read_to_end(&mut bytes).unwrap();
             if name == "xl/worksheets/sheet1.xml" {
                 let xml = String::from_utf8(bytes).unwrap();
-                let xml = xml.replace("A1:B2", "A1:XFD1048576").replace(
-                    "</sheetData>",
-                    "<row r=\"1048576\"><c r=\"XFD1048576\"><v>2</v></c></row></sheetData>",
-                );
+                let xml = rewrite_sheet1.take().unwrap()(xml);
                 bytes = xml.into_bytes();
             }
             let options = zip::write::SimpleFileOptions::default();
@@ -1550,6 +1542,28 @@ mod tests {
         writer.finish().unwrap().into_inner()
     }
 
+    fn sparse_workbook_bytes() -> Vec<u8> {
+        workbook_bytes_with_sheet1_rewrite(|xml| {
+            xml.replace("A1:B2", "A1:XFD1048576").replace(
+                "</sheetData>",
+                "<row r=\"3\"><c r=\"A3\"/></row><row r=\"1048576\"><c r=\"XFD1048576\"><v>2</v></c></row></sheetData>",
+            )
+        })
+    }
+
+    fn workbook_with_leading_empty_cell_bytes() -> Vec<u8> {
+        workbook_bytes_with_sheet1_rewrite(|mut xml| {
+            xml = xml.replace("A1:B2", "A1:A2");
+            let sheet_data_start = xml.find("<sheetData>").unwrap();
+            let sheet_data_end = xml.find("</sheetData>").unwrap() + "</sheetData>".len();
+            xml.replace_range(
+                sheet_data_start..sheet_data_end,
+                "<sheetData><row r=\"1\"><c r=\"A1\"/></row><row r=\"2\"><c r=\"A2\" t=\"inlineStr\"><is><t>later</t></is></c></row></sheetData>",
+            );
+            xml
+        })
+    }
+
     #[test]
     fn sparse_workbook_is_rejected_before_dense_range_allocation() {
         let dir = tempfile::tempdir().unwrap();
@@ -1557,6 +1571,17 @@ mod tests {
         std::fs::write(&path, sparse_workbook_bytes()).unwrap();
 
         assert!(read_workbook_sheets(&path).is_err_and(|error| error.contains("table limit")));
+    }
+
+    #[test]
+    fn leading_empty_cell_does_not_end_the_workbook_bounds_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("leading-empty.xlsx");
+        std::fs::write(&path, workbook_with_leading_empty_cell_bytes()).unwrap();
+
+        let sheets = read_workbook_sheets(&path).unwrap();
+
+        assert!(sheets[0].text.contains("later"));
     }
 
     #[test]
