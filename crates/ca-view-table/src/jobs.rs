@@ -564,6 +564,17 @@ pub(crate) fn is_workbook_path(path: &Path) -> bool {
         })
 }
 
+fn is_streaming_workbook_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "xlsx" | "xlsm" | "xlam" | "xlsb"
+            )
+        })
+}
+
 fn read_sheets(
     path: &Path,
     format: &FormatSettings,
@@ -648,6 +659,12 @@ fn build_sheets(prepared: Vec<PreparedSheet>, path: &Path) -> Result<Vec<LoadedS
 fn read_workbook_sheets(path: &Path) -> Result<Vec<RawSheet>, String> {
     use calamine::Reader;
 
+    if !is_streaming_workbook_path(path) {
+        return Err(format!(
+            "{} uses a workbook format that Table Compare cannot load safely; use .xlsx, .xlsm, .xlam, or .xlsb",
+            path.display()
+        ));
+    }
     let size = std::fs::metadata(path)
         .map_err(|error| format!("{}: {error}", path.display()))?
         .len();
@@ -674,8 +691,21 @@ fn read_workbook_sheets(path: &Path) -> Result<Vec<RawSheet>, String> {
     if is_zip_workbook_path(path) {
         check_workbook_archive(path, &bytes)?;
     }
-    let mut workbook = calamine::open_workbook_auto_from_rs(std::io::Cursor::new(bytes))
-        .map_err(|error| format!("{}: {error}", path.display()))?;
+    let mut workbook = if path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("xlsb"))
+    {
+        calamine::Sheets::Xlsb(
+            calamine::open_workbook_from_rs::<calamine::Xlsb<_>, _>(std::io::Cursor::new(bytes))
+                .map_err(|error| format!("{}: {error}", path.display()))?,
+        )
+    } else {
+        calamine::Sheets::Xlsx(
+            calamine::open_workbook_from_rs::<calamine::Xlsx<_>, _>(std::io::Cursor::new(bytes))
+                .map_err(|error| format!("{}: {error}", path.display()))?,
+        )
+    };
     let names = workbook.sheet_names().clone();
     if names.len() > MAX_WORKBOOK_SHEETS {
         return Err(format!(
@@ -687,20 +717,20 @@ fn read_workbook_sheets(path: &Path) -> Result<Vec<RawSheet>, String> {
     let mut sheets = Vec::with_capacity(names.len());
     let mut total_bytes = 0usize;
     for name in names {
-        let range = workbook
-            .worksheet_range(&name)
-            .map_err(|error| format!("{} — {name}: {error}", path.display()))?;
-        let (rows, columns) = range.get_size();
-        let cells = rows.saturating_mul(columns);
-        if cells > ca_table::parse::MAX_TABLE_CELLS || rows > ca_table::parse::MAX_TABLE_ROWS {
-            return Err(format!(
-                "{} — {name} is past the {} row or {} cell table limit",
-                path.display(),
-                ca_table::parse::MAX_TABLE_ROWS,
-                ca_table::parse::MAX_TABLE_CELLS
-            ));
-        }
-        let text = range_to_delimited_text(&range, path, &name, &mut total_bytes)?;
+        let text = match &mut workbook {
+            calamine::Sheets::Xlsx(reader) => {
+                read_xlsx_sheet(reader, &name, path, &name, &mut total_bytes)?
+            }
+            calamine::Sheets::Xlsb(reader) => {
+                read_xlsb_sheet(reader, &name, path, &name, &mut total_bytes)?
+            }
+            calamine::Sheets::Xls(_) | calamine::Sheets::Ods(_) => {
+                return Err(format!(
+                    "{} uses a workbook format that Table Compare cannot load safely; use .xlsx, .xlsm, .xlam, or .xlsb",
+                    path.display()
+                ));
+            }
+        };
         sheets.push(RawSheet {
             name,
             text,
@@ -720,7 +750,7 @@ fn is_zip_workbook_path(path: &Path) -> bool {
         .is_some_and(|extension| {
             matches!(
                 extension.to_ascii_lowercase().as_str(),
-                "xlsx" | "xlsm" | "xlam" | "xlsb" | "ods"
+                "xlsx" | "xlsm" | "xlam" | "xlsb"
             )
         })
 }
@@ -752,62 +782,278 @@ fn check_workbook_archive(path: &Path, bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-fn range_to_delimited_text(
-    range: &calamine::Range<calamine::Data>,
+#[derive(Debug, Clone, Copy)]
+struct SheetBounds {
+    first_row: u32,
+    last_row: u32,
+    first_column: u32,
+    last_column: u32,
+}
+
+fn read_xlsx_sheet<R: std::io::Read + std::io::Seek>(
+    workbook: &mut calamine::Xlsx<R>,
+    name: &str,
+    path: &Path,
+    sheet: &str,
+    total_bytes: &mut usize,
+) -> Result<String, String> {
+    let bounds = {
+        let mut reader = workbook
+            .worksheet_cells_reader(name)
+            .map_err(|error| format!("{} — {sheet}: {error}", path.display()))?;
+        scan_sheet_bounds(
+            || {
+                reader
+                    .next_cell()
+                    .map_err(|error| format!("{} — {sheet}: {error}", path.display()))
+                    .map(|cell| {
+                        cell.and_then(|cell| {
+                            (!matches!(cell.get_value(), calamine::DataRef::Empty))
+                                .then_some(cell.get_position())
+                        })
+                    })
+            },
+            path,
+            sheet,
+        )?
+    };
+    let Some(bounds) = bounds else {
+        return Ok(String::new());
+    };
+    let mut reader = workbook
+        .worksheet_cells_reader(name)
+        .map_err(|error| format!("{} — {sheet}: {error}", path.display()))?;
+    stream_sheet_text(
+        || {
+            reader
+                .next_cell()
+                .map_err(|error| format!("{} — {sheet}: {error}", path.display()))
+                .map(|cell| cell.map(|cell| (cell.get_position(), cell)))
+        },
+        bounds,
+        path,
+        sheet,
+        total_bytes,
+    )
+}
+
+fn read_xlsb_sheet<R: std::io::Read + std::io::Seek>(
+    workbook: &mut calamine::Xlsb<R>,
+    name: &str,
+    path: &Path,
+    sheet: &str,
+    total_bytes: &mut usize,
+) -> Result<String, String> {
+    let bounds = {
+        let mut reader = workbook
+            .worksheet_cells_reader(name)
+            .map_err(|error| format!("{} — {sheet}: {error}", path.display()))?;
+        scan_sheet_bounds(
+            || {
+                reader
+                    .next_cell()
+                    .map_err(|error| format!("{} — {sheet}: {error}", path.display()))
+                    .map(|cell| {
+                        cell.and_then(|cell| {
+                            (!matches!(cell.get_value(), calamine::DataRef::Empty))
+                                .then_some(cell.get_position())
+                        })
+                    })
+            },
+            path,
+            sheet,
+        )?
+    };
+    let Some(bounds) = bounds else {
+        return Ok(String::new());
+    };
+    let mut reader = workbook
+        .worksheet_cells_reader(name)
+        .map_err(|error| format!("{} — {sheet}: {error}", path.display()))?;
+    stream_sheet_text(
+        || {
+            reader
+                .next_cell()
+                .map_err(|error| format!("{} — {sheet}: {error}", path.display()))
+                .map(|cell| cell.map(|cell| (cell.get_position(), cell)))
+        },
+        bounds,
+        path,
+        sheet,
+        total_bytes,
+    )
+}
+
+fn scan_sheet_bounds(
+    mut next_cell: impl FnMut() -> Result<Option<(u32, u32)>, String>,
+    path: &Path,
+    sheet: &str,
+) -> Result<Option<SheetBounds>, String> {
+    let mut bounds: Option<SheetBounds> = None;
+    while let Some((row, column)) = next_cell()? {
+        let current = bounds.get_or_insert(SheetBounds {
+            first_row: row,
+            last_row: row,
+            first_column: column,
+            last_column: column,
+        });
+        current.first_row = current.first_row.min(row);
+        current.last_row = current.last_row.max(row);
+        current.first_column = current.first_column.min(column);
+        current.last_column = current.last_column.max(column);
+
+        let rows = u64::from(current.last_row) - u64::from(current.first_row) + 1;
+        let columns = u64::from(current.last_column) - u64::from(current.first_column) + 1;
+        let cells = rows.saturating_mul(columns);
+        if rows > ca_table::parse::MAX_TABLE_ROWS as u64
+            || cells > ca_table::parse::MAX_TABLE_CELLS as u64
+        {
+            return Err(format!(
+                "{} — {sheet} is past the {} row or {} cell table limit",
+                path.display(),
+                ca_table::parse::MAX_TABLE_ROWS,
+                ca_table::parse::MAX_TABLE_CELLS
+            ));
+        }
+    }
+    Ok(bounds)
+}
+
+fn stream_sheet_text<'a>(
+    mut next_cell: impl FnMut() -> Result<
+        Option<((u32, u32), calamine::Cell<calamine::DataRef<'a>>)>,
+        String,
+    >,
+    bounds: SheetBounds,
     path: &Path,
     sheet: &str,
     total_bytes: &mut usize,
 ) -> Result<String, String> {
     let mut output = String::new();
-    for (row_index, row) in range.rows().enumerate() {
-        if row_index > 0 {
-            output.push('\n');
+    let mut current_row = bounds.first_row;
+    let mut last_column = None;
+    let mut previous_position = None;
+    while let Some(((row, column), cell)) = next_cell()? {
+        if cell.is_empty() {
+            continue;
         }
-        for (column_index, cell) in row.iter().enumerate() {
-            if column_index > 0 {
-                output.push('\t');
-            }
-            let value = workbook_cell_text(cell);
-            if value
-                .chars()
-                .any(|character| matches!(character, '\t' | '\n' | '\r' | '"'))
-                || value.trim() != value
-            {
-                output.push('"');
-                for character in value.chars() {
-                    output.push(character);
-                    if character == '"' {
-                        output.push('"');
-                    }
-                }
-                output.push('"');
-            } else {
-                output.push_str(&value);
-            }
-            if output.len() > MAX_WORKBOOK_TEXT_BYTES
-                || total_bytes.saturating_add(output.len()) > MAX_WORKBOOK_TEXT_BYTES
-            {
+        if let Some(previous) = previous_position {
+            if (row, column) <= previous {
                 return Err(format!(
-                    "{} — {sheet} expands past the {} byte workbook table limit",
-                    path.display(),
-                    MAX_WORKBOOK_TEXT_BYTES
+                    "{} — {sheet} has cells outside row order",
+                    path.display()
                 ));
             }
         }
+        while current_row < row {
+            output.push('\n');
+            current_row += 1;
+            last_column = None;
+        }
+        let tabs = last_column.map_or_else(
+            || column - bounds.first_column,
+            |previous| column - previous,
+        );
+        for _ in 0..tabs {
+            output.push('\t');
+        }
+        let value = cell.text();
+        append_workbook_cell(&mut output, value.as_ref(), path, sheet, *total_bytes)?;
+        last_column = Some(column);
+        current_row = row;
+        previous_position = Some((row, column));
+    }
+    if output.len() > MAX_WORKBOOK_TEXT_BYTES
+        || total_bytes.saturating_add(output.len()) > MAX_WORKBOOK_TEXT_BYTES
+    {
+        return Err(workbook_text_limit_error(path, sheet));
     }
     *total_bytes = total_bytes.saturating_add(output.len());
     Ok(output)
 }
 
-fn workbook_cell_text(cell: &calamine::Data) -> String {
-    match cell {
-        calamine::Data::DateTime(value) if value.is_datetime() => {
-            let (year, month, day, hour, minute, second, millisecond) = value.to_ymd_hms_milli();
-            format!(
-                "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millisecond:03}"
-            )
+fn append_workbook_cell(
+    output: &mut String,
+    value: &str,
+    path: &Path,
+    sheet: &str,
+    previous_bytes: usize,
+) -> Result<(), String> {
+    if value.len() > MAX_WORKBOOK_TEXT_BYTES
+        || previous_bytes
+            .saturating_add(output.len())
+            .saturating_add(value.len())
+            > MAX_WORKBOOK_TEXT_BYTES
+    {
+        return Err(workbook_text_limit_error(path, sheet));
+    }
+    let quoted = value
+        .chars()
+        .any(|character| matches!(character, '\t' | '\n' | '\r' | '"'))
+        || value.trim() != value;
+    let encoded_len = value
+        .len()
+        .saturating_add(if quoted { 2 } else { 0 })
+        .saturating_add(if quoted {
+            value.chars().filter(|character| *character == '"').count()
+        } else {
+            0
+        });
+    if previous_bytes
+        .saturating_add(output.len())
+        .saturating_add(encoded_len)
+        > MAX_WORKBOOK_TEXT_BYTES
+    {
+        return Err(workbook_text_limit_error(path, sheet));
+    }
+    if quoted {
+        output.push('"');
+        for character in value.chars() {
+            output.push(character);
+            if character == '"' {
+                output.push('"');
+            }
         }
-        _ => cell.to_string(),
+        output.push('"');
+    } else {
+        output.push_str(value);
+    }
+    Ok(())
+}
+
+fn workbook_text_limit_error(path: &Path, sheet: &str) -> String {
+    format!(
+        "{} — {sheet} expands past the {} byte workbook table limit",
+        path.display(),
+        MAX_WORKBOOK_TEXT_BYTES
+    )
+}
+
+trait WorkbookCellValue {
+    fn is_empty(&self) -> bool;
+    fn text(&self) -> std::borrow::Cow<'_, str>;
+}
+
+impl WorkbookCellValue for calamine::Cell<calamine::DataRef<'_>> {
+    fn is_empty(&self) -> bool {
+        matches!(self.get_value(), calamine::DataRef::Empty)
+    }
+
+    fn text(&self) -> std::borrow::Cow<'_, str> {
+        match self.get_value() {
+            calamine::DataRef::DateTime(value) if value.is_datetime() => {
+                let (year, month, day, hour, minute, second, millisecond) =
+                    value.to_ymd_hms_milli();
+                std::borrow::Cow::Owned(format!(
+                "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millisecond:03}"
+            ))
+            }
+            calamine::DataRef::String(value)
+            | calamine::DataRef::DateTimeIso(value)
+            | calamine::DataRef::DurationIso(value) => std::borrow::Cow::Borrowed(value.as_str()),
+            calamine::DataRef::SharedString(value) => std::borrow::Cow::Borrowed(value),
+            value => std::borrow::Cow::Owned(calamine::Data::from(value.clone()).to_string()),
+        }
     }
 }
 
@@ -1185,12 +1431,13 @@ impl Pipeline {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::{
-        read_side_with_open, spawn_load, spawn_recompare, FormatSettings, Pipeline, Side, Stage,
-        TableMessage, TableSettings,
+        read_side_with_open, read_workbook_sheets, spawn_load, spawn_recompare, FormatSettings,
+        Pipeline, Side, Stage, TableMessage, TableSettings,
     };
     use ca_table::compare::CellStatus;
     use ca_table::schema::{ColumnAlignment, ColumnHandling, ColumnType, ManualColumnPair};
     use std::fmt::Write as _;
+    use std::io::{Read as IoRead, Write as IoWrite};
     use std::path::Path;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -1269,6 +1516,47 @@ mod tests {
         assert_eq!(data.alignment.len(), 2);
         assert_eq!(data.comparison.totals.rows_with_differences(), 1);
         assert_eq!(data.left.facts.encoding, "UTF-8");
+    }
+
+    fn sparse_workbook_bytes() -> Vec<u8> {
+        let fixture = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/multiple-left.xlsx"
+        ));
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(fixture.as_slice())).unwrap();
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for index in 0..archive.len() {
+            let mut entry = archive.by_index(index).unwrap();
+            let name = entry.name().unwrap().into_owned();
+            let is_directory = entry.is_dir();
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes).unwrap();
+            if name == "xl/worksheets/sheet1.xml" {
+                let xml = String::from_utf8(bytes).unwrap();
+                let xml = xml.replace("A1:B2", "A1:XFD1048576").replace(
+                    "</sheetData>",
+                    "<row r=\"1048576\"><c r=\"XFD1048576\"><v>2</v></c></row></sheetData>",
+                );
+                bytes = xml.into_bytes();
+            }
+            let options = zip::write::SimpleFileOptions::default();
+            if is_directory {
+                writer.add_directory(name, options).unwrap();
+            } else {
+                writer.start_file(name, options).unwrap();
+                writer.write_all(&bytes).unwrap();
+            }
+        }
+        writer.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    fn sparse_workbook_is_rejected_before_dense_range_allocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sparse.xlsx");
+        std::fs::write(&path, sparse_workbook_bytes()).unwrap();
+
+        assert!(read_workbook_sheets(&path).is_err_and(|error| error.contains("table limit")));
     }
 
     #[test]
