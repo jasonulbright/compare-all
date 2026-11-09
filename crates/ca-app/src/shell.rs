@@ -4,6 +4,7 @@
 use crate::cli::Startup;
 use crate::home::{HomeAction, HomeOutbox, HomeView, SharedNotice};
 use crate::registry;
+use ca_fs::{ContentMethod, ContentOutcome, ContentTests, RulesEngine};
 use ca_session::settings::{SessionSettings, SessionSettingsOverride};
 use ca_session::{
     AdminPolicies, ExportSelection, ImportOptions, SavedSession, SessionId, SessionKind, Workspace,
@@ -19,7 +20,7 @@ use ca_ui::theme::Variant;
 use ca_ui::view::{CommandState, OpenRequest, SessionView, ViewAction, ViewContext};
 use ca_ui::viewport::{Host, NativeWindow};
 use ca_ui::widgets;
-use ca_ui::worker::Job;
+use ca_ui::worker::{Job, Terminal};
 use ca_ui::workspace::{WorkspaceAction, WorkspaceManager};
 use ca_view_folder::opjobs::RecoverMessage;
 use std::fmt::Write as _;
@@ -679,6 +680,7 @@ const FOLDER_MENUS: &[(&str, &[Entry])] = &[
                 Command::CompareContents,
                 "The active view has no file pairs to read",
             ),
+            Entry::Run(Command::QuickCompare, "Select one or two files to compare"),
             Entry::Run(Command::CopyToOtherSide, ACTIONABLE),
             Entry::Run(Command::MoveToOtherSide, ACTIONABLE),
             Entry::Run(Command::CopyToFolder, ACTIONABLE),
@@ -942,6 +944,96 @@ const ACTIONS_MENU: &str = "Actions";
 /// The fixed menu the Actions menu is placed after.
 const ACTIONS_AFTER: &str = "Edit";
 
+/// The wording shared by startup quick compare results.
+const fn startup_quick_compare_result(outcome: ContentOutcome) -> &'static str {
+    match outcome {
+        ContentOutcome::BinarySame | ContentOutcome::RulesSame => "Files are identical",
+        ContentOutcome::UnimportantDifferences => "Unimportant differences",
+        ContentOutcome::ImportantDifferences => "Important differences",
+        ContentOutcome::BinaryDifferences => "Differences",
+        ContentOutcome::NotComparedCloudPlaceholder => "Not compared",
+    }
+}
+
+/// What the startup content comparison reports.
+enum StartupQuickCompareMessage {
+    Done(Result<ContentOutcome, String>),
+    NotFilePair,
+    Cancelled,
+}
+
+impl Terminal for StartupQuickCompareMessage {
+    fn is_terminal(&self) -> bool {
+        true
+    }
+
+    fn cancelled() -> Self {
+        Self::Cancelled
+    }
+
+    fn panicked(detail: String) -> Self {
+        Self::Done(Err(detail))
+    }
+}
+
+/// A startup summary, its content worker, and the request it can open.
+struct StartupQuickCompare {
+    request: OpenRequest,
+    dialog: ca_ui::quick_compare::QuickCompareDialog,
+    job: Option<Job<StartupQuickCompareMessage>>,
+    open_view_if_different: bool,
+}
+
+impl StartupQuickCompare {
+    fn new(
+        request: OpenRequest,
+        method: ContentMethod,
+        open_view_if_different: bool,
+        notify: Arc<dyn Fn() + Send + Sync>,
+    ) -> Self {
+        let left = request.left.clone();
+        let right = request.right.clone();
+        let dialog = ca_ui::quick_compare::QuickCompareDialog::new(
+            left.display().to_string(),
+            right.display().to_string(),
+        )
+        .with_selected_view(request.kind.clone());
+        let job = Job::spawn_notifying(
+            move |emitter, cancel| {
+                if !left.is_file() || !right.is_file() {
+                    emitter.send(StartupQuickCompareMessage::NotFilePair);
+                    return;
+                }
+                let rules =
+                    (method == ContentMethod::Rules).then(RulesEngine::with_builtin_formats);
+                let tests = ContentTests {
+                    enabled: true,
+                    method,
+                    ..ContentTests::default()
+                };
+                let result = ca_fs::compare_contents(
+                    &left,
+                    &right,
+                    &tests,
+                    rules
+                        .as_ref()
+                        .map(|engine| engine as &dyn ca_fs::RulesComparer),
+                    cancel.as_fs(),
+                )
+                .map_err(|error| error.to_string());
+                emitter.send(StartupQuickCompareMessage::Done(result));
+            },
+            notify,
+        );
+        Self {
+            request,
+            dialog,
+            job: Some(job),
+            open_view_if_different,
+        }
+    }
+}
+
 /// The window and everything in it.
 ///
 /// The window carries one flag per thing it is in the middle of, so the count
@@ -961,6 +1053,10 @@ pub struct App {
     fullscreen_wanted: Option<bool>,
     next_instance: u64,
     closing: bool,
+    /// A command-line comparison waiting for the options read to finish.
+    pending_startup_open: Option<OpenRequest>,
+    /// The summary shown for a command-line file pair.
+    startup_quick_compare: Option<StartupQuickCompare>,
     /// What the active view declared this frame, read once and used by every
     /// menu line, so a menu never rebuilds a view's whole declaration per item.
     declared: Vec<CommandState>,
@@ -1264,6 +1360,8 @@ impl App {
             fullscreen_wanted: None,
             next_instance: 0,
             closing: false,
+            pending_startup_open: None,
+            startup_quick_compare: None,
             declared: Vec::new(),
             recovery: None,
             startup_notice: SharedNotice::default(),
@@ -1499,7 +1597,18 @@ impl App {
             }
             // An automatic merge that reaches the window is one whose conflicts
             // are to be reviewed, so it opens as an ordinary merge.
-            Startup::Open(request) | Startup::AutoMerge(request, _) => app.open(&request, context),
+            Startup::Open(request) => {
+                if app
+                    .settings_directory
+                    .join(ca_session::options::OPTIONS_FILE)
+                    .is_file()
+                {
+                    app.pending_startup_open = Some(request);
+                } else {
+                    app.open(&request, context);
+                }
+            }
+            Startup::AutoMerge(request, _) => app.open(&request, context),
         }
         app
     }
@@ -2388,6 +2497,112 @@ impl App {
         drop(handle);
         self.restored = true;
         self.load_workspace(&name, context);
+    }
+
+    /// Resolve a command-line open after the options it depends on have loaded.
+    fn start_pending_startup_open(&mut self, context: &ViewContext) {
+        if !self.options.is_ready() {
+            return;
+        }
+        let Some(request) = self.pending_startup_open.take() else {
+            return;
+        };
+        let startup = &self.resolved.stored.startup;
+        if startup.show_quick_compare && ca_ui::quick_compare::supports_view(&request.kind) {
+            let method = if startup.quick_compare_method.uses_rules() {
+                ContentMethod::Rules
+            } else {
+                ContentMethod::Binary
+            };
+            self.startup_quick_compare = Some(StartupQuickCompare::new(
+                request,
+                method,
+                startup.open_view_if_different,
+                context.notify.clone(),
+            ));
+        } else {
+            self.open(&request, context);
+        }
+    }
+
+    /// Fold a completed startup comparison into the summary or open its view.
+    fn poll_startup_quick_compare(&mut self, context: &ViewContext) {
+        let mut open = None;
+        if let Some(state) = self.startup_quick_compare.as_mut() {
+            if let Some(job) = state.job.as_mut() {
+                let messages = job.drain();
+                let finished = job.is_finished();
+                for message in messages {
+                    match message {
+                        StartupQuickCompareMessage::NotFilePair => {
+                            open = Some(state.request.clone());
+                        }
+                        StartupQuickCompareMessage::Done(Ok(outcome))
+                            if state.open_view_if_different
+                                && matches!(
+                                    outcome,
+                                    ContentOutcome::BinaryDifferences
+                                        | ContentOutcome::UnimportantDifferences
+                                        | ContentOutcome::ImportantDifferences
+                                ) =>
+                        {
+                            open = Some(state.request.clone());
+                        }
+                        StartupQuickCompareMessage::Done(Ok(outcome)) => {
+                            state
+                                .dialog
+                                .set_result(startup_quick_compare_result(outcome));
+                        }
+                        StartupQuickCompareMessage::Done(Err(reason)) => {
+                            state
+                                .dialog
+                                .set_result(format!("Could not compare: {reason}"));
+                        }
+                        StartupQuickCompareMessage::Cancelled => {
+                            state.dialog.set_result("Comparison cancelled");
+                        }
+                    }
+                }
+                if finished {
+                    state.job = None;
+                }
+            }
+        }
+        if let Some(request) = open {
+            self.startup_quick_compare = None;
+            self.open(&request, context);
+        }
+    }
+
+    /// Draw and route the summary window the command line requested.
+    fn draw_startup_quick_compare(&mut self, ctx: &egui::Context, context: &ViewContext) {
+        let action = self.startup_quick_compare.as_mut().and_then(|state| {
+            state
+                .dialog
+                .show(ctx, egui::Id::new("startup-quick-compare"))
+        });
+        let Some(action) = action else {
+            return;
+        };
+        let Some(state) = self.startup_quick_compare.take() else {
+            return;
+        };
+        match action {
+            ca_ui::quick_compare::QuickCompareAction::Close => {
+                if self.tabs.is_empty() {
+                    self.update.restart_on_leave = false;
+                    self.closing = self.resolved.stored.tabs.close_window_with_last_tab;
+                    if !self.closing {
+                        self.open_home(context);
+                    }
+                }
+            }
+            ca_ui::quick_compare::QuickCompareAction::OpenView(kind) => {
+                let mut request = state.request;
+                request.kind = kind;
+                self.open(&request, context);
+            }
+        }
     }
 
     /// Explain a delayed named workspace once; restoration still retries.
@@ -4548,6 +4763,8 @@ impl App {
             notify: Arc::new(move || repaint.request_repaint()),
         };
         self.resolved = resolved;
+        self.start_pending_startup_open(&context);
+        self.poll_startup_quick_compare(&context);
         self.poll_recovery();
         self.poll_store();
         self.poll_launches();
@@ -4604,6 +4821,7 @@ impl App {
             self.draw_settings_notice(ctx);
             self.draw_policy_notice(ctx);
         }
+        self.draw_startup_quick_compare(ctx, &context);
         if ctx.input(|input| input.viewport().close_requested()) && !self.closing {
             self.request_exit();
             if !self.closing {
@@ -4774,7 +4992,9 @@ fn specs_of(settings: &SessionSettings) -> Option<ResolvedSpecs> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::{
-        menus_for, specs_of, App, Entry, ACTIONS_MENU, EDITABLE, NOT_YET, SIDES_UNSUPPORTED,
+        menus_for, specs_of, startup_quick_compare_result, App, ContentOutcome, Entry,
+        StartupQuickCompare, StartupQuickCompareMessage, ACTIONS_MENU, EDITABLE, NOT_YET,
+        SIDES_UNSUPPORTED,
     };
     use crate::cli::Startup;
     use crate::registry;
@@ -5253,6 +5473,54 @@ mod tests {
             dir.path().join("journals"),
         );
         (dir, app)
+    }
+
+    fn frame_until(app: &mut App, ready: impl Fn(&App) -> bool) {
+        let context = egui::Context::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !ready(app) && std::time::Instant::now() < deadline {
+            let _ = context.run(raw_input(), |ctx| app.frame(ctx));
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(ready(app), "application did not reach the requested state");
+    }
+
+    fn write_quick_compare_options(directory: &Path, open_if_different: bool) {
+        write_quick_compare_options_with_method(
+            directory,
+            open_if_different,
+            ca_session::options::QuickCompareMethod::default(),
+        );
+    }
+
+    fn write_quick_compare_options_with_method(
+        directory: &Path,
+        open_if_different: bool,
+        method: ca_session::options::QuickCompareMethod,
+    ) {
+        let mut options = ca_session::options::ProgramOptions::default();
+        options.startup.show_quick_compare = true;
+        options.startup.open_view_if_different = open_if_different;
+        options.startup.quick_compare_method = method;
+        std::fs::write(
+            directory.join(ca_session::options::OPTIONS_FILE),
+            serde_json::to_vec(&options).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn startup_dialog_state(request: OpenRequest) -> StartupQuickCompare {
+        let dialog = ca_ui::quick_compare::QuickCompareDialog::new(
+            request.left.display().to_string(),
+            request.right.display().to_string(),
+        )
+        .with_selected_view(request.kind.clone());
+        StartupQuickCompare {
+            request,
+            dialog,
+            job: None,
+            open_view_if_different: false,
+        }
     }
 
     #[test]
@@ -6450,6 +6718,341 @@ mod tests {
     }
 
     #[test]
+    fn startup_quick_compare_shows_identical_files_in_the_summary() {
+        let directory = settings();
+        write_quick_compare_options(directory.path(), true);
+        let left = directory.path().join("left.txt");
+        let right = directory.path().join("right.txt");
+        std::fs::write(&left, b"same").unwrap();
+        std::fs::write(&right, b"same").unwrap();
+        let request = OpenRequest::new(SessionKind::TextCompare, left, right);
+        let mut app = App::from_startup_in(
+            Startup::Open(request),
+            &context(),
+            directory.path().to_path_buf(),
+            directory.path().join("journals"),
+        );
+
+        frame_until(&mut app, |app| {
+            app.startup_quick_compare
+                .as_ref()
+                .and_then(|state| state.dialog.result())
+                .is_some()
+        });
+        assert_eq!(app.tab_count(), 0);
+        assert!(app
+            .startup_quick_compare
+            .as_ref()
+            .and_then(|state| state.dialog.result())
+            .is_some());
+    }
+
+    #[test]
+    fn startup_quick_compare_opens_the_view_when_files_differ() {
+        let directory = settings();
+        write_quick_compare_options(directory.path(), true);
+        let left = directory.path().join("left.txt");
+        let right = directory.path().join("right.txt");
+        std::fs::write(&left, b"left").unwrap();
+        std::fs::write(&right, b"right").unwrap();
+        let request = OpenRequest::new(SessionKind::TextCompare, left, right);
+        let mut app = App::from_startup_in(
+            Startup::Open(request),
+            &context(),
+            directory.path().to_path_buf(),
+            directory.path().join("journals"),
+        );
+
+        frame_until(&mut app, |app| app.tab_count() == 1);
+        assert_eq!(app.tabs[0].kind(), Some(SessionKind::TextCompare));
+        assert!(app.startup_quick_compare.is_none());
+    }
+
+    #[test]
+    fn startup_quick_compare_keeps_non_file_pairs_on_the_regular_open_path() {
+        let directory = settings();
+        write_quick_compare_options(directory.path(), true);
+        let left = directory.path().join("left");
+        let right = directory.path().join("right");
+        std::fs::create_dir_all(&left).unwrap();
+        std::fs::create_dir_all(&right).unwrap();
+        let request = OpenRequest::new(SessionKind::TextCompare, left, right);
+        let mut app = App::from_startup_in(
+            Startup::Open(request),
+            &context(),
+            directory.path().to_path_buf(),
+            directory.path().join("journals"),
+        );
+
+        frame_until(&mut app, |app| app.tab_count() == 1);
+        assert_eq!(app.tabs[0].kind(), Some(SessionKind::TextCompare));
+        assert!(app.startup_quick_compare.is_none());
+    }
+
+    #[test]
+    fn startup_quick_compare_does_not_intercept_merge_requests() {
+        let directory = settings();
+        write_quick_compare_options(directory.path(), true);
+        let left = directory.path().join("left.txt");
+        let right = directory.path().join("right.txt");
+        let ancestor = directory.path().join("ancestor.txt");
+        let output = directory.path().join("output.txt");
+        std::fs::write(&left, b"left\n").unwrap();
+        std::fs::write(&right, b"right\n").unwrap();
+        std::fs::write(&ancestor, b"base\n").unwrap();
+        let request = OpenRequest::new(SessionKind::TextMerge, left, right)
+            .with_center(Some(ancestor))
+            .with_output(Some(output));
+        let mut app = App::from_startup_in(
+            Startup::Open(request),
+            &context(),
+            directory.path().to_path_buf(),
+            directory.path().join("journals"),
+        );
+
+        frame_until(&mut app, |app| app.tab_count() == 1);
+        assert_eq!(app.tabs[0].kind(), Some(SessionKind::TextMerge));
+        assert!(app.startup_quick_compare.is_none());
+    }
+
+    #[test]
+    fn startup_quick_compare_shows_differences_when_auto_open_is_off() {
+        let directory = settings();
+        write_quick_compare_options(directory.path(), false);
+        let left = directory.path().join("left.txt");
+        let right = directory.path().join("right.txt");
+        std::fs::write(&left, b"left").unwrap();
+        std::fs::write(&right, b"right").unwrap();
+        let request = OpenRequest::new(SessionKind::TextCompare, left, right);
+        let mut app = App::from_startup_in(
+            Startup::Open(request),
+            &context(),
+            directory.path().to_path_buf(),
+            directory.path().join("journals"),
+        );
+
+        frame_until(&mut app, |app| {
+            app.startup_quick_compare
+                .as_ref()
+                .and_then(|state| state.dialog.result())
+                .is_some()
+        });
+        assert_eq!(app.tab_count(), 0);
+    }
+
+    #[test]
+    fn startup_quick_compare_uses_the_rules_method_from_options() {
+        let directory = settings();
+        write_quick_compare_options_with_method(
+            directory.path(),
+            false,
+            ca_session::options::QuickCompareMethod::from_id("rules"),
+        );
+        let left = directory.path().join("left.rs");
+        let right = directory.path().join("right.rs");
+        std::fs::write(&left, b"let item = 1;\n").unwrap();
+        std::fs::write(&right, b"let    item = 1;\n").unwrap();
+        let request = OpenRequest::new(SessionKind::TextCompare, left, right);
+        let mut app = App::from_startup_in(
+            Startup::Open(request),
+            &context(),
+            directory.path().to_path_buf(),
+            directory.path().join("journals"),
+        );
+
+        frame_until(&mut app, |app| {
+            app.startup_quick_compare
+                .as_ref()
+                .and_then(|state| state.dialog.result())
+                .is_some()
+        });
+        assert_eq!(
+            app.startup_quick_compare
+                .as_ref()
+                .and_then(|state| state.dialog.result()),
+            Some(startup_quick_compare_result(
+                ContentOutcome::UnimportantDifferences
+            ))
+        );
+    }
+
+    #[test]
+    fn startup_open_view_uses_the_requested_view_and_routes_through_the_dialog() {
+        use ca_ui::testing::probe::Probe;
+
+        let directory = settings();
+        write_quick_compare_options(directory.path(), false);
+        let left = directory.path().join("left.bin");
+        let right = directory.path().join("right.bin");
+        std::fs::write(&left, b"same").unwrap();
+        std::fs::write(&right, b"same").unwrap();
+        let request = OpenRequest::new(SessionKind::HexCompare, left, right);
+        let mut app = App::from_startup_in(
+            Startup::Open(request),
+            &context(),
+            directory.path().to_path_buf(),
+            directory.path().join("journals"),
+        );
+        frame_until(&mut app, |app| {
+            app.startup_quick_compare
+                .as_ref()
+                .and_then(|state| state.dialog.result())
+                .is_some()
+        });
+
+        let view_context = context();
+        let mut probe = Probe::new(900.0, 600.0);
+        {
+            let mut draw = |ctx: &egui::Context| app.draw_startup_quick_compare(ctx, &view_context);
+            probe.idle(&mut draw);
+            probe.idle(&mut draw);
+            probe.click("Open View", &mut draw).unwrap();
+        }
+
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.tabs[0].kind(), Some(SessionKind::HexCompare));
+        assert!(app.startup_quick_compare.is_none());
+    }
+
+    #[test]
+    fn startup_error_and_cancel_messages_leave_a_result_in_the_dialog() {
+        for (message, expected) in [
+            (
+                StartupQuickCompareMessage::Done(Err("read denied".to_owned())),
+                "read denied",
+            ),
+            (
+                StartupQuickCompareMessage::Cancelled,
+                "Comparison cancelled",
+            ),
+        ] {
+            let (_settings, mut app) = empty_app();
+            let request = OpenRequest::new(
+                SessionKind::TextCompare,
+                PathBuf::from("left.txt"),
+                PathBuf::from("right.txt"),
+            );
+            let mut state = startup_dialog_state(request);
+            state.job = Some(ca_ui::worker::Job::spawn(move |emitter, _| {
+                emitter.send(message);
+            }));
+            app.startup_quick_compare = Some(state);
+
+            frame_until(&mut app, |app| {
+                app.startup_quick_compare
+                    .as_ref()
+                    .and_then(|state| state.dialog.result())
+                    .is_some()
+            });
+            let result = app
+                .startup_quick_compare
+                .as_ref()
+                .and_then(|state| state.dialog.result())
+                .unwrap();
+            assert!(result.contains(expected), "{result}");
+            assert_eq!(app.tab_count(), 0);
+        }
+    }
+
+    #[test]
+    fn closing_startup_quick_compare_uses_the_last_tab_setting() {
+        use ca_ui::testing::probe::Probe;
+
+        let (_settings, mut app) = empty_app();
+        Arc::make_mut(&mut app.resolved)
+            .stored
+            .tabs
+            .close_window_with_last_tab = false;
+        app.startup_quick_compare = Some(startup_dialog_state(OpenRequest::new(
+            SessionKind::TextCompare,
+            PathBuf::from("left.txt"),
+            PathBuf::from("right.txt"),
+        )));
+        app.startup_quick_compare
+            .as_mut()
+            .unwrap()
+            .dialog
+            .set_result("Files are identical");
+
+        let view_context = context();
+        let mut probe = Probe::new(900.0, 600.0);
+        {
+            let mut draw = |ctx: &egui::Context| app.draw_startup_quick_compare(ctx, &view_context);
+            probe.idle(&mut draw);
+            probe.idle(&mut draw);
+            probe.click("Close", &mut draw).unwrap();
+        }
+
+        assert!(!app.is_closing());
+        assert_eq!(app.tab_count(), 1);
+        assert_eq!(app.active_title().as_deref(), Some("Home"));
+    }
+
+    #[test]
+    fn closing_startup_quick_compare_closes_the_window_when_configured() {
+        use ca_ui::testing::probe::Probe;
+
+        let (_settings, mut app) = empty_app();
+        Arc::make_mut(&mut app.resolved)
+            .stored
+            .tabs
+            .close_window_with_last_tab = true;
+        app.startup_quick_compare = Some(startup_dialog_state(OpenRequest::new(
+            SessionKind::TextCompare,
+            PathBuf::from("left.txt"),
+            PathBuf::from("right.txt"),
+        )));
+        app.startup_quick_compare
+            .as_mut()
+            .unwrap()
+            .dialog
+            .set_result("Files are identical");
+
+        let view_context = context();
+        let mut probe = Probe::new(900.0, 600.0);
+        {
+            let mut draw = |ctx: &egui::Context| app.draw_startup_quick_compare(ctx, &view_context);
+            probe.idle(&mut draw);
+            probe.idle(&mut draw);
+            probe.click("Close", &mut draw).unwrap();
+        }
+
+        assert!(app.is_closing());
+        assert_eq!(app.tab_count(), 0);
+    }
+
+    #[test]
+    fn closing_startup_quick_compare_keeps_existing_tabs_open() {
+        use ca_ui::testing::probe::Probe;
+
+        let (_settings, mut app) = empty_app();
+        app.open_home(&context());
+        app.startup_quick_compare = Some(startup_dialog_state(OpenRequest::new(
+            SessionKind::TextCompare,
+            PathBuf::from("left.txt"),
+            PathBuf::from("right.txt"),
+        )));
+        app.startup_quick_compare
+            .as_mut()
+            .unwrap()
+            .dialog
+            .set_result("Files are identical");
+
+        let view_context = context();
+        let mut probe = Probe::new(900.0, 600.0);
+        {
+            let mut draw = |ctx: &egui::Context| app.draw_startup_quick_compare(ctx, &view_context);
+            probe.idle(&mut draw);
+            probe.idle(&mut draw);
+            probe.click("Close", &mut draw).unwrap();
+        }
+
+        assert!(!app.is_closing());
+        assert_eq!(app.tab_count(), 1);
+        assert_eq!(app.active_title().as_deref(), Some("Home"));
+    }
+
+    #[test]
     fn new_tab_and_close_tab_move_the_selection() {
         let (_settings, mut app) = empty_app();
         let context = context();
@@ -7344,6 +7947,7 @@ mod tests {
                 "Open With",
                 "---",
                 "Compare Contents...",
+                "Quick Compare",
                 "Copy to Side...",
                 "Move to Side...",
                 "Copy to Folder...",

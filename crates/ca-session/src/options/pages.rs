@@ -83,6 +83,14 @@ stored_choice!(
     }
 );
 
+impl QuickCompareMethod {
+    /// Whether this stored choice selects the rules-based comparison method.
+    #[must_use]
+    pub const fn uses_rules(&self) -> bool {
+        matches!(self, Self::Rules { .. })
+    }
+}
+
 stored_choice!(
     /// Where a new session is placed.
     NewSessionPlacement, NewTab, {
@@ -601,7 +609,7 @@ impl Default for TweakOptions {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
-    use super::{AppearanceOptions, ThemeChoice};
+    use super::{AppearanceOptions, QuickCompareMethod, ThemeChoice};
 
     #[test]
     fn every_choice_reads_back_from_its_stored_name() {
@@ -636,5 +644,12 @@ mod tests {
         assert_eq!(written["themePack"], "sample");
         let older: AppearanceOptions = serde_json::from_str("{}").unwrap();
         assert_eq!(older.theme_pack, "");
+    }
+
+    #[test]
+    fn quick_compare_method_uses_its_typed_variant() {
+        assert!(!QuickCompareMethod::default().uses_rules());
+        assert!(QuickCompareMethod::from_id("rules").uses_rules());
+        assert!(!QuickCompareMethod::from_id("unrecognized").uses_rules());
     }
 }

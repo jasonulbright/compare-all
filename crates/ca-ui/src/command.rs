@@ -293,6 +293,7 @@ commands! {
     SetAsBaseFolders, "Set as Base Folders", Actions, None, "Make the selected folders the two base folders.";
     OpenInNewView, "Open in New View", Actions, None, "Open the selection in a tab of its own.";
     CompareContents, "Compare Contents", Actions, None, "Start a content comparison over the paired files.";
+    QuickCompare, "Quick Compare", Actions, None, "Show a result summary for the selected files.";
     CopyToOtherSide, "Copy to Other Side", Actions, None, "Copy the selection to the opposite side.";
     MoveToOtherSide, "Move to Other Side", Actions, None, "Move the selection to the opposite side.";
     CopyToFolder, "Copy to Folder...", Actions, None, "Copy the selection into a chosen folder.";
