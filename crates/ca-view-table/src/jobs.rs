@@ -18,6 +18,7 @@ use ca_table::TableError;
 use ca_text::{DecodeOptions, LoadedText, TextBuffer};
 use ca_ui::save::{FileSystem, RealFileSystem, Stamp};
 use ca_ui::worker::{Cancel, Emitter, Job, Terminal};
+use calamine::Reader;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -564,15 +565,78 @@ pub(crate) fn is_workbook_path(path: &Path) -> bool {
         })
 }
 
-fn is_streaming_workbook_path(path: &Path) -> bool {
+#[derive(Clone, Copy)]
+enum WorkbookKind {
+    Xlsx,
+    Xlsb,
+}
+
+impl WorkbookKind {
+    const fn uses_zip_archive(self) -> bool {
+        matches!(self, Self::Xlsx | Self::Xlsb)
+    }
+}
+
+fn workbook_kind(path: &Path) -> Option<WorkbookKind> {
     path.extension()
         .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| {
-            matches!(
-                extension.to_ascii_lowercase().as_str(),
-                "xlsx" | "xlsm" | "xlam" | "xlsb"
-            )
+        .map(str::to_ascii_lowercase)
+        .and_then(|extension| match extension.as_str() {
+            "xlsx" | "xlsm" | "xlam" => Some(WorkbookKind::Xlsx),
+            "xlsb" => Some(WorkbookKind::Xlsb),
+            _ => None,
         })
+}
+
+enum StreamingWorkbook<R> {
+    Xlsx(calamine::Xlsx<R>),
+    Xlsb(calamine::Xlsb<R>),
+}
+
+impl<R: std::io::Read + std::io::Seek> StreamingWorkbook<R> {
+    fn sheet_names(&self) -> Vec<String> {
+        match self {
+            Self::Xlsx(reader) => reader.sheet_names().clone(),
+            Self::Xlsb(reader) => reader.sheet_names().clone(),
+        }
+    }
+
+    fn with_cells_reader<'a, F, T>(
+        &'a mut self,
+        name: &str,
+        path: &Path,
+        use_reader: F,
+    ) -> Result<T, String>
+    where
+        F: FnOnce(
+            &mut dyn FnMut() -> Result<Option<calamine::Cell<calamine::DataRef<'a>>>, String>,
+        ) -> Result<T, String>,
+    {
+        match self {
+            Self::Xlsx(workbook) => {
+                let mut reader = workbook
+                    .worksheet_cells_reader(name)
+                    .map_err(|error| format!("{} — {name}: {error}", path.display()))?;
+                let mut next_cell = || {
+                    reader
+                        .next_cell()
+                        .map_err(|error| format!("{} — {name}: {error}", path.display()))
+                };
+                use_reader(&mut next_cell)
+            }
+            Self::Xlsb(workbook) => {
+                let mut reader = workbook
+                    .worksheet_cells_reader(name)
+                    .map_err(|error| format!("{} — {name}: {error}", path.display()))?;
+                let mut next_cell = || {
+                    reader
+                        .next_cell()
+                        .map_err(|error| format!("{} — {name}: {error}", path.display()))
+                };
+                use_reader(&mut next_cell)
+            }
+        }
+    }
 }
 
 fn read_sheets(
@@ -657,14 +721,12 @@ fn build_sheets(prepared: Vec<PreparedSheet>, path: &Path) -> Result<Vec<LoadedS
 }
 
 fn read_workbook_sheets(path: &Path) -> Result<Vec<RawSheet>, String> {
-    use calamine::Reader;
-
-    if !is_streaming_workbook_path(path) {
-        return Err(format!(
+    let kind = workbook_kind(path).ok_or_else(|| {
+        format!(
             "{} uses a workbook format that Table Compare cannot load safely; use .xlsx, .xlsm, .xlam, or .xlsb",
             path.display()
-        ));
-    }
+        )
+    })?;
     let size = std::fs::metadata(path)
         .map_err(|error| format!("{}: {error}", path.display()))?
         .len();
@@ -688,25 +750,20 @@ fn read_workbook_sheets(path: &Path) -> Result<Vec<RawSheet>, String> {
             path.display()
         ));
     }
-    if is_zip_workbook_path(path) {
+    if kind.uses_zip_archive() {
         check_workbook_archive(path, &bytes)?;
     }
-    let mut workbook = if path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("xlsb"))
-    {
-        calamine::Sheets::Xlsb(
+    let mut workbook = match kind {
+        WorkbookKind::Xlsb => StreamingWorkbook::Xlsb(
             calamine::open_workbook_from_rs::<calamine::Xlsb<_>, _>(std::io::Cursor::new(bytes))
                 .map_err(|error| format!("{}: {error}", path.display()))?,
-        )
-    } else {
-        calamine::Sheets::Xlsx(
+        ),
+        WorkbookKind::Xlsx => StreamingWorkbook::Xlsx(
             calamine::open_workbook_from_rs::<calamine::Xlsx<_>, _>(std::io::Cursor::new(bytes))
                 .map_err(|error| format!("{}: {error}", path.display()))?,
-        )
+        ),
     };
-    let names = workbook.sheet_names().clone();
+    let names = workbook.sheet_names();
     if names.len() > MAX_WORKBOOK_SHEETS {
         return Err(format!(
             "{} has {} sheets, past the {MAX_WORKBOOK_SHEETS} sheet limit",
@@ -717,20 +774,7 @@ fn read_workbook_sheets(path: &Path) -> Result<Vec<RawSheet>, String> {
     let mut sheets = Vec::with_capacity(names.len());
     let mut total_bytes = 0usize;
     for name in names {
-        let text = match &mut workbook {
-            calamine::Sheets::Xlsx(reader) => {
-                read_xlsx_sheet(reader, &name, path, &name, &mut total_bytes)?
-            }
-            calamine::Sheets::Xlsb(reader) => {
-                read_xlsb_sheet(reader, &name, path, &name, &mut total_bytes)?
-            }
-            calamine::Sheets::Xls(_) | calamine::Sheets::Ods(_) => {
-                return Err(format!(
-                    "{} uses a workbook format that Table Compare cannot load safely; use .xlsx, .xlsm, .xlam, or .xlsb",
-                    path.display()
-                ));
-            }
-        };
+        let text = read_streaming_sheet(&mut workbook, &name, path, &mut total_bytes)?;
         sheets.push(RawSheet {
             name,
             text,
@@ -742,17 +786,6 @@ fn read_workbook_sheets(path: &Path) -> Result<Vec<RawSheet>, String> {
         });
     }
     Ok(sheets)
-}
-
-fn is_zip_workbook_path(path: &Path) -> bool {
-    path.extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| {
-            matches!(
-                extension.to_ascii_lowercase().as_str(),
-                "xlsx" | "xlsm" | "xlam" | "xlsb"
-            )
-        })
 }
 
 fn check_workbook_archive(path: &Path, bytes: &[u8]) -> Result<(), String> {
@@ -790,86 +823,27 @@ struct SheetBounds {
     last_column: u32,
 }
 
-fn read_xlsx_sheet<R: std::io::Read + std::io::Seek>(
-    workbook: &mut calamine::Xlsx<R>,
+fn read_streaming_sheet<R: std::io::Read + std::io::Seek>(
+    workbook: &mut StreamingWorkbook<R>,
     name: &str,
     path: &Path,
-    sheet: &str,
     total_bytes: &mut usize,
 ) -> Result<String, String> {
-    let bounds = {
-        let mut reader = workbook
-            .worksheet_cells_reader(name)
-            .map_err(|error| format!("{} — {sheet}: {error}", path.display()))?;
-        scan_sheet_bounds(
-            || {
-                reader
-                    .next_cell()
-                    .map_err(|error| format!("{} — {sheet}: {error}", path.display()))
-            },
-            path,
-            sheet,
-        )?
-    };
+    let bounds = workbook.with_cells_reader(name, path, |next_cell| {
+        scan_sheet_bounds(next_cell, path, name)
+    })?;
     let Some(bounds) = bounds else {
         return Ok(String::new());
     };
-    let mut reader = workbook
-        .worksheet_cells_reader(name)
-        .map_err(|error| format!("{} — {sheet}: {error}", path.display()))?;
-    stream_sheet_text(
-        || {
-            reader
-                .next_cell()
-                .map_err(|error| format!("{} — {sheet}: {error}", path.display()))
-                .map(|cell| cell.map(|cell| (cell.get_position(), cell)))
-        },
-        bounds,
-        path,
-        sheet,
-        total_bytes,
-    )
-}
-
-fn read_xlsb_sheet<R: std::io::Read + std::io::Seek>(
-    workbook: &mut calamine::Xlsb<R>,
-    name: &str,
-    path: &Path,
-    sheet: &str,
-    total_bytes: &mut usize,
-) -> Result<String, String> {
-    let bounds = {
-        let mut reader = workbook
-            .worksheet_cells_reader(name)
-            .map_err(|error| format!("{} — {sheet}: {error}", path.display()))?;
-        scan_sheet_bounds(
-            || {
-                reader
-                    .next_cell()
-                    .map_err(|error| format!("{} — {sheet}: {error}", path.display()))
-            },
+    workbook.with_cells_reader(name, path, |next_cell| {
+        stream_sheet_text(
+            || next_cell().map(|cell| cell.map(|cell| (cell.get_position(), cell))),
+            bounds,
             path,
-            sheet,
-        )?
-    };
-    let Some(bounds) = bounds else {
-        return Ok(String::new());
-    };
-    let mut reader = workbook
-        .worksheet_cells_reader(name)
-        .map_err(|error| format!("{} — {sheet}: {error}", path.display()))?;
-    stream_sheet_text(
-        || {
-            reader
-                .next_cell()
-                .map_err(|error| format!("{} — {sheet}: {error}", path.display()))
-                .map(|cell| cell.map(|cell| (cell.get_position(), cell)))
-        },
-        bounds,
-        path,
-        sheet,
-        total_bytes,
-    )
+            name,
+            total_bytes,
+        )
+    })
 }
 
 fn scan_sheet_bounds<'a>(
