@@ -1579,10 +1579,21 @@ mod tests {
                 let xml = String::from_utf8(bytes).unwrap();
                 let worksheet_content_type = "PartName=\"/xl/worksheets/sheet3.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"";
                 assert!(xml.contains(worksheet_content_type));
-                bytes = xml
+                let xml = xml
                     .replace(
                         worksheet_content_type,
                         "PartName=\"/xl/chartsheets/sheet3.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.chartsheet+xml\"",
+                    );
+                assert!(xml.contains("</Types>"));
+                bytes = xml
+                    .replacen(
+                        "</Types>",
+                        concat!(
+                            r#"<Override PartName="/xl/drawings/drawing3.xml" ContentType="application/vnd.openxmlformats-officedocument.drawing+xml"/>"#,
+                            r#"<Override PartName="/xl/charts/chart3.xml" ContentType="application/vnd.openxmlformats-officedocument.drawingml.chart+xml"/>"#,
+                            "</Types>"
+                        ),
+                        1,
                     )
                     .into_bytes();
             }
@@ -1602,10 +1613,90 @@ mod tests {
             .unwrap();
         writer
             .write_all(
-                b"<chartsheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><sheetViews><sheetView workbookViewId=\"0\"/></sheetViews></chartsheet>",
+                br#"<chartsheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheetViews><sheetView workbookViewId="0"/></sheetViews>
+  <drawing r:id="rId1"/>
+</chartsheet>"#,
             )
             .unwrap();
+        for (name, xml) in chartsheet_parts() {
+            writer
+                .start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(xml.as_bytes()).unwrap();
+        }
         writer.finish().unwrap().into_inner()
+    }
+
+    fn chartsheet_parts() -> [(&'static str, &'static str); 4] {
+        [
+            (
+                "xl/chartsheets/_rels/sheet3.xml.rels",
+                r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing3.xml"/>
+</Relationships>"#,
+            ),
+            (
+                "xl/drawings/drawing3.xml",
+                r#"<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+  <xdr:absoluteAnchor>
+    <xdr:pos x="0" y="0"/>
+    <xdr:ext cx="9144000" cy="5143500"/>
+    <xdr:graphicFrame macro="">
+      <xdr:nvGraphicFramePr>
+        <xdr:cNvPr id="2" name="Chart 1"/>
+        <xdr:cNvGraphicFramePr><a:graphicFrameLocks noGrp="1"/></xdr:cNvGraphicFramePr>
+      </xdr:nvGraphicFramePr>
+      <xdr:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/></xdr:xfrm>
+      <a:graphic>
+        <a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart">
+          <c:chart xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:id="rId1"/>
+        </a:graphicData>
+      </a:graphic>
+    </xdr:graphicFrame>
+    <xdr:clientData/>
+  </xdr:absoluteAnchor>
+</xdr:wsDr>"#,
+            ),
+            (
+                "xl/drawings/_rels/drawing3.xml.rels",
+                r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="../charts/chart3.xml"/>
+</Relationships>"#,
+            ),
+            (
+                "xl/charts/chart3.xml",
+                r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart">
+  <c:chart>
+    <c:plotArea>
+      <c:layout/>
+      <c:barChart>
+        <c:barDir val="col"/>
+        <c:grouping val="clustered"/>
+        <c:ser>
+          <c:idx val="0"/><c:order val="0"/>
+          <c:tx><c:v>Series 1</c:v></c:tx>
+          <c:cat><c:strLit><c:ptCount val="1"/><c:pt idx="0"><c:v>Sample</c:v></c:pt></c:strLit></c:cat>
+          <c:val><c:numLit><c:formatCode>General</c:formatCode><c:ptCount val="1"/><c:pt idx="0"><c:v>1</c:v></c:pt></c:numLit></c:val>
+        </c:ser>
+        <c:axId val="1"/><c:axId val="2"/>
+      </c:barChart>
+      <c:catAx>
+        <c:axId val="1"/><c:scaling><c:orientation val="minMax"/></c:scaling>
+        <c:axPos val="b"/><c:tickLblPos val="nextTo"/><c:crossAx val="2"/>
+        <c:crosses val="autoZero"/>
+      </c:catAx>
+      <c:valAx>
+        <c:axId val="2"/><c:scaling><c:orientation val="minMax"/></c:scaling>
+        <c:axPos val="l"/><c:crossAx val="1"/><c:crosses val="autoZero"/>
+        <c:crossBetween val="between"/>
+      </c:valAx>
+    </c:plotArea>
+    <c:legend><c:legendPos val="r"/></c:legend>
+  </c:chart>
+</c:chartSpace>"#,
+            ),
+        ]
     }
 
     fn workbook_with_only_chartsheets_bytes() -> Vec<u8> {
@@ -1615,6 +1706,12 @@ mod tests {
         for index in 0..archive.len() {
             let mut entry = archive.by_index(index).unwrap();
             let name = entry.name().unwrap().into_owned();
+            if matches!(
+                name.as_str(),
+                "xl/worksheets/sheet1.xml" | "xl/worksheets/sheet2.xml"
+            ) {
+                continue;
+            }
             let is_directory = entry.is_dir();
             let mut bytes = Vec::new();
             entry.read_to_end(&mut bytes).unwrap();
@@ -1630,6 +1727,32 @@ mod tests {
                 bytes = worksheet_entries
                     .into_iter()
                     .fold(xml, |xml, worksheet| xml.replace(worksheet, ""))
+                    .into_bytes();
+            } else if name == "xl/_rels/workbook.xml.rels" {
+                let xml = String::from_utf8(bytes).unwrap();
+                let worksheet_relationships = [
+                    "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet1.xml\"/>",
+                    "<Relationship Id=\"rId2\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet2.xml\"/>",
+                ];
+                for relationship in worksheet_relationships {
+                    assert!(xml.contains(relationship));
+                }
+                bytes = worksheet_relationships
+                    .into_iter()
+                    .fold(xml, |xml, relationship| xml.replace(relationship, ""))
+                    .into_bytes();
+            } else if name == "[Content_Types].xml" {
+                let xml = String::from_utf8(bytes).unwrap();
+                let worksheet_content_types = [
+                    "<Override PartName=\"/xl/worksheets/sheet1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/>",
+                    "<Override PartName=\"/xl/worksheets/sheet2.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/>",
+                ];
+                for content_type in worksheet_content_types {
+                    assert!(xml.contains(content_type));
+                }
+                bytes = worksheet_content_types
+                    .into_iter()
+                    .fold(xml, |xml, content_type| xml.replace(content_type, ""))
                     .into_bytes();
             }
             let options = zip::write::SimpleFileOptions::default();
