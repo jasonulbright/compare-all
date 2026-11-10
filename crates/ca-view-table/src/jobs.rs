@@ -776,6 +776,12 @@ fn read_workbook_sheets(path: &Path) -> Result<Vec<RawSheet>, String> {
         .filter(|sheet| sheet.typ == calamine::SheetType::WorkSheet)
         .map(|sheet| sheet.name.clone())
         .collect();
+    if names.is_empty() {
+        return Err(format!(
+            "{} contains no worksheets that Table Compare can read",
+            path.display()
+        ));
+    }
     let mut sheets = Vec::with_capacity(names.len());
     let mut total_bytes = 0usize;
     for name in names {
@@ -1602,6 +1608,41 @@ mod tests {
         writer.finish().unwrap().into_inner()
     }
 
+    fn workbook_with_only_chartsheets_bytes() -> Vec<u8> {
+        let fixture = workbook_with_chartsheet_bytes();
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(fixture)).unwrap();
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for index in 0..archive.len() {
+            let mut entry = archive.by_index(index).unwrap();
+            let name = entry.name().unwrap().into_owned();
+            let is_directory = entry.is_dir();
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes).unwrap();
+            if name == "xl/workbook.xml" {
+                let xml = String::from_utf8(bytes).unwrap();
+                let worksheet_entries = [
+                    "<sheet name=\"One\" sheetId=\"1\" r:id=\"rId1\"/>",
+                    "<sheet name=\"Shared A\" sheetId=\"2\" r:id=\"rId2\"/>",
+                ];
+                for worksheet in worksheet_entries {
+                    assert!(xml.contains(worksheet));
+                }
+                bytes = worksheet_entries
+                    .into_iter()
+                    .fold(xml, |xml, worksheet| xml.replace(worksheet, ""))
+                    .into_bytes();
+            }
+            let options = zip::write::SimpleFileOptions::default();
+            if is_directory {
+                writer.add_directory(name, options).unwrap();
+            } else {
+                writer.start_file(name, options).unwrap();
+                writer.write_all(&bytes).unwrap();
+            }
+        }
+        writer.finish().unwrap().into_inner()
+    }
+
     #[test]
     fn sparse_workbook_is_rejected_before_dense_range_allocation() {
         let dir = tempfile::tempdir().unwrap();
@@ -1639,6 +1680,16 @@ mod tests {
         );
         assert!(!sheets[0].text.is_empty());
         assert!(!sheets[1].text.is_empty());
+    }
+
+    #[test]
+    fn workbook_with_no_worksheets_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chartsheet-only.xlsx");
+        std::fs::write(&path, workbook_with_only_chartsheets_bytes()).unwrap();
+
+        assert!(read_workbook_sheets(&path)
+            .is_err_and(|error| error.contains("no worksheets that Table Compare can read")));
     }
 
     #[test]
