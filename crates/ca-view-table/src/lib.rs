@@ -183,6 +183,10 @@ pub struct TableView {
     /// The files are copies the tab owns, so no cell takes an edit and nothing
     /// is saved.
     pub(crate) read_only: bool,
+    /// Whether the open request came from an archive copy.
+    archive_read_only: bool,
+    /// Why this source cannot be edited when `read_only` is set.
+    pub(crate) read_only_reason: &'static str,
     left_path: PathBuf,
     right_path: PathBuf,
     left_field: String,
@@ -194,6 +198,16 @@ pub struct TableView {
     /// The parsed tables, kept so a settings change re-runs only the stages
     /// that depend on it.
     sides: Option<Box<(SideData, SideData)>>,
+    /// Sheet inputs loaded from either workbook.
+    sheet_pairs: Vec<jobs::SheetPair>,
+    /// The selected sheet pair in `sheet_pairs`.
+    active_sheet: usize,
+    /// Whether the current sources support sheet tabs.
+    show_sheet_tabs: bool,
+    /// Left-side sheet names, including sheets outside a custom pairing.
+    left_sheet_names: Vec<String>,
+    /// Right-side sheet names, including sheets outside a custom pairing.
+    right_sheet_names: Vec<String>,
     status: Status,
     strip: Strip,
     /// What the strip was built for, so it is built again only when it must be.
@@ -290,14 +304,39 @@ pub struct TableView {
     clipboard_asked: Option<Side>,
 }
 
+fn workbook_read_only_reason(left: &Path, right: &Path) -> Option<&'static str> {
+    (jobs::is_workbook_path(left) || jobs::is_workbook_path(right))
+        .then_some("Spreadsheet files are read-only in Table Compare.")
+}
+
+fn apply_panel_settings(
+    view: &mut TableView,
+    settings: TableSettings,
+    previous_sheet_pairing: &ca_session::settings::table::TablePairing,
+) {
+    if &settings.sheets == previous_sheet_pairing {
+        view.settings = settings;
+        view.recompare();
+    } else {
+        view.pending_settings = Some(Box::new(settings));
+        view.request_reread(ca_ui::save::Reread::Settings);
+    }
+}
+
 impl TableView {
     /// A tab over the two sides, with the comparison already started.
     #[must_use]
     pub fn new(left: PathBuf, right: PathBuf, context: &ViewContext, instance: u64) -> Self {
+        let read_only = jobs::is_workbook_path(&left) || jobs::is_workbook_path(&right);
+        let read_only_reason = workbook_read_only_reason(&left, &right).unwrap_or(
+            "The file is a copy taken out of an archive, so it cannot be edited or saved.",
+        );
         let mut view = Self {
             id: egui::Id::new(("table-compare", instance)),
             specs: ca_session::settings::SpecsSettings::default(),
-            read_only: false,
+            read_only,
+            archive_read_only: false,
+            read_only_reason,
             left_field: left.display().to_string(),
             right_field: right.display().to_string(),
             left_path: left,
@@ -307,6 +346,11 @@ impl TableView {
             settings: TableSettings::default(),
             grid: Grid::default(),
             sides: None,
+            sheet_pairs: Vec::new(),
+            active_sheet: 0,
+            show_sheet_tabs: false,
+            left_sheet_names: Vec::new(),
+            right_sheet_names: Vec::new(),
             status: Status::Running(Stage::Reading),
             strip: Strip::default(),
             strip_key: (0, 0, 0),
@@ -520,10 +564,16 @@ impl TableView {
 
     /// Read both files again and compare them.
     pub fn restart(&mut self) {
+        self.refresh_read_only();
         self.clipboard_requested = None;
         self.clipboard_asked = None;
         self.cancel_selection_copy();
         self.sides = None;
+        self.sheet_pairs.clear();
+        self.active_sheet = 0;
+        self.show_sheet_tabs = false;
+        self.left_sheet_names.clear();
+        self.right_sheet_names.clear();
         self.cell_editor = None;
         self.pending = editing::Pending::Load;
         self.status = Status::Running(Stage::Reading);
@@ -537,6 +587,18 @@ impl TableView {
         self.pipeline.start(job);
     }
 
+    fn refresh_read_only(&mut self) {
+        let spreadsheet_reason = workbook_read_only_reason(&self.left_path, &self.right_path);
+        self.read_only = self.archive_read_only || spreadsheet_reason.is_some();
+        self.read_only_reason = if self.archive_read_only {
+            "The file is a copy taken out of an archive, so it cannot be edited or saved."
+        } else {
+            spreadsheet_reason.unwrap_or(
+                "The file is a copy taken out of an archive, so it cannot be edited or saved.",
+            )
+        };
+    }
+
     /// Compare again under the current settings, without reading the files.
     pub fn recompare(&mut self) {
         self.cancel_selection_copy();
@@ -544,19 +606,44 @@ impl TableView {
             self.start_reparse();
             return;
         }
-        let Some(sides) = self.sides.as_ref() else {
+        self.status = Status::Running(Stage::Schema);
+        self.pending = editing::Pending::Recompare;
+        let job = if self.show_sheet_tabs && !self.sheet_pairs.is_empty() {
+            jobs::spawn_recompare_sheet(
+                self.sheet_pairs.clone(),
+                self.active_sheet,
+                self.show_sheet_tabs,
+                (
+                    self.left_sheet_names.clone(),
+                    self.right_sheet_names.clone(),
+                ),
+                self.settings.clone(),
+                Arc::clone(&self.notify),
+            )
+        } else if let Some(sides) = self.sides.as_ref() {
+            jobs::spawn_recompare(
+                sides.0.clone(),
+                sides.1.clone(),
+                self.settings.clone(),
+                Arc::clone(&self.notify),
+            )
+        } else {
             self.restart();
             return;
         };
-        self.status = Status::Running(Stage::Schema);
-        self.pending = editing::Pending::Recompare;
-        let job = jobs::spawn_recompare(
-            sides.0.clone(),
-            sides.1.clone(),
-            self.settings.clone(),
-            Arc::clone(&self.notify),
-        );
         self.pipeline.start(job);
+    }
+
+    fn select_sheet(&mut self, index: usize) {
+        if index == self.active_sheet || index >= self.sheet_pairs.len() {
+            return;
+        }
+        self.active_sheet = index;
+        self.clear_selection();
+        self.cell_editor = None;
+        self.scroll = RowScroll::top();
+        self.horizontal = 0.0;
+        self.recompare();
     }
 
     /// Take whatever the worker has posted.
@@ -711,6 +798,13 @@ impl TableView {
         self.cancel_auto_fit();
         self.clear_selection();
         let pending = self.pending;
+        if !data.sheet_pairs.is_empty() {
+            self.sheet_pairs.clone_from(&data.sheet_pairs);
+            self.active_sheet = data.active_sheet;
+            self.show_sheet_tabs = data.show_sheet_tabs;
+            self.left_sheet_names.clone_from(&data.left_sheet_names);
+            self.right_sheet_names.clone_from(&data.right_sheet_names);
+        }
         self.sides = Some(Box::new((data.left.clone(), data.right.clone())));
         self.mapping = Some((Arc::clone(&data.schema), Arc::clone(&data.comparison)));
         if let Some((left, right)) = data.texts.clone() {
@@ -720,6 +814,8 @@ impl TableView {
             self.stamps = (data.left.facts.stamp, data.right.facts.stamp);
         } else if pending == editing::Pending::Edit {
             self.parsed = self.reparse_revisions;
+        } else if !data.sheet_pairs.is_empty() {
+            self.parsed = (self.left_text.revision(), self.right_text.revision());
         }
         let cursor = self.grid.cursor();
         self.grid.set_source(Arc::new(ComparisonSource::new(data)));
@@ -1544,6 +1640,30 @@ impl TableView {
             });
     }
 
+    fn sheet_tabs_ui(&mut self, ui: &mut egui::Ui) {
+        if !self.show_sheet_tabs || self.sheet_pairs.is_empty() {
+            return;
+        }
+        let labels = self
+            .sheet_pairs
+            .iter()
+            .map(|sheet| sheet.label.clone())
+            .collect::<Vec<_>>();
+        egui::ScrollArea::horizontal()
+            .id_salt(self.id.with("sheet-tabs"))
+            .max_height(28.0)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    for (index, label) in labels.iter().enumerate() {
+                        let selected = self.active_sheet == index;
+                        if ui.selectable_label(selected, label).clicked() {
+                            self.select_sheet(index);
+                        }
+                    }
+                });
+            });
+    }
+
     fn status_bar(&self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
             match &self.status {
@@ -2295,7 +2415,8 @@ impl ca_ui::view::ViewFactory for TableView {
             context,
             instance,
         );
-        view.read_only = request.read_only;
+        view.archive_read_only = request.read_only;
+        view.refresh_read_only();
         view
     }
 }
@@ -2358,19 +2479,30 @@ impl SessionView for TableView {
         if self.panel.is_open() {
             let columns = self.grid.source().columns().to_vec();
             let mut settings = self.settings.clone();
-            let changed = self.panel.show(ui, self.id, &mut settings, &columns);
-            self.settings = settings;
+            let previous_sheet_pairing = settings.sheets.clone();
+            let changed = self.panel.show(
+                ui,
+                self.id,
+                &mut settings,
+                &columns,
+                &self.sheet_pairs,
+                (&self.left_sheet_names, &self.right_sheet_names),
+            );
             if changed {
-                self.recompare();
+                apply_panel_settings(self, settings, &previous_sheet_pairing);
+            } else {
+                self.settings = settings;
             }
             return Vec::new();
         }
-        let reserved = if self.show_details { 54.0 } else { 0.0 };
+        let reserved = (if self.show_details { 54.0 } else { 0.0 })
+            + if self.show_sheet_tabs { 28.0 } else { 0.0 };
         let status_height = 26.0;
         let room = (ui.available_height() - reserved - status_height).max(self.row_height() * 2.0);
         ui.allocate_ui(egui::vec2(ui.available_width(), room), |ui| {
             self.grids(ui, palette);
         });
+        self.sheet_tabs_ui(ui);
         self.details_area(ui, palette);
         ui.separator();
         self.status_bar(ui);
@@ -2694,7 +2826,8 @@ impl SessionView for TableView {
         let reread = built.left_format.parse != self.settings.left_format.parse
             || built.right_format.parse != self.settings.right_format.parse
             || built.left_format.encoding != self.settings.left_format.encoding
-            || built.right_format.encoding != self.settings.right_format.encoding;
+            || built.right_format.encoding != self.settings.right_format.encoding
+            || built.sheets != self.settings.sheets;
         if !reread && built.schema == self.settings.schema && built.align == self.settings.align {
             return;
         }
@@ -2791,7 +2924,10 @@ impl SessionView for TableView {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::{cell_status_label, parse_table_address, MenuView, TableView, ROW_HEIGHT};
+    use super::{
+        apply_panel_settings, cell_status_label, parse_table_address, MenuView, TableView,
+        ROW_HEIGHT,
+    };
     use crate::model::{Cursor, DisplayFilter, Side, Source};
     use crate::testing::FakeSource;
     use ca_table::compare::{CellStatus, RowStatus};
@@ -2799,7 +2935,7 @@ mod tests {
     use ca_ui::testing::{context, event_input, sized_input, wait_until};
     use ca_ui::view::SessionView;
     use std::fmt::Write as _;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -3941,6 +4077,87 @@ mod tests {
         assert_eq!(view.grid().cursor().row, 0);
         view.navigate(egui::Key::ArrowUp, 5);
         assert_eq!(view.grid().cursor().row, 0);
+    }
+
+    #[test]
+    fn workbook_view_selects_a_sheet_tab_and_stays_read_only() {
+        let left = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/multiple-left.xlsx");
+        let right =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/multiple-right.xlsx");
+        let egui = egui::Context::default();
+        let mut view = TableView::new(left, right, &context(), 77);
+        assert!(settle(&mut view, &egui));
+        assert!(view.show_sheet_tabs);
+        assert!(view.read_only);
+        assert!(!view.accepts(Command::SaveFileAs));
+        assert_eq!(
+            view.write_block(Side::Left),
+            Some("Spreadsheet files are read-only in Table Compare.")
+        );
+        assert_eq!(view.sheet_pairs.len(), 3);
+
+        view.select_sheet(1);
+        assert!(settle(&mut view, &egui));
+        assert_eq!(view.active_sheet, 1);
+        let sides = view.sides.as_ref().expect("the selected sheet is loaded");
+        assert_eq!(sides.0.table.cell_text(0, 0), "shared");
+        assert_eq!(sides.1.table.cell_text(0, 0), "one");
+        view.on_close();
+    }
+
+    #[test]
+    fn changing_open_paths_refreshes_read_only_reasons_and_preserves_archive_flag() {
+        let (_dir, left_csv, right_csv) = files("id,value\n1,left\n", "id,value\n1,right\n");
+        let workbook =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/multiple-left.xlsx");
+        let mut view = TableView::new(left_csv.clone(), right_csv.clone(), &context(), 78);
+        assert!(!view.read_only);
+
+        view.left_field = workbook.display().to_string();
+        view.apply_fields();
+        assert!(view.read_only);
+        assert_eq!(
+            view.read_only_reason,
+            "Spreadsheet files are read-only in Table Compare."
+        );
+
+        view.left_field = left_csv.display().to_string();
+        view.apply_fields();
+        assert!(!view.read_only);
+
+        view.archive_read_only = true;
+        view.apply_fields();
+        assert!(view.read_only);
+        assert_eq!(
+            view.read_only_reason,
+            "The file is a copy taken out of an archive, so it cannot be edited or saved."
+        );
+        view.on_close();
+    }
+
+    #[test]
+    fn sheet_pairing_changes_prompt_before_discarding_csv_edits() {
+        let (_dir, left, right) = files("id,value\n1,left\n", "id,value\n1,right\n");
+        let egui = egui::Context::default();
+        let mut view = TableView::new(left, right, &context(), 79);
+        assert!(settle(&mut view, &egui));
+        view.run(Command::Delete);
+        assert!(settle(&mut view, &egui));
+        assert!(view.is_modified(Side::Left));
+
+        let previous_pairing = view.settings.sheets.clone();
+        let mut next_settings = view.settings.clone();
+        next_settings.sheets = ca_session::settings::table::TablePairing::by_left_name();
+        apply_panel_settings(&mut view, next_settings, &previous_pairing);
+
+        assert!(view.prompt.is_some());
+        assert!(view.pending_settings.is_some());
+        assert!(view.is_modified(Side::Left));
+        view.answer_unsaved(ca_ui::save::CloseChoice::Cancel);
+        assert!(view.prompt.is_none());
+        assert!(view.pending_settings.is_none());
+        assert!(view.is_modified(Side::Left));
+        view.on_close();
     }
 
     #[test]

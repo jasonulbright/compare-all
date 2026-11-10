@@ -18,6 +18,7 @@ use ca_table::TableError;
 use ca_text::{DecodeOptions, LoadedText, TextBuffer};
 use ca_ui::save::{FileSystem, RealFileSystem, Stamp};
 use ca_ui::worker::{Cancel, Emitter, Job, Terminal};
+use calamine::Reader;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -66,6 +67,8 @@ pub struct FormatSettings {
 /// Everything a comparison needs beyond the two paths.
 #[derive(Debug, Clone, Default)]
 pub struct TableSettings {
+    /// How worksheets on the two sides are paired.
+    pub sheets: ca_session::settings::table::TablePairing,
     /// How the left file is read.
     pub left_format: FormatSettings,
     /// How the right file is read.
@@ -130,6 +133,45 @@ pub struct TableData {
     /// The view edits this text; a comparison that did not read the files
     /// carries none, and the view keeps the text it holds.
     pub texts: Option<(Arc<String>, Arc<String>)>,
+    /// The paired sheet inputs available to the view.
+    pub sheet_pairs: Vec<SheetPair>,
+    /// The selected sheet in `sheet_pairs`.
+    pub active_sheet: usize,
+    /// Whether this input came from a multi-sheet-capable format.
+    pub show_sheet_tabs: bool,
+    /// Left-side sheet names in source order.
+    pub left_sheet_names: Vec<String>,
+    /// Right-side sheet names in source order.
+    pub right_sheet_names: Vec<String>,
+}
+
+/// One pair of sheet inputs, including an empty side when a sheet is unpaired.
+#[derive(Debug, Clone)]
+pub struct SheetPair {
+    /// What the bottom tab calls this pair.
+    pub label: String,
+    /// The left-side sheet name, if one exists.
+    pub left_name: Option<String>,
+    /// The right-side sheet name, if one exists.
+    pub right_name: Option<String>,
+    /// Left sheet index in source order, if one exists.
+    pub left_index: Option<u32>,
+    /// Right sheet index in source order, if one exists.
+    pub right_index: Option<u32>,
+    /// The left-side table, or an empty table for a right-only sheet.
+    pub left: Side,
+    /// The right-side table, or an empty table for a left-only sheet.
+    pub right: Side,
+    /// Text snapshots for ordinary editable text tables.
+    pub texts: Option<(Arc<String>, Arc<String>)>,
+}
+
+#[derive(Debug, Default)]
+struct SheetContext {
+    pairs: Vec<SheetPair>,
+    active: usize,
+    show_tabs: bool,
+    names: (Vec<String>, Vec<String>),
 }
 
 /// What the worker posts back.
@@ -223,7 +265,15 @@ pub fn spawn_reparse(
             if cancel.is_cancelled() {
                 return;
             }
-            compare_tables(left, right, &settings, emitter, cancel, None);
+            compare_tables(
+                left,
+                right,
+                &settings,
+                emitter,
+                cancel,
+                None,
+                SheetContext::default(),
+            );
         },
         notify,
     )
@@ -256,7 +306,52 @@ pub fn spawn_recompare(
 ) -> Job<TableMessage> {
     Job::spawn_notifying(
         move |emitter, cancel| {
-            compare_tables(left, right, &settings, emitter, cancel, None);
+            compare_tables(
+                left,
+                right,
+                &settings,
+                emitter,
+                cancel,
+                None,
+                SheetContext::default(),
+            );
+        },
+        notify,
+    )
+}
+
+/// Compare the selected sheet from already loaded sheet inputs.
+#[must_use]
+pub fn spawn_recompare_sheet(
+    sheets: Vec<SheetPair>,
+    active_sheet: usize,
+    show_sheet_tabs: bool,
+    sheet_names: (Vec<String>, Vec<String>),
+    settings: TableSettings,
+    notify: Arc<dyn Fn() + Send + Sync>,
+) -> Job<TableMessage> {
+    Job::spawn_notifying(
+        move |emitter, cancel| {
+            let Some(sheet) = sheets.get(active_sheet) else {
+                emitter.send(TableMessage::Failed(
+                    "The selected sheet is no longer available.".into(),
+                ));
+                return;
+            };
+            compare_tables(
+                sheet.left.clone(),
+                sheet.right.clone(),
+                &settings,
+                emitter,
+                cancel,
+                None,
+                SheetContext {
+                    pairs: sheets,
+                    active: active_sheet,
+                    show_tabs: show_sheet_tabs,
+                    names: sheet_names,
+                },
+            );
         },
         notify,
     )
@@ -271,15 +366,15 @@ fn load_and_compare(
     cancel: &Cancel,
 ) {
     emitter.send(TableMessage::Progress(Stage::Reading));
-    let left_text = match read_input(left, &settings.left_format, clipboard[0].as_deref()) {
-        Ok(text) => text,
+    let left_sheets = match read_sheets(left, &settings.left_format, clipboard[0].as_deref()) {
+        Ok(sheets) => sheets,
         Err(message) => {
             emitter.send(TableMessage::Failed(message));
             return;
         }
     };
-    let right_text = match read_input(right, &settings.right_format, clipboard[1].as_deref()) {
-        Ok(text) => text,
+    let right_sheets = match read_sheets(right, &settings.right_format, clipboard[1].as_deref()) {
+        Ok(sheets) => sheets,
         Err(message) => {
             emitter.send(TableMessage::Failed(message));
             return;
@@ -290,14 +385,14 @@ fn load_and_compare(
     }
 
     emitter.send(TableMessage::Progress(Stage::Detecting));
-    let left_options = resolve(
-        &left_text.text,
+    let left_prepared = prepare_sheets(
+        left_sheets,
         &settings.left_format,
         settings,
         &settings.schema.left_regional,
     );
-    let right_options = resolve(
-        &right_text.text,
+    let right_prepared = prepare_sheets(
+        right_sheets,
         &settings.right_format,
         settings,
         &settings.schema.right_regional,
@@ -307,19 +402,15 @@ fn load_and_compare(
     }
 
     emitter.send(TableMessage::Progress(Stage::Parsing));
-    let texts = (
-        Arc::new(left_text.text.clone()),
-        Arc::new(right_text.text.clone()),
-    );
-    let left_side = match build_side(left_text, &left_options) {
-        Ok(side) => side,
+    let left_sheets = match build_sheets(left_prepared, left) {
+        Ok(sheets) => sheets,
         Err(message) => {
             emitter.send(TableMessage::Failed(message));
             return;
         }
     };
-    let right_side = match build_side(right_text, &right_options) {
-        Ok(side) => side,
+    let right_sheets = match build_sheets(right_prepared, right) {
+        Ok(sheets) => sheets,
         Err(message) => {
             emitter.send(TableMessage::Failed(message));
             return;
@@ -328,13 +419,45 @@ fn load_and_compare(
     if cancel.is_cancelled() {
         return;
     }
+
+    let sheet_names = (
+        left_sheets.iter().map(|sheet| sheet.name.clone()).collect(),
+        right_sheets
+            .iter()
+            .map(|sheet| sheet.name.clone())
+            .collect(),
+    );
+    let show_sheet_tabs = (is_workbook_path(left) && clipboard[0].is_none())
+        || (is_workbook_path(right) && clipboard[1].is_none());
+    let sheets = match pair_sheets(&left_sheets, &right_sheets, &settings.sheets) {
+        Ok(sheets) => sheets,
+        Err(message) => {
+            emitter.send(TableMessage::Failed(message));
+            return;
+        }
+    };
+    if cancel.is_cancelled() {
+        return;
+    }
+    let Some(selected) = sheets.first() else {
+        emitter.send(TableMessage::Failed(
+            "No sheets were available to compare.".into(),
+        ));
+        return;
+    };
     compare_tables(
-        left_side,
-        right_side,
+        selected.left.clone(),
+        selected.right.clone(),
         settings,
         emitter,
         cancel,
-        Some(texts),
+        selected.texts.clone(),
+        SheetContext {
+            pairs: sheets,
+            active: 0,
+            show_tabs: show_sheet_tabs,
+            names: sheet_names,
+        },
     );
 }
 
@@ -345,6 +468,7 @@ fn compare_tables(
     emitter: &Emitter<TableMessage>,
     cancel: &Cancel,
     texts: Option<(Arc<String>, Arc<String>)>,
+    sheets: SheetContext,
 ) {
     emitter.send(TableMessage::Progress(Stage::Schema));
     let schema = Schema::build(&left.table, &right.table, &settings.schema);
@@ -387,6 +511,11 @@ fn compare_tables(
         alignment: Arc::new(alignment),
         comparison: Arc::new(comparison),
         texts,
+        sheet_pairs: sheets.pairs,
+        active_sheet: sheets.active,
+        show_sheet_tabs: sheets.show_tabs,
+        left_sheet_names: sheets.names.0,
+        right_sheet_names: sheets.names.1,
     })));
 }
 
@@ -397,6 +526,670 @@ struct SideText {
     had_errors: bool,
     stamp: Option<Stamp>,
     template: Arc<LoadedText>,
+}
+
+struct LoadedSheet {
+    name: String,
+    side: Side,
+    text: Option<Arc<String>>,
+}
+
+struct RawSheet {
+    name: String,
+    text: String,
+    encoding: String,
+    had_errors: bool,
+    stamp: Option<Stamp>,
+    template: Option<Arc<LoadedText>>,
+    workbook: bool,
+}
+
+struct PreparedSheet {
+    raw: RawSheet,
+    options: ParseOptions,
+}
+
+const MAX_WORKBOOK_SHEETS: usize = 256;
+const MAX_WORKBOOK_TEXT_BYTES: usize = ca_table::parse::MAX_INPUT_BYTES;
+const MAX_WORKBOOK_ARCHIVE_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_WORKBOOK_ARCHIVE_ENTRIES: usize = 4_096;
+
+pub(crate) fn is_workbook_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "xls" | "xla" | "xlsx" | "xlsm" | "xlam" | "xlsb" | "ods"
+            )
+        })
+}
+
+#[derive(Clone, Copy)]
+enum WorkbookKind {
+    Xlsx,
+    Xlsb,
+}
+
+impl WorkbookKind {
+    const fn uses_zip_archive(self) -> bool {
+        matches!(self, Self::Xlsx | Self::Xlsb)
+    }
+}
+
+fn workbook_kind(path: &Path) -> Option<WorkbookKind> {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .and_then(|extension| match extension.as_str() {
+            "xlsx" | "xlsm" | "xlam" => Some(WorkbookKind::Xlsx),
+            "xlsb" => Some(WorkbookKind::Xlsb),
+            _ => None,
+        })
+}
+
+enum StreamingWorkbook<R> {
+    Xlsx(calamine::Xlsx<R>),
+    Xlsb(calamine::Xlsb<R>),
+}
+
+impl<R: std::io::Read + std::io::Seek> StreamingWorkbook<R> {
+    fn sheets_metadata(&self) -> &[calamine::Sheet] {
+        match self {
+            Self::Xlsx(reader) => reader.sheets_metadata(),
+            Self::Xlsb(reader) => reader.sheets_metadata(),
+        }
+    }
+
+    fn with_cells_reader<'a, F, T>(
+        &'a mut self,
+        name: &str,
+        path: &Path,
+        use_reader: F,
+    ) -> Result<T, String>
+    where
+        F: FnOnce(
+            &mut dyn FnMut() -> Result<Option<calamine::Cell<calamine::DataRef<'a>>>, String>,
+        ) -> Result<T, String>,
+    {
+        match self {
+            Self::Xlsx(workbook) => {
+                let mut reader = workbook
+                    .worksheet_cells_reader(name)
+                    .map_err(|error| format!("{} — {name}: {error}", path.display()))?;
+                let mut next_cell = || {
+                    reader
+                        .next_cell()
+                        .map_err(|error| format!("{} — {name}: {error}", path.display()))
+                };
+                use_reader(&mut next_cell)
+            }
+            Self::Xlsb(workbook) => {
+                let mut reader = workbook
+                    .worksheet_cells_reader(name)
+                    .map_err(|error| format!("{} — {name}: {error}", path.display()))?;
+                let mut next_cell = || {
+                    reader
+                        .next_cell()
+                        .map_err(|error| format!("{} — {name}: {error}", path.display()))
+                };
+                use_reader(&mut next_cell)
+            }
+        }
+    }
+}
+
+fn read_sheets(
+    path: &Path,
+    format: &FormatSettings,
+    clipboard: Option<&str>,
+) -> Result<Vec<RawSheet>, String> {
+    if clipboard.is_none() && is_workbook_path(path) {
+        return read_workbook_sheets(path);
+    }
+    let input = read_input(path, format, clipboard)?;
+    let name = path.file_name().map_or_else(
+        || path.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    Ok(vec![RawSheet {
+        name,
+        text: input.text,
+        encoding: input.encoding,
+        had_errors: input.had_errors,
+        stamp: input.stamp,
+        template: Some(input.template),
+        workbook: false,
+    }])
+}
+
+fn prepare_sheets(
+    raw_sheets: Vec<RawSheet>,
+    format: &FormatSettings,
+    settings: &TableSettings,
+    regional: &ca_table::regional::Regional,
+) -> Vec<PreparedSheet> {
+    raw_sheets
+        .into_iter()
+        .map(|raw| {
+            let options = if raw.workbook {
+                ParseOptions {
+                    syntax: ca_table::parse::FieldSyntax::delimited(['\t']),
+                    ..ParseOptions::default()
+                }
+            } else {
+                resolve(&raw.text, format, settings, regional)
+            };
+            PreparedSheet { raw, options }
+        })
+        .collect()
+}
+
+fn build_sheets(prepared: Vec<PreparedSheet>, path: &Path) -> Result<Vec<LoadedSheet>, String> {
+    prepared
+        .into_iter()
+        .map(|prepared| {
+            let PreparedSheet { raw, options } = prepared;
+            let table = parse(&raw.text, &options)
+                .map_err(|error| format!("{} — {}: {error}", path.display(), raw.name))?;
+            let mut resolved_options = options;
+            resolved_options.first_line_contains = table.first_line_contains().clone();
+            let facts = SideFacts {
+                encoding: raw.encoding,
+                had_errors: raw.had_errors,
+                syntax: if raw.workbook {
+                    "Spreadsheet cells".to_owned()
+                } else {
+                    syntax_label(&resolved_options)
+                },
+                header: header_label(&table),
+                warnings: table.warnings().to_vec(),
+                options: resolved_options,
+                stamp: raw.stamp,
+                template: raw.template,
+            };
+            Ok(LoadedSheet {
+                name: raw.name,
+                side: Side {
+                    table: Arc::new(table),
+                    facts,
+                },
+                text: (!raw.workbook).then(|| Arc::new(raw.text)),
+            })
+        })
+        .collect()
+}
+
+fn read_workbook_sheets(path: &Path) -> Result<Vec<RawSheet>, String> {
+    let kind = workbook_kind(path).ok_or_else(|| {
+        format!(
+            "{} uses a workbook format that Table Compare cannot load safely; use .xlsx, .xlsm, .xlam, or .xlsb",
+            path.display()
+        )
+    })?;
+    let size = std::fs::metadata(path)
+        .map_err(|error| format!("{}: {error}", path.display()))?
+        .len();
+    let limit = u64::try_from(ca_table::parse::MAX_INPUT_BYTES).unwrap_or(u64::MAX);
+    if size > limit {
+        return Err(format!(
+            "{} is {size} bytes, past the {limit} byte workbook input limit",
+            path.display()
+        ));
+    }
+    let stamp = RealFileSystem.stamp(path);
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .map_err(|error| format!("{}: {error}", path.display()))?
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    if bytes.len() > ca_table::parse::MAX_INPUT_BYTES {
+        return Err(format!(
+            "{} grew past the {limit} byte workbook input limit while it was read",
+            path.display()
+        ));
+    }
+    if kind.uses_zip_archive() {
+        check_workbook_archive(path, &bytes)?;
+    }
+    let mut workbook = match kind {
+        WorkbookKind::Xlsb => StreamingWorkbook::Xlsb(
+            calamine::open_workbook_from_rs::<calamine::Xlsb<_>, _>(std::io::Cursor::new(bytes))
+                .map_err(|error| format!("{}: {error}", path.display()))?,
+        ),
+        WorkbookKind::Xlsx => StreamingWorkbook::Xlsx(
+            calamine::open_workbook_from_rs::<calamine::Xlsx<_>, _>(std::io::Cursor::new(bytes))
+                .map_err(|error| format!("{}: {error}", path.display()))?,
+        ),
+    };
+    let metadata = workbook.sheets_metadata();
+    let sheet_count = metadata.len();
+    if sheet_count > MAX_WORKBOOK_SHEETS {
+        return Err(format!(
+            "{} has {sheet_count} sheets, past the {MAX_WORKBOOK_SHEETS} sheet limit",
+            path.display(),
+        ));
+    }
+    let names: Vec<_> = metadata
+        .iter()
+        .filter(|sheet| sheet.typ == calamine::SheetType::WorkSheet)
+        .map(|sheet| sheet.name.clone())
+        .collect();
+    if names.is_empty() {
+        return Err(format!(
+            "{} contains no worksheets that Table Compare can read",
+            path.display()
+        ));
+    }
+    let mut sheets = Vec::with_capacity(names.len());
+    let mut total_bytes = 0usize;
+    for name in names {
+        let text = read_streaming_sheet(&mut workbook, &name, path, &mut total_bytes)?;
+        sheets.push(RawSheet {
+            name,
+            text,
+            encoding: "Spreadsheet values".to_owned(),
+            had_errors: false,
+            stamp,
+            template: None,
+            workbook: true,
+        });
+    }
+    Ok(sheets)
+}
+
+fn check_workbook_archive(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    if archive.len() > MAX_WORKBOOK_ARCHIVE_ENTRIES {
+        return Err(format!(
+            "{} has {} archive entries, past the {MAX_WORKBOOK_ARCHIVE_ENTRIES} entry workbook limit",
+            path.display(),
+            archive.len()
+        ));
+    }
+    let mut expanded_bytes = 0u64;
+    for index in 0..archive.len() {
+        let entry = archive
+            .by_index(index)
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        expanded_bytes = expanded_bytes.saturating_add(entry.size());
+        if expanded_bytes > MAX_WORKBOOK_ARCHIVE_BYTES {
+            return Err(format!(
+                "{} expands past the {} byte workbook archive limit",
+                path.display(),
+                MAX_WORKBOOK_ARCHIVE_BYTES
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SheetBounds {
+    first_row: u32,
+    last_row: u32,
+    first_column: u32,
+    last_column: u32,
+}
+
+fn read_streaming_sheet<R: std::io::Read + std::io::Seek>(
+    workbook: &mut StreamingWorkbook<R>,
+    name: &str,
+    path: &Path,
+    total_bytes: &mut usize,
+) -> Result<String, String> {
+    let bounds = workbook.with_cells_reader(name, path, |next_cell| {
+        scan_sheet_bounds(next_cell, path, name)
+    })?;
+    let Some(bounds) = bounds else {
+        return Ok(String::new());
+    };
+    workbook.with_cells_reader(name, path, |next_cell| {
+        stream_sheet_text(
+            || next_cell().map(|cell| cell.map(|cell| (cell.get_position(), cell))),
+            bounds,
+            path,
+            name,
+            total_bytes,
+        )
+    })
+}
+
+fn scan_sheet_bounds<'a>(
+    mut next_cell: impl FnMut() -> Result<Option<calamine::Cell<calamine::DataRef<'a>>>, String>,
+    path: &Path,
+    sheet: &str,
+) -> Result<Option<SheetBounds>, String> {
+    let mut bounds: Option<SheetBounds> = None;
+    while let Some(cell) = next_cell()? {
+        if cell.is_empty() {
+            continue;
+        }
+        let (row, column) = cell.get_position();
+        let current = bounds.get_or_insert(SheetBounds {
+            first_row: row,
+            last_row: row,
+            first_column: column,
+            last_column: column,
+        });
+        current.first_row = current.first_row.min(row);
+        current.last_row = current.last_row.max(row);
+        current.first_column = current.first_column.min(column);
+        current.last_column = current.last_column.max(column);
+
+        let rows = u64::from(current.last_row) - u64::from(current.first_row) + 1;
+        let columns = u64::from(current.last_column) - u64::from(current.first_column) + 1;
+        let cells = rows.saturating_mul(columns);
+        if rows > ca_table::parse::MAX_TABLE_ROWS as u64
+            || cells > ca_table::parse::MAX_TABLE_CELLS as u64
+        {
+            return Err(format!(
+                "{} — {sheet} is past the {} row or {} cell table limit",
+                path.display(),
+                ca_table::parse::MAX_TABLE_ROWS,
+                ca_table::parse::MAX_TABLE_CELLS
+            ));
+        }
+    }
+    Ok(bounds)
+}
+
+fn stream_sheet_text<'a>(
+    mut next_cell: impl FnMut() -> Result<
+        Option<((u32, u32), calamine::Cell<calamine::DataRef<'a>>)>,
+        String,
+    >,
+    bounds: SheetBounds,
+    path: &Path,
+    sheet: &str,
+    total_bytes: &mut usize,
+) -> Result<String, String> {
+    let mut output = String::new();
+    let mut current_row = bounds.first_row;
+    let mut last_column = None;
+    let mut previous_position = None;
+    while let Some(((row, column), cell)) = next_cell()? {
+        if cell.is_empty() {
+            continue;
+        }
+        if let Some(previous) = previous_position {
+            if (row, column) <= previous {
+                return Err(format!(
+                    "{} — {sheet} has cells outside row order",
+                    path.display()
+                ));
+            }
+        }
+        while current_row < row {
+            output.push('\n');
+            current_row += 1;
+            last_column = None;
+        }
+        let tabs = last_column.map_or_else(
+            || column - bounds.first_column,
+            |previous| column - previous,
+        );
+        for _ in 0..tabs {
+            output.push('\t');
+        }
+        let value = cell.text();
+        append_workbook_cell(&mut output, value.as_ref(), path, sheet, *total_bytes)?;
+        last_column = Some(column);
+        current_row = row;
+        previous_position = Some((row, column));
+    }
+    if output.len() > MAX_WORKBOOK_TEXT_BYTES
+        || total_bytes.saturating_add(output.len()) > MAX_WORKBOOK_TEXT_BYTES
+    {
+        return Err(workbook_text_limit_error(path, sheet));
+    }
+    *total_bytes = total_bytes.saturating_add(output.len());
+    Ok(output)
+}
+
+fn append_workbook_cell(
+    output: &mut String,
+    value: &str,
+    path: &Path,
+    sheet: &str,
+    previous_bytes: usize,
+) -> Result<(), String> {
+    if value.len() > MAX_WORKBOOK_TEXT_BYTES
+        || previous_bytes
+            .saturating_add(output.len())
+            .saturating_add(value.len())
+            > MAX_WORKBOOK_TEXT_BYTES
+    {
+        return Err(workbook_text_limit_error(path, sheet));
+    }
+    let quoted = value
+        .chars()
+        .any(|character| matches!(character, '\t' | '\n' | '\r' | '"'))
+        || value.trim() != value;
+    let encoded_len = value
+        .len()
+        .saturating_add(if quoted { 2 } else { 0 })
+        .saturating_add(if quoted {
+            value.chars().filter(|character| *character == '"').count()
+        } else {
+            0
+        });
+    if previous_bytes
+        .saturating_add(output.len())
+        .saturating_add(encoded_len)
+        > MAX_WORKBOOK_TEXT_BYTES
+    {
+        return Err(workbook_text_limit_error(path, sheet));
+    }
+    if quoted {
+        output.push('"');
+        for character in value.chars() {
+            output.push(character);
+            if character == '"' {
+                output.push('"');
+            }
+        }
+        output.push('"');
+    } else {
+        output.push_str(value);
+    }
+    Ok(())
+}
+
+fn workbook_text_limit_error(path: &Path, sheet: &str) -> String {
+    format!(
+        "{} — {sheet} expands past the {} byte workbook table limit",
+        path.display(),
+        MAX_WORKBOOK_TEXT_BYTES
+    )
+}
+
+trait WorkbookCellValue {
+    fn is_empty(&self) -> bool;
+    fn text(&self) -> std::borrow::Cow<'_, str>;
+}
+
+impl WorkbookCellValue for calamine::Cell<calamine::DataRef<'_>> {
+    fn is_empty(&self) -> bool {
+        matches!(self.get_value(), calamine::DataRef::Empty)
+    }
+
+    fn text(&self) -> std::borrow::Cow<'_, str> {
+        match self.get_value() {
+            calamine::DataRef::DateTime(value) if value.is_datetime() => {
+                let (year, month, day, hour, minute, second, millisecond) =
+                    value.to_ymd_hms_milli();
+                std::borrow::Cow::Owned(format!(
+                "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millisecond:03}"
+            ))
+            }
+            calamine::DataRef::String(value)
+            | calamine::DataRef::DateTimeIso(value)
+            | calamine::DataRef::DurationIso(value) => std::borrow::Cow::Borrowed(value.as_str()),
+            calamine::DataRef::SharedString(value) => std::borrow::Cow::Borrowed(value),
+            value => std::borrow::Cow::Owned(calamine::Data::from(value.clone()).to_string()),
+        }
+    }
+}
+
+fn pair_sheets(
+    left: &[LoadedSheet],
+    right: &[LoadedSheet],
+    pairing: &ca_session::settings::table::TablePairing,
+) -> Result<Vec<SheetPair>, String> {
+    let indexes = pair_sheet_indexes(left, right, pairing);
+
+    let empty = empty_side()?;
+    let mut result = Vec::with_capacity(indexes.len().max(1));
+    for (left_index, right_index) in indexes {
+        let left_sheet = left_index.and_then(|index| left.get(index));
+        let right_sheet = right_index.and_then(|index| right.get(index));
+        if left_sheet.is_none() && right_sheet.is_none() {
+            continue;
+        }
+        let left_name = left_sheet.map(|sheet| sheet.name.clone());
+        let right_name = right_sheet.map(|sheet| sheet.name.clone());
+        let label = pair_label(left_name.as_deref(), right_name.as_deref());
+        let left_index = left_sheet
+            .and(left_index)
+            .and_then(|index| u32::try_from(index).ok());
+        let right_index = right_sheet
+            .and(right_index)
+            .and_then(|index| u32::try_from(index).ok());
+        let texts = match (
+            left_sheet.and_then(|sheet| sheet.text.clone()),
+            right_sheet.and_then(|sheet| sheet.text.clone()),
+        ) {
+            (Some(left), Some(right)) => Some((left, right)),
+            _ => None,
+        };
+        result.push(SheetPair {
+            label,
+            left_name,
+            right_name,
+            left_index,
+            right_index,
+            left: left_sheet.map_or_else(|| empty.clone(), |sheet| sheet.side.clone()),
+            right: right_sheet.map_or_else(|| empty.clone(), |sheet| sheet.side.clone()),
+            texts,
+        });
+    }
+    if result.is_empty() {
+        result.push(SheetPair {
+            label: "No sheets paired".to_owned(),
+            left_name: None,
+            right_name: None,
+            left_index: None,
+            right_index: None,
+            left: empty.clone(),
+            right: empty,
+            texts: None,
+        });
+    }
+    Ok(result)
+}
+
+fn pair_sheet_indexes(
+    left: &[LoadedSheet],
+    right: &[LoadedSheet],
+    pairing: &ca_session::settings::table::TablePairing,
+) -> Vec<(Option<usize>, Option<usize>)> {
+    use ca_session::settings::table::TablePairing;
+
+    match pairing {
+        TablePairing::ByLeftName { .. } => {
+            let mut used = vec![false; right.len()];
+            let mut pairs = Vec::with_capacity(left.len() + right.len());
+            for (left_index, sheet) in left.iter().enumerate() {
+                let right_index = right.iter().enumerate().find_map(|(index, candidate)| {
+                    (!used[index]
+                        && normalized_sheet_name(&sheet.name)
+                            == normalized_sheet_name(&candidate.name))
+                    .then_some(index)
+                });
+                if let Some(index) = right_index {
+                    used[index] = true;
+                }
+                pairs.push((Some(left_index), right_index));
+            }
+            pairs.extend(
+                used.iter()
+                    .enumerate()
+                    .filter_map(|(index, used)| (!used).then_some((None, Some(index)))),
+            );
+            pairs
+        }
+        TablePairing::ByRightName { .. } => {
+            let mut used = vec![false; left.len()];
+            let mut pairs = Vec::with_capacity(left.len() + right.len());
+            for (right_index, sheet) in right.iter().enumerate() {
+                let left_index = left.iter().enumerate().find_map(|(index, candidate)| {
+                    (!used[index]
+                        && normalized_sheet_name(&sheet.name)
+                            == normalized_sheet_name(&candidate.name))
+                    .then_some(index)
+                });
+                if let Some(index) = left_index {
+                    used[index] = true;
+                }
+                pairs.push((left_index, Some(right_index)));
+            }
+            pairs.extend(
+                used.iter()
+                    .enumerate()
+                    .filter_map(|(index, used)| (!used).then_some((Some(index), None))),
+            );
+            pairs
+        }
+        TablePairing::Custom { pairs, .. } => pairs
+            .iter()
+            .filter_map(|(left, right)| {
+                let left = left.and_then(|index| usize::try_from(index).ok());
+                let right = right.and_then(|index| usize::try_from(index).ok());
+                (left.is_some() || right.is_some()).then_some((left, right))
+            })
+            .collect(),
+        _ => (0..left.len().max(right.len()))
+            .map(|index| {
+                (
+                    (index < left.len()).then_some(index),
+                    (index < right.len()).then_some(index),
+                )
+            })
+            .collect(),
+    }
+}
+
+fn normalized_sheet_name(name: &str) -> String {
+    name.chars()
+        .filter(|character| !character.is_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn pair_label(left: Option<&str>, right: Option<&str>) -> String {
+    match (left, right) {
+        (Some(left), Some(right))
+            if normalized_sheet_name(left) == normalized_sheet_name(right) =>
+        {
+            left.to_owned()
+        }
+        (Some(left), Some(right)) => format!("{left} ↔ {right}"),
+        (Some(left), None) => format!("{left} (left only)"),
+        (None, Some(right)) => format!("{right} (right only)"),
+        (None, None) => "No sheets paired".to_owned(),
+    }
+}
+
+fn empty_side() -> Result<Side, String> {
+    let options = ParseOptions::default();
+    let table = parse("", &options).map_err(|error| error.to_string())?;
+    Ok(Side {
+        table: Arc::new(table),
+        facts: SideFacts::default(),
+    })
 }
 
 fn read_side(path: &Path, format: &FormatSettings) -> Result<SideText, String> {
@@ -498,26 +1291,6 @@ fn resolve(
         first_line_contains: detected.first_line_contains,
         ..ParseOptions::default()
     }
-}
-
-fn build_side(text: SideText, options: &ParseOptions) -> Result<Side, String> {
-    let table = parse(&text.text, options).map_err(|error| error.to_string())?;
-    let mut resolved_options = options.clone();
-    resolved_options.first_line_contains = table.first_line_contains().clone();
-    let facts = SideFacts {
-        encoding: text.encoding,
-        had_errors: text.had_errors,
-        syntax: syntax_label(options),
-        header: header_label(&table),
-        warnings: table.warnings().to_vec(),
-        options: resolved_options,
-        stamp: text.stamp,
-        template: Some(text.template),
-    };
-    Ok(Side {
-        table: Arc::new(table),
-        facts,
-    })
 }
 
 /// A one word description of a field syntax, for the information line.
@@ -635,12 +1408,13 @@ impl Pipeline {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::{
-        read_side_with_open, spawn_load, spawn_recompare, FormatSettings, Pipeline, Side, Stage,
-        TableMessage, TableSettings,
+        read_side_with_open, read_workbook_sheets, spawn_load, spawn_recompare, FormatSettings,
+        Pipeline, Side, Stage, TableMessage, TableSettings,
     };
     use ca_table::compare::CellStatus;
     use ca_table::schema::{ColumnAlignment, ColumnHandling, ColumnType, ManualColumnPair};
     use std::fmt::Write as _;
+    use std::io::{Read as IoRead, Write as IoWrite};
     use std::path::Path;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -719,6 +1493,405 @@ mod tests {
         assert_eq!(data.alignment.len(), 2);
         assert_eq!(data.comparison.totals.rows_with_differences(), 1);
         assert_eq!(data.left.facts.encoding, "UTF-8");
+    }
+
+    fn workbook_bytes_with_sheet1_rewrite(
+        rewrite_sheet1: impl FnOnce(String) -> String,
+    ) -> Vec<u8> {
+        let fixture = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/multiple-left.xlsx"
+        ));
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(fixture.as_slice())).unwrap();
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let mut rewrite_sheet1 = Some(rewrite_sheet1);
+        for index in 0..archive.len() {
+            let mut entry = archive.by_index(index).unwrap();
+            let name = entry.name().unwrap().into_owned();
+            let is_directory = entry.is_dir();
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes).unwrap();
+            if name == "xl/worksheets/sheet1.xml" {
+                let xml = String::from_utf8(bytes).unwrap();
+                let xml = rewrite_sheet1.take().unwrap()(xml);
+                bytes = xml.into_bytes();
+            }
+            let options = zip::write::SimpleFileOptions::default();
+            if is_directory {
+                writer.add_directory(name, options).unwrap();
+            } else {
+                writer.start_file(name, options).unwrap();
+                writer.write_all(&bytes).unwrap();
+            }
+        }
+        writer.finish().unwrap().into_inner()
+    }
+
+    fn sparse_workbook_bytes() -> Vec<u8> {
+        workbook_bytes_with_sheet1_rewrite(|xml| {
+            xml.replace("A1:B2", "A1:XFD1048576").replace(
+                "</sheetData>",
+                "<row r=\"3\"><c r=\"A3\"/></row><row r=\"1048576\"><c r=\"XFD1048576\"><v>2</v></c></row></sheetData>",
+            )
+        })
+    }
+
+    fn workbook_with_leading_empty_cell_bytes() -> Vec<u8> {
+        workbook_bytes_with_sheet1_rewrite(|mut xml| {
+            xml = xml.replace("A1:B2", "A1:A2");
+            let sheet_data_start = xml.find("<sheetData>").unwrap();
+            let sheet_data_end = xml.find("</sheetData>").unwrap() + "</sheetData>".len();
+            xml.replace_range(
+                sheet_data_start..sheet_data_end,
+                "<sheetData><row r=\"1\"><c r=\"A1\"/></row><row r=\"2\"><c r=\"A2\" t=\"inlineStr\"><is><t>later</t></is></c></row></sheetData>",
+            );
+            xml
+        })
+    }
+
+    fn workbook_with_chartsheet_bytes() -> Vec<u8> {
+        let fixture = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/multiple-left.xlsx"
+        ));
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(fixture.as_slice())).unwrap();
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for index in 0..archive.len() {
+            let mut entry = archive.by_index(index).unwrap();
+            let name = entry.name().unwrap().into_owned();
+            if name == "xl/worksheets/sheet3.xml" {
+                continue;
+            }
+            let is_directory = entry.is_dir();
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes).unwrap();
+            if name == "xl/_rels/workbook.xml.rels" {
+                let xml = String::from_utf8(bytes).unwrap();
+                let worksheet_relation = "Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet3.xml\"";
+                assert!(xml.contains(worksheet_relation));
+                bytes = xml
+                    .replace(
+                        worksheet_relation,
+                        "Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/chartsheet\" Target=\"chartsheets/sheet3.xml\"",
+                    )
+                    .into_bytes();
+            } else if name == "[Content_Types].xml" {
+                let xml = String::from_utf8(bytes).unwrap();
+                let worksheet_content_type = "PartName=\"/xl/worksheets/sheet3.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"";
+                assert!(xml.contains(worksheet_content_type));
+                let xml = xml
+                    .replace(
+                        worksheet_content_type,
+                        "PartName=\"/xl/chartsheets/sheet3.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.chartsheet+xml\"",
+                    );
+                assert!(xml.contains("</Types>"));
+                bytes = xml
+                    .replacen(
+                        "</Types>",
+                        concat!(
+                            r#"<Override PartName="/xl/drawings/drawing3.xml" ContentType="application/vnd.openxmlformats-officedocument.drawing+xml"/>"#,
+                            r#"<Override PartName="/xl/charts/chart3.xml" ContentType="application/vnd.openxmlformats-officedocument.drawingml.chart+xml"/>"#,
+                            "</Types>"
+                        ),
+                        1,
+                    )
+                    .into_bytes();
+            }
+            let options = zip::write::SimpleFileOptions::default();
+            if is_directory {
+                writer.add_directory(name, options).unwrap();
+            } else {
+                writer.start_file(name, options).unwrap();
+                writer.write_all(&bytes).unwrap();
+            }
+        }
+        writer
+            .start_file(
+                "xl/chartsheets/sheet3.xml",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        writer
+            .write_all(
+                br#"<chartsheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheetViews><sheetView workbookViewId="0"/></sheetViews>
+  <drawing r:id="rId1"/>
+</chartsheet>"#,
+            )
+            .unwrap();
+        for (name, xml) in chartsheet_parts() {
+            writer
+                .start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(xml.as_bytes()).unwrap();
+        }
+        writer.finish().unwrap().into_inner()
+    }
+
+    fn chartsheet_parts() -> [(&'static str, &'static str); 4] {
+        [
+            (
+                "xl/chartsheets/_rels/sheet3.xml.rels",
+                r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing3.xml"/>
+</Relationships>"#,
+            ),
+            (
+                "xl/drawings/drawing3.xml",
+                r#"<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+  <xdr:absoluteAnchor>
+    <xdr:pos x="0" y="0"/>
+    <xdr:ext cx="9144000" cy="5143500"/>
+    <xdr:graphicFrame macro="">
+      <xdr:nvGraphicFramePr>
+        <xdr:cNvPr id="2" name="Chart 1"/>
+        <xdr:cNvGraphicFramePr><a:graphicFrameLocks noGrp="1"/></xdr:cNvGraphicFramePr>
+      </xdr:nvGraphicFramePr>
+      <xdr:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/></xdr:xfrm>
+      <a:graphic>
+        <a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart">
+          <c:chart xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:id="rId1"/>
+        </a:graphicData>
+      </a:graphic>
+    </xdr:graphicFrame>
+    <xdr:clientData/>
+  </xdr:absoluteAnchor>
+</xdr:wsDr>"#,
+            ),
+            (
+                "xl/drawings/_rels/drawing3.xml.rels",
+                r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="../charts/chart3.xml"/>
+</Relationships>"#,
+            ),
+            (
+                "xl/charts/chart3.xml",
+                r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart">
+  <c:chart>
+    <c:plotArea>
+      <c:layout/>
+      <c:barChart>
+        <c:barDir val="col"/>
+        <c:grouping val="clustered"/>
+        <c:ser>
+          <c:idx val="0"/><c:order val="0"/>
+          <c:tx><c:v>Series 1</c:v></c:tx>
+          <c:cat><c:strLit><c:ptCount val="1"/><c:pt idx="0"><c:v>Sample</c:v></c:pt></c:strLit></c:cat>
+          <c:val><c:numLit><c:formatCode>General</c:formatCode><c:ptCount val="1"/><c:pt idx="0"><c:v>1</c:v></c:pt></c:numLit></c:val>
+        </c:ser>
+        <c:axId val="1"/><c:axId val="2"/>
+      </c:barChart>
+      <c:catAx>
+        <c:axId val="1"/><c:scaling><c:orientation val="minMax"/></c:scaling>
+        <c:axPos val="b"/><c:tickLblPos val="nextTo"/><c:crossAx val="2"/>
+        <c:crosses val="autoZero"/>
+      </c:catAx>
+      <c:valAx>
+        <c:axId val="2"/><c:scaling><c:orientation val="minMax"/></c:scaling>
+        <c:axPos val="l"/><c:crossAx val="1"/><c:crosses val="autoZero"/>
+        <c:crossBetween val="between"/>
+      </c:valAx>
+    </c:plotArea>
+    <c:legend><c:legendPos val="r"/></c:legend>
+  </c:chart>
+</c:chartSpace>"#,
+            ),
+        ]
+    }
+
+    fn workbook_with_only_chartsheets_bytes() -> Vec<u8> {
+        let fixture = workbook_with_chartsheet_bytes();
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(fixture)).unwrap();
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for index in 0..archive.len() {
+            let mut entry = archive.by_index(index).unwrap();
+            let name = entry.name().unwrap().into_owned();
+            if matches!(
+                name.as_str(),
+                "xl/worksheets/sheet1.xml" | "xl/worksheets/sheet2.xml"
+            ) {
+                continue;
+            }
+            let is_directory = entry.is_dir();
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes).unwrap();
+            if name == "xl/workbook.xml" {
+                let xml = String::from_utf8(bytes).unwrap();
+                let worksheet_entries = [
+                    "<sheet name=\"One\" sheetId=\"1\" r:id=\"rId1\"/>",
+                    "<sheet name=\"Shared A\" sheetId=\"2\" r:id=\"rId2\"/>",
+                ];
+                for worksheet in worksheet_entries {
+                    assert!(xml.contains(worksheet));
+                }
+                bytes = worksheet_entries
+                    .into_iter()
+                    .fold(xml, |xml, worksheet| xml.replace(worksheet, ""))
+                    .into_bytes();
+            } else if name == "xl/_rels/workbook.xml.rels" {
+                let xml = String::from_utf8(bytes).unwrap();
+                let worksheet_relationships = [
+                    "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet1.xml\"/>",
+                    "<Relationship Id=\"rId2\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet2.xml\"/>",
+                ];
+                for relationship in worksheet_relationships {
+                    assert!(xml.contains(relationship));
+                }
+                bytes = worksheet_relationships
+                    .into_iter()
+                    .fold(xml, |xml, relationship| xml.replace(relationship, ""))
+                    .into_bytes();
+            } else if name == "[Content_Types].xml" {
+                let xml = String::from_utf8(bytes).unwrap();
+                let worksheet_content_types = [
+                    "<Override PartName=\"/xl/worksheets/sheet1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/>",
+                    "<Override PartName=\"/xl/worksheets/sheet2.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/>",
+                ];
+                for content_type in worksheet_content_types {
+                    assert!(xml.contains(content_type));
+                }
+                bytes = worksheet_content_types
+                    .into_iter()
+                    .fold(xml, |xml, content_type| xml.replace(content_type, ""))
+                    .into_bytes();
+            }
+            let options = zip::write::SimpleFileOptions::default();
+            if is_directory {
+                writer.add_directory(name, options).unwrap();
+            } else {
+                writer.start_file(name, options).unwrap();
+                writer.write_all(&bytes).unwrap();
+            }
+        }
+        writer.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    fn sparse_workbook_is_rejected_before_dense_range_allocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sparse.xlsx");
+        std::fs::write(&path, sparse_workbook_bytes()).unwrap();
+
+        assert!(read_workbook_sheets(&path).is_err_and(|error| error.contains("table limit")));
+    }
+
+    #[test]
+    fn leading_empty_cell_does_not_end_the_workbook_bounds_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("leading-empty.xlsx");
+        std::fs::write(&path, workbook_with_leading_empty_cell_bytes()).unwrap();
+
+        let sheets = read_workbook_sheets(&path).unwrap();
+
+        assert!(sheets[0].text.contains("later"));
+    }
+
+    #[test]
+    fn chartsheets_are_skipped_while_worksheets_continue_loading() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("with-chartsheet.xlsx");
+        std::fs::write(&path, workbook_with_chartsheet_bytes()).unwrap();
+
+        let sheets = read_workbook_sheets(&path).unwrap();
+
+        assert_eq!(
+            sheets
+                .iter()
+                .map(|sheet| sheet.name.as_str())
+                .collect::<Vec<_>>(),
+            ["One", "Shared A"]
+        );
+        assert!(!sheets[0].text.is_empty());
+        assert!(!sheets[1].text.is_empty());
+    }
+
+    #[test]
+    fn workbook_with_no_worksheets_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chartsheet-only.xlsx");
+        std::fs::write(&path, workbook_with_only_chartsheets_bytes()).unwrap();
+
+        assert!(read_workbook_sheets(&path)
+            .is_err_and(|error| error.contains("no worksheets that Table Compare can read")));
+    }
+
+    #[test]
+    fn workbook_sheets_can_pair_by_normalized_name_and_keep_unpaired_sheets() {
+        let left = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/multiple-left.xlsx");
+        let right =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/multiple-right.xlsx");
+        let mut settings = TableSettings::default();
+        settings.sheets = ca_session::settings::table::TablePairing::by_left_name();
+        let data = run(&left, &right, settings);
+
+        assert!(data.show_sheet_tabs);
+        assert_eq!(data.sheet_pairs.len(), 4);
+        assert_eq!(data.sheet_pairs[0].label, "One");
+        assert_eq!(data.sheet_pairs[0].left_name.as_deref(), Some("One"));
+        assert_eq!(data.sheet_pairs[0].right_name.as_deref(), Some("one"));
+        assert_eq!(data.comparison.totals.rows_with_differences(), 0);
+        assert_eq!(data.sheet_pairs[1].label, "Shared A");
+        assert_eq!(data.sheet_pairs[2].label, "Only Left (left only)");
+        assert_eq!(data.sheet_pairs[3].label, "Only Right (right only)");
+        assert!(data.sheet_pairs[2].right_name.is_none());
+        assert!(data.sheet_pairs[3].left_name.is_none());
+    }
+
+    #[test]
+    fn right_name_pairing_keeps_right_order_and_appends_left_only_sheets() {
+        let left = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/multiple-left.xlsx");
+        let right =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/multiple-right.xlsx");
+        let mut settings = TableSettings::default();
+        settings.sheets = ca_session::settings::table::TablePairing::by_right_name();
+        let data = run(&left, &right, settings);
+
+        assert_eq!(data.sheet_pairs.len(), 4);
+        assert_eq!(data.sheet_pairs[0].label, "Shared A");
+        assert_eq!(data.sheet_pairs[0].left_index, Some(1));
+        assert_eq!(data.sheet_pairs[0].right_index, Some(0));
+        assert_eq!(data.sheet_pairs[1].label, "One");
+        assert_eq!(data.sheet_pairs[2].label, "Only Right (right only)");
+        assert_eq!(data.sheet_pairs[3].label, "Only Left (left only)");
+    }
+
+    #[test]
+    fn workbook_sheets_pair_by_position_or_follow_custom_order() {
+        let left = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/multiple-left.xlsx");
+        let right =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/multiple-right.xlsx");
+        let positional = run(&left, &right, TableSettings::default());
+        assert_eq!(positional.sheet_pairs.len(), 3);
+        assert_eq!(positional.sheet_pairs[0].label, "One ↔ SharedA");
+        assert!(positional.comparison.totals.rows_with_differences() > 0);
+
+        let mut settings = TableSettings::default();
+        settings.sheets = ca_session::settings::table::TablePairing::Custom {
+            pairs: vec![(Some(1), Some(0)), (Some(2), None), (None, Some(2))],
+            unknown: std::collections::BTreeMap::new(),
+        };
+        let custom = run(&left, &right, settings);
+        assert_eq!(custom.sheet_pairs.len(), 3);
+        assert_eq!(custom.sheet_pairs[0].label, "Shared A");
+        assert_eq!(custom.sheet_pairs[1].label, "Only Left (left only)");
+        assert_eq!(custom.sheet_pairs[2].label, "Only Right (right only)");
+
+        let mut job = super::spawn_recompare_sheet(
+            custom.sheet_pairs.clone(),
+            1,
+            true,
+            (
+                vec!["One".into(), "Shared A".into(), "Only Left".into()],
+                vec!["SharedA".into(), "one".into(), "Only Right".into()],
+            ),
+            TableSettings::default(),
+            Arc::new(|| {}),
+        );
+        let selected = ready(drain(&mut job));
+        assert_eq!(selected.active_sheet, 1);
+        assert!(selected.show_sheet_tabs);
+        assert_eq!(selected.left.table.row_count(), 1);
+        assert_eq!(selected.right.table.row_count(), 0);
     }
 
     #[test]

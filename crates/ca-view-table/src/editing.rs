@@ -174,9 +174,7 @@ impl TableView {
             return Some("Clipboard text is a temporary input and cannot be edited or saved.");
         }
         if self.read_only {
-            return Some(
-                "The file is a copy taken out of an archive, so it cannot be edited or saved.",
-            );
+            return Some(self.read_only_reason);
         }
         if self.specs.disable_editing {
             return Some("Editing is turned off for this session, so no cell takes an edit.");

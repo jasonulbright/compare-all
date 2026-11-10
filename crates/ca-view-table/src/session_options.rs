@@ -166,6 +166,7 @@ pub fn options_over(settings: &TableCompareSettings, base: &TableSettings) -> Ta
     built.schema.handling = per_column(&settings.columns);
     built.schema.custom = manual_pairs(&settings.columns.pairing);
     built.align = row_options(&settings.rows);
+    built.sheets = settings.sheets.pairing.clone();
     built.left_format = side_format(
         &settings.format.left_format,
         &settings.format.left_encoding,
@@ -310,6 +311,10 @@ pub fn stored_algorithm(mode: &RowAlignmentMode) -> AlignmentAlgorithm {
 pub fn stored_from(settings: &TableSettings) -> TableCompareSettings {
     TableCompareSettings {
         format: format_settings(&settings.left_format, &settings.right_format),
+        sheets: ca_session::settings::table::SheetSettings {
+            pairing: settings.sheets.clone(),
+            ..ca_session::settings::table::SheetSettings::default()
+        },
         columns: ca_session::settings::table::ColumnSettings {
             pairing: stored_pairing(&settings.schema.alignment, &settings.schema.custom),
             default_handling: stored_handling(None, &settings.schema.default_handling),
@@ -526,6 +531,7 @@ mod tests {
             pairs: vec![(Some(1), None)],
             unknown: std::collections::BTreeMap::new(),
         };
+        settings.sheets.pairing = TablePairing::by_right_name();
         settings.columns.default_handling.ignore_whitespace = true;
         settings.columns.default_handling.numeric_tolerance = 0.25;
         settings.columns.default_handling.date_tolerance_seconds = 45;
@@ -556,6 +562,7 @@ mod tests {
         assert_eq!(back.rows.skew_tolerance, 13);
         assert!(back.rows.sort_before_alignment);
         assert_eq!(back.format.left_format, settings.format.left_format);
+        assert_eq!(back.sheets.pairing, settings.sheets.pairing);
     }
 
     #[test]
