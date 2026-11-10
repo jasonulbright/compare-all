@@ -594,10 +594,10 @@ enum StreamingWorkbook<R> {
 }
 
 impl<R: std::io::Read + std::io::Seek> StreamingWorkbook<R> {
-    fn sheet_names(&self) -> Vec<String> {
+    fn sheets_metadata(&self) -> &[calamine::Sheet] {
         match self {
-            Self::Xlsx(reader) => reader.sheet_names().clone(),
-            Self::Xlsb(reader) => reader.sheet_names().clone(),
+            Self::Xlsx(reader) => reader.sheets_metadata(),
+            Self::Xlsb(reader) => reader.sheets_metadata(),
         }
     }
 
@@ -763,14 +763,19 @@ fn read_workbook_sheets(path: &Path) -> Result<Vec<RawSheet>, String> {
                 .map_err(|error| format!("{}: {error}", path.display()))?,
         ),
     };
-    let names = workbook.sheet_names();
-    if names.len() > MAX_WORKBOOK_SHEETS {
+    let metadata = workbook.sheets_metadata();
+    let sheet_count = metadata.len();
+    if sheet_count > MAX_WORKBOOK_SHEETS {
         return Err(format!(
-            "{} has {} sheets, past the {MAX_WORKBOOK_SHEETS} sheet limit",
+            "{} has {sheet_count} sheets, past the {MAX_WORKBOOK_SHEETS} sheet limit",
             path.display(),
-            names.len()
         ));
     }
+    let names: Vec<_> = metadata
+        .iter()
+        .filter(|sheet| sheet.typ == calamine::SheetType::WorkSheet)
+        .map(|sheet| sheet.name.clone())
+        .collect();
     let mut sheets = Vec::with_capacity(names.len());
     let mut total_bytes = 0usize;
     for name in names {
@@ -1538,6 +1543,65 @@ mod tests {
         })
     }
 
+    fn workbook_with_chartsheet_bytes() -> Vec<u8> {
+        let fixture = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/multiple-left.xlsx"
+        ));
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(fixture.as_slice())).unwrap();
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for index in 0..archive.len() {
+            let mut entry = archive.by_index(index).unwrap();
+            let name = entry.name().unwrap().into_owned();
+            if name == "xl/worksheets/sheet3.xml" {
+                continue;
+            }
+            let is_directory = entry.is_dir();
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes).unwrap();
+            if name == "xl/_rels/workbook.xml.rels" {
+                let xml = String::from_utf8(bytes).unwrap();
+                let worksheet_relation = "Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet3.xml\"";
+                assert!(xml.contains(worksheet_relation));
+                bytes = xml
+                    .replace(
+                        worksheet_relation,
+                        "Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/chartsheet\" Target=\"chartsheets/sheet3.xml\"",
+                    )
+                    .into_bytes();
+            } else if name == "[Content_Types].xml" {
+                let xml = String::from_utf8(bytes).unwrap();
+                let worksheet_content_type = "PartName=\"/xl/worksheets/sheet3.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"";
+                assert!(xml.contains(worksheet_content_type));
+                bytes = xml
+                    .replace(
+                        worksheet_content_type,
+                        "PartName=\"/xl/chartsheets/sheet3.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.chartsheet+xml\"",
+                    )
+                    .into_bytes();
+            }
+            let options = zip::write::SimpleFileOptions::default();
+            if is_directory {
+                writer.add_directory(name, options).unwrap();
+            } else {
+                writer.start_file(name, options).unwrap();
+                writer.write_all(&bytes).unwrap();
+            }
+        }
+        writer
+            .start_file(
+                "xl/chartsheets/sheet3.xml",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        writer
+            .write_all(
+                b"<chartsheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><sheetViews><sheetView workbookViewId=\"0\"/></sheetViews></chartsheet>",
+            )
+            .unwrap();
+        writer.finish().unwrap().into_inner()
+    }
+
     #[test]
     fn sparse_workbook_is_rejected_before_dense_range_allocation() {
         let dir = tempfile::tempdir().unwrap();
@@ -1556,6 +1620,25 @@ mod tests {
         let sheets = read_workbook_sheets(&path).unwrap();
 
         assert!(sheets[0].text.contains("later"));
+    }
+
+    #[test]
+    fn chartsheets_are_skipped_while_worksheets_continue_loading() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("with-chartsheet.xlsx");
+        std::fs::write(&path, workbook_with_chartsheet_bytes()).unwrap();
+
+        let sheets = read_workbook_sheets(&path).unwrap();
+
+        assert_eq!(
+            sheets
+                .iter()
+                .map(|sheet| sheet.name.as_str())
+                .collect::<Vec<_>>(),
+            ["One", "Shared A"]
+        );
+        assert!(!sheets[0].text.is_empty());
+        assert!(!sheets[1].text.is_empty());
     }
 
     #[test]
