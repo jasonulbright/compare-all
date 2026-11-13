@@ -7,11 +7,10 @@
 //!
 //! The manifest and the SHA-256 come from the same host as the file, so the
 //! signature is the only check an attacker on that path cannot satisfy. The
-//! portable archive is therefore held to a fixed file set compiled into the
-//! program: every program file in it is signer-checked, no other file may be
-//! a program, and every signed program must carry the version the release
-//! claims inside its signed sections, so an older signed build cannot be
-//! staged under a newer version.
+//! updater extracts only a fixed set of installable files. It reads and
+//! discards the optional `program-state.json` seed. Every program file is
+//! signer-checked and must carry the release version inside its signed
+//! sections, so an older signed build cannot be staged under a newer version.
 
 use crate::signature::{verify_signer, SignatureVerifier};
 use crate::staging::AssetKind;
@@ -22,13 +21,13 @@ use std::path::Path;
 
 const MSI_MAGIC: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
 const ZIP_MAGIC: [u8; 4] = *b"PK\x03\x04";
+const PORTABLE_STATE_FILE: &str = "program-state.json";
 /// Largest unpacked size of a portable archive.
 const MAX_UNPACKED_BYTES: u64 = 1024 * 1024 * 1024;
 /// Most entries a portable archive may hold.
 const MAX_ENTRIES: usize = 64;
 
-/// Every file the portable archive may hold, in install order. Nothing else
-/// is unpacked and nothing else is written into the program folder.
+/// The portable archive's installable files, in install order.
 pub const PORTABLE_FILES: [&str; 6] = [
     "CHANGELOG.md",
     "LICENSE",
@@ -517,11 +516,11 @@ fn check_format(file: &Path, kind: AssetKind) -> Result<(), String> {
     })
 }
 
-/// Unpack a portable archive into `destination`. Only the names of
-/// [`PORTABLE_FILES`] are accepted, each once; a folder, a path, another name,
-/// a name repeated in any letter case, a missing program or an unexpected
-/// number of entries fails the whole archive. Each file is held open from
-/// the moment it is written.
+/// Unpack a portable archive into `destination`. Only [`PORTABLE_FILES`] and
+/// an optional `program-state.json` entry are accepted. The state entry is
+/// read and discarded. Each name may appear once; folders, paths, other
+/// names, missing programs or too many entries fail the whole archive. Each
+/// extracted file stays open from the moment it is written.
 ///
 /// # Errors
 /// Returns why the archive is not a release archive.
@@ -547,7 +546,7 @@ pub fn unpack_release_zip(zip_path: &Path, destination: &Path) -> Result<Unpacke
         if entry.is_dir() || !crate::manifest::is_plain_file_name(&name) {
             return Err(format!("the archive entry {name:?} is not a plain file"));
         }
-        if !PORTABLE_FILES.contains(&name.as_str()) {
+        if name != PORTABLE_STATE_FILE && !PORTABLE_FILES.contains(&name.as_str()) {
             return Err(format!("the archive entry {name:?} is not a release file"));
         }
         let folded = name.to_ascii_lowercase();
@@ -558,6 +557,19 @@ pub fn unpack_release_zip(zip_path: &Path, destination: &Path) -> Result<Unpacke
         total = total.saturating_add(entry.size());
         if total > MAX_UNPACKED_BYTES {
             return Err("the archive unpacks to more than allowed".to_owned());
+        }
+        if name == PORTABLE_STATE_FILE {
+            // The zip may carry the portable-state seed, but an update must
+            // preserve the running copy's state and never install the seed.
+            let copied = std::io::copy(
+                &mut (&mut entry).take(MAX_UNPACKED_BYTES),
+                &mut std::io::sink(),
+            )
+            .map_err(|error| format!("cannot read portable state entry: {error}"))?;
+            if copied != entry.size() {
+                return Err(format!("the archive entry {name:?} has the wrong size"));
+            }
+            continue;
         }
         let target = destination.join(&name);
         let out = std::fs::OpenOptions::new()
@@ -708,6 +720,29 @@ mod tests {
     fn an_archive_with_the_right_sizes_unpacks() {
         let bytes = stored_zip(&[("ca.exe", b"AAAAAAAA"), ("compare-all.exe", b"BBBBBBBB")]);
         assert_eq!(unpack_bytes(&bytes).unwrap().files.len(), 2);
+    }
+
+    #[test]
+    fn the_program_state_entry_is_accepted_but_not_unpacked() -> std::io::Result<()> {
+        let bytes = stored_zip(&[
+            ("ca.exe", b"AAAAAAAA"),
+            ("compare-all.exe", b"BBBBBBBB"),
+            (PORTABLE_STATE_FILE, b"{\"seed\":true}"),
+        ]);
+        let scratch = tempfile::tempdir()?;
+        let archive = scratch.path().join("release.zip");
+        let destination = scratch.path().join("out");
+        std::fs::write(&archive, bytes)?;
+
+        let unpacked = unpack_release_zip(&archive, &destination).map_err(std::io::Error::other)?;
+
+        assert_eq!(
+            unpacked.names().collect::<Vec<_>>(),
+            vec!["ca.exe", "compare-all.exe"]
+        );
+        assert!(!destination.join(PORTABLE_STATE_FILE).exists());
+        drop(unpacked);
+        Ok(())
     }
 
     #[test]

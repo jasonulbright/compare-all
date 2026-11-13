@@ -477,9 +477,22 @@ fn portable_zip() -> Vec<u8> {
     ])
 }
 
+fn portable_zip_with_state_seed() -> Vec<u8> {
+    zip_bytes(&[
+        ("compare-all.exe", &new_exe()),
+        ("ca.exe", &new_ca()),
+        ("README.md", b"new readme"),
+        ("program-state.json", b"{\"seed\":true}"),
+    ])
+}
+
 fn stage_portable(server: &Server, staging: &Staging) {
     let zip = portable_zip();
-    let asset = publish(server, &zip_name(NEXT), &zip, "application/zip");
+    stage_portable_zip(server, staging, &zip);
+}
+
+fn stage_portable_zip(server: &Server, staging: &Staging, zip: &[u8]) {
+    let asset = publish(server, &zip_name(NEXT), zip, "application/zip");
     publish_manifest(server, vec![asset]);
     let outcome = check(
         server,
@@ -510,10 +523,11 @@ fn names(dir: &Path) -> Vec<String> {
 }
 
 #[test]
-fn a_portable_update_replaces_program_files_and_keeps_settings() {
+fn a_portable_update_ignores_the_state_seed_and_keeps_existing_settings() {
     let server = Server::start();
     let (_keep, staging) = staging_dir();
-    stage_portable(&server, &staging);
+    let zip = portable_zip_with_state_seed();
+    stage_portable_zip(&server, &staging, &zip);
     let target = program_folder();
     let signer = FakeSigner::signed_by(SIGNER);
     let endpoints = server.endpoints();
