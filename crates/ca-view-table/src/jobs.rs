@@ -568,6 +568,7 @@ struct PreparedSheet {
 
 const MAX_SHEETS: usize = 256;
 const MAX_SHEET_TEXT_BYTES: usize = ca_table::parse::MAX_INPUT_BYTES;
+const MAX_HTML_INPUT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_HTML_MARKUP_CHARACTERS: usize = 100_000;
 const MAX_HTML_ATTRIBUTES_PER_TAG: usize = 128;
 const MAX_HTML_DOCUMENT_ATTRIBUTES: usize = 200_000;
@@ -731,8 +732,11 @@ fn read_html_tables(
     format: &FormatSettings,
     cancel: &Cancel,
 ) -> Result<Vec<RawSheet>, String> {
-    let input = read_html_input(path, format)?;
+    let input = read_html_input(path, format, cancel)?;
     check_html_markup_limit(&input.text, path, cancel)?;
+    if cancel.is_cancelled() {
+        return Err(String::new());
+    }
     let document = Html::parse_document(&input.text);
     if cancel.is_cancelled() {
         return Err(String::new());
@@ -1939,20 +1943,39 @@ fn read_side(path: &Path, format: &FormatSettings) -> Result<SideText, String> {
     read_side_with_open(path, format, file_size, || std::fs::File::open(path))
 }
 
+#[derive(Clone, Copy)]
+enum ReadMode<'a> {
+    Table,
+    Html(&'a Cancel),
+}
+
 fn read_side_with_open<R: Read>(
     path: &Path,
     format: &FormatSettings,
     file_size: u64,
     open: impl FnOnce() -> std::io::Result<R>,
 ) -> Result<SideText, String> {
-    read_side_with_open_mode(path, format, file_size, open, false)
+    read_side_with_open_mode(path, format, file_size, open, ReadMode::Table)
 }
 
-fn read_html_input(path: &Path, format: &FormatSettings) -> Result<SideText, String> {
+fn read_html_input(
+    path: &Path,
+    format: &FormatSettings,
+    cancel: &Cancel,
+) -> Result<SideText, String> {
+    if cancel.is_cancelled() {
+        return Err(String::new());
+    }
     let file_size = std::fs::metadata(path)
         .map_err(|error| format!("{}: {error}", path.display()))?
         .len();
-    read_side_with_open_mode(path, format, file_size, || std::fs::File::open(path), true)
+    read_side_with_open_mode(
+        path,
+        format,
+        file_size,
+        || std::fs::File::open(path),
+        ReadMode::Html(cancel),
+    )
 }
 
 fn read_side_with_open_mode<R: Read>(
@@ -1960,28 +1983,56 @@ fn read_side_with_open_mode<R: Read>(
     format: &FormatSettings,
     file_size: u64,
     open: impl FnOnce() -> std::io::Result<R>,
-    sniff_html_charset: bool,
+    mode: ReadMode<'_>,
 ) -> Result<SideText, String> {
-    let input_limit = u64::try_from(ca_table::parse::MAX_INPUT_BYTES).unwrap_or(u64::MAX);
-    if file_size > input_limit {
+    let (sniff_html_charset, input_limit, input_kind, cancel) = match mode {
+        ReadMode::Table => (false, ca_table::parse::MAX_INPUT_BYTES, "table", None),
+        ReadMode::Html(cancel) => (true, MAX_HTML_INPUT_BYTES, "HTML", Some(cancel)),
+    };
+    if cancel.is_some_and(Cancel::is_cancelled) {
+        return Err(String::new());
+    }
+    let input_limit_bytes = u64::try_from(input_limit).unwrap_or(u64::MAX);
+    if file_size > input_limit_bytes {
         return Err(format!(
-            "{} is {file_size} bytes, past the {input_limit} byte table input limit",
+            "{} is {file_size} bytes, past the {input_limit_bytes} byte {input_kind} input limit",
             path.display()
         ));
     }
     // The stamp is taken before the read, so a change made while the bytes are
     // read is reported by the next save rather than overwritten.
     let stamp = RealFileSystem.stamp(path);
-    let file = open().map_err(|error| format!("{}: {error}", path.display()))?;
-    let mut bytes = Vec::new();
-    file.take(input_limit.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .map_err(|error| format!("{}: {error}", path.display()))?;
-    if bytes.len() > ca_table::parse::MAX_INPUT_BYTES {
-        return Err(format!(
-            "{} grew past the {input_limit} byte table input limit while it was read",
-            path.display()
-        ));
+    let mut file = open().map_err(|error| format!("{}: {error}", path.display()))?;
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(file_size)
+            .unwrap_or(input_limit)
+            .min(input_limit),
+    );
+    let mut chunk = [0; 16 * 1024];
+    loop {
+        if cancel.is_some_and(Cancel::is_cancelled) {
+            return Err(String::new());
+        }
+        let remaining_plus_one = input_limit.saturating_sub(bytes.len()).saturating_add(1);
+        let read_size = chunk.len().min(remaining_plus_one);
+        let count = match file.read(&mut chunk[..read_size]) {
+            Ok(count) => count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(format!("{}: {error}", path.display())),
+        };
+        if count == 0 {
+            break;
+        }
+        if bytes.len().saturating_add(count) > input_limit {
+            return Err(format!(
+                "{} grew past the {input_limit_bytes} byte {input_kind} input limit while it was read",
+                path.display()
+            ));
+        }
+        bytes.extend_from_slice(&chunk[..count]);
+    }
+    if cancel.is_some_and(Cancel::is_cancelled) {
+        return Err(String::new());
     }
     let declared_html_encoding =
         (sniff_html_charset && format.encoding.is_none() && !has_byte_order_mark(&bytes))
@@ -1992,6 +2043,9 @@ fn read_side_with_open_mode<R: Read>(
         ..DecodeOptions::default()
     };
     let mut loaded = LoadedText::load(&bytes, &options);
+    if cancel.is_some_and(Cancel::is_cancelled) {
+        return Err(String::new());
+    }
     let text = loaded.buffer.text();
     loaded.buffer = TextBuffer::from_text("");
     Ok(SideText {
@@ -2241,10 +2295,11 @@ impl Pipeline {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::{
-        read_html_input, read_html_tables, read_side_with_open, read_workbook_sheets, spawn_load,
-        spawn_recompare, Cancel, FormatSettings, HtmlTableText, Pipeline, Side, Stage,
-        TableMessage, TableSettings, MAX_HTML_ATTRIBUTES_PER_TAG, MAX_HTML_DOCUMENT_CELLS,
-        MAX_HTML_MARKUP_CHARACTERS, MAX_HTML_TABLE_NAME_CHARS,
+        read_html_input, read_html_tables, read_side_with_open, read_side_with_open_mode,
+        read_workbook_sheets, spawn_load, spawn_recompare, Cancel, FormatSettings, HtmlTableText,
+        Pipeline, ReadMode, Side, Stage, TableMessage, TableSettings, MAX_HTML_ATTRIBUTES_PER_TAG,
+        MAX_HTML_DOCUMENT_CELLS, MAX_HTML_INPUT_BYTES, MAX_HTML_MARKUP_CHARACTERS,
+        MAX_HTML_TABLE_NAME_CHARS,
     };
     use ca_table::compare::CellStatus;
     use ca_table::schema::{ColumnAlignment, ColumnHandling, ColumnType, ManualColumnPair};
@@ -2315,6 +2370,63 @@ mod tests {
             !opened,
             "the file reader must not be opened for an oversized input"
         );
+    }
+
+    #[test]
+    fn an_html_file_over_its_input_limit_is_refused_before_reading_it() {
+        let path = Path::new("oversized.html");
+        let mut opened = false;
+        let cancel = Cancel::new();
+        let result = read_side_with_open_mode(
+            path,
+            &FormatSettings::default(),
+            u64::try_from(MAX_HTML_INPUT_BYTES).unwrap() + 1,
+            || {
+                opened = true;
+                Ok(std::io::Cursor::new(b"<table></table>".to_vec()))
+            },
+            ReadMode::Html(&cancel),
+        );
+
+        assert!(matches!(result, Err(error) if error.contains("HTML input limit")));
+        assert!(!opened, "an oversized HTML file must not be opened");
+    }
+
+    #[test]
+    fn html_input_read_stops_when_cancelled() {
+        struct CancelOnRead {
+            cancel: Cancel,
+            read: bool,
+        }
+
+        impl IoRead for CancelOnRead {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                if self.read || buffer.is_empty() {
+                    return Ok(0);
+                }
+                self.read = true;
+                let source = b"<table></table>";
+                buffer[..source.len()].copy_from_slice(source);
+                self.cancel.cancel();
+                Ok(source.len())
+            }
+        }
+
+        let cancel = Cancel::new();
+        let result = read_side_with_open_mode(
+            Path::new("cancelled.html"),
+            &FormatSettings::default(),
+            15,
+            || {
+                Ok(CancelOnRead {
+                    cancel: cancel.clone(),
+                    read: false,
+                })
+            },
+            ReadMode::Html(&cancel),
+        );
+
+        assert!(matches!(result, Err(error) if error.is_empty()));
     }
 
     #[test]
@@ -2882,6 +2994,38 @@ mod tests {
     }
 
     #[test]
+    fn html_headers_keep_columns_missing_from_every_data_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let left = dir.path().join("left.html");
+        let right = dir.path().join("right.html");
+        std::fs::write(
+            &left,
+            concat!(
+                "<table><thead><tr><th>A</th><th>B</th><th>C</th></tr></thead>",
+                "<tbody><tr><td>1</td><td>2</td></tr></tbody></table>"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &right,
+            concat!(
+                "<table><thead><tr><th>A</th><th>B</th><th>C</th></tr></thead>",
+                "<tbody><tr><td>1</td><td>3</td></tr></tbody></table>"
+            ),
+        )
+        .unwrap();
+
+        let data = run(&left, &right, TableSettings::default());
+        let table = &data.sheet_pairs[0].left.table;
+
+        assert_eq!(table.column_count(), 3);
+        assert_eq!(table.header().unwrap(), ["A", "B", "C"].map(str::to_owned));
+        assert_eq!(table.row_count(), 1);
+        assert_eq!(table.row_len(0), 2);
+        assert_eq!(table.cell_text(0, 2), "");
+    }
+
+    #[test]
     fn html_duplicate_captions_do_not_collide_with_literal_suffixes() {
         let dir = tempfile::tempdir().unwrap();
         let left = dir.path().join("left.html");
@@ -2975,7 +3119,8 @@ mod tests {
         legacy_bytes.extend_from_slice(suffix);
         std::fs::write(&legacy, legacy_bytes).unwrap();
 
-        let legacy_input = read_html_input(&legacy, &FormatSettings::default()).unwrap();
+        let legacy_input =
+            read_html_input(&legacy, &FormatSettings::default(), &Cancel::new()).unwrap();
         assert_eq!(legacy_input.encoding, "windows-1252");
         assert!(legacy_input.text.contains("Ã©"));
 
@@ -2984,7 +3129,7 @@ mod tests {
         bom_bytes.extend_from_slice("é".as_bytes());
         bom_bytes.extend_from_slice(suffix);
         std::fs::write(&bom, bom_bytes).unwrap();
-        let bom_input = read_html_input(&bom, &FormatSettings::default()).unwrap();
+        let bom_input = read_html_input(&bom, &FormatSettings::default(), &Cancel::new()).unwrap();
         assert_eq!(bom_input.encoding, "UTF-8");
         assert!(bom_input.text.contains('é'));
 
@@ -2994,6 +3139,7 @@ mod tests {
                 encoding: Some(ca_text::TextEncoding::Utf8),
                 ..FormatSettings::default()
             },
+            &Cancel::new(),
         )
         .unwrap();
         assert_eq!(override_input.encoding, "UTF-8");

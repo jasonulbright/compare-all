@@ -583,10 +583,12 @@ impl Table {
         if self.row_starts.len() > 1 {
             self.row_starts.remove(0);
         }
-        self.column_count = (0..self.row_count())
+        let data_width = (0..self.row_count())
             .map(|row| self.row_len(row))
             .max()
             .unwrap_or(0);
+        let header_width = self.header.as_ref().map_or(0, Vec::len);
+        self.column_count = data_width.max(header_width);
     }
 }
 
@@ -1192,6 +1194,22 @@ mod tests {
         assert_eq!(table.row_len(1), 1);
         assert!(table.cell(1, 1).is_none());
         assert_eq!(table.cell_text(1, 1), "");
+    }
+
+    #[test]
+    fn a_wide_header_keeps_columns_missing_from_every_data_row() {
+        let mut options = ParseOptions::tab_separated();
+        options.first_line_contains = FirstLineContains::ColumnNames;
+        let table = parse("a\tb\tc\n1\t2\n", &options).unwrap();
+
+        assert_eq!(table.column_count(), 3);
+        assert_eq!(
+            table.header(),
+            Some(["a", "b", "c"].map(str::to_owned).as_slice())
+        );
+        assert_eq!(table.row_count(), 1);
+        assert_eq!(table.row_len(0), 2);
+        assert_eq!(table.cell_text(0, 2), "");
     }
 
     #[test]

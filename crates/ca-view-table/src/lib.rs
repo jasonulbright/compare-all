@@ -3600,6 +3600,44 @@ mod tests {
     }
 
     #[test]
+    fn copy_to_right_skips_a_header_column_missing_from_both_rows() {
+        let left_text = "id,name,extra\n1,A\n";
+        let right_text = "id,name,extra\n1,B\n";
+        let (_dir, left, right) = files(left_text, right_text);
+        let ctx = egui::Context::default();
+        let mut view = TableView::new(left, right, &context(), 47);
+        assert!(settle(&mut view, &ctx));
+        view.set_active_side(Side::Left);
+        view.grid.set_cursor(Cursor { row: 0, column: 0 });
+
+        assert!(view.accepts(Command::CopyToRight));
+        view.run(Command::CopyToRight);
+        assert!(settle(&mut view, &ctx));
+
+        assert_eq!(view.side_text(Side::Right).text(), left_text);
+        assert_eq!(view.grid.cell_text(0, 1, Side::Right), "A");
+    }
+
+    #[test]
+    fn copy_to_right_skips_an_empty_source_cell_missing_from_target() {
+        let left_text = "id,name,extra\n1,A,\n";
+        let right_text = "id,name,extra\n1,B\n";
+        let (_dir, left, right) = files(left_text, right_text);
+        let ctx = egui::Context::default();
+        let mut view = TableView::new(left, right, &context(), 48);
+        assert!(settle(&mut view, &ctx));
+        view.set_active_side(Side::Left);
+        view.grid.set_cursor(Cursor { row: 0, column: 0 });
+
+        assert!(view.accepts(Command::CopyToRight));
+        view.run(Command::CopyToRight);
+        assert!(settle(&mut view, &ctx));
+
+        assert_eq!(view.side_text(Side::Right).text(), "id,name,extra\n1,A\n");
+        assert_eq!(view.grid.cell_text(0, 1, Side::Right), "A");
+    }
+
+    #[test]
     fn copy_to_right_and_left_insert_and_remove_one_sided_rows() {
         let (_dir, left, right) = files(
             "id,name\n1,Ann\n2,Bob\n3,Cy\n",

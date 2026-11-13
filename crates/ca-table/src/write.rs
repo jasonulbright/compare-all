@@ -87,7 +87,7 @@ pub fn cell_write(
                 || (*surrounding_whitespace_is_delimiter && value.trim() != value)
                 || (*consecutive_delimiters_as_one && value.is_empty())
                 || (value.is_empty()
-                    && table.column_count() == 1
+                    && table.row_len(row) == 1
                     && row + 1 == table.row_count()
                     && table
                         .row_source_range(row)
@@ -297,6 +297,16 @@ mod tests {
     #[test]
     fn clearing_a_single_cell_at_end_of_file_keeps_its_row() {
         assert_eq!(written("v\na\nb", &csv(), 2, 0, ""), "v\na\n\"\"");
+    }
+
+    #[test]
+    fn clearing_a_one_cell_row_keeps_it_beneath_a_wider_header() {
+        let options = ParseOptions {
+            first_line_contains: crate::parse::FirstLineContains::ColumnNames,
+            ..ParseOptions::comma_separated()
+        };
+
+        assert_eq!(written("a,b\nvalue", &options, 0, 0, ""), "a,b\n\"\"");
     }
 
     #[test]
