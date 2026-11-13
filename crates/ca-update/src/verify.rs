@@ -723,18 +723,18 @@ mod tests {
     }
 
     #[test]
-    fn the_program_state_entry_is_accepted_but_not_unpacked() {
+    fn the_program_state_entry_is_accepted_but_not_unpacked() -> std::io::Result<()> {
         let bytes = stored_zip(&[
             ("ca.exe", b"AAAAAAAA"),
             ("compare-all.exe", b"BBBBBBBB"),
             (PORTABLE_STATE_FILE, b"{\"seed\":true}"),
         ]);
-        let scratch = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir()?;
         let archive = scratch.path().join("release.zip");
         let destination = scratch.path().join("out");
-        std::fs::write(&archive, bytes).unwrap();
+        std::fs::write(&archive, bytes)?;
 
-        let unpacked = unpack_release_zip(&archive, &destination).unwrap();
+        let unpacked = unpack_release_zip(&archive, &destination).map_err(std::io::Error::other)?;
 
         assert_eq!(
             unpacked.names().collect::<Vec<_>>(),
@@ -742,6 +742,7 @@ mod tests {
         );
         assert!(!destination.join(PORTABLE_STATE_FILE).exists());
         drop(unpacked);
+        Ok(())
     }
 
     #[test]
