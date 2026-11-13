@@ -78,21 +78,17 @@ fn append_matched_row_changes(
         let source_column_index = *source_column as usize;
         let target_row_index = target_row as usize;
         let target_column_index = *target_column as usize;
-        if context
-            .source_table
-            .cell(source_row_index, source_column_index)
-            .is_none()
-            && context
-                .target_table
-                .cell(target_row_index, target_column_index)
-                .is_none()
-        {
-            continue;
-        }
+        let target_has_cell = context
+            .target_table
+            .cell(target_row_index, target_column_index)
+            .is_some();
         let value = context
             .source_table
             .cell_text(source_row_index, source_column_index)
             .into_owned();
+        if !target_has_cell && value.is_empty() {
+            continue;
+        }
         let write = cell_write(
             context.target_table,
             context.options,
