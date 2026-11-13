@@ -1,3 +1,34 @@
+# v2026.11.13.0016
+
+## 19 improvements across comparison, navigation, dialogs, and updates
+
+### Features
+
+- Refresh selected rows in folder views.
+- Show ignored folders as rows in folder comparisons.
+- Wrap long lines in text comparisons.
+- Start Quick Compare from a focused summary flow.
+- Compare folder contents in a dedicated results view.
+- Keep every open tab reachable from the scrolling tab strip.
+- Align multiple lines manually in Text Merge.
+- Compare multiple sheets and HTML tables in Table Compare.
+- Choose whether operation confirmations include hidden items.
+- Ignore portable state seeds during ZIP updates and preserve existing settings.
+
+### Fixes
+
+- Harden mounted paths and apply replacements atomically.
+- Limit HTML input size and keep column headers within bounds.
+- Standardize pane typography, row heights, and shared spacing.
+- Clarify profile deletion and discard actions.
+- Complete remaining confirmation dialogs with consistent native layouts and keyboard behavior.
+
+### Dependencies
+
+- Update SSH dependencies and callback handling.
+
+Full changelog: CHANGELOG.md
+
 # v2026.10.30.0015
 
 ## Picture alignment and dialog windows improved
