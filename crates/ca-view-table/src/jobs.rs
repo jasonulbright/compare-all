@@ -19,6 +19,7 @@ use ca_text::{DecodeOptions, LoadedText, TextBuffer};
 use ca_ui::save::{FileSystem, RealFileSystem, Stamp};
 use ca_ui::worker::{Cancel, Emitter, Job, Terminal};
 use calamine::Reader;
+use scraper::{ElementRef, Html, Node, Selector};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -366,19 +367,26 @@ fn load_and_compare(
     cancel: &Cancel,
 ) {
     emitter.send(TableMessage::Progress(Stage::Reading));
-    let left_sheets = match read_sheets(left, &settings.left_format, clipboard[0].as_deref()) {
-        Ok(sheets) => sheets,
-        Err(message) => {
-            emitter.send(TableMessage::Failed(message));
-            return;
-        }
+    let Some(left_sheets) = read_sheets_for_comparison(
+        left,
+        &settings.left_format,
+        clipboard[0].as_deref(),
+        cancel,
+        emitter,
+    ) else {
+        return;
     };
-    let right_sheets = match read_sheets(right, &settings.right_format, clipboard[1].as_deref()) {
-        Ok(sheets) => sheets,
-        Err(message) => {
-            emitter.send(TableMessage::Failed(message));
-            return;
-        }
+    if cancel.is_cancelled() {
+        return;
+    }
+    let Some(right_sheets) = read_sheets_for_comparison(
+        right,
+        &settings.right_format,
+        clipboard[1].as_deref(),
+        cancel,
+        emitter,
+    ) else {
+        return;
     };
     if cancel.is_cancelled() {
         return;
@@ -427,8 +435,8 @@ fn load_and_compare(
             .map(|sheet| sheet.name.clone())
             .collect(),
     );
-    let show_sheet_tabs = (is_workbook_path(left) && clipboard[0].is_none())
-        || (is_workbook_path(right) && clipboard[1].is_none());
+    let show_sheet_tabs = (is_sheeted_path(left) && clipboard[0].is_none())
+        || (is_sheeted_path(right) && clipboard[1].is_none());
     let sheets = match pair_sheets(&left_sheets, &right_sheets, &settings.sheets) {
         Ok(sheets) => sheets,
         Err(message) => {
@@ -530,18 +538,27 @@ struct SideText {
 
 struct LoadedSheet {
     name: String,
+    pairing_key: [u8; 32],
     side: Side,
     text: Option<Arc<String>>,
 }
 
 struct RawSheet {
     name: String,
+    pairing_key: Option<[u8; 32]>,
     text: String,
     encoding: String,
     had_errors: bool,
     stamp: Option<Stamp>,
     template: Option<Arc<LoadedText>>,
-    workbook: bool,
+    kind: RawKind,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RawKind {
+    Text,
+    Workbook,
+    HtmlTable { first_row_is_header: bool },
 }
 
 struct PreparedSheet {
@@ -549,8 +566,13 @@ struct PreparedSheet {
     options: ParseOptions,
 }
 
-const MAX_WORKBOOK_SHEETS: usize = 256;
-const MAX_WORKBOOK_TEXT_BYTES: usize = ca_table::parse::MAX_INPUT_BYTES;
+const MAX_SHEETS: usize = 256;
+const MAX_SHEET_TEXT_BYTES: usize = ca_table::parse::MAX_INPUT_BYTES;
+const MAX_HTML_MARKUP_CHARACTERS: usize = 100_000;
+const MAX_HTML_ATTRIBUTES_PER_TAG: usize = 128;
+const MAX_HTML_DOCUMENT_ATTRIBUTES: usize = 200_000;
+const MAX_HTML_TABLE_NAME_CHARS: usize = 120;
+const MAX_HTML_DOCUMENT_CELLS: usize = ca_table::parse::MAX_TABLE_CELLS;
 const MAX_WORKBOOK_ARCHIVE_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_WORKBOOK_ARCHIVE_ENTRIES: usize = 4_096;
 
@@ -563,6 +585,21 @@ pub(crate) fn is_workbook_path(path: &Path) -> bool {
                 "xls" | "xla" | "xlsx" | "xlsm" | "xlam" | "xlsb" | "ods"
             )
         })
+}
+
+pub(crate) fn is_html_tables_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "asp" | "ascx" | "aspx" | "htm" | "html"
+            )
+        })
+}
+
+fn is_sheeted_path(path: &Path) -> bool {
+    is_workbook_path(path) || is_html_tables_path(path)
 }
 
 #[derive(Clone, Copy)]
@@ -643,9 +680,16 @@ fn read_sheets(
     path: &Path,
     format: &FormatSettings,
     clipboard: Option<&str>,
+    cancel: &Cancel,
 ) -> Result<Vec<RawSheet>, String> {
+    if cancel.is_cancelled() {
+        return Err(String::new());
+    }
     if clipboard.is_none() && is_workbook_path(path) {
         return read_workbook_sheets(path);
+    }
+    if clipboard.is_none() && is_html_tables_path(path) {
+        return read_html_tables(path, format, cancel);
     }
     let input = read_input(path, format, clipboard)?;
     let name = path.file_name().map_or_else(
@@ -654,13 +698,659 @@ fn read_sheets(
     );
     Ok(vec![RawSheet {
         name,
+        pairing_key: None,
         text: input.text,
         encoding: input.encoding,
         had_errors: input.had_errors,
         stamp: input.stamp,
         template: Some(input.template),
-        workbook: false,
+        kind: RawKind::Text,
     }])
+}
+
+fn read_sheets_for_comparison(
+    path: &Path,
+    format: &FormatSettings,
+    clipboard: Option<&str>,
+    cancel: &Cancel,
+    emitter: &Emitter<TableMessage>,
+) -> Option<Vec<RawSheet>> {
+    match read_sheets(path, format, clipboard, cancel) {
+        Ok(sheets) => Some(sheets),
+        Err(message) => {
+            if !cancel.is_cancelled() {
+                emitter.send(TableMessage::Failed(message));
+            }
+            None
+        }
+    }
+}
+
+fn read_html_tables(
+    path: &Path,
+    format: &FormatSettings,
+    cancel: &Cancel,
+) -> Result<Vec<RawSheet>, String> {
+    let input = read_html_input(path, format)?;
+    check_html_markup_limit(&input.text, path, cancel)?;
+    let document = Html::parse_document(&input.text);
+    if cancel.is_cancelled() {
+        return Err(String::new());
+    }
+    let selector = Selector::parse("table")
+        .map_err(|_| "Table Compare could not create its HTML table selector.".to_owned())?;
+    let mut tables = Vec::new();
+    for table in document.select(&selector) {
+        if cancel.is_cancelled() {
+            return Err(String::new());
+        }
+        if tables.len() == MAX_SHEETS {
+            return Err(format!(
+                "{} has more than the {} HTML table limit",
+                path.display(),
+                MAX_SHEETS
+            ));
+        }
+        tables.push(table);
+    }
+    if tables.is_empty() {
+        return Err(format!(
+            "{} contains no HTML tables that Table Compare can read",
+            path.display()
+        ));
+    }
+    let mut total_bytes = 0usize;
+    let mut total_cells = 0usize;
+    let mut sheets = Vec::with_capacity(tables.len());
+    let mut pairing_keys = Vec::with_capacity(tables.len());
+    let mut base_names = Vec::with_capacity(tables.len());
+    for (index, table) in tables.iter().enumerate() {
+        if cancel.is_cancelled() {
+            return Err(String::new());
+        }
+        let full_name = html_table_name(*table, index + 1);
+        pairing_keys.push(sheet_pairing_key(&full_name));
+        base_names.push(bounded_html_table_name(&full_name));
+    }
+    let reserved_names = base_names
+        .iter()
+        .map(|name| normalized_sheet_name(name))
+        .collect::<std::collections::HashSet<_>>();
+    let mut name_counts = std::collections::HashMap::new();
+    let mut assigned_names = std::collections::HashSet::new();
+    for ((table, pairing_key), base_name) in tables.into_iter().zip(pairing_keys).zip(base_names) {
+        if cancel.is_cancelled() {
+            return Err(String::new());
+        }
+        let occurrence = name_counts.entry(pairing_key).or_insert(0usize);
+        *occurrence += 1;
+        let base_key = normalized_sheet_name(&base_name);
+        let name = if *occurrence == 1 && !assigned_names.contains(&base_key) {
+            base_name
+        } else {
+            let mut suffix = (*occurrence).max(2);
+            loop {
+                let candidate = format!("{base_name} ({suffix})");
+                let candidate_key = normalized_sheet_name(&candidate);
+                if !reserved_names.contains(&candidate_key)
+                    && !assigned_names.contains(&candidate_key)
+                {
+                    break candidate;
+                }
+                suffix = suffix.saturating_add(1);
+            }
+        };
+        assigned_names.insert(normalized_sheet_name(&name));
+        let (text, first_row_is_header) = html_table_text(
+            table,
+            &name,
+            path,
+            &mut total_bytes,
+            &mut total_cells,
+            cancel,
+        )?;
+        sheets.push(RawSheet {
+            name,
+            pairing_key: Some(pairing_key),
+            text,
+            encoding: input.encoding.clone(),
+            had_errors: input.had_errors,
+            stamp: input.stamp,
+            template: None,
+            kind: RawKind::HtmlTable {
+                first_row_is_header,
+            },
+        });
+    }
+    Ok(sheets)
+}
+
+fn html_table_name(table: ElementRef<'_>, ordinal: usize) -> String {
+    let caption = table
+        .child_elements()
+        .find(|element| element.value().name() == "caption")
+        .map(html_element_text)
+        .filter(|text| !text.is_empty());
+    caption
+        .or_else(|| table.attr("aria-label").map(str::trim).map(str::to_owned))
+        .filter(|text| !text.is_empty())
+        .unwrap_or_else(|| format!("Table {ordinal}"))
+}
+
+fn bounded_html_table_name(name: &str) -> String {
+    let Some((end, _)) = name.char_indices().nth(MAX_HTML_TABLE_NAME_CHARS) else {
+        return name.to_owned();
+    };
+    format!("{}…", &name[..end])
+}
+
+fn html_row_is_column_header(row: ElementRef<'_>) -> bool {
+    let mut saw_header = false;
+    for cell in row
+        .child_elements()
+        .filter(|element| matches!(element.value().name(), "td" | "th"))
+    {
+        if cell.value().name() != "th"
+            || cell.attr("scope").is_some_and(|scope| {
+                matches!(
+                    scope.trim().to_ascii_lowercase().as_str(),
+                    "row" | "rowgroup"
+                )
+            })
+        {
+            return false;
+        }
+        saw_header = true;
+    }
+    saw_header
+}
+
+fn check_html_markup_limit(text: &str, path: &Path, cancel: &Cancel) -> Result<(), String> {
+    let mut markup_characters = 0usize;
+    for (index, byte) in text.bytes().enumerate() {
+        if index.is_multiple_of(65_536) && cancel.is_cancelled() {
+            return Err(String::new());
+        }
+        markup_characters = markup_characters.saturating_add(usize::from(byte == b'<'));
+        if markup_characters > MAX_HTML_MARKUP_CHARACTERS {
+            break;
+        }
+    }
+    if markup_characters > MAX_HTML_MARKUP_CHARACTERS {
+        return Err(format!(
+            "{} has more than the {MAX_HTML_MARKUP_CHARACTERS} HTML markup character limit",
+            path.display()
+        ));
+    }
+    let bytes = text.as_bytes();
+    let mut index = 0usize;
+    let mut total_attributes = 0usize;
+    let mut attribute_scan_bytes = 0usize;
+    let attribute_scan_limit = bytes.len().saturating_mul(2);
+    while index + 1 < bytes.len() {
+        if index.is_multiple_of(65_536) && cancel.is_cancelled() {
+            return Err(String::new());
+        }
+        let is_end_tag = bytes[index] == b'<' && bytes[index + 1] == b'/';
+        let name_start = index + usize::from(is_end_tag) + 1;
+        if bytes[index] == b'<' && bytes.get(name_start).is_some_and(u8::is_ascii_alphabetic) {
+            let Some((end, attributes)) = html_tag_attributes(bytes, name_start, cancel) else {
+                return Err(String::new());
+            };
+            attribute_scan_bytes = attribute_scan_bytes.saturating_add(end.saturating_sub(index));
+            if attribute_scan_bytes > attribute_scan_limit {
+                return Err(format!(
+                    "{} expands past the bounded HTML attribute scan limit",
+                    path.display()
+                ));
+            }
+            if attributes > MAX_HTML_ATTRIBUTES_PER_TAG {
+                return Err(format!(
+                    "{} has an HTML tag above the {MAX_HTML_ATTRIBUTES_PER_TAG} attribute limit",
+                    path.display()
+                ));
+            }
+            total_attributes = total_attributes.saturating_add(attributes);
+            if total_attributes > MAX_HTML_DOCUMENT_ATTRIBUTES {
+                return Err(format!(
+                    "{} has more than the {MAX_HTML_DOCUMENT_ATTRIBUTES} HTML attribute limit",
+                    path.display()
+                ));
+            }
+        }
+        index += 1;
+    }
+    Ok(())
+}
+
+fn html_tag_attributes(bytes: &[u8], name_start: usize, cancel: &Cancel) -> Option<(usize, usize)> {
+    let mut index = name_start;
+    while bytes
+        .get(index)
+        .is_some_and(|byte| !byte.is_ascii_whitespace() && !matches!(*byte, b'/' | b'>'))
+    {
+        index += 1;
+        if index.is_multiple_of(65_536) && cancel.is_cancelled() {
+            return None;
+        }
+    }
+    let mut attributes = 0usize;
+    loop {
+        while bytes.get(index).is_some_and(u8::is_ascii_whitespace) {
+            index += 1;
+            if index.is_multiple_of(65_536) && cancel.is_cancelled() {
+                return None;
+            }
+        }
+        match (bytes.get(index), bytes.get(index + 1)) {
+            (Some(b'>'), _) => return Some((index + 1, attributes)),
+            (Some(b'/'), Some(b'>')) => return Some((index + 2, attributes)),
+            (Some(b'/'), _) => {
+                index += 1;
+                continue;
+            }
+            (None, _) => return Some((index, attributes)),
+            _ => {}
+        }
+        attributes = attributes.saturating_add(1);
+        if bytes.get(index) == Some(&b'=') {
+            index += 1;
+        }
+        while bytes.get(index).is_some_and(|byte| {
+            !byte.is_ascii_whitespace() && !matches!(*byte, b'/' | b'>') && *byte != b'='
+        }) {
+            index += 1;
+            if index.is_multiple_of(65_536) && cancel.is_cancelled() {
+                return None;
+            }
+        }
+        while bytes.get(index).is_some_and(u8::is_ascii_whitespace) {
+            index += 1;
+            if index.is_multiple_of(65_536) && cancel.is_cancelled() {
+                return None;
+            }
+        }
+        if bytes.get(index) == Some(&b'/') {
+            continue;
+        }
+        if bytes.get(index) == Some(&b'=') {
+            index += 1;
+            while bytes.get(index).is_some_and(u8::is_ascii_whitespace) {
+                index += 1;
+                if index.is_multiple_of(65_536) && cancel.is_cancelled() {
+                    return None;
+                }
+            }
+            if let Some(quote @ (b'\'' | b'"')) = bytes.get(index).copied() {
+                index += 1;
+                while bytes.get(index).is_some_and(|byte| *byte != quote) {
+                    index += 1;
+                    if index.is_multiple_of(65_536) && cancel.is_cancelled() {
+                        return None;
+                    }
+                }
+                if bytes.get(index) == Some(&quote) {
+                    index += 1;
+                }
+            } else {
+                while bytes
+                    .get(index)
+                    .is_some_and(|byte| !byte.is_ascii_whitespace() && *byte != b'>')
+                {
+                    index += 1;
+                    if index.is_multiple_of(65_536) && cancel.is_cancelled() {
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn html_table_text(
+    table: ElementRef<'_>,
+    table_name: &str,
+    path: &Path,
+    total_bytes: &mut usize,
+    total_document_cells: &mut usize,
+    cancel: &Cancel,
+) -> Result<(String, bool), String> {
+    let mut builder =
+        HtmlTableText::new(path, table_name, total_bytes, total_document_cells, cancel);
+    for child in table.child_elements() {
+        match child.value().name() {
+            "tr" => builder.append_row(child, false)?,
+            "thead" | "tbody" | "tfoot" => {
+                builder.clear_row_group();
+                let in_header = child.value().name() == "thead";
+                for row in child.child_elements() {
+                    if row.value().name() == "tr" {
+                        builder.append_row(row, in_header)?;
+                    }
+                }
+                builder.clear_row_group();
+            }
+            _ => {}
+        }
+    }
+    Ok(builder.finish())
+}
+
+struct HtmlTableText<'a> {
+    path: &'a Path,
+    name: &'a str,
+    total_bytes: &'a mut usize,
+    total_document_cells: &'a mut usize,
+    cancel: &'a Cancel,
+    output: String,
+    row_count: usize,
+    total_cells: usize,
+    row_spans: Vec<usize>,
+    first_row_is_header: bool,
+}
+
+impl<'a> HtmlTableText<'a> {
+    fn new(
+        path: &'a Path,
+        name: &'a str,
+        total_bytes: &'a mut usize,
+        total_document_cells: &'a mut usize,
+        cancel: &'a Cancel,
+    ) -> Self {
+        Self {
+            path,
+            name,
+            total_bytes,
+            total_document_cells,
+            cancel,
+            output: String::new(),
+            row_count: 0,
+            total_cells: 0,
+            row_spans: Vec::new(),
+            first_row_is_header: false,
+        }
+    }
+
+    fn clear_row_group(&mut self) {
+        self.row_spans.clear();
+    }
+
+    fn append_row(&mut self, row: ElementRef<'_>, in_header: bool) -> Result<(), String> {
+        if self.cancel.is_cancelled() {
+            return Err(String::new());
+        }
+        if self.row_count >= ca_table::parse::MAX_TABLE_ROWS {
+            return Err(format!(
+                "{} — {} is past the {} row HTML table limit",
+                self.path.display(),
+                self.name,
+                ca_table::parse::MAX_TABLE_ROWS
+            ));
+        }
+        if self.row_count == 0 {
+            self.first_row_is_header = in_header || html_row_is_column_header(row);
+        } else {
+            self.append_delimiter('\n')?;
+        }
+
+        let values = self.row_values(row)?;
+        if values.is_empty() {
+            self.append_field("")?;
+        }
+        for (index, value) in values.iter().enumerate() {
+            if index > 0 {
+                self.append_delimiter('\t')?;
+            }
+            self.append_field(value)?;
+        }
+        self.row_count += 1;
+        Ok(())
+    }
+
+    fn row_values(&mut self, row: ElementRef<'_>) -> Result<Vec<String>, String> {
+        let occupied = self.row_spans.clone();
+        let active_width = occupied
+            .iter()
+            .rposition(|remaining| *remaining > 0)
+            .map_or(0, |column| column + 1);
+        if self.total_cells.saturating_add(active_width) > ca_table::parse::MAX_TABLE_CELLS {
+            return Err(html_table_cell_limit_error(self.path, self.name));
+        }
+        if self.total_document_cells.saturating_add(active_width) > MAX_HTML_DOCUMENT_CELLS {
+            return Err(html_document_cell_limit_error(self.path));
+        }
+        let mut values = vec![String::new(); active_width];
+        for remaining in &mut self.row_spans {
+            *remaining = remaining.saturating_sub(1);
+        }
+
+        let mut column = 0usize;
+        for (cell_index, cell) in row
+            .child_elements()
+            .filter(|element| matches!(element.value().name(), "td" | "th"))
+            .enumerate()
+        {
+            if cell_index % 128 == 0 && self.cancel.is_cancelled() {
+                return Err(String::new());
+            }
+            let colspan = html_span(
+                cell,
+                "colspan",
+                ca_table::parse::MAX_TABLE_CELLS,
+                self.path,
+                self.name,
+            )?;
+            let rowspan = html_span(
+                cell,
+                "rowspan",
+                ca_table::parse::MAX_TABLE_ROWS,
+                self.path,
+                self.name,
+            )?;
+            while let Some(offset) = occupied
+                .iter()
+                .skip(column)
+                .take(colspan)
+                .position(|remaining| *remaining > 0)
+            {
+                column = column.saturating_add(offset).saturating_add(1);
+            }
+            let end = column.saturating_add(colspan);
+            if end > ca_table::parse::MAX_TABLE_CELLS {
+                return Err(html_table_cell_limit_error(self.path, self.name));
+            }
+            let width = end.max(values.len());
+            if self.total_cells.saturating_add(width) > ca_table::parse::MAX_TABLE_CELLS {
+                return Err(html_table_cell_limit_error(self.path, self.name));
+            }
+            if self.total_document_cells.saturating_add(width) > MAX_HTML_DOCUMENT_CELLS {
+                return Err(html_document_cell_limit_error(self.path));
+            }
+            values.resize(width, String::new());
+            values[column] = html_element_text(cell);
+            if rowspan > 1 {
+                self.row_spans.resize(width, 0);
+                for remaining in self.row_spans.iter_mut().skip(column).take(colspan) {
+                    *remaining = (*remaining).max(rowspan.saturating_sub(1));
+                }
+            }
+            column = end;
+        }
+
+        self.total_cells = self.total_cells.saturating_add(values.len());
+        *self.total_document_cells = self.total_document_cells.saturating_add(values.len());
+        if self.total_cells > ca_table::parse::MAX_TABLE_CELLS {
+            return Err(html_table_cell_limit_error(self.path, self.name));
+        }
+        if *self.total_document_cells > MAX_HTML_DOCUMENT_CELLS {
+            return Err(html_document_cell_limit_error(self.path));
+        }
+        while self
+            .row_spans
+            .last()
+            .is_some_and(|remaining| *remaining == 0)
+        {
+            self.row_spans.pop();
+        }
+        Ok(values)
+    }
+
+    fn append_delimiter(&mut self, delimiter: char) -> Result<(), String> {
+        if self
+            .total_bytes
+            .saturating_add(self.output.len())
+            .saturating_add(1)
+            > MAX_SHEET_TEXT_BYTES
+        {
+            return Err(html_table_text_limit_error(self.path, self.name));
+        }
+        self.output.push(delimiter);
+        Ok(())
+    }
+
+    fn append_field(&mut self, value: &str) -> Result<(), String> {
+        if self
+            .total_bytes
+            .saturating_add(self.output.len())
+            .saturating_add(html_encoded_tab_field_len(value))
+            > MAX_SHEET_TEXT_BYTES
+        {
+            return Err(html_table_text_limit_error(self.path, self.name));
+        }
+        append_html_encoded_tab_field(&mut self.output, value);
+        Ok(())
+    }
+
+    fn finish(self) -> (String, bool) {
+        *self.total_bytes = self.total_bytes.saturating_add(self.output.len());
+        (self.output, self.first_row_is_header && self.row_count > 1)
+    }
+}
+
+fn html_table_cell_limit_error(path: &Path, table_name: &str) -> String {
+    format!(
+        "{} — {table_name} is past the {} cell HTML table limit",
+        path.display(),
+        ca_table::parse::MAX_TABLE_CELLS
+    )
+}
+
+fn html_document_cell_limit_error(path: &Path) -> String {
+    format!(
+        "{} is past the {MAX_HTML_DOCUMENT_CELLS} expanded HTML cell limit",
+        path.display()
+    )
+}
+
+fn html_span(
+    cell: ElementRef<'_>,
+    attribute: &str,
+    maximum: usize,
+    path: &Path,
+    table_name: &str,
+) -> Result<usize, String> {
+    let parsed = cell
+        .attr(attribute)
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(1);
+    let span = if attribute == "rowspan" && parsed == 0 {
+        maximum
+    } else if parsed == 0 {
+        1
+    } else {
+        parsed
+    };
+    if span > maximum {
+        return Err(format!(
+            "{} — {table_name} has an HTML {attribute} above its {maximum} limit",
+            path.display()
+        ));
+    }
+    Ok(span)
+}
+
+fn html_table_text_limit_error(path: &Path, table_name: &str) -> String {
+    format!(
+        "{} — {table_name} expands past the {} byte HTML table limit",
+        path.display(),
+        MAX_SHEET_TEXT_BYTES
+    )
+}
+
+fn html_element_text(element: ElementRef<'_>) -> String {
+    let mut output = String::new();
+    let mut pending = element.children().map(Some).collect::<Vec<_>>();
+    pending.reverse();
+    while let Some(node) = pending.pop() {
+        let Some(node) = node else {
+            output.push(' ');
+            continue;
+        };
+        match node.value() {
+            Node::Text(text) => output.push_str(&text.text),
+            Node::Element(tag) => {
+                if matches!(tag.name(), "table" | "script" | "style" | "noscript") {
+                    continue;
+                }
+                let is_block = is_html_block_element(tag.name());
+                if tag.name() == "br" || is_block {
+                    output.push(' ');
+                }
+                if is_block {
+                    pending.push(None);
+                }
+                let mut children = node.children().collect::<Vec<_>>();
+                children.reverse();
+                pending.extend(children.into_iter().map(Some));
+            }
+            _ => {}
+        }
+    }
+    let mut normalized = String::new();
+    for word in output.split_whitespace() {
+        if !normalized.is_empty() {
+            normalized.push(' ');
+        }
+        normalized.push_str(word);
+    }
+    normalized
+}
+
+fn is_html_block_element(name: &str) -> bool {
+    matches!(
+        name,
+        "address"
+            | "article"
+            | "aside"
+            | "blockquote"
+            | "dd"
+            | "details"
+            | "dialog"
+            | "div"
+            | "dl"
+            | "dt"
+            | "fieldset"
+            | "figcaption"
+            | "figure"
+            | "footer"
+            | "form"
+            | "h1"
+            | "h2"
+            | "h3"
+            | "h4"
+            | "h5"
+            | "h6"
+            | "header"
+            | "hr"
+            | "li"
+            | "main"
+            | "nav"
+            | "ol"
+            | "p"
+            | "pre"
+            | "section"
+            | "ul"
+    )
 }
 
 fn prepare_sheets(
@@ -672,13 +1362,23 @@ fn prepare_sheets(
     raw_sheets
         .into_iter()
         .map(|raw| {
-            let options = if raw.workbook {
-                ParseOptions {
+            let options = match raw.kind {
+                RawKind::Text => resolve(&raw.text, format, settings, regional),
+                RawKind::Workbook => ParseOptions {
                     syntax: ca_table::parse::FieldSyntax::delimited(['\t']),
                     ..ParseOptions::default()
-                }
-            } else {
-                resolve(&raw.text, format, settings, regional)
+                },
+                RawKind::HtmlTable {
+                    first_row_is_header,
+                } => ParseOptions {
+                    syntax: ca_table::parse::FieldSyntax::delimited(['\t']),
+                    first_line_contains: if first_row_is_header {
+                        ca_table::parse::FirstLineContains::ColumnNames
+                    } else {
+                        ca_table::parse::FirstLineContains::CellData
+                    },
+                    ..ParseOptions::default()
+                },
             };
             PreparedSheet { raw, options }
         })
@@ -697,10 +1397,10 @@ fn build_sheets(prepared: Vec<PreparedSheet>, path: &Path) -> Result<Vec<LoadedS
             let facts = SideFacts {
                 encoding: raw.encoding,
                 had_errors: raw.had_errors,
-                syntax: if raw.workbook {
-                    "Spreadsheet cells".to_owned()
-                } else {
-                    syntax_label(&resolved_options)
+                syntax: match raw.kind {
+                    RawKind::Text => syntax_label(&resolved_options),
+                    RawKind::Workbook => "Spreadsheet cells".to_owned(),
+                    RawKind::HtmlTable { .. } => "HTML table cells".to_owned(),
                 },
                 header: header_label(&table),
                 warnings: table.warnings().to_vec(),
@@ -708,13 +1408,17 @@ fn build_sheets(prepared: Vec<PreparedSheet>, path: &Path) -> Result<Vec<LoadedS
                 stamp: raw.stamp,
                 template: raw.template,
             };
+            let pairing_key = raw
+                .pairing_key
+                .unwrap_or_else(|| sheet_pairing_key(&raw.name));
             Ok(LoadedSheet {
                 name: raw.name,
+                pairing_key,
                 side: Side {
                     table: Arc::new(table),
                     facts,
                 },
-                text: (!raw.workbook).then(|| Arc::new(raw.text)),
+                text: matches!(raw.kind, RawKind::Text).then(|| Arc::new(raw.text)),
             })
         })
         .collect()
@@ -765,9 +1469,9 @@ fn read_workbook_sheets(path: &Path) -> Result<Vec<RawSheet>, String> {
     };
     let metadata = workbook.sheets_metadata();
     let sheet_count = metadata.len();
-    if sheet_count > MAX_WORKBOOK_SHEETS {
+    if sheet_count > MAX_SHEETS {
         return Err(format!(
-            "{} has {sheet_count} sheets, past the {MAX_WORKBOOK_SHEETS} sheet limit",
+            "{} has {sheet_count} sheets, past the {MAX_SHEETS} sheet limit",
             path.display(),
         ));
     }
@@ -788,12 +1492,13 @@ fn read_workbook_sheets(path: &Path) -> Result<Vec<RawSheet>, String> {
         let text = read_streaming_sheet(&mut workbook, &name, path, &mut total_bytes)?;
         sheets.push(RawSheet {
             name,
+            pairing_key: None,
             text,
             encoding: "Spreadsheet values".to_owned(),
             had_errors: false,
             stamp,
             template: None,
-            workbook: true,
+            kind: RawKind::Workbook,
         });
     }
     Ok(sheets)
@@ -940,8 +1645,8 @@ fn stream_sheet_text<'a>(
         current_row = row;
         previous_position = Some((row, column));
     }
-    if output.len() > MAX_WORKBOOK_TEXT_BYTES
-        || total_bytes.saturating_add(output.len()) > MAX_WORKBOOK_TEXT_BYTES
+    if output.len() > MAX_SHEET_TEXT_BYTES
+        || total_bytes.saturating_add(output.len()) > MAX_SHEET_TEXT_BYTES
     {
         return Err(workbook_text_limit_error(path, sheet));
     }
@@ -956,33 +1661,62 @@ fn append_workbook_cell(
     sheet: &str,
     previous_bytes: usize,
 ) -> Result<(), String> {
-    if value.len() > MAX_WORKBOOK_TEXT_BYTES
-        || previous_bytes
-            .saturating_add(output.len())
-            .saturating_add(value.len())
-            > MAX_WORKBOOK_TEXT_BYTES
-    {
-        return Err(workbook_text_limit_error(path, sheet));
-    }
+    let encoded_len = encoded_tab_field_len(value);
     let quoted = value
         .chars()
         .any(|character| matches!(character, '\t' | '\n' | '\r' | '"'))
         || value.trim() != value;
-    let encoded_len = value
+    if previous_bytes
+        .saturating_add(output.len())
+        .saturating_add(encoded_len)
+        > MAX_SHEET_TEXT_BYTES
+    {
+        return Err(workbook_text_limit_error(path, sheet));
+    }
+    append_encoded_tab_field_with_quote(output, value, quoted);
+    Ok(())
+}
+
+fn encoded_tab_field_len(value: &str) -> usize {
+    let quoted = value
+        .chars()
+        .any(|character| matches!(character, '\t' | '\n' | '\r' | '"'))
+        || value.trim() != value;
+    value
         .len()
         .saturating_add(if quoted { 2 } else { 0 })
         .saturating_add(if quoted {
             value.chars().filter(|character| *character == '"').count()
         } else {
             0
-        });
-    if previous_bytes
-        .saturating_add(output.len())
-        .saturating_add(encoded_len)
-        > MAX_WORKBOOK_TEXT_BYTES
-    {
-        return Err(workbook_text_limit_error(path, sheet));
+        })
+}
+
+fn html_encoded_tab_field_len(value: &str) -> usize {
+    if value.is_empty() {
+        2
+    } else {
+        encoded_tab_field_len(value)
     }
+}
+
+fn append_encoded_tab_field(output: &mut String, value: &str) {
+    let quoted = value
+        .chars()
+        .any(|character| matches!(character, '\t' | '\n' | '\r' | '"'))
+        || value.trim() != value;
+    append_encoded_tab_field_with_quote(output, value, quoted);
+}
+
+fn append_html_encoded_tab_field(output: &mut String, value: &str) {
+    if value.is_empty() {
+        append_encoded_tab_field_with_quote(output, value, true);
+    } else {
+        append_encoded_tab_field(output, value);
+    }
+}
+
+fn append_encoded_tab_field_with_quote(output: &mut String, value: &str, quoted: bool) {
     if quoted {
         output.push('"');
         for character in value.chars() {
@@ -995,14 +1729,13 @@ fn append_workbook_cell(
     } else {
         output.push_str(value);
     }
-    Ok(())
 }
 
 fn workbook_text_limit_error(path: &Path, sheet: &str) -> String {
     format!(
         "{} — {sheet} expands past the {} byte workbook table limit",
         path.display(),
-        MAX_WORKBOOK_TEXT_BYTES
+        MAX_SHEET_TEXT_BYTES
     )
 }
 
@@ -1104,10 +1837,7 @@ fn pair_sheet_indexes(
             let mut pairs = Vec::with_capacity(left.len() + right.len());
             for (left_index, sheet) in left.iter().enumerate() {
                 let right_index = right.iter().enumerate().find_map(|(index, candidate)| {
-                    (!used[index]
-                        && normalized_sheet_name(&sheet.name)
-                            == normalized_sheet_name(&candidate.name))
-                    .then_some(index)
+                    (!used[index] && sheet.pairing_key == candidate.pairing_key).then_some(index)
                 });
                 if let Some(index) = right_index {
                     used[index] = true;
@@ -1126,10 +1856,7 @@ fn pair_sheet_indexes(
             let mut pairs = Vec::with_capacity(left.len() + right.len());
             for (right_index, sheet) in right.iter().enumerate() {
                 let left_index = left.iter().enumerate().find_map(|(index, candidate)| {
-                    (!used[index]
-                        && normalized_sheet_name(&sheet.name)
-                            == normalized_sheet_name(&candidate.name))
-                    .then_some(index)
+                    (!used[index] && sheet.pairing_key == candidate.pairing_key).then_some(index)
                 });
                 if let Some(index) = left_index {
                     used[index] = true;
@@ -1169,6 +1896,19 @@ fn normalized_sheet_name(name: &str) -> String {
         .collect()
 }
 
+fn sheet_pairing_key(name: &str) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    for character in name
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .flat_map(char::to_lowercase)
+    {
+        let mut buffer = [0; 4];
+        hasher.update(character.encode_utf8(&mut buffer).as_bytes());
+    }
+    *hasher.finalize().as_bytes()
+}
+
 fn pair_label(left: Option<&str>, right: Option<&str>) -> String {
     match (left, right) {
         (Some(left), Some(right))
@@ -1205,6 +1945,23 @@ fn read_side_with_open<R: Read>(
     file_size: u64,
     open: impl FnOnce() -> std::io::Result<R>,
 ) -> Result<SideText, String> {
+    read_side_with_open_mode(path, format, file_size, open, false)
+}
+
+fn read_html_input(path: &Path, format: &FormatSettings) -> Result<SideText, String> {
+    let file_size = std::fs::metadata(path)
+        .map_err(|error| format!("{}: {error}", path.display()))?
+        .len();
+    read_side_with_open_mode(path, format, file_size, || std::fs::File::open(path), true)
+}
+
+fn read_side_with_open_mode<R: Read>(
+    path: &Path,
+    format: &FormatSettings,
+    file_size: u64,
+    open: impl FnOnce() -> std::io::Result<R>,
+    sniff_html_charset: bool,
+) -> Result<SideText, String> {
     let input_limit = u64::try_from(ca_table::parse::MAX_INPUT_BYTES).unwrap_or(u64::MAX);
     if file_size > input_limit {
         return Err(format!(
@@ -1226,8 +1983,12 @@ fn read_side_with_open<R: Read>(
             path.display()
         ));
     }
+    let declared_html_encoding =
+        (sniff_html_charset && format.encoding.is_none() && !has_byte_order_mark(&bytes))
+            .then(|| html_meta_encoding(&bytes))
+            .flatten();
     let options = DecodeOptions {
-        forced: format.encoding,
+        forced: format.encoding.or(declared_html_encoding),
         ..DecodeOptions::default()
     };
     let mut loaded = LoadedText::load(&bytes, &options);
@@ -1240,6 +2001,78 @@ fn read_side_with_open<R: Read>(
         stamp,
         template: Arc::new(loaded),
     })
+}
+
+fn has_byte_order_mark(bytes: &[u8]) -> bool {
+    [
+        &[0x00, 0x00, 0xFE, 0xFF][..],
+        &[0xFF, 0xFE, 0x00, 0x00][..],
+        &[0xEF, 0xBB, 0xBF][..],
+        &[0xFE, 0xFF][..],
+        &[0xFF, 0xFE][..],
+    ]
+    .iter()
+    .any(|bom| bytes.starts_with(bom))
+}
+
+fn html_meta_encoding(bytes: &[u8]) -> Option<ca_text::TextEncoding> {
+    let prefix = String::from_utf8_lossy(&bytes[..bytes.len().min(1024)]);
+    let document = Html::parse_document(&prefix);
+    let selector = Selector::parse("meta").ok()?;
+    for meta in document.select(&selector) {
+        let label = meta
+            .attr("charset")
+            .map(str::trim)
+            .filter(|label| !label.is_empty())
+            .map(str::to_owned)
+            .or_else(|| {
+                meta.attr("http-equiv")
+                    .is_some_and(|value| value.trim().eq_ignore_ascii_case("content-type"))
+                    .then(|| meta.attr("content").and_then(html_content_charset))
+                    .flatten()
+            });
+        if let Some(encoding) = label.as_deref().and_then(ca_text::TextEncoding::from_label) {
+            return Some(match encoding {
+                ca_text::TextEncoding::Utf16Le | ca_text::TextEncoding::Utf16Be => {
+                    ca_text::TextEncoding::Utf8
+                }
+                other => other,
+            });
+        }
+    }
+    None
+}
+
+fn html_content_charset(content: &str) -> Option<String> {
+    let lower = content.to_ascii_lowercase();
+    let mut search_from = 0usize;
+    while let Some(offset) = lower[search_from..].find("charset") {
+        let start = search_from + offset;
+        let before_ok = start == 0
+            || !lower.as_bytes()[start - 1].is_ascii_alphanumeric()
+                && lower.as_bytes()[start - 1] != b'-';
+        let after_key = start.saturating_add("charset".len());
+        let rest = lower[after_key..].trim_start();
+        if before_ok && rest.starts_with('=') {
+            let value_start = after_key + lower[after_key..].len() - rest.len() + 1;
+            let value = content[value_start..].trim_start();
+            let value = value.trim_matches(|character: char| character == '\'' || character == '"');
+            let label = value
+                .chars()
+                .take_while(|character| {
+                    !character.is_ascii_whitespace()
+                        && *character != ';'
+                        && *character != '\''
+                        && *character != '"'
+                })
+                .collect::<String>();
+            if !label.is_empty() {
+                return Some(label);
+            }
+        }
+        search_from = after_key;
+    }
+    None
 }
 
 fn read_input(
@@ -1408,11 +2241,14 @@ impl Pipeline {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::{
-        read_side_with_open, read_workbook_sheets, spawn_load, spawn_recompare, FormatSettings,
-        Pipeline, Side, Stage, TableMessage, TableSettings,
+        read_html_input, read_html_tables, read_side_with_open, read_workbook_sheets, spawn_load,
+        spawn_recompare, Cancel, FormatSettings, HtmlTableText, Pipeline, Side, Stage,
+        TableMessage, TableSettings, MAX_HTML_ATTRIBUTES_PER_TAG, MAX_HTML_DOCUMENT_CELLS,
+        MAX_HTML_MARKUP_CHARACTERS, MAX_HTML_TABLE_NAME_CHARS,
     };
     use ca_table::compare::CellStatus;
     use ca_table::schema::{ColumnAlignment, ColumnHandling, ColumnType, ManualColumnPair};
+    use scraper::{Html, Selector};
     use std::fmt::Write as _;
     use std::io::{Read as IoRead, Write as IoWrite};
     use std::path::Path;
@@ -1835,6 +2671,441 @@ mod tests {
         assert_eq!(data.sheet_pairs[3].label, "Only Right (right only)");
         assert!(data.sheet_pairs[2].right_name.is_none());
         assert!(data.sheet_pairs[3].left_name.is_none());
+    }
+
+    #[test]
+    fn html_tables_load_as_named_read_only_sheets_and_pair_by_caption() {
+        let dir = tempfile::tempdir().unwrap();
+        let left = dir.path().join("left.asp");
+        let right = dir.path().join("right.html");
+        std::fs::write(
+            &left,
+            concat!(
+                "<table><caption>Summary</caption><thead><tr><th>ID</th><th>Value</th></tr></thead>",
+                "<tbody><tr><td>1</td><td>Left &amp; one</td></tr></tbody></table>",
+                "<table aria-label=\"Details\"><tr><th>Code</th><th>Text</th></tr>",
+                "<tr><td>A</td><td>left detail</td></tr></table>"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &right,
+            concat!(
+                "<table aria-label=\"Details\"><tr><th>Code</th><th>Text</th></tr>",
+                "<tr><td>A</td><td>right detail</td></tr></table>",
+                "<table><caption>Summary</caption><tr><th>ID</th><th>Value</th></tr>",
+                "<tr><td>1</td><td>Right</td></tr></table>"
+            ),
+        )
+        .unwrap();
+        let mut settings = TableSettings::default();
+        settings.sheets = ca_session::settings::table::TablePairing::by_left_name();
+
+        let data = run(&left, &right, settings);
+
+        assert!(data.show_sheet_tabs);
+        assert_eq!(data.sheet_pairs.len(), 2);
+        assert_eq!(data.sheet_pairs[0].label, "Summary");
+        assert_eq!(data.sheet_pairs[0].right_index, Some(1));
+        assert_eq!(data.sheet_pairs[1].label, "Details");
+        assert_eq!(data.sheet_pairs[1].right_index, Some(0));
+        assert_eq!(
+            data.sheet_pairs[0].left.table.first_line_contains(),
+            &ca_table::parse::FirstLineContains::ColumnNames
+        );
+        assert_eq!(data.sheet_pairs[0].left.table.cell_text(0, 1), "Left & one");
+        assert_eq!(
+            data.sheet_pairs[1].right.table.cell_text(0, 1),
+            "right detail"
+        );
+        assert_eq!(data.sheet_pairs[0].left.facts.syntax, "HTML table cells");
+        assert!(data.texts.is_none());
+        assert!(data.sheet_pairs.iter().all(|sheet| {
+            sheet.texts.is_none()
+                && sheet.left.facts.template.is_none()
+                && sheet.right.facts.template.is_none()
+        }));
+    }
+
+    #[test]
+    fn html_tables_do_not_flatten_nested_table_cells_into_the_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let left = dir.path().join("left.html");
+        let right = dir.path().join("right.html");
+        std::fs::write(
+            &left,
+            "<table><tr><td>Before <table><tr><td>Nested</td></tr></table> after</td></tr></table>",
+        )
+        .unwrap();
+        std::fs::write(
+            &right,
+            "<table><tr><td>Before after</td></tr></table><table><tr><td>Nested</td></tr></table>",
+        )
+        .unwrap();
+
+        let data = run(&left, &right, TableSettings::default());
+
+        assert_eq!(data.sheet_pairs.len(), 2);
+        assert_eq!(
+            data.sheet_pairs[0].left.table.cell_text(0, 0),
+            "Before after"
+        );
+        assert_eq!(data.sheet_pairs[1].left.table.cell_text(0, 0), "Nested");
+    }
+
+    #[test]
+    fn html_table_row_and_column_spans_keep_cell_positions() {
+        let dir = tempfile::tempdir().unwrap();
+        let left = dir.path().join("left.html");
+        let right = dir.path().join("right.html");
+        let html = concat!(
+            "<table><tr><th colspan=\"2\">Group</th><th>Code</th></tr>",
+            "<tr><td rowspan=\"2\">A</td><td>B</td><td>1</td></tr>",
+            "<tr><td>C</td><td>2</td></tr></table>"
+        );
+        std::fs::write(&left, html).unwrap();
+        std::fs::write(&right, html).unwrap();
+
+        let data = run(&left, &right, TableSettings::default());
+
+        assert_eq!(data.sheet_pairs[0].left.table.cell_text(1, 1), "C");
+        assert_eq!(data.sheet_pairs[0].left.table.cell_text(1, 2), "2");
+    }
+
+    #[test]
+    fn html_rowspan_zero_grows_to_the_end_of_its_row_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let left = dir.path().join("left.html");
+        let right = dir.path().join("right.html");
+        let html = concat!(
+            "<table><tbody><tr><td rowspan=\"0\">A</td><td>1</td></tr>",
+            "<tr><td>X</td></tr></tbody></table>"
+        );
+        std::fs::write(&left, html).unwrap();
+        std::fs::write(&right, html).unwrap();
+
+        let data = run(&left, &right, TableSettings::default());
+
+        assert_eq!(data.sheet_pairs[0].left.table.cell_text(1, 0), "");
+        assert_eq!(data.sheet_pairs[0].left.table.cell_text(1, 1), "X");
+    }
+
+    #[test]
+    fn html_row_spans_do_not_cross_row_group_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let left = dir.path().join("left.html");
+        let right = dir.path().join("right.html");
+        let html = concat!(
+            "<table><tbody><tr><td rowspan=\"2\">A</td><td>1</td></tr></tbody>",
+            "<tbody><tr><td>B</td><td>2</td></tr></tbody></table>"
+        );
+        std::fs::write(&left, html).unwrap();
+        std::fs::write(&right, html).unwrap();
+
+        let data = run(&left, &right, TableSettings::default());
+
+        assert_eq!(data.sheet_pairs[0].left.table.cell_text(1, 0), "B");
+        assert_eq!(data.sheet_pairs[0].left.table.cell_text(1, 1), "2");
+    }
+
+    #[test]
+    fn html_empty_cells_at_table_edges_are_retained() {
+        let dir = tempfile::tempdir().unwrap();
+        let left = dir.path().join("left.html");
+        let right = dir.path().join("right.html");
+        let html = concat!(
+            "<table><tr><td></td></tr><tr><td>middle</td></tr>",
+            "<tr><td></td></tr></table>"
+        );
+        std::fs::write(&left, html).unwrap();
+        std::fs::write(&right, html).unwrap();
+
+        let data = run(&left, &right, TableSettings::default());
+        let table = &data.sheet_pairs[0].left.table;
+
+        assert_eq!(table.row_count(), 3);
+        assert_eq!(table.column_count(), 1);
+        assert_eq!(table.cell_text(0, 0), "");
+        assert_eq!(table.cell_text(2, 0), "");
+    }
+
+    #[test]
+    fn html_row_headers_remain_data_and_differences_are_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let left = dir.path().join("left.html");
+        let right = dir.path().join("right.html");
+        let left_html = concat!(
+            "<table><tbody><tr><th scope=\"row\">Product</th><td>1</td></tr>",
+            "<tr><th scope=\"row\">Other</th><td>2</td></tr></tbody></table>"
+        );
+        let right_html = concat!(
+            "<table><tbody><tr><th scope=\"row\">Goods</th><td>1</td></tr>",
+            "<tr><th scope=\"row\">Other</th><td>2</td></tr></tbody></table>"
+        );
+        std::fs::write(&left, left_html).unwrap();
+        std::fs::write(&right, right_html).unwrap();
+
+        let data = run(&left, &right, TableSettings::default());
+
+        assert_eq!(data.sheet_pairs[0].left.table.row_count(), 2);
+        assert_eq!(
+            data.sheet_pairs[0].left.table.first_line_contains(),
+            &ca_table::parse::FirstLineContains::CellData
+        );
+        assert_eq!(data.comparison.totals.rows_with_differences(), 1);
+    }
+
+    #[test]
+    fn html_header_only_tables_keep_their_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let left = dir.path().join("left.html");
+        let right = dir.path().join("right.html");
+        std::fs::write(
+            &left,
+            "<table><thead><tr><th>Name</th><th>Value</th></tr></thead></table>",
+        )
+        .unwrap();
+        std::fs::write(
+            &right,
+            "<table><thead><tr><th>Label</th><th>Value</th></tr></thead></table>",
+        )
+        .unwrap();
+
+        let data = run(&left, &right, TableSettings::default());
+        let table = &data.sheet_pairs[0].left.table;
+
+        assert_eq!(table.row_count(), 1);
+        assert_eq!(table.column_count(), 2);
+        assert_eq!(table.cell_text(0, 0), "Name");
+        assert_eq!(table.cell_text(0, 1), "Value");
+        assert_eq!(data.comparison.totals.rows_with_differences(), 1);
+    }
+
+    #[test]
+    fn html_duplicate_captions_do_not_collide_with_literal_suffixes() {
+        let dir = tempfile::tempdir().unwrap();
+        let left = dir.path().join("left.html");
+        let right = dir.path().join("right.html");
+        std::fs::write(
+            &left,
+            html_named_tables(&[("Q", "left one"), ("Q", "left two"), ("Q (2)", "literal")]),
+        )
+        .unwrap();
+        std::fs::write(
+            &right,
+            html_named_tables(&[("Q (2)", "literal"), ("Q", "right one"), ("Q", "right two")]),
+        )
+        .unwrap();
+        let mut settings = TableSettings::default();
+        settings.sheets = ca_session::settings::table::TablePairing::by_left_name();
+
+        let data = run(&left, &right, settings);
+
+        assert_eq!(data.sheet_pairs.len(), 3);
+        assert_eq!(data.sheet_pairs[0].right_index, Some(1));
+        assert_eq!(data.sheet_pairs[1].right_index, Some(2));
+        assert_eq!(data.sheet_pairs[2].right_index, Some(0));
+        assert_eq!(data.sheet_pairs[1].left_name.as_deref(), Some("Q (3)"));
+        assert_eq!(data.sheet_pairs[2].left_name.as_deref(), Some("Q (2)"));
+    }
+
+    fn html_named_tables(tables: &[(&str, &str)]) -> String {
+        tables
+            .iter()
+            .fold(String::new(), |mut html, (caption, value)| {
+                write!(
+                    html,
+                    "<table><caption>{caption}</caption><tr><td>{value}</td></tr></table>"
+                )
+                .unwrap();
+                html
+            })
+    }
+
+    #[test]
+    fn html_long_captions_keep_distinct_pairing_keys_and_bounded_labels() {
+        let dir = tempfile::tempdir().unwrap();
+        let left = dir.path().join("left.html");
+        let right = dir.path().join("right.html");
+        let prefix = "x".repeat(MAX_HTML_TABLE_NAME_CHARS + 40);
+        let name_a = format!("{prefix}A");
+        let name_b = format!("{prefix}B");
+        std::fs::write(&left, html_named_tables(&[(&name_a, "A"), (&name_b, "B")])).unwrap();
+        std::fs::write(&right, html_named_tables(&[(&name_b, "B"), (&name_a, "A")])).unwrap();
+        let mut settings = TableSettings::default();
+        settings.sheets = ca_session::settings::table::TablePairing::by_left_name();
+
+        let data = run(&left, &right, settings);
+
+        assert_eq!(data.sheet_pairs[0].right_index, Some(1));
+        assert_eq!(data.sheet_pairs[1].right_index, Some(0));
+        assert!(data
+            .sheet_pairs
+            .iter()
+            .all(|pair| { pair.label.chars().count() <= 2 * (MAX_HTML_TABLE_NAME_CHARS + 5) + 3 }));
+    }
+
+    #[test]
+    fn html_block_elements_separate_adjacent_visible_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let left = dir.path().join("left.html");
+        let right = dir.path().join("right.html");
+        std::fs::write(
+            &left,
+            "<table><tr><td><div>A</div><div>B</div></td></tr></table>",
+        )
+        .unwrap();
+        std::fs::write(&right, "<table><tr><td>AB</td></tr></table>").unwrap();
+
+        let data = run(&left, &right, TableSettings::default());
+
+        assert_eq!(data.sheet_pairs[0].left.table.cell_text(0, 0), "A B");
+        assert_eq!(data.comparison.totals.rows_with_differences(), 1);
+    }
+
+    #[test]
+    fn html_meta_charset_is_used_without_overriding_a_bom_or_user_choice() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("legacy.html");
+        let bom = dir.path().join("bom.html");
+        let prefix = b"<meta charset=\"windows-1252\"><table><tr><td>";
+        let suffix = b"</td></tr></table>";
+        let mut legacy_bytes = prefix.to_vec();
+        legacy_bytes.extend_from_slice(&[0xC3, 0xA9]);
+        legacy_bytes.extend_from_slice(suffix);
+        std::fs::write(&legacy, legacy_bytes).unwrap();
+
+        let legacy_input = read_html_input(&legacy, &FormatSettings::default()).unwrap();
+        assert_eq!(legacy_input.encoding, "windows-1252");
+        assert!(legacy_input.text.contains("Ã©"));
+
+        let mut bom_bytes = vec![0xEF, 0xBB, 0xBF];
+        bom_bytes.extend_from_slice(prefix);
+        bom_bytes.extend_from_slice("é".as_bytes());
+        bom_bytes.extend_from_slice(suffix);
+        std::fs::write(&bom, bom_bytes).unwrap();
+        let bom_input = read_html_input(&bom, &FormatSettings::default()).unwrap();
+        assert_eq!(bom_input.encoding, "UTF-8");
+        assert!(bom_input.text.contains('é'));
+
+        let override_input = read_html_input(
+            &legacy,
+            &FormatSettings {
+                encoding: Some(ca_text::TextEncoding::Utf8),
+                ..FormatSettings::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(override_input.encoding, "UTF-8");
+        assert!(override_input.text.contains('é'));
+    }
+
+    #[test]
+    fn html_markup_budget_rejects_input_before_building_the_document() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("many-tags.html");
+        let html = format!("<!-->{}", "<".repeat(MAX_HTML_MARKUP_CHARACTERS + 1));
+        std::fs::write(&path, html).unwrap();
+
+        let error = read_html_tables(&path, &FormatSettings::default(), &Cancel::new())
+            .err()
+            .expect("the markup budget rejects the document");
+
+        assert!(error.contains("HTML markup character limit"));
+    }
+
+    #[test]
+    fn html_attribute_budget_rejects_an_attribute_dense_tag() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("many-attributes.html");
+        let end_tag_path = dir.path().join("many-end-tag-attributes.html");
+        let mut attributes = String::new();
+        for index in 0..=MAX_HTML_ATTRIBUTES_PER_TAG {
+            write!(attributes, " data-{index}").unwrap();
+        }
+        std::fs::write(
+            &path,
+            format!("<table =\"{attributes}><tr><td>value</td></tr></table>"),
+        )
+        .unwrap();
+
+        let error = read_html_tables(&path, &FormatSettings::default(), &Cancel::new())
+            .err()
+            .expect("the attribute budget rejects the tag");
+
+        assert!(error.contains("attribute limit"));
+
+        std::fs::write(&end_tag_path, format!("<table></table{attributes}>")).unwrap();
+        let error = read_html_tables(&end_tag_path, &FormatSettings::default(), &Cancel::new())
+            .err()
+            .expect("the attribute budget also checks end tags");
+        assert!(error.contains("attribute limit"));
+    }
+
+    #[test]
+    fn html_wide_unspanned_rows_do_not_retain_span_storage() {
+        let document = Html::parse_document(
+            "<table><tr><td colspan=\"4000\">wide</td></tr><tr><td>narrow</td></tr></table>",
+        );
+        let table_selector = Selector::parse("table").unwrap();
+        let row_selector = Selector::parse("tr").unwrap();
+        let table = document.select(&table_selector).next().unwrap();
+        let mut total_bytes = 0;
+        let mut total_cells = 0;
+        let cancel = Cancel::new();
+        let mut builder = HtmlTableText::new(
+            Path::new("wide.html"),
+            "Wide",
+            &mut total_bytes,
+            &mut total_cells,
+            &cancel,
+        );
+
+        for row in table.select(&row_selector) {
+            builder.append_row(row, false).unwrap();
+            assert!(builder.row_spans.is_empty());
+        }
+    }
+
+    #[test]
+    fn html_document_cell_limit_rejects_growth_before_allocating_the_row() {
+        let document = Html::parse_document("<table><tr><td>value</td></tr></table>");
+        let table_selector = Selector::parse("table").unwrap();
+        let row_selector = Selector::parse("tr").unwrap();
+        let table = document.select(&table_selector).next().unwrap();
+        let row = table.select(&row_selector).next().unwrap();
+        let mut total_bytes = 0;
+        let mut total_cells = MAX_HTML_DOCUMENT_CELLS;
+        let cancel = Cancel::new();
+        let mut builder = HtmlTableText::new(
+            Path::new("full.html"),
+            "Full",
+            &mut total_bytes,
+            &mut total_cells,
+            &cancel,
+        );
+
+        let error = builder.append_row(row, false).unwrap_err();
+
+        assert!(error.contains("expanded HTML cell limit"));
+    }
+
+    #[test]
+    fn html_file_without_tables_returns_a_clear_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let left = dir.path().join("left.html");
+        let right = dir.path().join("right.csv");
+        std::fs::write(&left, "<html><body>There is no table here.</body></html>").unwrap();
+        std::fs::write(&right, "id,value\n1,ok\n").unwrap();
+        let mut job = spawn_load(left, right, TableSettings::default(), Arc::new(|| {}));
+
+        let messages = drain(&mut job);
+
+        assert!(messages.into_iter().any(|message| matches!(
+            message,
+            TableMessage::Failed(reason)
+                if reason.contains("contains no HTML tables that Table Compare can read")
+        )));
     }
 
     #[test]

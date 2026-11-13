@@ -304,9 +304,14 @@ pub struct TableView {
     clipboard_asked: Option<Side>,
 }
 
-fn workbook_read_only_reason(left: &Path, right: &Path) -> Option<&'static str> {
-    (jobs::is_workbook_path(left) || jobs::is_workbook_path(right))
-        .then_some("Spreadsheet files are read-only in Table Compare.")
+fn table_format_read_only_reason(left: &Path, right: &Path) -> Option<&'static str> {
+    if jobs::is_workbook_path(left) || jobs::is_workbook_path(right) {
+        Some("Spreadsheet files are read-only in Table Compare.")
+    } else if jobs::is_html_tables_path(left) || jobs::is_html_tables_path(right) {
+        Some("HTML table files are read-only in Table Compare.")
+    } else {
+        None
+    }
 }
 
 fn apply_panel_settings(
@@ -327,8 +332,8 @@ impl TableView {
     /// A tab over the two sides, with the comparison already started.
     #[must_use]
     pub fn new(left: PathBuf, right: PathBuf, context: &ViewContext, instance: u64) -> Self {
-        let read_only = jobs::is_workbook_path(&left) || jobs::is_workbook_path(&right);
-        let read_only_reason = workbook_read_only_reason(&left, &right).unwrap_or(
+        let read_only = table_format_read_only_reason(&left, &right).is_some();
+        let read_only_reason = table_format_read_only_reason(&left, &right).unwrap_or(
             "The file is a copy taken out of an archive, so it cannot be edited or saved.",
         );
         let mut view = Self {
@@ -588,12 +593,12 @@ impl TableView {
     }
 
     fn refresh_read_only(&mut self) {
-        let spreadsheet_reason = workbook_read_only_reason(&self.left_path, &self.right_path);
-        self.read_only = self.archive_read_only || spreadsheet_reason.is_some();
+        let table_reason = table_format_read_only_reason(&self.left_path, &self.right_path);
+        self.read_only = self.archive_read_only || table_reason.is_some();
         self.read_only_reason = if self.archive_read_only {
             "The file is a copy taken out of an archive, so it cannot be edited or saved."
         } else {
-            spreadsheet_reason.unwrap_or(
+            table_reason.unwrap_or(
                 "The file is a copy taken out of an archive, so it cannot be edited or saved.",
             )
         };
@@ -4102,6 +4107,78 @@ mod tests {
         let sides = view.sides.as_ref().expect("the selected sheet is loaded");
         assert_eq!(sides.0.table.cell_text(0, 0), "shared");
         assert_eq!(sides.1.table.cell_text(0, 0), "one");
+        view.on_close();
+    }
+
+    #[test]
+    fn html_table_view_selects_a_table_tab_and_stays_read_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let left = dir.path().join("left.html");
+        let right = dir.path().join("right.html");
+        std::fs::write(
+            &left,
+            "<table><caption>Summary</caption><tr><td>summary</td></tr></table><table><caption>Details</caption><tr><td>details</td></tr></table>",
+        )
+        .unwrap();
+        std::fs::write(
+            &right,
+            "<table><caption>Summary</caption><tr><td>summary</td></tr></table><table><caption>Details</caption><tr><td>details</td></tr></table>",
+        )
+        .unwrap();
+        let egui = egui::Context::default();
+        let mut view = TableView::new(left, right, &context(), 79);
+
+        assert!(settle(&mut view, &egui));
+        assert!(view.show_sheet_tabs);
+        assert!(view.read_only);
+        assert!(!view.accepts(Command::SaveFileAs));
+        assert_eq!(
+            view.write_block(Side::Left),
+            Some("HTML table files are read-only in Table Compare.")
+        );
+        assert_eq!(view.sheet_pairs.len(), 2);
+
+        let output = egui.run(sized_input(1_280.0, 800.0), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                view.ui(ui, &context());
+            });
+        });
+        let details_position = output
+            .shapes
+            .iter()
+            .rev()
+            .find_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) if text.galley.text() == "Details" => {
+                    Some(clipped.shape.visual_bounding_rect().center())
+                }
+                _ => None,
+            })
+            .expect("the Details table tab is visible");
+        let click = vec![
+            egui::Event::PointerMoved(details_position),
+            egui::Event::PointerButton {
+                pos: details_position,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::default(),
+            },
+            egui::Event::PointerButton {
+                pos: details_position,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::default(),
+            },
+        ];
+        let _ = egui.run(event_input(1_280.0, 800.0, click), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                view.ui(ui, &context());
+            });
+        });
+        assert_eq!(view.active_sheet, 1);
+        assert!(settle(&mut view, &egui));
+        let sides = view.sides.as_ref().expect("the selected table is loaded");
+        assert_eq!(sides.0.table.cell_text(0, 0), "details");
+        assert_eq!(sides.1.table.cell_text(0, 0), "details");
         view.on_close();
     }
 
