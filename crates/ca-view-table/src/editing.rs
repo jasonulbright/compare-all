@@ -10,6 +10,7 @@ use crate::jobs::{self, Stage};
 use crate::model::{Cursor, Side};
 use crate::search::{self, CellMatcher, ReplaceMessage, Scope, SearchMessage};
 use crate::{Status, TableView};
+use ca_table::parse::Table;
 use ca_table::write::{cell_write, is_writable, record_text};
 use ca_text::TextBuffer;
 use ca_ui::save::text::SaveConsent;
@@ -27,6 +28,14 @@ struct RowCopy {
     cells: usize,
     added: usize,
     removed: usize,
+}
+
+struct MatchedRowContext<'a> {
+    source_table: &'a Table,
+    target_table: &'a Table,
+    target_text: &'a str,
+    options: &'a ca_table::parse::ParseOptions,
+    column_pairs: &'a [(u32, u32)],
 }
 
 /// The line terminator `text` uses first, or a line feed when it has none.
@@ -56,6 +65,48 @@ fn merge_at_same_start(mut changes: Splices) -> Splices {
         }
     }
     merged
+}
+
+fn append_matched_row_changes(
+    context: &MatchedRowContext<'_>,
+    source_row: u32,
+    target_row: u32,
+    copy: &mut RowCopy,
+) -> Result<(), String> {
+    for (source_column, target_column) in context.column_pairs {
+        let source_row_index = source_row as usize;
+        let source_column_index = *source_column as usize;
+        let target_row_index = target_row as usize;
+        let target_column_index = *target_column as usize;
+        if context
+            .source_table
+            .cell(source_row_index, source_column_index)
+            .is_none()
+            && context
+                .target_table
+                .cell(target_row_index, target_column_index)
+                .is_none()
+        {
+            continue;
+        }
+        let value = context
+            .source_table
+            .cell_text(source_row_index, source_column_index)
+            .into_owned();
+        let write = cell_write(
+            context.target_table,
+            context.options,
+            target_row_index,
+            target_column_index,
+            &value,
+        )
+        .map_err(|error| format!("The rows cannot be copied: {error}."))?;
+        if context.target_text.get(write.range.clone()) != Some(write.text.as_str()) {
+            copy.changes.push((write.range, write.text));
+            copy.cells += 1;
+        }
+    }
+    Ok(())
 }
 
 /// A question the view is waiting on an answer to.
@@ -394,6 +445,13 @@ impl TableView {
                 Side::Right => column.right.zip(column.left),
             })
             .collect();
+        let matched_row_context = MatchedRowContext {
+            source_table: &source_data.table,
+            target_table,
+            target_text,
+            options,
+            column_pairs: &column_pairs,
+        };
         let source_cell = |row: u32, column: u32| {
             source_data
                 .table
@@ -404,21 +462,12 @@ impl TableView {
         for row in rows {
             match side_rows(*row) {
                 Some((Some(source_row), Some(target_row))) => {
-                    for (source_column, target_column) in &column_pairs {
-                        let value = source_cell(source_row, *source_column);
-                        let write = cell_write(
-                            target_table,
-                            options,
-                            target_row as usize,
-                            *target_column as usize,
-                            &value,
-                        )
-                        .map_err(|error| format!("The rows cannot be copied: {error}."))?;
-                        if target_text.get(write.range.clone()) != Some(write.text.as_str()) {
-                            copy.changes.push((write.range, write.text));
-                            copy.cells += 1;
-                        }
-                    }
+                    append_matched_row_changes(
+                        &matched_row_context,
+                        source_row,
+                        target_row,
+                        &mut copy,
+                    )?;
                 }
                 Some((Some(source_row), None)) => {
                     let values: Vec<String> = (0..target_table.column_count())
