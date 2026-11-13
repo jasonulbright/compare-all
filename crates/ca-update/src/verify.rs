@@ -7,11 +7,10 @@
 //!
 //! The manifest and the SHA-256 come from the same host as the file, so the
 //! signature is the only check an attacker on that path cannot satisfy. The
-//! portable archive is therefore held to a fixed file set compiled into the
-//! program: every program file in it is signer-checked, no other file may be
-//! a program, and every signed program must carry the version the release
-//! claims inside its signed sections, so an older signed build cannot be
-//! staged under a newer version.
+//! updater extracts only a fixed set of installable files. It reads and
+//! discards the optional `program-state.json` seed. Every program file is
+//! signer-checked and must carry the release version inside its signed
+//! sections, so an older signed build cannot be staged under a newer version.
 
 use crate::signature::{verify_signer, SignatureVerifier};
 use crate::staging::AssetKind;
@@ -28,8 +27,7 @@ const MAX_UNPACKED_BYTES: u64 = 1024 * 1024 * 1024;
 /// Most entries a portable archive may hold.
 const MAX_ENTRIES: usize = 64;
 
-/// Every file the portable archive may hold, in install order. Nothing else
-/// is unpacked and nothing else is written into the program folder.
+/// The portable archive's installable files, in install order.
 pub const PORTABLE_FILES: [&str; 6] = [
     "CHANGELOG.md",
     "LICENSE",
@@ -518,11 +516,11 @@ fn check_format(file: &Path, kind: AssetKind) -> Result<(), String> {
     })
 }
 
-/// Unpack a portable archive into `destination`. Only the names of
-/// [`PORTABLE_FILES`] are accepted, each once; a folder, a path, another name,
-/// a name repeated in any letter case, a missing program or an unexpected
-/// number of entries fails the whole archive. Each file is held open from
-/// the moment it is written.
+/// Unpack a portable archive into `destination`. Only [`PORTABLE_FILES`] and
+/// an optional `program-state.json` entry are accepted. The state entry is
+/// read and discarded. Each name may appear once; folders, paths, other
+/// names, missing programs or too many entries fail the whole archive. Each
+/// extracted file stays open from the moment it is written.
 ///
 /// # Errors
 /// Returns why the archive is not a release archive.
