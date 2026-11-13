@@ -1237,6 +1237,7 @@ dependencies = [
 name = "ca-view-table"
 version = "0.0.0"
 dependencies = [
+ "blake3",
  "ca-session",
  "ca-table",
  "ca-text",

@@ -4117,12 +4117,12 @@ mod tests {
         let right = dir.path().join("right.html");
         std::fs::write(
             &left,
-            "<table><tr><td>summary</td></tr></table><table><tr><td>details</td></tr></table>",
+            "<table><caption>Summary</caption><tr><td>summary</td></tr></table><table><caption>Details</caption><tr><td>details</td></tr></table>",
         )
         .unwrap();
         std::fs::write(
             &right,
-            "<table><tr><td>summary</td></tr></table><table><tr><td>details</td></tr></table>",
+            "<table><caption>Summary</caption><tr><td>summary</td></tr></table><table><caption>Details</caption><tr><td>details</td></tr></table>",
         )
         .unwrap();
         let egui = egui::Context::default();
@@ -4138,9 +4138,44 @@ mod tests {
         );
         assert_eq!(view.sheet_pairs.len(), 2);
 
-        view.select_sheet(1);
-        assert!(settle(&mut view, &egui));
+        let output = egui.run(sized_input(1_280.0, 800.0), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                view.ui(ui, &context());
+            });
+        });
+        let details_position = output
+            .shapes
+            .iter()
+            .rev()
+            .find_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) if text.galley.text() == "Details" => {
+                    Some(clipped.shape.visual_bounding_rect().center())
+                }
+                _ => None,
+            })
+            .expect("the Details table tab is visible");
+        let click = vec![
+            egui::Event::PointerMoved(details_position),
+            egui::Event::PointerButton {
+                pos: details_position,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::default(),
+            },
+            egui::Event::PointerButton {
+                pos: details_position,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::default(),
+            },
+        ];
+        let _ = egui.run(event_input(1_280.0, 800.0, click), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                view.ui(ui, &context());
+            });
+        });
         assert_eq!(view.active_sheet, 1);
+        assert!(settle(&mut view, &egui));
         let sides = view.sides.as_ref().expect("the selected table is loaded");
         assert_eq!(sides.0.table.cell_text(0, 0), "details");
         assert_eq!(sides.1.table.cell_text(0, 0), "details");

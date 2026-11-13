@@ -16,6 +16,7 @@ ca-session.workspace = true
 ca-table.workspace = true
 ca-text.workspace = true
 ca-ui.workspace = true
+blake3.workspace = true
 calamine.workspace = true
 egui.workspace = true
 scraper.workspace = true
